@@ -14,6 +14,23 @@ to check that a change fits.
   The title becomes the squashed commit message.
 - New CI jobs arrive in the same pull request as the thing they test.
 
+### What has to pass
+
+A ruleset on `main` enforces the following, with no bypass for anyone:
+
+- Required status checks, on the pull request and again on the merge queue's
+  combined commit: `build`, `vet`, `lint`, `test`, `govulncheck`, `actionlint`
+  and `docs`.
+- CodeQL code scanning must report no new alert of severity error, or security
+  severity high or above, before a pull request can enter the queue. Merge
+  queue groups are not scanned again; GitHub does not apply this rule to them.
+- No approving review is required. The project has one maintainer, and a
+  required approval would block their own pull requests.
+- No force pushes to `main` and no deleting it.
+
+To merge, use "Merge when ready" on the pull request, or `gh pr merge --squash`.
+The queue runs the required checks again and then lands the squashed commit.
+
 ## Running the checks locally
 
 You need Go (the version in `go.mod` or newer) and
