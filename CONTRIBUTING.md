@@ -1,0 +1,57 @@
+# Contributing to skylite
+
+skylite is pre-alpha. Read the [README](README.md) for the current status and
+roadmap before proposing larger changes; opening an issue first is the best way
+to check that a change fits.
+
+## Pull requests and the merge queue
+
+- All changes go through pull requests. Nobody pushes directly to `main`.
+- Pull requests are merged through the merge queue using squash merge, so
+  `main` keeps a linear history.
+- Pull request titles follow [Conventional Commits](https://www.conventionalcommits.org/),
+  for example `feat(storage): add Azure Blob backend` or `fix(cli): exit 2 on unknown command`.
+  The title becomes the squashed commit message.
+- New CI jobs arrive in the same pull request as the thing they test.
+
+## Running the checks locally
+
+You need Go (the version in `go.mod` or newer) and
+[golangci-lint](https://golangci-lint.run/) v2.
+
+| Command      | What it runs                                         |
+|--------------|------------------------------------------------------|
+| `make build` | `CGO_ENABLED=0` build of `bin/skylite`               |
+| `make test`  | `go test -race -count=1 ./...`                       |
+| `make vet`   | `go vet ./...`                                       |
+| `make lint`  | `golangci-lint run`                                  |
+| `make vuln`  | `govulncheck ./...` at the pinned version            |
+| `make check` | all of the above                                     |
+
+Run `make check` before opening a pull request. CI runs the same checks plus
+`go mod tidy -diff` and workflow linting. CodeQL code scanning runs through
+GitHub's default setup, which is managed at the organisation level, so there is
+no CodeQL workflow in this repository.
+
+Pure-Go builds are a project requirement: skylite must not depend on cgo, and
+`CGO_ENABLED=0 go build ./...` must pass.
+
+## Documentation
+
+- Docs live in this repository under `docs/`.
+- Any pull request that changes behaviour, configuration, an API or the CLI
+  updates the docs in the same pull request.
+- Reference pages are generated from source. The CLI reference is generated
+  from `skylite help` at build time and is not committed.
+
+Docs site generator: Hugo — one static Go binary with no Node or Python dependency tree to audit, templates we fully control, and fast builds.
+
+## Security
+
+Do not report vulnerabilities in public issues or pull requests. See
+[SECURITY.md](SECURITY.md).
+
+## License
+
+By contributing, you agree that your contributions are licensed under the
+[Apache License 2.0](LICENSE).

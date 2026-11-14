@@ -1,0 +1,8 @@
+{{- /* Rendered twice by docs layouts: a disclosure for narrow screens and a sidebar for wide ones. CSS shows one. */ -}}
+{{- $docs := site.GetPage "/docs" -}}
+<nav class="docnav" aria-label="Documentation">
+  <ul>
+    <li><a href="{{ $docs.RelPermalink }}"{{ if eq . $docs }} aria-current="page"{{ end }}>Overview</a></li>
+  </ul>
+  {{ partial "docnav-tree.html" (dict "section" $docs "cur" .) }}
+</nav>

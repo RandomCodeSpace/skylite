@@ -1,0 +1,75 @@
+{{ define "bodyclass" }}home{{ end }}
+{{ define "main" }}
+{{- $arch := site.GetPage "/docs/architecture" -}}
+{{- $start := site.GetPage "/docs/getting-started" -}}
+{{- $roadmap := site.GetPage "/docs/roadmap" -}}
+<section class="hero wrap" aria-labelledby="hero-title">
+  <h1 id="hero-title">A SQL database server where object storage is the source of truth.</h1>
+  <div class="hero-text">
+    <p class="lede">skylite is a pre-alpha Go project. The aim is a SQL server on SQLite for Kubernetes pods that have no persistent volumes. The design keeps all durable state in object storage and treats pod disk as a cache. Services will read and write through it over HTTPS.</p>
+    <p class="redmark"><strong>Pre-alpha.</strong> Today the binary prints its version and help, and nothing else. The drawing below is the target design, not working software.</p>
+    <p class="actions">
+      <a class="btn btn-primary" href="{{ $arch.RelPermalink }}">Read the design direction</a>
+      <a class="btn" href="{{ site.Params.repo }}">Source on GitHub</a>
+    </p>
+  </div>
+</section>
+
+<div class="wrap wrap-wide">
+  {{ partial "diagram.html" . }}
+</div>
+
+<section class="band wrap" aria-labelledby="why">
+  <h2 id="why">Why it exists</h2>
+  <div class="split">
+    <div class="prose">
+      <p>Teams on Kubernetes often want a small relational database for their services, without running a stateful database tier or attaching persistent volumes to pods.</p>
+      <p>Object storage is already durable, cheap and replicated, and it comes with cloud-native authentication. skylite is designed to make it the source of truth, so that anything inside a pod can be thrown away and rebuilt.</p>
+      <p>The plan is to build on SQLite rather than a new engine, so the SQL dialect and file format will be SQLite&rsquo;s own.</p>
+    </div>
+    <aside class="trade" aria-labelledby="trade-h">
+      <h3 id="trade-h">The trade, by design</h3>
+      <dl>
+        <dt>Given up</dt>
+        <dd>Low write latency. Each write waits for object storage to confirm it before it is acknowledged.</dd>
+        <dt>In return</dt>
+        <dd>No stateful tier to operate and no persistent volumes to attach. Durability, replication and access control come from the object store you already run.</dd>
+      </dl>
+    </aside>
+  </div>
+</section>
+
+<section class="band wrap" aria-labelledby="goals">
+  <div class="band-head">
+    <h2 id="goals">Design goals</h2>
+    <p class="marker">Goals, not features. None of these exist yet.</p>
+  </div>
+  <dl class="goals">
+    {{- range hugo.Data.goals.items }}
+    <div class="goal"><dt>{{ .title }}</dt><dd>{{ .text }}</dd></div>
+    {{- end }}
+  </dl>
+</section>
+
+<section class="band wrap" aria-labelledby="today">
+  <div class="split split-even">
+    <div class="prose">
+      <h2 id="today">What runs today</h2>
+      <p>With a Go toolchain installed, install the binary and ask for its version. That is all it does yet: it prints its version and help.</p>
+      <p>To build from a clone instead, run <code>make build</code> and then <code>./bin/skylite version</code>. The <a href="{{ $start.RelPermalink }}">getting started guide</a> has both paths.</p>
+    </div>
+    <div class="quick">
+      {{ transform.Highlight "go install github.com/RandomCodeSpace/skylite/cmd/skylite@latest\nskylite version" "sh" }}
+    </div>
+  </div>
+</section>
+
+<section class="band wrap" aria-labelledby="status">
+  <div class="band-head">
+    <h2 id="status">Status and roadmap</h2>
+    <p>One item is done. The rest is listed in planned order, and none of it is built.</p>
+  </div>
+  {{ partial "roadmap.html" . }}
+  <p class="more"><a href="{{ $roadmap.RelPermalink }}">Roadmap and status in the docs</a></p>
+</section>
+{{ end }}

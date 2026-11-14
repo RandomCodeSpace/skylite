@@ -1,0 +1,33 @@
+# Design goals shown on the landing page. Goals, not features: none of this is built yet.
+
+[[items]]
+title = "Acknowledged means stored"
+text = "A write is acknowledged only after object storage confirms it."
+
+[[items]]
+title = "Disk is only a cache"
+text = "Pod disk and memory make it faster. They are never required for capacity."
+
+[[items]]
+title = "One leader per database"
+text = "A lease object in object storage chooses the leader; other pods forward writes to it. Conditional writes, not the lease alone, fence a stale leader."
+
+[[items]]
+title = "Reads scale with pods"
+text = "Readers fetch pages from object storage on demand, with a bounded cache. Add pods to add read capacity."
+
+[[items]]
+title = "Relational SQL over HTTPS"
+text = "Full SQL from SQLite, carried over HTTPS so it passes through ingress and Istio without a raw TCP port."
+
+[[items]]
+title = "Drivers you already use"
+text = "A Go database/sql driver (target: works with GORM). A JDBC driver and Hibernate dialect (target: works with Spring Data JPA)."
+
+[[items]]
+title = "Locked down by default"
+text = "Authentication and authorisation on the query endpoint. No extension loading, no attaching arbitrary files, query time and size limits, no secrets in logs."
+
+[[items]]
+title = "Every cloud auth method"
+text = "Each method each cloud supports. For Azure: Entra ID managed identity, workload identity, service principal, CLI login, shared key, SAS token and connection string."

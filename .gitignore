@@ -1,0 +1,5 @@
+bin/
+docs/public/
+docs/resources/
+docs/.hugo_build.lock
+docs/content/docs/reference/cli.md

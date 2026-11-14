@@ -1,0 +1,162 @@
+{{- /* Target architecture drawing. Two hand-authored variants: wide (>= 60rem) and stacked (narrow). Colours come from CSS custom properties in main.css. */ -}}
+<figure class="sheet" aria-labelledby="sheet-caption">
+  <div class="sheet-draw">
+    <svg class="dg dg-wide" viewBox="0 0 1136 500" role="img" aria-labelledby="dgw-t dgw-d">
+      <title id="dgw-t">Target architecture of skylite (design direction, not implemented)</title>
+      <desc id="dgw-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes and keeps a working copy on ephemeral disk; followers forward writes to the leader and fetch pages on demand. Object storage holds the lease object, change files and snapshots. A write is acknowledged only after the upload is confirmed. The lease plus conditional writes fence a stale leader.</desc>
+      <defs>
+        <marker id="dgw-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="dg-head" d="M0 1 9 5 0 9z"/></marker>
+      </defs>
+
+      <!-- clients -->
+      <text class="dg-h" x="20" y="60">Clients</text>
+      <rect class="dg-box" x="20" y="112" width="180" height="84" rx="6"/>
+      <text class="dg-b" x="38" y="146">Go services</text>
+      <text class="dg-m" x="38" y="172">database/sql driver</text>
+      <rect class="dg-box" x="20" y="328" width="180" height="84" rx="6"/>
+      <text class="dg-b" x="38" y="362">Java services</text>
+      <text class="dg-m" x="38" y="388">JDBC driver</text>
+
+      <!-- ingress band -->
+      <rect class="dg-band" x="236" y="40" width="44" height="420" rx="22"/>
+      <text class="dg-band-t" transform="translate(264 250) rotate(-90)" text-anchor="middle">HTTPS through ingress / Istio</text>
+      <path class="dg-arrow" d="M200 154H312" marker-end="url(#dgw-head)"/>
+      <path class="dg-arrow" d="M200 370H312" marker-end="url(#dgw-head)"/>
+
+      <!-- pods -->
+      <rect class="dg-group" x="316" y="30" width="320" height="440" rx="10"/>
+      <text class="dg-h" x="336" y="60">skylite pods for one database</text>
+      <text class="dg-m" x="336" y="82">No persistent volumes</text>
+
+      <rect class="dg-box dg-leader" x="336" y="104" width="280" height="110" rx="6"/>
+      <text class="dg-t" x="354" y="138">Leader</text>
+      <text x="354" y="166">Takes all writes</text>
+      <text class="dg-m" x="354" y="192">Working copy on ephemeral disk</text>
+      <g class="dg-disk" transform="translate(584 124)"><ellipse cx="0" cy="0" rx="12" ry="4"/><path d="M-12 0v18M12 0v18"/><path class="dg-dash" d="M-12 18a12 4 0 0 0 24 0"/></g>
+
+      <rect class="dg-box dg-back" x="352" y="316" width="280" height="130" rx="6"/>
+      <rect class="dg-box dg-back" x="344" y="308" width="280" height="130" rx="6"/>
+      <rect class="dg-box" x="336" y="300" width="280" height="130" rx="6"/>
+      <text class="dg-t" x="354" y="334">Followers (N pods)</text>
+      <text x="354" y="362">Forward writes to the leader</text>
+      <text class="dg-m" x="354" y="386">Fetch pages on demand</text>
+      <text class="dg-m" x="354" y="410">Serve reads from a bounded cache</text>
+
+      <path class="dg-arrow" d="M420 298V218" marker-end="url(#dgw-head)"/>
+      <text class="dg-s" x="432" y="262">forward writes</text>
+
+      <!-- storage -->
+      <rect class="dg-store" x="856" y="30" width="260" height="420" rx="10"/>
+      <text class="dg-h" x="876" y="60">Object storage</text>
+      <text class="dg-m" x="876" y="82">Azure Blob, S3, GCS</text>
+      <text class="dg-m" x="876" y="102">or local filesystem</text>
+      <rect class="dg-chip" x="876" y="116" width="220" height="40" rx="4"/>
+      <text x="892" y="141">Lease object</text>
+      <rect class="dg-chip" x="876" y="186" width="220" height="40" rx="4"/>
+      <text x="892" y="211">Change files</text>
+      <rect class="dg-chip" x="876" y="240" width="220" height="40" rx="4"/>
+      <text x="892" y="265">Snapshots</text>
+      <text class="dg-m" x="876" y="424">All durable state lives here.</text>
+      <!-- leader to storage -->
+      <path class="dg-arrow" d="M618 136H872" marker-end="url(#dgw-head)"/>
+      <path class="dg-arrow" d="M618 196 872 205" marker-end="url(#dgw-head)"/>
+      <path class="dg-arrow" d="M854 372H636" marker-end="url(#dgw-head)"/>
+      <text class="dg-s" x="745" y="360" text-anchor="middle">pages on demand</text>
+
+      <!-- annotations -->
+      <path class="dg-redline" d="M746 92V128"/>
+      <circle class="dg-dot" cx="746" cy="136" r="5"/>
+      <text class="dg-red" x="652" y="56">Lease + conditional writes</text>
+      <text class="dg-red" x="652" y="78">fence a stale leader</text>
+      <circle class="dg-dot" cx="746" cy="201" r="5"/>
+      <path class="dg-redline" d="M746 208V238"/>
+      <text class="dg-red" x="652" y="258">Acknowledged only after</text>
+      <text class="dg-red" x="652" y="280">the upload is confirmed</text>
+
+    </svg>
+
+    <svg class="dg dg-narrow" viewBox="0 0 340 830" role="img" aria-labelledby="dgn-t dgn-d">
+      <title id="dgn-t">Target architecture of skylite (design direction, not implemented)</title>
+      <desc id="dgn-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes and keeps a working copy on ephemeral disk; followers forward writes to the leader and fetch pages on demand. Object storage holds change files, snapshots and the lease object. A write is acknowledged only after the upload is confirmed. The lease plus conditional writes fence a stale leader.</desc>
+      <defs>
+        <marker id="dgn-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="dg-head" d="M0 1 9 5 0 9z"/></marker>
+      </defs>
+
+      <text class="dg-h" x="10" y="22">Clients</text>
+      <rect class="dg-box" x="10" y="36" width="155" height="62" rx="6"/>
+      <text class="dg-b" x="24" y="62">Go services</text>
+      <text class="dg-m" x="24" y="85">database/sql</text>
+      <rect class="dg-box" x="175" y="36" width="155" height="62" rx="6"/>
+      <text class="dg-b" x="189" y="62">Java services</text>
+      <text class="dg-m" x="189" y="85">JDBC</text>
+
+      <rect class="dg-band" x="10" y="112" width="320" height="30" rx="15"/>
+      <text class="dg-band-t" x="170" y="132" text-anchor="middle">HTTPS through ingress / Istio</text>
+      <path class="dg-arrow" d="M56 98V154" marker-end="url(#dgn-head)"/>
+      <path class="dg-arrow" d="M284 98V154" marker-end="url(#dgn-head)"/>
+
+      <rect class="dg-group" x="10" y="158" width="320" height="330" rx="10"/>
+      <text class="dg-h" x="26" y="184">skylite pods for one database</text>
+      <text class="dg-m" x="26" y="205">No persistent volumes</text>
+
+      <rect class="dg-box dg-leader" x="26" y="220" width="288" height="92" rx="6"/>
+      <text class="dg-t" x="40" y="248">Leader</text>
+      <text x="40" y="272">Takes all writes</text>
+      <text class="dg-m" x="40" y="295">Working copy on ephemeral disk</text>
+      <g class="dg-disk" transform="translate(288 236)"><ellipse cx="0" cy="0" rx="12" ry="4"/><path d="M-12 0v18M12 0v18"/><path class="dg-dash" d="M-12 18a12 4 0 0 0 24 0"/></g>
+
+      <path class="dg-arrow" d="M70 376V316" marker-end="url(#dgn-head)"/>
+      <text class="dg-s" x="82" y="350">forward writes</text>
+
+      <rect class="dg-box dg-back" x="42" y="394" width="272" height="80" rx="6"/>
+      <rect class="dg-box dg-back" x="34" y="386" width="272" height="80" rx="6"/>
+      <rect class="dg-box" x="26" y="378" width="272" height="80" rx="6"/>
+      <text class="dg-t" x="40" y="404">Followers (N pods)</text>
+      <text x="40" y="427">Forward writes to the leader</text>
+      <text class="dg-m" x="40" y="448">Fetch pages on demand, cache</text>
+
+      <!-- between pods and storage -->
+      <path class="dg-arrow" d="M30 490V636" marker-end="url(#dgn-head)"/>
+      <text class="dg-s" x="44" y="510">from the leader</text>
+      <circle class="dg-dot" cx="30" cy="538" r="5"/>
+      <text class="dg-red" x="44" y="535">Acknowledged only after</text>
+      <text class="dg-red" x="44" y="556">the upload is confirmed</text>
+      <circle class="dg-dot" cx="30" cy="590" r="5"/>
+      <text class="dg-red" x="44" y="587">Lease + conditional writes</text>
+      <text class="dg-red" x="44" y="608">fence a stale leader</text>
+      <path class="dg-arrow" d="M312 638V492" marker-end="url(#dgn-head)"/>
+      <text class="dg-s" x="300" y="632" text-anchor="end">pages on demand</text>
+
+      <rect class="dg-store" x="10" y="642" width="320" height="180" rx="10"/>
+      <text class="dg-h" x="26" y="668">Object storage</text>
+      <text class="dg-m" x="26" y="690">Azure Blob, S3, GCS or local filesystem</text>
+      <rect class="dg-chip" x="26" y="706" width="92" height="56" rx="4"/>
+      <text class="dg-c" x="72" y="730" text-anchor="middle">Change</text>
+      <text class="dg-c" x="72" y="749" text-anchor="middle">files</text>
+      <rect class="dg-chip" x="124" y="706" width="92" height="56" rx="4"/>
+      <text class="dg-c" x="170" y="739" text-anchor="middle">Snapshots</text>
+      <rect class="dg-chip" x="222" y="706" width="92" height="56" rx="4"/>
+      <text class="dg-c" x="268" y="730" text-anchor="middle">Lease</text>
+      <text class="dg-c" x="268" y="749" text-anchor="middle">object</text>
+      <text class="dg-m" x="26" y="796">All durable state lives here.</text>
+    </svg>
+  </div>
+
+  <figcaption id="sheet-caption" class="titleblock">
+    <span class="tb-cell tb-name"><span class="tb-k">Drawing</span> Target architecture</span>
+    <span class="tb-cell tb-status"><span class="tb-k">Status</span> Not implemented</span>
+    <span class="tb-cell"><span class="tb-k">Revision</span> Design direction, subject to change after the durability spike</span>
+  </figcaption>
+
+  <details class="sheet-alt">
+    <summary>Read the diagram as text</summary>
+    <ol>
+      <li>Go services (through the <code>database/sql</code> driver) and Java services (through the JDBC driver) send SQL over HTTPS, through ingress or Istio.</li>
+      <li>A group of skylite pods serves one database. The pods have no persistent volumes.</li>
+      <li>One pod is the leader. It takes all writes and keeps a working copy on ephemeral disk.</li>
+      <li>The other pods are followers. They forward writes to the leader and serve reads by fetching pages from object storage on demand, with a bounded cache.</li>
+      <li>The leader uploads change files and snapshots to object storage. A write is acknowledged only after the upload is confirmed.</li>
+      <li>Object storage (Azure Blob, S3, GCS or local filesystem) also holds the lease object. The lease plus conditional writes fence a stale leader.</li>
+    </ol>
+  </details>
+</figure>

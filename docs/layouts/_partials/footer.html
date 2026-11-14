@@ -1,0 +1,11 @@
+<footer class="sitefoot">
+  <div class="wrap foot">
+    <p class="foot-brand">{{ partial "mark.html" }}<span>skylite is pre-alpha open-source software, licensed under Apache-2.0.</span></p>
+    <ul class="foot-links">
+      <li><a href="{{ site.Params.repo }}">Source on GitHub</a></li>
+      <li><a href="{{ (site.GetPage "/docs/getting-started").RelPermalink }}">Getting started</a></li>
+      <li><a href="{{ (site.GetPage "/docs/contributing-docs").RelPermalink }}">Contributing to docs</a></li>
+    </ul>
+  </div>
+</footer>
+<p id="copy-status" class="sr-only" role="status" aria-live="polite"></p>

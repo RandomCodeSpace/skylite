@@ -1,0 +1,43 @@
+# Single source for the roadmap on the landing page and the roadmap docs page.
+# status: "done" or "planned". Order is the planned order of work.
+
+[[items]]
+title = "Bootstrap: repo, CI, docs site"
+status = "done"
+detail = "Project scaffolding, CI, this site, and a binary that prints its version and help."
+
+[[items]]
+title = "Evaluate Litebase and run a durability spike"
+status = "planned"
+detail = "Evaluate Litebase, an existing MIT-licensed SQLite-on-object-storage database, as a base. Against Azurite: acknowledge only after upload, kill mid-write, restore on an empty disk, and prove that no acknowledged write is lost and a stale leader cannot commit."
+gate = "The architecture is decided after this milestone. Until then, everything on this site is design direction, subject to change."
+
+[[items]]
+title = "Storage interface and four backends"
+status = "planned"
+detail = "One storage interface with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators."
+
+[[items]]
+title = "HTTPS query API"
+status = "planned"
+detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port."
+
+[[items]]
+title = "Leader lease and failover"
+status = "planned"
+detail = "One leader per database, chosen by a lease object in object storage. Conditional writes fence a stale leader."
+
+[[items]]
+title = "On-demand readers"
+status = "planned"
+detail = "Followers fetch pages from object storage on demand, with a bounded cache, so reads scale by adding pods."
+
+[[items]]
+title = "Clients: Go driver, JDBC driver and Hibernate dialect"
+status = "planned"
+detail = "A Go database/sql driver (target: works with GORM) and a JDBC driver with a Hibernate dialect (target: works with Spring Data JPA)."
+
+[[items]]
+title = "Endpoint auth and SQL lockdown"
+status = "planned"
+detail = "Authentication and authorisation on the query endpoint; no extension loading, no attaching arbitrary files, query time and size limits."

@@ -1,0 +1,30 @@
+{{- $init := resources.Get "js/theme-init.js" | minify | fingerprint "sha256" -}}
+{{- $css := resources.Get "css/main.css" | minify | fingerprint "sha384" -}}
+{{- $js := resources.Get "js/site.js" | minify | fingerprint "sha384" -}}
+{{- $desc := or .Description site.Params.description -}}
+{{- $title := cond .IsHome (printf "%s: %s" site.Title "SQL on object storage") (printf "%s | %s" .Title site.Title) -}}
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' '{{ $init.Data.Integrity }}'; style-src 'self'; img-src 'self'; font-src 'self'; {{ if hugo.IsServer }}connect-src 'self' ws:; {{ end }}base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="color-scheme" content="light dark">
+<script>{{ $init.Content | safeJS }}</script>
+<title>{{ $title }}</title>
+<meta name="description" content="{{ $desc }}">
+<link rel="canonical" href="{{ .Permalink }}">
+<link rel="icon" href="{{ "favicon.svg" | relURL }}" type="image/svg+xml">
+<link rel="stylesheet" href="{{ $css.RelPermalink }}" integrity="{{ $css.Data.Integrity }}">
+<script src="{{ $js.RelPermalink }}" integrity="{{ $js.Data.Integrity }}" defer></script>
+<meta property="og:type" content="{{ cond .IsHome "website" "article" }}">
+<meta property="og:site_name" content="{{ site.Title }}">
+<meta property="og:title" content="{{ $title }}">
+<meta property="og:description" content="{{ $desc }}">
+<meta property="og:url" content="{{ .Permalink }}">
+<meta property="og:image" content="{{ "og.png" | absURL }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="skylite: a SQL database server where object storage is the source of truth">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ $title }}">
+<meta name="twitter:description" content="{{ $desc }}">
+<meta name="twitter:image" content="{{ "og.png" | absURL }}">

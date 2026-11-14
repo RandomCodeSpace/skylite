@@ -1,0 +1,12 @@
+<ol class="roadmap">
+  {{- range $i, $m := hugo.Data.roadmap.items }}
+  <li class="rm rm-{{ $m.status }}">
+    <span class="rm-step" aria-hidden="true">{{ if eq $m.status "done" }}<svg viewBox="0 0 16 16"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg>{{ else }}{{ $i }}{{ end }}</span>
+    <div class="rm-body">
+      <p class="rm-title">{{ $m.title }} <span class="rm-state">{{ cond (eq $m.status "done") "Done" "Planned" }}</span></p>
+      <p class="rm-detail">{{ $m.detail }}</p>
+      {{- with $m.gate }}<p class="rm-gate">{{ . }}</p>{{ end }}
+    </div>
+  </li>
+  {{- end }}
+</ol>

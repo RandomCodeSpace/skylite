@@ -1,0 +1,27 @@
+baseURL = "https://randomcodespace.github.io/skylite/"
+locale = "en"
+title = "skylite"
+disableKinds = ["taxonomy", "term", "rss"]
+enableRobotsTXT = false
+
+[outputs]
+  home = ["html"]
+  section = ["html"]
+  page = ["html"]
+
+[params]
+  description = "A pre-alpha project to build a SQL database server where object storage is the source of truth, on SQLite, for Kubernetes pods with no persistent volumes."
+  repo = "https://github.com/RandomCodeSpace/skylite"
+  editBase = "https://github.com/RandomCodeSpace/skylite/edit/main/docs/content/"
+
+[markup]
+  [markup.goldmark.renderer]
+    unsafe = false
+  [markup.goldmark.renderHooks.link]
+    useEmbedded = "fallback"
+  [markup.highlight]
+    noClasses = false
+    lineNos = false
+  [markup.tableOfContents]
+    startLevel = 2
+    endLevel = 3
