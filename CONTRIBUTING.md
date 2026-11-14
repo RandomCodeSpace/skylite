@@ -23,7 +23,8 @@ A ruleset on `main` enforces the following, with no bypass for anyone:
   and `docs`.
 - CodeQL code scanning must report no new alert of severity error, or security
   severity high or above, before a pull request can enter the queue. Merge
-  queue groups are not scanned again; GitHub does not apply this rule to them.
+  queue groups are not scanned again; GitHub does not apply this rule to them,
+  and it also exempts Dependabot pull requests analysed by default setup.
 - No approving review is required. The project has one maintainer, and a
   required approval would block their own pull requests.
 - No force pushes to `main` and no deleting it.
