@@ -31,7 +31,7 @@ The protocol is version 1, as described below and in the [wire specification](#w
 ### 1. What the protocol promises
 
 - **At most once.** No request changes a database more than once, whatever intermediaries do: lose, delay without bound, truncate, reorder or duplicate requests and responses. A stateless read can be executed more than once if an intermediary duplicates it; that has no effect, because the stateless endpoint executes nothing that can change a database ([decision 5](#5-reads)).
-- **Honest outcomes.** A driver reports success only for a write that is durably committed. It reports "not executed" or "not committed" only with one of the proofs in [decision 4](#4-when-a-driver-may-report-not-executed). Otherwise it reports "unknown".
+- **Honest outcomes.** A driver reports success only for a write that is durably committed. It reports "not executed" or "not committed" only with one of the proofs in [decision 4](#4-when-a-driver-may-report-not-executed). Otherwise it reports "unknown". These promises hold for a driver that is the only holder of its channel's token ([two drivers sharing one](#attempts-to-break-the-channel-design)).
 - **Resolution after a channel is lost.** A write whose channel is lost before the driver learns its outcome, by a leader change, a restart, the channel idle limit or anything else, is settled as committed or not committed by [`resolve`](#resolving-a-request-after-its-channel-is-lost). The bound: a leader is in office before the driver's resolve wait ends (default 30 s), and the request's floor is at most the resolve bound (default 100,000 transactions) below that leader's head. Outside the bound, and while the channel is still live on the leader in office, the driver reports unknown.
 - **Not promised:**
   - Exactly-once for the application. An application that retries after an error issues a new operation; that is the application's business, as with any database.
@@ -41,7 +41,7 @@ The protocol is version 1, as described below and in the [wire specification](#w
 
 Every request that can write goes through a **channel**: a small piece of server state on one pod, opened by the driver. A driver connection (`driver.Conn`, `java.sql.Connection`) holds at most one write channel and at most one read-only channel.
 
-**Opening.** `open` returns an opaque, unguessable **token** and a **channel identifier** that is not secret, for logs and errors. The channel is bound to the database, the authenticated principal (the JWT's issuer and subject), its owning pod and, for a write channel, the leader epoch. Write channels live on the leader. A read-only channel lives on the pod that received the open. The token carries at least 256 bits from a cryptographically secure random source, names the database identifier and the owning pod by an identifier that is not an address, and travels only in request bodies, never in a URL or a header. The channel identifier is drawn independently and reveals nothing about the token.
+**Opening.** `open` returns an opaque, unguessable **token** and a **channel identifier** that is not secret, for logs and errors. The channel is bound to the database, the authenticated principal (the JWT's issuer and subject), its owning pod and, for a write channel, the leader epoch. Write channels live on the leader. A read-only channel lives on the pod that received the open. The token carries at least 256 bits from a cryptographically secure random source, names the database identifier and the owning pod by an identifier that is not an address, carries the channel's **open head**, the head that the open answer reports as `txn` ([decision 4](#resolving-a-request-after-its-channel-is-lost)), and travels only in request bodies, never in a URL or a header. A token is matched by all of its bytes. The channel identifier is drawn independently and reveals nothing about the token.
 
 **Sequence numbers.** Every request on a channel, other than `cancel` and `close`, carries a sequence number. The owner keeps, per channel: the last accepted sequence number, whether that request is still running, its recorded outcome ([decision 3](#3-replay-of-the-last-outcome)) and the SHA-256 digest of its request body. On arrival, after authenticating the caller, matching the principal and, on a write channel, checking the [floor](#resolving-a-request-after-its-channel-is-lost):
 
@@ -55,7 +55,7 @@ Every request that can write goes through a **channel**: a small piece of server
 | below last | `stale_sequence` |
 | above last + 1 | `sequence_gap` |
 
-**A refused sequence number never changes any state.** It never rolls anything back and never ends the channel. A driver resends a request with a byte-identical body. A different body under an accepted sequence number is refused, and that refusal is final for the body that was refused: it can never be accepted, because its sequence number is taken. So a driver that shares a token with another, by mistake, is never told the other's outcome as its own.
+**A refused sequence number never changes any state.** It never rolls anything back and never ends the channel. A driver resends a request with a byte-identical body. A different body under an accepted sequence number is refused, and that refusal is final for the body that was refused: it can never be accepted, because its sequence number is taken. So two drivers that share a token by mistake are never told each other's outcome for the same sequence number; they still act on one channel ([attempts to break the channel design](#attempts-to-break-the-channel-design)).
 
 **Transactions are a state of the channel.** Begin, statements, commit and rollback are requests on it. While a write transaction is open, the channel holds one SQLite connection and the database's write lock. An autocommit write is a single request on the channel. When SQLite rolls a transaction back by itself after an error, or a transaction limit ends it, the channel enters the **aborted** state: it holds nothing, and refuses every request except `rollback` until it gets one. So a statement is never run outside the transaction the driver believes it is in.
 
@@ -65,7 +65,7 @@ Every request that can write goes through a **channel**: a small piece of server
 
 **Opening is not deduplicated.** A duplicated open leaves a channel nobody owns. It holds no SQLite connection and no lock, and it expires at the channel idle limit. Channels are bounded per principal and per database on each pod; at the bound, open is refused with `too_many_channels` and nothing is created.
 
-**The commit identifier** stored in the commit object ([0004 decision 3](/docs/decisions/0004-storage-engine/#3-durable-layout-in-object-storage-per-database)) is composed by the server, 24 bytes: the first 16 bytes of the SHA-256 digest of the token's bytes, then a sequence number as 8 bytes, big-endian. An autocommit write carries its own sequence number; a transaction carries the sequence number of its `commit` request. Clients never choose it. Only a holder of the token can compute it, and the digest does not reveal the token. The channel identifier is not stored in commits. Sixteen bytes make a collision between two channels a 2^−128 event per pair, and the identifier stays well inside the format's 64-byte field.
+**The commit identifier** stored in the commit object ([0004 decision 3](/docs/decisions/0004-storage-engine/#3-durable-layout-in-object-storage-per-database)) is composed by the server, 24 bytes: the first 16 bytes of the SHA-256 digest of all of the token's bytes, its open head included, then a sequence number as 8 bytes, big-endian. An autocommit write carries its own sequence number; a transaction carries the sequence number of its `commit` request. Clients never choose it. Only a holder of the token can compute it, and the digest does not reveal the token. The channel identifier is not stored in commits. Sixteen bytes make a collision between two channels a 2^−128 event per pair, and the identifier stays well inside the format's 64-byte field.
 
 ### 3. Replay of the last outcome
 
@@ -105,35 +105,43 @@ The insert is committed. The driver sends `resolve` for sequence 7 with floor 13
 
 #### Resolving a request after its channel is lost
 
-**The floor.** Every sequenced request on a write channel carries `floor`, a transaction number at or below which its commit cannot be. The driver sets it to the pool's highest seen transaction number ([decision 5](#5-reads)), which includes the open answer's `txn`, the leader's head when the channel opened; a resend carries the same floor, because its body is byte-identical. The server reports in `txn` only numbers that are in the durable log, so a floor never exceeds the durable head. Before acceptance, and changing nothing, the owner refuses a floor below the channel's open head with `invalid_request` and a floor above its own head with `behind`. So a request executes only on a leader whose head is at or above its floor, and its commit, if there is one, is above the floor. A leader in office is never behind a floor; `behind` from a write channel's owner means it has been superseded, and the driver treats it as `channel_lost`.
+**The floor.** Every sequenced request on a write channel carries `floor`, a transaction number at or below which its commit cannot be. The driver sets it to the pool's highest seen transaction number ([decision 5](#5-reads)), which includes the open answer's `txn`, the leader's head when the channel opened; a resend carries the same floor, because its body is byte-identical. The server reports in `txn` only numbers that are in the durable log, so a floor never exceeds the durable head. Before acceptance, and changing nothing, the owner refuses a floor above its own head with `behind`. So a request executes only on a leader whose head is at or above its floor, and its commit, if there is one, is above the floor. A leader in office is never behind a floor; `behind` from a write channel's owner means it has been superseded, and the driver treats it as `channel_lost`.
 
-**`resolve`** takes the token, the sequence number and the floor that the request carried. Any pod accepts it and forwards it to the leader. The leader, whose head is *h*:
+**The open head.** The token carries the channel's open head, the owner's head when the channel was opened ([decision 2](#2-channels)). The owner creates a commit only at its head plus one, and its head was the open head when the channel opened, so every commit of the channel is above the open head. A request's commit, if there is one, is above both its floor and the open head.
 
-1. If the floor is above *h*, answers `behind`. The answer is about this delivery.
-2. If the floor is more than the resolve bound below *h*, answers `unknown`.
-3. Looks the channel up in its own channel table, and only then reads *h* again and the commit headers from floor + 1 upward, in order. A header carrying the identifier: `committed`, at that transaction number. An epoch-bump commit: `not_committed`.
+**`resolve`** takes the token, the sequence number and a floor no higher than the one the request carried; the driver sends that same floor. Any pod accepts it and forwards it to the leader. The leader takes as the start *s* the larger of the token's open head and the floor the resolve carries, so it never scans from below the open head. With its head *h*, it:
+
+1. If *s* is above *h*, answers `behind`. The answer is about this delivery.
+2. If *s* is more than the resolve bound below *h*, answers `unknown`.
+3. Looks the channel up in its own channel table, and only then reads *h* again and the commit headers from *s* + 1 upward, in order. A header carrying the identifier: `committed`, at that transaction number. An epoch-bump commit: `not_committed`.
 4. Having reached *h* with neither: `pending` if the channel is live in its table, otherwise `not_committed`.
+
+**What the answers mean.** `committed` means that the request's changes are durably in the database's history. `not_committed` means that the request has no effect on the database and never will. A request that completed and changed nothing, such as an update that matched no rows or a transaction that only read, creates no commit object, and `resolve` answers `not_committed` for it. That answer is exact: the request has no effect, and an application that runs it again gets a serial execution in which the first never happened. While the channel lives, the owner answers the same commit with `committed: true, wrote: false`, which is also true of it.
 
 Resolve changes nothing and needs no deduplication. The leader reads headers from a window of the last resolve-bound transaction numbers that it keeps in memory: its own commits, the headers its takeover walk read, and the rest of the window read from storage once, on demand. A retired commit keeps its header ([0004 decision 3](/docs/decisions/0004-storage-engine/#3-durable-layout-in-object-storage-per-database)), so either form serves. A token that names another database is `invalid_request`. Resolve needs the permission a write-channel open needs, and counts against the stateless request bounds.
 
-*Correction marked by this record's author:* the project owner's decision answered `pending` whenever the scan reached the head. Then a channel ended by its idle limit or a close on a leader that stays in office would never settle. Step 4 settles it from the leader's own channel table, and the fourth bullet below shows that it settles every channel of an earlier leader as well. The owner's decision also bounded the number of headers scanned; this record bounds the floor's distance from the head instead, so that the leader never reads a header outside its window.
+*Correction marked by this record's author:* the project owner's decision answered `pending` whenever the scan reached the head. Then a channel ended by its idle limit or a close on a leader that stays in office would never settle. Step 4 settles it from the leader's own channel table, and the fourth bullet below shows that it settles every channel of an earlier leader as well. The owner's decision also bounded the number of headers scanned; this record bounds the start's distance from the head instead, so that the leader never reads a header outside its window.
 
-**Why the answers are final.** Let L be the leader on which the channel was opened. L's epoch bump is at or below the channel's open head, so at or below the floor. A candidacy creates one bump ([0004 decision 9](/docs/decisions/0004-storage-engine/#9-takeover)), so every bump above the floor belongs to another candidacy, whether that candidacy then took office or failed.
+**Why the answers are final.** Let L be the leader on which the channel was opened and *o* the open head. L was in office at *o*, and a leader's head is exactly its own last commit, so L's epoch bump is at or below *o* and every name from that bump to *o* is L's. A candidacy creates at most one bump ([0004 decision 9](/docs/decisions/0004-storage-engine/#9-takeover)), so every bump above *o* was created by another candidacy, whether that candidacy then took office or failed. Each of them fences L: L creates a commit at *n* + 1 only while it holds *n*, and its names run contiguously from its own bump, so L holds no name at or above a bump of another candidacy that lies above its own. All of L's commits therefore lie below the first bump above *o*, and a scan that starts at any *s* at or above *o* and runs to the first bump above *s* covers every commit the channel could have made above *s*. The request's commit, if any, is above the floor it was sent with and above *o*, so it is above every start that a floor no higher than the sent one gives.
 
 - **Identifier found.** The first object created at a name is the only object ever there ([0004 decision 6](/docs/decisions/0004-storage-engine/#6-commit-outcomes-and-fail-stop)), and its retired form keeps the header. The match is permanent.
-- **Bump found first.** L creates a commit at *n* + 1 only while it holds *n*, and its names run contiguously from its own bump, so L holds no name at or above a bump of another candidacy that lies above its own. All of L's commits are below the first bump above the floor. The request's commit, if any, is L's and above the floor. Every name between is occupied for good, and none carries the identifier, so the commit does not exist and never will.
-- **Head reached, channel not live, and L is this leader.** The channel has ended and nothing of it can still reach storage, it never accepts a request again, and the lookup came before *h* was read, so every commit of it is at or below *h*. None was found.
-- **Head reached, and L is another leader.** L's bump is at or below the floor. Names between this leader's bump and *h* are this leader's own commits, so L's bump is below this leader's bump, and this leader's bump fences L. No bump was found above the floor, so this leader's bump is at or below the floor, and so are all of L's commits. The request has no commit.
+- **Bump found first.** The request's commit, if any, is L's, above *s* and below the first bump above *s*. Every name between is occupied for good, and none carries the identifier, so the commit does not exist and never will.
+- **Head reached, channel not live, and L is this leader.** The channel has ended and nothing of it can still reach storage, it never accepts a request again, and the lookup came before *h* was read, so every commit of it is at or below *h*. None was found above *s*, and the request's commit would be above *s*.
+- **Head reached, and L is another leader.** L's bump is at or below *o*, so at or below *s*. Names between this leader's bump and *h* are this leader's own commits, so L's bump is below this leader's bump, and this leader's bump fences L. No bump was found above *s*, so this leader's bump is at or below *s*, and so are all of L's commits. The request has no commit.
 - **Pending** only when the channel is live on this leader: the request may still be running, or arrive.
 
-A leader that has been deposed and does not know it answers only from names that never change and from its own table, so its answers stay true. A channel of a later leader has a floor at or above that leader's bump, which is above the deposed leader's head: `behind`.
+**Which floor the driver sends.** A floor lower than the one the request was sent with, but not below *o*, only makes the scan longer: it cannot turn `committed` into `not_committed` or back, although it can put *s* more than the resolve bound below *h*, and the answer is then `unknown`. A floor below *o* counts as *o*. A floor above the one sent can put *s* at or above the request's commit; the scan then misses it and can answer a false `not_committed`. The server cannot detect that, so a driver never resolves with a floor above the request's.
+
+**An altered token.** The stored identifier is a hash of the whole token, so a token whose open head a client has altered names an identifier that nothing was ever stored under, and, matched by all its bytes, no channel. Its resolve never answers `committed`, and the only party it misleads is the client that altered it.
+
+A leader that has been deposed and does not know it answers only from names that never change and from its own table, so its answers stay true. A channel of a later leader has an open head at or above that leader's bump, which is above the deposed leader's head, so *s* is above that head: `behind`.
 
 **Without a leader change.** An owner pod that restarts, or stops serving and takes office again, does so as a new candidacy with a new bump ([0004 invariant 1](/docs/decisions/0004-storage-engine/#4-invariants)), and its old channels settle by the second bullet. A channel ended by its idle limit or a close, on a leader that stays in office, settles by the third. The case that cannot be made final is a channel still live on the leader in office; a driver reaches it only after its principal changed ([decision 10](#10-authentication)), and reports unknown unless the channel's idle limit ends it within the resolve wait.
 
-**What the driver does.** A driver that holds an unsettled autocommit `execute` or `batch`, or an unsettled `commit`, and gets `channel_lost`, or `behind` from the channel's owner, sends `resolve`. It sends it again after `no_leader`, `behind`, `pending` or a transport error, until its resolve wait ends (default 30 s, sooner if the caller's own deadline is sooner).
+**What the driver does.** A driver that holds an unsettled autocommit `execute` or `batch`, or an unsettled `commit`, and gets `channel_lost`, or `behind` from the channel's owner, sends `resolve` with the request's floor. It sends it again after `no_leader`, `behind`, `pending` or a transport error, until its resolve wait ends (default 30 s, sooner if the caller's own deadline is sooner).
 
 - `committed`: a commit succeeds. An autocommit write whose result the caller needs gets the committed, result-unavailable error of [decision 3](#3-replay-of-the-last-outcome).
-- `not_committed`: an autocommit write may be executed once more, on a new channel, as a new request; otherwise it is reported not executed. A commit is reported as a rolled-back transaction. A write that changed nothing, such as an update that matched no rows, creates no commit object and so resolves `not_committed`. That is still true of the database, which holds no change from it, although the owner would have answered such a commit with `committed: true, wrote: false`.
+- `not_committed`: an autocommit write may be executed once more, on a new channel, as a new request; otherwise it is reported not executed. A commit is reported as a rolled-back transaction.
 - `unknown`, `pending` at the end of the wait, or no answer: unknown.
 
 An unsettled statement inside a transaction settles without a resolve: the commit was never sent, so the transaction is reported rolled back. A `begin`, `describe` or `ping` changed nothing and is sent again on a new channel. After any of these, the driver opens a new channel for its next request.
@@ -378,7 +386,7 @@ terminal = done / error
 | open | `txn`, the pod's head or applied transaction; `channel`: `token`, `id`, `mode`, `epoch` (write), `limits` |
 | cancel | `outcome`: the named request's recorded outcome |
 | close | `last_seq`; `outcome`, the recorded outcome of `last_seq`, absent if `last_seq` is 0 |
-| resolve | `resolution`: `"committed"`, `"not_committed"`, `"pending"` or `"unknown"`; `txn`: for `committed` the commit's transaction number, otherwise the leader's head |
+| resolve | `resolution`: `"committed"`, `"not_committed"`, `"pending"` or `"unknown"`, with the meanings in [decision 4](#resolving-a-request-after-its-channel-is-lost); `txn`: for `committed` the commit's transaction number, otherwise the leader's head |
 | `GET` status | `txn` (the leader's head), `epoch`, `sqlite_version`, `limits` |
 | `PUT` | `txn`, `epoch` |
 
@@ -399,7 +407,7 @@ The closed list of codes. "Status" applies when the error is the whole response.
 
 | Code | Status | Recorded | Meaning |
 |---|---|---|---|
-| `invalid_request` | 400 | yes | Malformed body, unknown field, bad value, binding mismatch, more than one statement, transaction-control SQL, a batch entry with columns. Before acceptance only when the body names no channel and sequence number, on a stateless path or resolve, or for a floor below the channel's open head |
+| `invalid_request` | 400 | yes | Malformed body, unknown field, bad value, binding mismatch, more than one statement, transaction-control SQL, a batch entry with columns. Before acceptance only when the body names no channel and sequence number, on a stateless path or resolve |
 | `unauthenticated` | 401 | no | Bearer token missing, malformed, expired or unverifiable |
 | `forbidden` | 403 | no | The principal may not do this on this database |
 | `statement_forbidden` | 403 | yes | The SQL policy refused the statement |
@@ -426,14 +434,14 @@ The closed list of codes. "Status" applies when the error is the whole response.
 | `commit_outcome_unknown` | final frame | no | The upload's outcome was not definite within the engine's bound; the pod stops serving the database. `not_executed: false` |
 | `no_leader` | 503 | no | No leader is reachable |
 | `not_serving` | 503 | no | This pod does not serve this database now, or a forwarded request reached a pod that does not own it |
-| `behind` | 503 or final frame | yes, for a read-only `begin` | A read-only channel's pod did not reach `min_txn` within the catch-up wait, or the leader's state is below `min_txn` or below a write-channel request's or a resolve's `floor`, which only a leader that has been superseded can answer |
+| `behind` | 503 or final frame | yes, for a read-only `begin` | A read-only channel's pod did not reach `min_txn` within the catch-up wait, or the leader's state is below `min_txn` or below a write-channel request's `floor` or a resolve's start, which only a leader that has been superseded can answer |
 | `internal` | 500 or final frame | yes, before the commit point | Unexpected server failure; `not_executed` true only when known |
 
 ### Channel state machine
 
 States: **idle** (nothing running, no transaction); **running** (request *s* running outside a transaction, including a `begin` waiting for the lock); **open** (transaction open, nothing running); **running in transaction**; **committing** (commit running before its commit point); **durable wait** (a commit or an autocommit write past its commit point, waiting for storage's definite answer); **aborted**; **ended**.
 
-Before the table applies, every request goes through these checks in order, and a refusal changes nothing: the body parses and names a channel; the bearer token verifies; the token names this pod (otherwise forward, or `not_serving` if already forwarded); the channel exists here, belongs to this principal and has not ended (otherwise `channel_lost`); on a write channel, the floor is at or above the channel's open head (otherwise `invalid_request`) and at or below the owner's head (otherwise `behind`).
+Before the table applies, every request goes through these checks in order, and a refusal changes nothing: the body parses and names a channel; the bearer token verifies; the token names this pod (otherwise forward, or `not_serving` if already forwarded); the channel exists here, belongs to this principal and has not ended (otherwise `channel_lost`); on a write channel, the floor is at or below the owner's head (otherwise `behind`).
 
 | State | Event | Action | Next state | Answer |
 |---|---|---|---|---|
@@ -452,7 +460,7 @@ Before the table applies, every request goes through these checks in order, and 
 | running | read-only `begin` does not reach `min_txn` within the catch-up wait | Record `behind` | idle | `behind` |
 | running | autocommit write reaches its commit point | none | durable wait | none yet |
 | running | autocommit request fails before its commit point | Roll back, close the connection, record | idle | The error, `not_executed: true` |
-| running | read-only or describe or ping request finishes | Record | idle | Its result |
+| running | read-only or describe or ping request finishes, or an autocommit write that changed no page | Record; after the write, close the connection | idle | Its result |
 | open | `execute`, `batch`, `describe`, `ping`, `rollback` | Accept | running in transaction | When it finishes |
 | open | `commit` | Accept | committing | When it finishes |
 | open | `begin` | Accept, record `invalid_state` | open | `invalid_state` |
@@ -554,7 +562,7 @@ POST /v1/databases/library/resolve HTTP/1.1
 | A duplicate arrives after the driver gave up and reported unknown | If it is the next sequence number on a live channel, it may execute and commit, once. Unknown was the honest answer |
 | A duplicate of `open`, `close` or `cancel` | `open`: an orphan channel, holding nothing, expiring at the idle limit. `close`: `channel_lost`. `cancel` naming an older sequence number: `stale_sequence` |
 | A duplicate of the previous statement while the commit is in durable wait | `stale_sequence`; the commit continues. This was finding 9 |
-| Two drivers present the same token | The second body under a taken sequence number gets `sequence_conflict`, final for that body; the first driver's state is untouched. If the second takes the next number first, the first driver gets `sequence_conflict` on its next request, closes the channel and reports its transaction failed; the commit it never sent cannot commit |
+| Two drivers present the same token | A token shared by two drivers is one channel, and holding the token is the authority to act on it. The request digest stops them receiving each other's answers for the same sequence number: the second body under a taken number gets `sequence_conflict`, final for that body. It does not stop one from continuing the other's transaction: the second can send a commit under the next number, which commits the first driver's statements, and the first, refused its own commit with `sequence_conflict`, can report as rolled back a transaction that committed. Sharing a token is a driver bug, and the protocol does not defend against it beyond the digest |
 | Another principal replays a token | `channel_lost`. The channel is untouched |
 | The owner pod restarts mid-request | Channel state is in memory only, so the channel has ended. A write channel's leader restarting means a new epoch ([0004 invariant 1](/docs/decisions/0004-storage-engine/#4-invariants)). A commit in durable wait may land; the driver sees `channel_lost` and resolves |
 | A leader change during a commit | Before the commit point: the commit fails with no effect. After it: storage answers committed, or definitely not if the bump took the name, and the owner answers if it still can; otherwise the driver resolves |
@@ -567,30 +575,32 @@ POST /v1/databases/library/resolve HTTP/1.1
 
 ## Attempts to break resolution
 
-L is the leader on which the channel was opened, F the request's floor.
+L is the leader on which the channel was opened, F the request's floor, *s* the resolve's start.
 
 | Sequence | What happens |
 |---|---|
-| A resolve races L's commit that is still landing | The resolve reaches a final answer only at an identifier or at a bump above F. Every name below that bump is already occupied, so a commit of L's that landed is found. L's create can land only at its head plus one; if the bump holds that name, the create can never land |
+| A resolve races L's commit that is still landing | The resolve reaches a final answer only at an identifier or at a bump above *s*. Every name below that bump is already occupied, so a commit of L's that landed is found. L's create can land only at its head plus one; if the bump holds that name, the create can never land |
 | `not_committed`, then a delayed duplicate of the request reaches L | If L is still running and the channel live there, L may execute it, but its commit meets the bump that the resolve found and fails with `commit_failed`. If the answer came from step 4, the channel has ended: `channel_lost` |
 | The same duplicate reaches the new leader, or a follower | The token names L's pod. A follower forwards it there. A pod that is not the owner, or the restarted pod under the same name, does not know the token: `channel_lost`. Nothing executes |
-| A resolve reaches a deposed leader that does not know it | Its answers come from names that never change and from its own table, so they hold. A channel of a later leader has a floor above its head: `behind`, and the driver tries again |
-| F stale by millions of transactions | More than the resolve bound below the head: `unknown`, at once, with no storage reads. Within the bound the leader reads only its window. Floors rise with every answer, so a correct driver's floor trails the head by roughly the commits made during the channel idle limit, the statement time limit and the resolve wait: about 33,000 at 50 commits per second, a third of the bound |
-| F above the new leader's head | Every reported `txn` is durable, so only a leader that has been superseded is behind a correct driver's floor: `behind`, not final. The driver tries again; its resolve wait bounds the attempts |
+| A resolve reaches a deposed leader that does not know it | Its answers come from names that never change and from its own table, so they hold. A channel of a later leader has an open head above its head: `behind`, and the driver tries again |
+| *s* stale by millions of transactions | More than the resolve bound below the head: `unknown`, at once, with no storage reads. Within the bound the leader reads only its window. Floors rise with every answer, so a correct driver's floor trails the head by roughly the commits made during the channel idle limit, the statement time limit and the resolve wait: about 33,000 at 50 commits per second, a third of the bound |
+| *s* above the new leader's head | Every reported `txn` is durable, so only a leader that has been superseded is behind a correct driver's floor or a channel's open head: `behind`, not final. The driver tries again; its resolve wait bounds the attempts |
 | A token guessed by another principal | 256 random bits. A guessed token matches no identifier, and the answer for it is `not_committed`, which is true |
 | A token replayed by another principal with write access | The holder learns whether that channel's requests committed, and where. It changes nothing: resolve has no effect, and channel requests from another principal get `channel_lost`. The token's secrecy is the protection, as for the channel itself |
 | Two channels' identifiers collide in the stored prefix | A 2^−128 event per pair, and needs the same sequence number too. A party cannot choose its token, so it cannot aim for a collision. The consequence would be a false `committed` |
 | A retired header in the scan range | The retired form keeps the identifier and the bump flag; a header read is the same in either form |
 | A candidacy whose bump landed and which then failed its final check | Its bump fences L like any other ([0004 decision 9](/docs/decisions/0004-storage-engine/#9-takeover)). The scan stops at it: `not_committed` for anything not found below it |
-| No writes since F | L still in office: nothing above F; `pending` if the channel is live on L, `not_committed` if it has ended. After a takeover, the bump is at F + 1: `not_committed` |
+| No writes since *s* | L still in office: nothing above *s*; `pending` if the channel is live on L, `not_committed` if it has ended. After a takeover, the bump is at *s* + 1: `not_committed` |
 | The channel ended by its idle limit, L still in office | A running request is never idle, and a channel leaves the table only when nothing of it can reach storage. L finds the identifier or answers `not_committed` |
 | L's pod restarts and takes office again | A new candidacy at a new epoch, with a new bump above L's last commit; the old channel settles as after any takeover |
 | L stopped on a commit whose outcome it could not resolve | The create may land later, at L's head plus one, until a candidate's bump takes that name. Once a new leader is in office, the resolve finds the commit or the bump |
 | A token of another database | The token names its database identifier: `invalid_request` |
-| A driver resolves with a floor below the one it sent | The scan could stop at a bump below L's commit and answer a false `not_committed`. Not closed by the server: the driver must resolve with the floor stored with the request, and its tests must show it |
+| A driver resolves with a floor below the one it sent | *s* is never below the token's open head, and every commit of the channel is above that, so the answer is the same; the scan is longer, and past the resolve bound the answer is `unknown`. Drivers send the request's own floor for the shortest scan |
+| A client alters the open head inside its token | The stored identifier is a hash of the whole token, so the altered token names an identifier nothing was stored under, and no channel. Its resolve never answers `committed`; only the client that altered it is misled |
+| A driver resolves with a floor above the one it sent | *s* can be at or above the request's commit; the scan then misses it and can answer a false `not_committed`. Not detectable by the server: the driver must never send a floor above the request's, and its tests must show it |
 | The principal changes while a channel is live | `channel_lost` for the new principal while the channel lives; the resolve answers `pending` until the channel's idle limit ends it, so the driver usually reports unknown |
 
-What remains open is not a safety violation: a resolve past the bound or the driver's resolve wait, and a channel still live on the leader in office, end unknown.
+What remains open is not a safety violation: a resolve past the bound or the driver's resolve wait, and a channel still live on the leader in office, as after the driver's principal changed, end unknown.
 
 ## Response to the design review
 
@@ -598,7 +608,7 @@ What remains open is not a safety violation: a resolve past the bound or the dri
 |---|---|---|
 | 1 | Commit identifier not bound to its operation | Falls away. Clients choose no identifier. Replayed: driver B cannot select A's identity; it can only share A's token, and a different body under a taken sequence number gets `sequence_conflict`, final for B's request, with A's channel untouched. The eviction sequence has no analogue: deduplication is by sequence number for the channel's whole life, and an ended channel answers `channel_lost` for ever |
 | 2 | Parser rejection claims "not committed" | Falls away. Replayed: the malformed second delivery is refused before acceptance, with `final: false`, and says nothing about the request. Only the owner's recorded outcome, a `sequence_conflict` or a close or cancel answer settles a request ([decision 4](#4-when-a-driver-may-report-not-executed)) |
-| 3 | No-op commit becomes "not committed" | Reopened by resolution, and accepted. While the channel lives, the no-op update's outcome is replayed as committed. After the channel is lost, a commit that wrote nothing has no commit object, and `resolve` answers `not_committed`; the driver reports the transaction rolled back. The database holds no change from it either way, so the answer is true of the database; the application sees a failure for a transaction that changed nothing, and running it again is safe ([decision 4](#resolving-a-request-after-its-channel-is-lost)) |
+| 3 | No-op commit becomes "not committed" | Reopened by resolution, and answered by the meaning of the outcomes ([decision 4](#resolving-a-request-after-its-channel-is-lost)). `not_committed` means that the request has no effect on the database and never will, and a commit that changed nothing has none: it creates no commit object, and `resolve` answers `not_committed` exactly. An application that runs it again gets a serial execution in which the first never happened. While the channel lives, the outcome is replayed as `committed: true, wrote: false`, which is also true |
 | 4 | Known-committed operations become failures | Closed by decisions [1](#1-what-the-protocol-promises) and [3](#3-replay-of-the-last-outcome). Exactly-once for the application is not promised; replay returns counts and small results for the channel's life; the remaining case raises a committed, result-unavailable error that is not transient. Durable receipts not accepted: beyond what this version promises |
 | 5 | Outcome recovery is not result recovery | Closed by [decision 5](#5-reads) (no retry once a row is exposed) and [decision 3](#3-replay-of-the-last-outcome). Durable recovery of results not accepted |
 | 6 | Response timeout after a durable commit | Closed by [decision 6](#6-statements-transactions-and-errors): the statement time limit stops at the commit point, and a response deadline only cuts the response |
@@ -633,6 +643,8 @@ What remains open is not a safety violation: a resolve past the bound or the dri
 
 **An exact log position as the operation identity**, suggested by the review: a write names the transaction number it must commit at, and recovery reads that one header. It makes lookup direct, but stateless writers contend for one slot, every write needs a fresh head, and a definite "not committed" needs a durable cancellation or a fence. Not adopted: the floor and the first epoch bump above it give a final answer without fixing a slot in advance.
 
+**A commit object for a transaction that changed nothing**, so that `resolve` would answer `committed` for it. Rejected: it would cost a storage write and a permanent header for every read-only transaction on a write channel, such as every Spring `@Transactional` method that is not marked read-only and only reads, to change an answer that is already exact.
+
 **Starting every transaction deferred.** SQLite's plain `BEGIN` defers the write lock ([sqlite.h.in#L4765-L4768][sq-begin]), and in WAL mode a transaction whose snapshot is no longer the newest cannot take it, returning `SQLITE_BUSY_SNAPSHOT` ([wal.c#L3816-L3823][sq-busysnap]). The failure would come part-way through a transaction; `BEGIN IMMEDIATE` moves the wait to the start, where `busy` is definite. Rejected.
 
 **Server-side prepared statements, cursors and paging.** Each would tie state to a pod and a snapshot across requests. Rejected; the server may cache compiled statements privately.
@@ -655,10 +667,13 @@ What remains open is not a safety violation: a resolve past the bound or the dri
 2. **The commit point is visible.** The storage layer must tell the server when it begins the create of a commit object, and the server must not interrupt the SQLite connection after that point.
 3. **Definite outcomes reach the server before fail-stop.** When the engine resolves a commit definitely (committed, or an epoch bump at the name) and then stops serving, the server must be able to answer the running request first.
 4. **The engine reports** the head, the epoch, a follower's applied transaction number and its application of epoch-bump commits, and waits until a follower reaches a given number.
-5. **A commit header can be read by transaction number**, live or retired, giving the commit identifier, the epoch and whether it is an epoch bump, for the life of the database.
-6. **The leader keeps a window of headers in memory**: the identifier and the bump flag of each of the last resolve-bound transaction numbers below its head (100,000 by default, about 2.5 MB per database), filled from its own commits, from its takeover walk and, for the rest, by reading each missing header from storage once. A header never changes once read, because a name's first object is its only object.
-7. **The leader's head is exact.** The server compares floors with the leader's head: the number of its own last commit, or of its bump before its first commit. A deposed leader's head never rises. Every `txn` the server reports is a number in the durable log.
-8. **No outcome index.** The log need not be indexed by identifier or listed, and the commit path needs no refusal check. The previous draft's requirements on garbage collection are withdrawn.
+5. **The header at any transaction number, live or retired, can be read directly** and gives the commit identifier, the epoch and whether it is an epoch bump.
+6. **A transaction that changes no page creates no commit object.**
+7. **A candidacy creates at most one epoch-bump commit.**
+8. **A leader's head is exactly its own last commit, and a deposed leader's head never rises.**
+9. **Every transaction number the server reports to a client is durable in the log.**
+10. **The leader keeps a window of headers in memory**: the identifier and the bump flag of each of the last resolve-bound transaction numbers below its head (100,000 by default, about 2.5 MB per database), filled from its own commits, from its takeover walk and, for the rest, by reading each missing header from storage once. A header never changes once read, because a name's first object is its only object.
+11. **No outcome index.** The log need not be indexed by identifier or listed, and the commit path needs no refusal check. The previous draft's requirements on garbage collection are withdrawn.
 
 0004 decision 6 currently says that a lookup which finds no match means unknown. With a floor, a match or an epoch bump above it is final, as argued in [decision 4](#resolving-a-request-after-its-channel-is-lost); 0004 must carry that rule, or link here for it.
 
@@ -670,7 +685,7 @@ Nothing here was run: there is no server or driver. Unverified or inference, eac
 - That Hibernate's translation of a vendor-code-0 `SQLException` with SQLState class `SK` ends non-transient in Spring.
 - That pods and proxies flush keepalive frames promptly, through Istio and through ingress-nginx with buffering on and off.
 - That SQLite's authorizer sees every function call and pragma the SQL policy needs to refuse.
-- That a transaction which changed no page creates no commit object, so that `resolve` answers `not_committed` for it, as [decision 4](#resolving-a-request-after-its-channel-is-lost) states; and that no write path produces a commit object without the identifier.
+- That no write path other than an epoch bump produces a commit object without the identifier.
 
 The first implementation must prove, by test:
 
@@ -678,9 +693,9 @@ The first implementation must prove, by test:
 - Every "not executed" and "not committed" a driver reports is true, for commits killed at each step of 0004's commit sequence, and `channel_lost` alone never produces one.
 - A refused sequence number changes no state, and a different body under a taken number gets `sequence_conflict`.
 - Close and cancel answers never precede the outcome of a running commit.
-- `resolve` never answers `not_committed` for a commit in the history and never `committed` for one outside it: for a leader killed, deposed or fenced by a failed candidacy at each step of 0004's commit sequence, for channels ended by close, idle limit and restart, with the floor at, below and above the owner's head, and with retired headers in range.
+- `resolve` never answers `not_committed` for a commit in the history and never `committed` for one outside it: for a leader killed, deposed or fenced by a failed candidacy at each step of 0004's commit sequence, for channels ended by close, idle limit and restart, with the floor at, below and above the owner's head, with resolve floors below the request's and below the open head, with an altered token, and with retired headers in range.
 - A channel leaves the owner's table only after nothing of it can reach storage, and the leader looks a channel up before it reads its head.
-- Each driver resolves with the floor stored with the request, and raises its floor only from reported `txn` values.
+- Each driver never resolves with a floor above the request's, which is a matter of correctness, and resolves with the request's own floor, which is a matter of scan length only; and it raises its floor only from reported `txn` values.
 - A durable commit is never answered with a negative or no-effect error, including under response deadlines and dropped connections.
 - Replay returns counts and retained rows; over budget it returns `rows_omitted`.
 - An autocommit `INSERT OR FAIL` that fails leaves nothing; inside a transaction `txn_state` matches SQLite after every error, and an aborted transaction never runs a statement in autocommit.
