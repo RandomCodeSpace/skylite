@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- The Spring Boot parent pins Hibernate, HikariCP, sqlite-jdbc, JUnit and the Maven plugins. -->
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.1.2</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>io.github.randomcodespace.skylite</groupId>
+  <artifactId>jpa-acceptance</artifactId>
+  <version>0.0.0</version>
+  <name>skylite JPA acceptance suite</name>
+
+  <properties>
+    <java.version>25</java.version>
+    <flight-sql-jdbc.version>19.0.0</flight-sql-jdbc.version>
+    <!-- Overridable with -Djdbc.url=... -Djdbc.driver=... -Djdbc.dialect=... -->
+    <jdbc.dialect>org.hibernate.community.dialect.SQLiteDialect</jdbc.dialect>
+    <jdbc.argLine></jdbc.argLine>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.hibernate.orm</groupId>
+      <artifactId>hibernate-community-dialects</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- Runs the suite inside the fault check's child JVMs (selfcheck/SuiteMain). -->
+    <dependency>
+      <groupId>org.junit.platform</groupId>
+      <artifactId>junit-platform-launcher</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <argLine>${jdbc.argLine}</argLine>
+          <systemPropertyVariables>
+            <!-- application.properties maps these to spring.*; ConnectionReport checks the application against them. -->
+            <jdbc.url>${jdbc.url}</jdbc.url>
+            <jdbc.driver>${jdbc.driver}</jdbc.driver>
+            <jdbc.dialect>${jdbc.dialect}</jdbc.dialect>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- Baseline: the reference SQLite JDBC driver on a file in target/. -->
+    <profile>
+      <id>sqlite</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+      </activation>
+      <properties>
+        <jdbc.url>jdbc:sqlite:${project.build.directory}/baseline.db?journal_mode=WAL&amp;busy_timeout=5000</jdbc.url>
+        <jdbc.driver>org.sqlite.JDBC</jdbc.driver>
+      </properties>
+      <dependencies>
+        <dependency>
+          <groupId>org.xerial</groupId>
+          <artifactId>sqlite-jdbc</artifactId>
+          <scope>runtime</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+
+    <!-- Candidate A: the Apache Arrow Flight SQL JDBC driver, against internal/spike/flightsql. -->
+    <profile>
+      <id>flightsql</id>
+      <properties>
+        <jdbc.url>jdbc:arrow-flight-sql://127.0.0.1:31337?useEncryption=false</jdbc.url>
+        <jdbc.driver>org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver</jdbc.driver>
+        <!-- The driver documents the first flag. The second is needed on Java 25, where the
+             driver's shaded Netty otherwise refuses sun.misc.Unsafe and the allocator fails. -->
+        <jdbc.argLine>--add-opens=java.base/java.nio=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow</jdbc.argLine>
+      </properties>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.arrow</groupId>
+          <artifactId>flight-sql-jdbc-driver</artifactId>
+          <version>${flight-sql-jdbc.version}</version>
+          <scope>runtime</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+
+    <!-- Checks the suite itself: runs it once per injected driver fault (selfcheck/FaultCheck). Use with sqlite. -->
+    <profile>
+      <id>fault-check</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <includes>
+                <include>**/selfcheck/FaultCheck.java</include>
+              </includes>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>
