@@ -36,7 +36,10 @@ class QueryTest extends AcceptanceTestBase {
     void derivedQuery() {
         assertThat(authors.findByNameStartingWithOrderByNameAsc("Al")).extracting(Author::getName)
                 .containsExactly("Alan", "Alice");
-        assertThat(authors.findByEmail("eve@example.com")).isPresent();
+        assertThat(authors.findByEmail("eve@example.com")).get().extracting(Author::getName, Author::getEmail)
+                .containsExactly("Eve", "eve@example.com");
+        assertThat(authors.count()).isEqualTo(7);
+        assertThat(authors.findByEmail("nobody@example.com")).isEmpty();
     }
 
     @Test

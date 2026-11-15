@@ -65,7 +65,8 @@ public final class FaultyDriver implements Driver {
             "pagination-params-swapped", "multirow-update-count-one", "null-rebind-ignored", "quote-string-corrupted",
             "int-truncated-to-short", "negative-numeric-absolute", "pre-epoch-shifted", "null-lob-as-empty",
             "empty-binary-as-null", "constraint-wrong-class", "generated-key-last-on-connection",
-            "string-supplementary-corrupted", "long-string-truncated");
+            "string-supplementary-corrupted", "long-string-truncated", "setbytes-mutates-input",
+            "generated-key-truncated-to-int", "email-filter-ignored");
 
     private static final String FAULT = System.getProperty("acceptance.fault", "none");
     private static final AtomicInteger injected = new AtomicInteger();
@@ -73,6 +74,7 @@ public final class FaultyDriver implements Driver {
     private static final AtomicReference<byte[]> lastBytes = new AtomicReference<>();
     private static final Pattern LIMIT = Pattern.compile("(?i)\\blimit\\s+(\\?|\\d+)");
     private static final Pattern OFFSET = Pattern.compile("(?i)\\boffset\\s+(\\?|\\d+)");
+    private static final Pattern EMAIL_FILTER = Pattern.compile("(?is)select .* from author .* where .*\\.email=\\?.*");
     private static final Pattern ORDER_BY = Pattern.compile("(?i)\\s+order\\s+by\\s+.+?(?=\\s+limit\\b|\\s+offset\\b|\\)|$)");
     private static final long SHIFT_MILLIS = 2 * 3600_000L;
 
@@ -173,6 +175,10 @@ public final class FaultyDriver implements Driver {
             return sql;
         }
         String result = sql;
+        if (is("email-filter-ignored") && EMAIL_FILTER.matcher(result).matches()) {
+            // The parameter stays in the statement, so binding it still works; it no longer filters.
+            result = result.replaceFirst("(?i)(\\w+)\\.email=\\?", "$1.rowid=(select min(rowid) from author) and ? is not null");
+        }
         if (is("limit-ignored")) {
             result = LIMIT.matcher(result).replaceAll(m -> "limit (0 * " + Matcher.quoteReplacement(m.group(1)) + " - 1)");
         }
@@ -420,6 +426,12 @@ public final class FaultyDriver implements Driver {
 
         private Object bind(Method method, Object[] args) throws Throwable {
             int index = (Integer) args[0];
+            if (is("setbytes-mutates-input") && method.getName().equals("setBytes") && args[1] instanceof byte[] b
+                    && b.length > 16) {
+                // Changes the caller's own array, which is then stored; 16-byte UUID ids are left alone.
+                b[b.length / 2] ^= 1;
+                inject(null);
+            }
             if (is("params-swapped") && (index == 1 || index == 2) && placeholders(preparedSql) >= 2) {
                 args[0] = inject(3 - index);
             }
@@ -588,6 +600,9 @@ public final class FaultyDriver implements Driver {
         }
 
         private Object mangle(String name, Object[] args, Object value) throws SQLException {
+            if (generatedKey && is("generated-key-truncated-to-int") && value instanceof Long n && n != n.intValue()) {
+                return inject((long) n.intValue());
+            }
             if (generatedKey && is("generated-key-wrong") && value instanceof Number n
                     && (name.equals("getLong") || name.equals("getInt") || name.equals("getObject"))) {
                 injected.incrementAndGet();

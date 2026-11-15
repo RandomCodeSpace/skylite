@@ -3,11 +3,13 @@ package io.github.randomcodespace.skylite.acceptance;
 import com.zaxxer.hikari.HikariDataSource;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
+import java.sql.Driver;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Properties;
 import javax.sql.DataSource;
 import org.hibernate.boot.Metadata;
 import org.hibernate.boot.spi.BootstrapContext;
@@ -24,7 +26,8 @@ import org.springframework.stereotype.Component;
 
 /**
  * At each application start, checks that the application is connected to the database the run asked for, before
- * anything is sent to it, logs it, and records whether it is the baseline stack.
+ * Hibernate creates, alters or drops anything, logs it, and records whether it is the baseline stack. Tests open
+ * connections outside the pool only through {@link #openOutsidePool()}, from the same verified values.
  *
  * <p>The requested connection is the JVM system properties {@code jdbc.url}, {@code jdbc.driver} and
  * {@code jdbc.dialect}, which Surefire sets from the Maven properties of the same names (pom.xml). They are read
@@ -110,6 +113,34 @@ class ConnectionReport implements BeanPostProcessor, HibernatePropertiesCustomiz
             throw new IllegalStateException("the connection has not been verified");
         }
         return b;
+    }
+
+    /**
+     * A new physical connection outside the pool, opened with the requested driver class and URL that start-up
+     * verified, never with Spring's separately bound {@code spring.datasource.*} values. The pool's user name and
+     * password, if any, are passed on; they do not choose the database.
+     */
+    Connection openOutsidePool() throws SQLException {
+        isBaseline(); // fails unless start-up verified the connection
+        String url = requested("jdbc.url");
+        String driver = requested("jdbc.driver");
+        Properties credentials = new Properties();
+        if (pool.getUsername() != null) {
+            credentials.setProperty("user", pool.getUsername());
+        }
+        if (pool.getPassword() != null) {
+            credentials.setProperty("password", pool.getPassword());
+        }
+        Connection c;
+        try {
+            c = ((Driver) Class.forName(driver).getDeclaredConstructor().newInstance()).connect(url, credentials);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("cannot load driver " + driver, e);
+        }
+        if (c == null) {
+            throw new IllegalStateException("driver " + driver + " does not accept " + url);
+        }
+        return c;
     }
 
     private static String requested(String property) {

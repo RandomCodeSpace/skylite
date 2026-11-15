@@ -1,12 +1,10 @@
 package io.github.randomcodespace.skylite.acceptance;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.jdbc.autoconfigure.DataSourceProperties;
 import org.springframework.boot.test.context.SpringBootTest;
 
 /** Shares one application context across test classes and empties the tables before each test. */
@@ -19,7 +17,7 @@ abstract class AcceptanceTestBase {
     @Autowired SampleRepository samples;
     @Autowired EventRepository events;
     @Autowired DocumentRepository documents;
-    @Autowired DataSourceProperties dataSourceProperties;
+    @Autowired ConnectionReport connectionReport;
 
     @BeforeEach
     void emptyTables() {
@@ -31,12 +29,9 @@ abstract class AcceptanceTestBase {
         documents.deleteAllInBatch();
     }
 
-    /** A new physical connection, outside the application's pool and transactions. */
+    /** A new physical connection to the verified database, outside the application's pool and transactions. */
     Connection secondConnection() throws SQLException {
-        return DriverManager.getConnection(
-                dataSourceProperties.determineUrl(),
-                dataSourceProperties.determineUsername(),
-                dataSourceProperties.determinePassword());
+        return connectionReport.openOutsidePool();
     }
 
     long countFromSecondConnection(String table) throws SQLException {

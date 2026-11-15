@@ -15,10 +15,12 @@ class LobTest extends AcceptanceTestBase {
     void lobRoundTrips() {
         byte[] content = new byte[300 * 1024];
         new Random(7).nextBytes(content);
+        // A copy taken before saving: the driver receives the entity's own array and could change it.
+        byte[] expected = content.clone();
         Long id = documents.save(new Document(content)).getId();
         Long emptyId = documents.save(new Document(new byte[0])).getId();
         Long nullId = documents.save(new Document(null)).getId();
-        assertThat(documents.findById(id).orElseThrow().getContent()).isEqualTo(content);
+        assertThat(documents.findById(id).orElseThrow().getContent()).isEqualTo(expected);
         assertThat(documents.findById(emptyId).orElseThrow().getContent()).isNotNull().isEmpty();
         assertThat(documents.findById(nullId).orElseThrow().getContent()).isNull();
     }

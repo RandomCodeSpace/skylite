@@ -63,10 +63,18 @@ class ConnectionPoolTest extends AcceptanceTestBase {
 
     /**
      * Two statements on one connection insert, then a statement on another connection; only then is each
-     * statement's generated key read, first statement first, and each is the id of that statement's own row.
+     * statement's generated key read, first statement first, and each is the id of that statement's own row. A row
+     * with id {@link Integer#MAX_VALUE} is inserted first, so every generated key needs more than 32 bits.
      */
     @Test
     void generatedKeyBelongsToTheStatementsOwnInsert() throws Exception {
+        try (Connection c = dataSource.getConnection();
+                PreparedStatement seed = c.prepareStatement("insert into author (id, name, email) values (?, ?, ?)")) {
+            seed.setLong(1, Integer.MAX_VALUE);
+            seed.setString(2, "Seed");
+            seed.setString(3, "seed@example.com");
+            assertThat(seed.executeUpdate()).isEqualTo(1);
+        }
         try (Connection first = dataSource.getConnection();
                 Connection second = dataSource.getConnection();
                 PreparedStatement one = first.prepareStatement(INSERT, Statement.RETURN_GENERATED_KEYS);
@@ -79,6 +87,7 @@ class ConnectionPoolTest extends AcceptanceTestBase {
             }
             for (int i = 0; i < inserts.size(); i++) {
                 long id = generatedKey(inserts.get(i));
+                assertThat(id).isGreaterThan(Integer.MAX_VALUE);
                 assertThat(authors.findById(id).orElseThrow().getEmail()).isEqualTo("insert" + i + "@example.com");
             }
         }

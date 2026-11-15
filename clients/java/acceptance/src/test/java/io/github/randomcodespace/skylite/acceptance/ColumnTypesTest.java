@@ -83,6 +83,8 @@ class ColumnTypesTest extends AcceptanceTestBase {
     }
 
     private void roundTrips(Sample written) {
+        // A copy taken before saving: the driver receives the entity's own array and could change it.
+        byte[] payload = written.getPayload().clone();
         Sample r = samples.findById(samples.save(written).getId()).orElseThrow();
         assertThat(r.getText()).isEqualTo(written.getText());
         assertThat(r.getNumber()).isEqualTo(written.getNumber());
@@ -91,7 +93,7 @@ class ColumnTypesTest extends AcceptanceTestBase {
         assertThat(r.getAmount()).isEqualByComparingTo(written.getAmount());
         assertThat(r.getCreatedAt()).isEqualTo(written.getCreatedAt());
         assertThat(r.getDay()).isEqualTo(written.getDay());
-        assertThat(r.getPayload()).isEqualTo(written.getPayload());
+        assertThat(r.getPayload()).isEqualTo(payload);
     }
 
     private static Sample sample(String text, long number, double ratio, boolean flag, String amount,
