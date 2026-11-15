@@ -3,7 +3,7 @@
   <div class="sheet-draw">
     <svg class="dg dg-wide" viewBox="0 0 1136 500" role="img" aria-labelledby="dgw-t dgw-d">
       <title id="dgw-t">Target architecture of skylite (planned design, not implemented)</title>
-      <desc id="dgw-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes, uploads each commit and reads pages on demand; followers forward writes to the leader and fetch pages on demand. Object storage holds the lease object, the commit log, the base page groups and the manifest. A write is acknowledged only after the upload is confirmed. The lease plus conditional writes fence a stale leader.</desc>
+      <desc id="dgw-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes, uploads each commit and reads pages on demand; followers forward writes to the leader and fetch pages on demand. Object storage holds the lease object, the commit log, the base page groups and the manifest. A write is acknowledged only after the upload is confirmed. Conditional writes fence a stale leader; the lease only helps a takeover make progress.</desc>
       <defs>
         <marker id="dgw-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="dg-head" d="M0 1 9 5 0 9z"/></marker>
       </defs>
@@ -79,7 +79,7 @@
 
     <svg class="dg dg-narrow" viewBox="0 0 340 830" role="img" aria-labelledby="dgn-t dgn-d">
       <title id="dgn-t">Target architecture of skylite (planned design, not implemented)</title>
-      <desc id="dgn-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes, uploads each commit and reads pages on demand; followers forward writes to the leader and fetch pages on demand. Object storage holds the commit log, the base page groups, the manifest and the lease object. A write is acknowledged only after the upload is confirmed. The lease plus conditional writes fence a stale leader.</desc>
+      <desc id="dgn-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes, uploads each commit and reads pages on demand; followers forward writes to the leader and fetch pages on demand. Object storage holds the commit log, the base page groups, the manifest and the lease object. A write is acknowledged only after the upload is confirmed. Conditional writes fence a stale leader; the lease only helps a takeover make progress.</desc>
       <defs>
         <marker id="dgn-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="dg-head" d="M0 1 9 5 0 9z"/></marker>
       </defs>
@@ -159,7 +159,7 @@
       <li>One pod is the leader. It takes all writes and keeps a working copy on ephemeral disk.</li>
       <li>The other pods are followers. They forward writes to the leader and serve reads by fetching pages from object storage on demand, with a bounded cache.</li>
       <li>The leader uploads change files and snapshots to object storage. A write is acknowledged only after the upload is confirmed.</li>
-      <li>Object storage (Azure Blob, S3, GCS or local filesystem) also holds the lease object. The lease plus conditional writes fence a stale leader.</li>
+      <li>Object storage (Azure Blob, S3, GCS or local filesystem) also holds the lease object. Conditional writes fence a stale leader; the lease only helps a takeover make progress.</li>
     </ol>
   </details>
 </figure>

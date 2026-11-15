@@ -5,7 +5,7 @@ weight: 20
 status: design
 ---
 
-Nothing on this page is implemented. It records the design the project has decided on and plans to build. The storage design follows [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/), which rests on the [durability spike](/docs/decisions/0002-durability-spike/) and on exploratory probes. The spike ran against an object-store emulator. The probes ran against in-memory models of storage, which is weaker evidence. The record lists what the engine's own tests must prove before any of it is relied on.
+Nothing on this page is implemented. It records the design the project has decided on and plans to build. The storage design follows [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/), which rests on the [durability spike](/docs/decisions/0002-durability-spike/) and on exploratory probes. The spike ran against an object-store emulator. The probes ran against in-memory models of storage, which is weaker evidence. The record is accepted on condition: the SQLite-side mechanisms must pass the engine's own tests at the pinned versions, or the design falls back to a single-connection mode or returns to the record. The record lists what those tests must prove before any of it is relied on.
 
 ## The shape of the system
 
@@ -25,20 +25,22 @@ The cost is write latency. Every acknowledged write includes an object storage r
 
 skylite plans its own storage engine under SQLite, using the pure-Go engine [`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3). Litestream is not used in the product. Each database is planned to have four kinds of object in storage:
 
-- A **commit log**: one object per committed transaction, named by its transaction number and created only if absent. That create is the commit point and the acknowledgement point.
-- A **base**: the database's pages in fixed-size groups of consecutive page numbers, each an immutable object under a name that is never reused.
-- A **manifest**: one object, changed only by compare-and-swap, that names the base objects, the transaction number they are current to, and every epoch-bump commit that must be kept.
+- A **commit log**: one object per transaction, named by its transaction number and created only if absent. That create is the commit point and the acknowledgement point. A name in the log is never freed: once the base covers a commit, garbage collection replaces the object with a small retired form that keeps its header and drops its pages.
+- A **base**: the database's pages in fixed-size groups of consecutive page numbers, each an immutable object.
+- A **manifest**: one object, changed only by compare-and-swap, that names the database identifier, the base objects, the transaction number they are current to, the epoch and the current leader's writer nonce.
+
+The database identifier is part of the key of every log and base object, so a delayed request from an old process lands in the namespace of the database it was working on.
 - A **lease** object, used so that a takeover makes progress.
 
-On the leader, SQLite is planned to run in WAL mode. The plan is for the storage engine to turn each commit in the write-ahead log into one commit object and upload it before `COMMIT` returns. A client is told one of three outcomes: committed, not committed, or unknown when the upload's result cannot be established. After an unknown outcome the pod stops serving that database until a takeover reads the durable history. The leader is to fold the commit log into new base objects and then swap the manifest.
+On the leader, SQLite is planned to run in WAL mode. The plan is for the storage engine to turn each commit in the write-ahead log into one commit object and upload it before `COMMIT` returns. A client is told one of three outcomes: committed, not committed, or unknown when the upload's result cannot be established. After an unknown outcome, and after any failure in the commit path once an upload may have started, the pod stops serving that database until a takeover reads the durable history. The leader is to fold the commit log into new base objects and then swap the manifest.
 
-The first version accepts these limits: one upload per commit, a maximum transaction size, a maximum manifest size, a bound on how long the leader's local log may grow while readers hold it back, and followers whose lag is not bounded by their polling interval. The [decision record](/docs/decisions/0004-storage-engine/#10-limits-accepted-in-the-first-version) states each one.
+The first version accepts these limits: one upload per commit; a maximum transaction size, which makes `VACUUM` and large index builds unsupported on large databases; a maximum manifest size; bounds on the leader's local log and on its uncompacted commit log; one small retired object kept per transaction for the life of the database; takeover latency that is not bounded; and followers whose lag is not bounded by their polling interval. The [decision record](/docs/decisions/0004-storage-engine/#10-limits-accepted-in-the-first-version) states each one.
 
 ## One leader per database
 
 Each database is to have exactly one leader, and other pods forward writes to it. A lease object in object storage lets a new leader take over, but the lease is not what keeps a stale leader out. A lease on its own cannot stop a leader that has paused, lost its network or missed its expiry from writing again.
 
-The fence is the storage layout. Commits are created only if absent, so a stale leader's next commit meets the new leader's epoch-bump commit at its name, and the stale leader stops. Epoch-bump commits are never deleted, so this holds even after old commits have been folded into the base. Everything other than a commit changes the manifest by compare-and-swap, which a takeover changes first. Two pods may briefly both believe they lead; the design prevents conflicting history, not that belief. A takeover downloads no database content, but it reads the manifest, which grows with the number of base groups.
+The fence is the storage layout. Commits are created only if absent, so a stale leader's next commit meets the new leader's epoch-bump commit at its name, and the stale leader stops. No commit-log object is ever deleted, so this holds even after old commits have been folded into the base. Compaction and the start of a takeover change the manifest by compare-and-swap, and a takeover changes it first, so a stale leader's compaction cannot win. Lease updates and garbage collection do not go through the manifest: the lease carries no safety, and garbage collection only retires commits the base already covers and deletes base objects that no manifest can reference again. Two pods may briefly both believe they lead; the design prevents conflicting history, not that belief. A takeover downloads no database content, but it reads the manifest, which grows with the number of base groups.
 
 ## Reads
 
