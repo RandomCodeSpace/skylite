@@ -26,7 +26,7 @@ The cost is write latency. Every acknowledged write includes an object storage r
 skylite plans its own storage engine under SQLite, using the pure-Go engine [`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3). Litestream is not used in the product. Each database is planned to have four kinds of object in storage:
 
 - A **commit log**: one object per transaction, named by its transaction number and created only if absent. That create is the commit point and the acknowledgement point. A name in the log is never freed: once the base covers a commit, garbage collection replaces the object with a small retired form that keeps its header and drops its pages.
-- A **base**: the database's pages in fixed-size groups of consecutive page numbers, each an immutable object whose name belongs to the one compaction attempt that created it.
+- A **base**: the database's pages in fixed-size groups of consecutive page numbers, each an object whose content never changes once it is created. A compaction attempt references a base object only if it created it or read back exactly the bytes it would have written.
 - A **manifest**: one object, changed only by compare-and-swap, that names the database identifier, the base objects, the transaction number they are current to, how far the commit log has been retired, the epoch and the current leader's writer nonce.
 - A **lease** object, used so that a takeover makes progress.
 
