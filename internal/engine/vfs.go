@@ -263,9 +263,8 @@ func (f *mainFile) Pragma(name, value string) (string, error) {
 	case value == "":
 	case name == "journal_mode" && v == "wal":
 	case name == "synchronous" && (v == "full" || v == "2"):
-	case name == "query_only" && f.c.internal:
 	case name == "journal_mode", name == "locking_mode", name == "synchronous",
-		name == "wal_autocheckpoint", name == "query_only":
+		name == "wal_autocheckpoint":
 		return "", fmt.Errorf("engine: PRAGMA %s cannot be changed on this database", name)
 	}
 	return "", sqlite3.NOTFOUND

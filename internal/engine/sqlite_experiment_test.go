@@ -525,23 +525,6 @@ func TestExperimentTruncateCheckpoint(t *testing.T) {
 	}
 }
 
-// Experiment: decision 10, admission. With PRAGMA query_only set, a write
-// statement and BEGIN IMMEDIATE fail before taking the write lock, so
-// another connection can still write.
-func TestExperimentQueryOnlyRefusesWriteLock(t *testing.T) {
-	v := newRecVFS(t, 4096)
-	c, path := openRec(t, v, "FULL")
-	mustExec(t, c, "CREATE TABLE t(x)")
-	other := reopenRec(t, v, path, "FULL")
-	mustExec(t, other, "PRAGMA query_only=1")
-	for _, sql := range []string{"INSERT INTO t VALUES (1)", "BEGIN IMMEDIATE"} {
-		if err := other.Exec(sql); !errors.Is(err, sqlite3.READONLY) {
-			t.Errorf("%s under query_only: %v", sql, err)
-		}
-		mustExec(t, c, "INSERT INTO t VALUES (2)")
-	}
-}
-
 // Experiment: decision 6, "Unproven: that discarding a connection after a
 // panic releases its locks and leaves the shared-memory index consistent
 // for the other connections." It does not, with ncruces v0.37.0 on Linux.

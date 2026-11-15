@@ -449,7 +449,7 @@ func TestCaptureCannotBeBypassed(t *testing.T) {
 		"PRAGMA journal_mode=DELETE", "PRAGMA journal_mode=TRUNCATE", "PRAGMA journal_mode=PERSIST",
 		"PRAGMA journal_mode=MEMORY", "PRAGMA journal_mode=OFF", "PRAGMA main.journal_mode=delete",
 		"PRAGMA locking_mode=EXCLUSIVE", "PRAGMA synchronous=OFF", "PRAGMA synchronous=NORMAL",
-		"PRAGMA synchronous=1", "PRAGMA wal_autocheckpoint=0", "PRAGMA query_only=1",
+		"PRAGMA synchronous=1", "PRAGMA wal_autocheckpoint=0",
 		"VACUUM INTO '" + filepath.Join(t.TempDir(), "copy.db") + "'",
 		"ATTACH 'file:" + l.path + "?vfs=" + l.vfs + "' AS again",
 	} {

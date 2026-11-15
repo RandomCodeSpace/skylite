@@ -327,13 +327,9 @@ type Conn struct {
 	interrupt context.CancelFunc
 	maint     bool  // maintenance asked this connection to give up its transaction
 	aborted   error // maintenance rolled this connection's transaction back
-	queryOnly bool
-	internal  bool // the engine is running its own pragma
 }
 
 func (c *Conn) setup() error {
-	c.internal = true
-	defer func() { c.internal = false }()
 	if err := c.db.Exec("PRAGMA synchronous=FULL"); err != nil {
 		return err
 	}
@@ -398,6 +394,10 @@ func (c *Conn) Run(id []byte, f func(db *sqlite3.Conn) error) (txn uint64, err e
 		err = fmt.Errorf("%w: connection closed", ErrStopped)
 	case c.aborted != nil:
 		err = c.aborted
+	case l.admitClosed && c != l.mconn:
+		// From decision 10's step 1 to its step 8, reads are refused as
+		// well as writes (amended by ADR 0005), before any reaches SQLite.
+		err = fmt.Errorf("%w: %w: maintenance is running", ErrNotCommitted, ErrRetry)
 	}
 	if err != nil {
 		l.cmu.Unlock()
@@ -405,11 +405,7 @@ func (c *Conn) Run(id []byte, f func(db *sqlite3.Conn) error) (txn uint64, err e
 	}
 	c.id, c.idUsed, c.done, c.outcome = bytes.Clone(id), false, 0, nil
 	c.interrupt = cancel
-	closed := l.admitClosed
 	l.cmu.Unlock()
-	if err := c.admit(!closed); err != nil {
-		return 0, err
-	}
 	c.db.SetInterrupt(ictx)
 
 	defer func() {
@@ -417,25 +413,6 @@ func (c *Conn) Run(id []byte, f func(db *sqlite3.Conn) error) (txn uint64, err e
 		txn, err = c.finish(p, err)
 	}()
 	return 0, f(c.db)
-}
-
-// admit sets query_only to match admission, so that a client write is
-// refused before it takes SQLite's write lock (decision 10, step 1).
-func (c *Conn) admit(open bool) error {
-	if c.queryOnly != open {
-		return nil
-	}
-	c.internal = true
-	defer func() { c.internal = false }()
-	v := "1"
-	if open {
-		v = "0"
-	}
-	if err := c.db.Exec("PRAGMA query_only=" + v); err != nil {
-		return err
-	}
-	c.queryOnly = !open
-	return nil
 }
 
 // finish ends a Run: it applies the rules for a panic or an error in the
@@ -477,8 +454,8 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	if p == nil && maint {
 		ferr = errors.Join(ferr, c.rollbackForMaintenance())
 	}
-	if ferr != nil && outcome == nil && !errors.Is(ferr, ErrNotCommitted) && (maint || c.queryOnly && errors.Is(ferr, sqlite3.READONLY)) {
-		// Interrupted by maintenance, or refused by closed admission.
+	if ferr != nil && outcome == nil && !errors.Is(ferr, ErrNotCommitted) && maint {
+		// Interrupted by maintenance.
 		ferr = fmt.Errorf("%w: %w: %w", ErrNotCommitted, ErrRetry, ferr)
 	}
 	if outcome != nil {

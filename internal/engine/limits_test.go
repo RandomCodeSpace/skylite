@@ -110,7 +110,9 @@ func TestWALBound(t *testing.T) {
 // reader ends, the engine's own TRUNCATE checkpoint resets the WAL, the
 // base version advances, ... with client writes refused throughout; then
 // writes resume"; Interleavings, "Maintenance while writes are refused";
-// decision 10, steps 1, 5, 6, 7 (up to compaction) and 8.
+// decision 10, steps 1, 5, 6, 7 (up to compaction) and 8, with steps 1 and
+// 5 as ADR 0005 amends them: new reads are refused too, and running ones
+// end.
 func TestMaintenanceAfterLongReader(t *testing.T) {
 	st, keys, o := newDatabase(t, 1024)
 	cfg := testConfig()
@@ -159,6 +161,14 @@ func TestMaintenanceAfterLongReader(t *testing.T) {
 	// Maintenance holds the TRUNCATE checkpoint: client writes are refused.
 	if _, err := exec(open(t, l), "INSERT INTO t VALUES (-1, 'refused')"); !errors.Is(err, ErrRetry) {
 		t.Fatalf("a write during maintenance: %v", err)
+	}
+	// So are reads, from admission closing to readmission (ADR 0005's
+	// amendment of decision 10, steps 1 and 5).
+	if _, err := open(t, l).Run(nil, func(db *sqlite3.Conn) error {
+		_, err := query(db, "SELECT count(*) FROM t")
+		return err
+	}); !errors.Is(err, ErrRetry) || !errors.Is(err, ErrNotCommitted) {
+		t.Fatalf("a read during maintenance: %v", err)
 	}
 	truncating.open()
 	waitMaintenance(t, l)
