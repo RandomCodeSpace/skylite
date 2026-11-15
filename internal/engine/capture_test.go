@@ -500,3 +500,93 @@ func TestMainFileRefusesOtherWrites(t *testing.T) {
 	}
 	_ = o
 }
+
+// Covers: Commit capture and failure, "Exactly one durable commit object
+// per intended transaction ... across ... spilled frames", for a
+// transaction whose spilled frames hold pages beyond the size it commits:
+// with auto_vacuum, a transaction that grows the database, spills, and
+// deletes what it added shrinks the database at its commit, and SQLite
+// leaves the spilled pages beyond the new size out of the commit.
+func TestCaptureSpilledPagesBeyondTheNewSize(t *testing.T) {
+	st, keys, o := newDatabase(t, 1024)
+	l := lead(t, st, keys, o, testConfig())
+	c := open(t, l)
+	or := newOracle(t)
+	for _, sql := range []string{
+		"PRAGMA auto_vacuum=FULL",
+		"VACUUM",
+		"CREATE TABLE t(k INTEGER PRIMARY KEY, v)",
+		"INSERT INTO t SELECT value, printf('%0500d', value) FROM generate_series(1, 50)",
+		"BEGIN; INSERT INTO t SELECT value, printf('%0900d', value) FROM generate_series(1000, 1400); DELETE FROM t WHERE k >= 1000; UPDATE t SET v = 'changed' WHERE k = 1; COMMIT",
+	} {
+		if _, err := c.Run(newID(), func(db *sqlite3.Conn) error {
+			if err := db.Exec("PRAGMA cache_size=5"); err != nil {
+				return err
+			}
+			return db.Exec(sql)
+		}); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		or.exec(t, sql)
+	}
+	exp := mustDump(t, or.db)
+	if got := mustDump(t, durable(t, st.Store, keys, 0)); got != exp {
+		t.Fatal("durable state differs from the oracle")
+	}
+	if got := dumpConn(t, open(t, l)); got != exp {
+		t.Fatal("a new connection differs from the oracle")
+	}
+}
+
+// Covers: Commit capture and failure, "No error from the commit point is
+// turned into success", for frames SQLite's own recovery would reject: a
+// frame in the transaction that does not carry the WAL header's salts, or
+// that breaks the checksum chain, as a torn or corrupted local write would
+// leave it. The commit fails as not committed with nothing sent, and the
+// next transaction commits.
+func TestCaptureRejectsCorruptFrames(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		off  int64 // into the transaction's first frame
+	}{{"salt", 8}, {"checksum", frameHeaderSize + 100}} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, keys, _, l, c := setup(t)
+			wal, err := os.OpenFile(l.path+"-wal", os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = wal.Close() }()
+			l.fault = func(file, op string, off int64, n int) error {
+				if file != "wal" || op != "sync" {
+					return nil
+				}
+				l.cmu.Lock()
+				start := l.wal.start
+				l.cmu.Unlock()
+				if start < 0 {
+					return nil
+				}
+				l.fault = nil
+				b := make([]byte, 1)
+				if _, err := wal.ReadAt(b, start+tc.off); err != nil {
+					return err
+				}
+				b[0] ^= 0xff
+				_, err := wal.WriteAt(b, start+tc.off)
+				return err
+			}
+			st.resetCounts()
+			txn, err := exec(c, "INSERT INTO t VALUES (1)")
+			if txn != 0 || !errors.Is(err, ErrNotCommitted) {
+				t.Fatalf("commit over a corrupt frame: %d, %v", txn, err)
+			}
+			if _, creates, _ := st.counts(); creates != 0 {
+				t.Fatalf("%d creates", creates)
+			}
+			mustRun(t, c, "INSERT INTO t VALUES (2)")
+			if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,2" {
+				t.Fatalf("durable rows %s", got)
+			}
+		})
+	}
+}
