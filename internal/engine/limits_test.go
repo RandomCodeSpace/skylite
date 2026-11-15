@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -325,10 +326,11 @@ func TestTailBoundCountsBumps(t *testing.T) {
 		})
 		return err
 	}
-	// A leader that takes office at the bound refuses from the start.
+	// A leader that takes office at the bound refuses from the start, a
+	// read as well as a write.
+	atBound("a read", read())
 	_, err := exec(c, "CREATE TABLE t(x)")
 	atBound("a write", err)
-	atBound("a read", read())
 	waitMaintenance(t, l)
 	_, err = exec(c, "CREATE TABLE t(x)")
 	atBound("a write after maintenance", err)
@@ -343,6 +345,7 @@ func TestTailBoundCountsBumps(t *testing.T) {
 	l = lead(t, st, keys, takeOffice(t, st.Store, keys), cfg) // a tail of 5
 	c = open(t, l)
 	mustRun(t, c, "CREATE TABLE t(x)")
+	atBound("a read straight after the commit that reached the bound", read())
 	_, err = exec(c, "INSERT INTO t VALUES (1)")
 	atBound("a write", err)
 	waitMaintenance(t, l)
@@ -353,6 +356,84 @@ func TestTailBoundCountsBumps(t *testing.T) {
 		t.Fatal("maintenance readmitted at the tail bound")
 	}
 	atBound("a read after maintenance", read())
+
+	// The commit point refuses at the bound too: a second commit in the Run
+	// whose first commit reached it.
+	o = takeOffice(t, st.Store, keys)
+	cfg.TailBound = o.Head + 1
+	l = lead(t, st, keys, o, cfg)
+	c = open(t, l)
+	txn, err := c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
+		if err := db.Exec("CREATE TABLE u(x)"); err != nil {
+			return err
+		}
+		return db.Exec("INSERT INTO u VALUES (1)")
+	})
+	if txn == 0 || err == nil || !strings.Contains(err.Error(), "tail is at its bound") || strings.Contains(err.Error(), "maintenance") {
+		t.Fatalf("a second commit in the Run that reached the bound: %d, %v", txn, err)
+	}
+	atBound("a read after it", read())
+}
+
+// Covers: Limits and size, at the tail bound a retry does not help: a Run
+// the bound's maintenance interrupted, with or without a transaction open,
+// a connection whose transaction it rolled back, and one whose transaction
+// an earlier maintenance rolled back are told ErrTailBound, not ErrRetry.
+func TestTailBoundAfterMaintenanceEnds(t *testing.T) {
+	ctx := context.Background()
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.TailBound = o.Head + 2
+	l := lead(t, st, keys, o, cfg)
+	a, early, idle := open(t, l), open(t, l), open(t, l)
+	mustRun(t, a, "CREATE TABLE t(x)")
+	inTxn := func(c *Conn) {
+		t.Helper()
+		if _, err := c.Run(ctx, nil, func(db *sqlite3.Conn) error { return db.Exec("BEGIN; SELECT count(*) FROM t") }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Maintenance below the bound: a retry can succeed.
+	inTxn(early)
+	startMaintenance(l)
+	waitMaintenance(t, l)
+	if _, err := exec(early, "SELECT 1"); !errors.Is(err, ErrRetry) {
+		t.Fatalf("below the bound, the connection whose transaction maintenance rolled back: %v", err)
+	}
+	inTxn(idle)
+	var running []chan error
+	for _, begin := range []string{"SELECT 1", "BEGIN; SELECT count(*) FROM t"} {
+		r := open(t, l)
+		entered, done := make(chan struct{}), make(chan error, 1)
+		go func() {
+			_, err := r.Run(ctx, nil, func(db *sqlite3.Conn) error {
+				if err := db.Exec(begin); err != nil {
+					return err
+				}
+				close(entered)
+				_, err := query(db, spin)
+				return err
+			})
+			done <- err
+		}()
+		<-entered
+		running = append(running, done)
+	}
+	mustRun(t, a, "INSERT INTO t VALUES (1)") // reaches the bound
+	tailBound := func(what string, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrTailBound) || errors.Is(err, ErrRetry) {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	for i, done := range running {
+		tailBound(fmt.Sprintf("interrupted Run %d", i), <-done)
+	}
+	waitMaintenance(t, l)
+	_, err := exec(idle, "SELECT 1")
+	tailBound("the connection whose transaction maintenance rolled back", err)
+	_, err = exec(early, "SELECT 1")
+	tailBound("the connection whose transaction maintenance rolled back below the bound", err)
 }
 
 // Covers: Limits and size, "A reader's walk is bounded ... The leader's
@@ -398,6 +479,44 @@ func TestLeaderTailWithinReaderLimits(t *testing.T) {
 				t.Fatalf("a fresh Open of the leader's tail: %v", err)
 			}
 		})
+	}
+}
+
+// Covers: Limits and size, "The leader's tail bound is at most half of
+// each", for page entries a takeover finds: a leader that takes office over
+// a tail at its entry bound refuses commits, so a fresh Open of the tail
+// still works.
+func TestTakeoverOverFullTail(t *testing.T) {
+	oldTail, oldPages := maxTail, maxTailPages
+	maxTail, maxTailPages = 64, 64
+	t.Cleanup(func() { maxTail, maxTailPages = oldTail, oldPages })
+	st, keys, o := newDatabase(t, 1024)
+	cfg := testConfig()
+	cfg.TailBound = uint64(maxTail / 2) //nolint:gosec // lowered above
+	l := lead(t, st, keys, o, cfg)
+	c := open(t, l)
+	mustRun(t, c, "CREATE TABLE t(x)")
+	const sql = "INSERT INTO t SELECT randomblob(900) FROM generate_series(1, 16)"
+	var err error
+	for i := 0; err == nil; i++ {
+		if i > maxTail {
+			t.Fatal("the leader never reached its tail bound")
+		}
+		_, err = exec(c, sql)
+	}
+	l.cmu.Lock()
+	pages := l.tailPages
+	l.cmu.Unlock()
+	if !errors.Is(err, ErrTailBound) || pages < maxTailPages/2 {
+		t.Fatalf("at the bound: %v, with %d page entries", err, pages)
+	}
+	_ = l.Close()
+	c = open(t, lead(t, st, keys, takeOffice(t, st.Store, keys), cfg))
+	if _, err := exec(c, sql); !errors.Is(err, ErrTailBound) {
+		t.Fatalf("a commit after the takeover: %v", err)
+	}
+	if _, err := Open(context.Background(), st.Store, keys, nil, 0); err != nil {
+		t.Fatalf("a fresh Open of the tail: %v", err)
 	}
 }
 
@@ -457,10 +576,14 @@ func TestTransactionTooLarge(t *testing.T) {
 func TestMaxTransactionNumberStops(t *testing.T) {
 	_, _, _, l, c := setup(t)
 	l.cmu.Lock()
-	l.head = 1<<63 - 1 // ADR 0005, requirement 13
+	l.head = 1<<63 - 2 // ADR 0005, requirement 13
+	l.manifestTxn = l.head - 1
 	l.cmu.Unlock()
-	if _, err := exec(c, "INSERT INTO t VALUES (1)"); !errors.Is(err, ErrNotCommitted) {
-		t.Fatalf("commit at the last transaction number: %v", err)
+	if txn, err := exec(c, "INSERT INTO t VALUES (1)"); txn != 1<<63-1 || err != nil {
+		t.Fatalf("commit of the last transaction number: %d, %v", txn, err)
+	}
+	if _, err := exec(c, "INSERT INTO t VALUES (2)"); !errors.Is(err, ErrNotCommitted) {
+		t.Fatalf("commit after the last transaction number: %v", err)
 	}
 	if !errors.Is(l.Err(), ErrStopped) {
 		t.Fatal("the leader did not stop at the last transaction number")
@@ -482,7 +605,7 @@ func TestMaintenanceAfterCommitInSameRun(t *testing.T) {
 		}
 		startMaintenance(l)
 		// Runs until maintenance interrupts it.
-		_, err := query(db, "SELECT count(*) FROM generate_series(1, 1000000000000)")
+		_, err := query(db, spin)
 		return err
 	})
 	if ctx.Err() != nil {
@@ -579,5 +702,59 @@ func TestTempFileBudget(t *testing.T) {
 	}
 	if used := l.tempUsed.Load(); used != 0 {
 		t.Fatalf("%d bytes counted after the statements ended", used)
+	}
+}
+
+// Covers: Limits and size, "SQLite's temporary files are bounded": they are
+// files in the leader's directory, gone once their connection closes.
+func TestTempFilesInLeaderDir(t *testing.T) {
+	st, keys, o := newDatabase(t, 4096)
+	l := lead(t, st, keys, o, testConfig())
+	c := open(t, l)
+	count := func() int {
+		m, err := filepath.Glob(filepath.Join(l.dir, "temp-*"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(m)
+	}
+	var during int
+	if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+		err := db.Exec("CREATE TEMP TABLE x AS SELECT randomblob(1000) AS v FROM generate_series(1, 5000)")
+		during = count()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if during == 0 {
+		t.Fatal("no temporary file in the leader's directory while a temporary table exists")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(); n != 0 {
+		t.Fatalf("%d temporary files left after their connection closed", n)
+	}
+}
+
+// Covers: Limits and size, "SQLite's temporary files are bounded", by "one
+// byte budget for the whole leader": two connections' temporary tables that
+// each fit the budget do not fit it together.
+func TestTempBudgetIsLeaderWide(t *testing.T) {
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.TempBudget = 8 << 20
+	l := lead(t, st, keys, o, cfg)
+	temp := func(c *Conn) error {
+		_, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+			return db.Exec("CREATE TEMP TABLE x AS SELECT randomblob(1000) AS v FROM generate_series(1, 5000)")
+		})
+		return err
+	}
+	if err := temp(open(t, l)); err != nil {
+		t.Fatalf("the first connection's temporary table: %v", err)
+	}
+	if err := temp(open(t, l)); !errors.Is(err, sqlite3.FULL) {
+		t.Fatalf("the second connection's temporary table, past the budget in all: %v", err)
 	}
 }

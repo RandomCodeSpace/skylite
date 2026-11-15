@@ -78,7 +78,8 @@ type Config struct {
 	// TempBudget is the most bytes SQLite's temporary files (sorts,
 	// temporary tables, statement journals) may hold at once over all the
 	// leader's connections. A write past it fails its statement with
-	// SQLITE_FULL.
+	// SQLITE_FULL, which can make SQLite roll back the whole transaction;
+	// the budget is shared, so another connection's sort can cause that.
 	TempBudget int64
 	// Cache holds pages read from storage; it may be shared.
 	Cache *Cache
@@ -317,8 +318,15 @@ func (l *Leader) Open() (_ *Conn, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	l.conns[c.n] = c
+	// Open's storage reads use this context, so maintenance can end them.
+	ctx, cancel := context.WithCancel(l.ctx)
+	defer cancel()
+	c.ctx, c.interrupt = ctx, cancel
 	l.cmu.Unlock()
 	defer func() {
+		l.cmu.Lock()
+		c.ctx, c.interrupt = nil, nil
+		l.cmu.Unlock()
 		p := recover()
 		if p != nil {
 			err = fmt.Errorf("engine: opening a connection panicked: %v", p)
@@ -331,6 +339,7 @@ func (l *Leader) Open() (_ *Conn, err error) {
 		if c.db == nil && p != nil || c.db != nil && !closeQuietly(c.db) {
 			_ = l.stop(fmt.Errorf("engine: a connection that failed to open could not be closed: %w", err))
 		}
+		c.db = nil // maintenance may already hold c
 		l.cmu.Lock()
 		delete(l.conns, c.n)
 		l.cmu.Unlock()
@@ -450,8 +459,12 @@ func (c *Conn) pragma(name string) (string, error) {
 //     of it can enter the history. It also matches ErrStopped if the leader
 //     stopped, ErrRetry if a retry can succeed, ErrTooLarge or ErrTailBound
 //     if it cannot, and wraps f's own error, if any. A transaction f left
-//     open stays open for the next Run unless the error says it was rolled
-//     back.
+//     open stays open for the next Run unless maintenance rolled it back,
+//     which the error says, or SQLite did, which it does not: SQLite can
+//     roll the whole transaction back after SQLITE_FULL (the temporary-file
+//     budget's included), SQLITE_IOERR, SQLITE_NOMEM or an interrupt, so f
+//     reads db.GetAutocommit() after a failed statement (record 0005,
+//     decision 6).
 //   - err matches ErrUnknown: f's commit may be in the history, now or
 //     later. The leader has stopped.
 func (c *Conn) Run(ctx context.Context, id []byte, f func(db *sqlite3.Conn) error) (txn uint64, err error) {
@@ -471,10 +484,10 @@ func (c *Conn) Run(ctx context.Context, id []byte, f func(db *sqlite3.Conn) erro
 		err = fmt.Errorf("%w: %w", ErrNotCommitted, l.stopped)
 	case c.db == nil:
 		err = fmt.Errorf("%w: the connection is closed", ErrNotCommitted)
-	case c.aborted != nil:
-		err = c.aborted
 	case l.admitClosed && c != l.mconn && l.tailFullLocked():
 		err = l.tailErrLocked()
+	case c.aborted != nil:
+		err = c.aborted
 	case l.admitClosed && c != l.mconn:
 		// From decision 10's step 1 to its step 8, reads are refused as
 		// well as writes (amended by ADR 0005), before any reaches SQLite.
@@ -525,15 +538,25 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	if done != 0 {
 		unsent = fmt.Sprintf("nothing of this Run after transaction %d was sent to storage", done)
 	}
+	// An earlier commit of this Run whose outcome is unknown keeps that
+	// outcome: nothing below may say the Run sent nothing.
+	unknown := errors.Is(outcome, ErrUnknown)
 	switch {
 	case discarded:
-		outcome = fmt.Errorf("%w: %s; the connection was closed and discarded (panic: %v)", ErrNotCommitted, unsent, p)
+		note := fmt.Errorf("%w: %s; the connection was closed and discarded (panic: %v)", ErrNotCommitted, unsent, p)
+		if unknown {
+			note = fmt.Errorf("the connection was closed and discarded (panic: %v)", p)
+		}
+		outcome = errors.Join(outcome, note)
 	case p != nil || inCommit:
 		// The Run ended in a panic that left the connection unclosable, or
 		// the commit path ended without SQLite completing a commit whose
 		// create may have taken effect.
 		cause := fmt.Errorf("%w: a commit's create may have taken effect", ErrUnknown)
-		if !inCommit {
+		switch {
+		case !inCommit && unknown:
+			cause = errors.New("the connection could not be closed")
+		case !inCommit:
 			cause = fmt.Errorf("%w: %s, but the connection could not be closed", ErrNotCommitted, unsent)
 		}
 		if uploaded != 0 {
@@ -545,7 +568,7 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 		}
 		cause = errors.Join(cause, ferr)
 		_ = l.stopLocked(cause)
-		outcome = fmt.Errorf("%w: %w", ErrStopped, cause)
+		outcome = errors.Join(outcome, fmt.Errorf("%w: %w", ErrStopped, cause))
 		c.inCommit, c.uploaded = false, 0
 		l.uploading = false
 		l.cond.Broadcast()
@@ -556,7 +579,9 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	}
 	if ferr != nil && outcome == nil && !errors.Is(ferr, ErrNotCommitted) && maint {
 		// Interrupted by maintenance.
-		ferr = fmt.Errorf("%w: %w: %w", ErrNotCommitted, ErrRetry, ferr)
+		l.cmu.Lock()
+		ferr = fmt.Errorf("%w: %w", l.maintRefusalLocked(), ferr)
+		l.cmu.Unlock()
 	}
 	if errors.Is(ferr, sqlite3.FULL) && l.tempRefused.Load() != c.tempSeen {
 		// shortcut: the count is leader-wide, so a full local disk during
@@ -595,10 +620,11 @@ func classify(done uint64, err, stopped error) (uint64, error) {
 	return done, err
 }
 
-// discard closes the connection after a panic outside the commit path, each
-// statement and then the connection under recover, and reports whether the
-// connection closed cleanly. Then SQLite has finalized every statement and
-// released the connection's locks, and the connection leaves the leader. A
+// discard closes the connection, at Close or after a panic outside the
+// commit path, each statement and then the connection under recover, and
+// reports whether the connection closed cleanly. Then SQLite has finalized
+// every statement and released the connection's locks, and the connection
+// leaves the leader. A
 // statement whose Close panics counts as closed: ncruces finalizes it first
 // and then re-reports its out-of-memory error that way; a statement it does
 // not track makes the connection's close fail.
@@ -661,7 +687,7 @@ func (c *Conn) rollbackHook() {
 }
 
 // Close closes the connection, rolling back an open transaction.
-func (c *Conn) Close() (err error) {
+func (c *Conn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	l := c.l
@@ -671,15 +697,12 @@ func (c *Conn) Close() (err error) {
 	if c.db == nil {
 		return nil
 	}
-	defer func() {
-		if p := recover(); p != nil {
-			// The connection may still hold locks that the others wait for.
-			err = l.stop(fmt.Errorf("engine: closing a connection panicked: %v", p))
-		}
-	}()
-	err = c.db.Close()
-	c.db = nil
-	return err
+	if !c.discard() {
+		// The connection may still hold locks that the others wait for.
+		c.db = nil
+		return l.stop(errors.New("engine: a connection could not be closed"))
+	}
+	return nil
 }
 
 // rollbackForMaintenance rolls back the open transaction of a connection
@@ -694,12 +717,21 @@ func (c *Conn) rollbackForMaintenance() error {
 	if c.db == nil || c.db.TxnState("main") == sqlite3.TXN_NONE {
 		return nil
 	}
-	retry := fmt.Errorf("%w: %w: transaction rolled back for maintenance", ErrNotCommitted, ErrRetry)
 	err := c.db.Exec("ROLLBACK")
 	l.cmu.Lock()
-	c.aborted = retry
+	c.aborted = fmt.Errorf("%w: transaction rolled back for maintenance", l.maintRefusalLocked())
+	aborted := c.aborted
 	l.cmu.Unlock()
-	return errors.Join(retry, err)
+	return errors.Join(aborted, err)
+}
+
+// maintRefusalLocked is the refusal of a transaction that maintenance
+// ended, with l.cmu held: at the tail bound a retry does not help.
+func (l *Leader) maintRefusalLocked() error {
+	if l.tailFullLocked() {
+		return l.tailErrLocked()
+	}
+	return fmt.Errorf("%w: %w", ErrNotCommitted, ErrRetry)
 }
 
 // startMaintenance begins decision 10's maintenance, with l.cmu held:

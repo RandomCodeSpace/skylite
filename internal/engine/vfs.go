@@ -450,6 +450,11 @@ func (w *walFile) Sync(flags vfs.SyncFlag) error {
 	l.cmu.Lock()
 	t := l.wal
 	stopped := l.stopped
+	if stopped == nil && w.c.inCommit {
+		// A panic left the connection's commit path unresolved, and SQLite
+		// is committing again: that commit's create may have taken effect.
+		stopped = l.stopLocked(errors.New("engine: a WAL sync during a commit whose create may have taken effect"))
+	}
 	l.cmu.Unlock()
 	if stopped != nil {
 		return stopped

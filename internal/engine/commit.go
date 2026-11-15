@@ -209,7 +209,7 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 		refuse = l.tailErrLocked()
 	case l.noCreates:
 		refuse = fmt.Errorf("%w: %w: maintenance is running", ErrNotCommitted, ErrRetry)
-	case c.id == nil:
+	case len(c.id) == 0:
 		refuse = fmt.Errorf("%w: the transaction has no commit identifier", ErrNotCommitted)
 	case c.idUsed:
 		refuse = fmt.Errorf("%w: a second commit with one commit identifier", ErrNotCommitted)

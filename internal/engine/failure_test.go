@@ -8,10 +8,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ncruces/go-sqlite3"
+
+	"github.com/RandomCodeSpace/skylite/internal/storage"
 )
 
 // Covers: Commit capture and failure, "Failures after publication: an
@@ -26,10 +30,14 @@ import (
 // from Go; ncruces reports it as a panic in Go once SQLite returns, which
 // the "panic after upload" case stands for. The I/O error case makes SQLite
 // itself fail the commit after the upload, through the last WAL write of
-// its sector padding, and roll it back.
+// its sector padding, and roll it back. A panic through db.Exec leaves the
+// connection unclosable; the cases "in a step" panic inside a prepared
+// statement's step, which leaves it closable, as ncruces's out-of-memory
+// panic does.
 func TestFailureAfterUpload(t *testing.T) {
-	for _, tc := range []string{"panic after upload", "panic in create", "SQLite error after upload"} {
+	for _, tc := range []string{"panic after upload", "panic in create", "SQLite error after upload", "panic after upload, in a step", "panic in create, in a step"} {
 		t.Run(tc, func(t *testing.T) {
+			how, step := strings.CutSuffix(tc, ", in a step")
 			st, keys, o := newDatabase(t, 4096)
 			l := lead(t, st, keys, o, testConfig())
 			w, other := open(t, l), open(t, l)
@@ -38,7 +46,7 @@ func TestFailureAfterUpload(t *testing.T) {
 				t.Fatalf("rows %s", got)
 			}
 			fired := false
-			switch tc {
+			switch how {
 			case "panic after upload":
 				l.afterUpload = func() { fired = true; panic("injected") }
 			case "panic in create":
@@ -71,7 +79,12 @@ func TestFailureAfterUpload(t *testing.T) {
 			// the image that lacks it.
 			var otherErr error
 			txn, err := w.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
-				err := db.Exec("INSERT INTO t VALUES (1)")
+				var err error
+				if step {
+					_, err = query(db, "INSERT INTO t VALUES (1)")
+				} else {
+					err = db.Exec("INSERT INTO t VALUES (1)")
+				}
 				if tc == "SQLite error after upload" {
 					_, otherErr = exec(other, "INSERT INTO t VALUES (2)")
 				}
@@ -90,13 +103,70 @@ func TestFailureAfterUpload(t *testing.T) {
 				t.Fatalf("told not committed after the upload may have started: %v", err)
 			}
 			durableRows := rows(t, durable(t, st.Store, keys, 0))
-			if tc != "panic in create" && (txn != o.Head+2 || durableRows != "0,1") {
+			if how != "panic in create" && (txn != o.Head+2 || durableRows != "0,1") {
 				t.Fatalf("committed in storage: reported %d, durable rows %s", txn, durableRows)
 			}
 			if _, err := other.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 				_, err := query(db, "SELECT x FROM t")
 				return err
 			}); !errors.Is(err, ErrStopped) {
+				t.Fatalf("the second connection served after the stop: %v", err)
+			}
+		})
+	}
+}
+
+// landThenPanic is a store whose Create of a commit panics once armed,
+// after the object landed.
+type landThenPanic struct {
+	storage.Store
+	armed atomic.Bool
+}
+
+func (s *landThenPanic) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	v, err := s.Store.Create(ctx, key, body)
+	if err == nil && isCommit(key) && s.armed.CompareAndSwap(true, false) {
+		panic("store bug after the create landed")
+	}
+	return v, err
+}
+
+// Covers: decision 6, a panic in the commit path stops the database and the
+// client is never told not committed for a transaction in the durable
+// history, for a panic in the store's Create after the object landed. With
+// the statement closed by defer, SQLite syncs the WAL again during the
+// unresolved commit; with it left open or run through db.Exec, it does not.
+func TestCreateLandsThenPanics(t *testing.T) {
+	for _, how := range []string{"step, statement closed by defer", "step, statement left open", "exec"} {
+		t.Run(how, func(t *testing.T) {
+			st, keys, o := newDatabase(t, 4096)
+			ps := &landThenPanic{Store: st}
+			l := lead(t, ps, keys, o, testConfig())
+			w, other := open(t, l), open(t, l)
+			mustRun(t, w, "BEGIN; CREATE TABLE t(x); INSERT INTO t VALUES (0); COMMIT")
+			ps.armed.Store(true)
+			txn, err := w.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
+				switch how {
+				case "exec":
+					return db.Exec("INSERT INTO t VALUES (1)")
+				case "step, statement left open":
+					s, _, err := db.Prepare("INSERT INTO t VALUES (1)")
+					if err != nil {
+						return err
+					}
+					s.Step()
+					return s.Close()
+				}
+				_, err := query(db, "INSERT INTO t VALUES (1)")
+				return err
+			})
+			if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,1" {
+				t.Fatalf("durable rows %s", got)
+			}
+			if txn == 0 && !errors.Is(err, ErrUnknown) || errors.Is(err, ErrNotCommitted) || !errors.Is(l.Err(), ErrStopped) {
+				t.Fatalf("Run: %d, %v; leader: %v; want committed or unknown, and the database stopped", txn, err, l.Err())
+			}
+			if _, err := exec(other, "SELECT 1"); !errors.Is(err, ErrStopped) {
 				t.Fatalf("the second connection served after the stop: %v", err)
 			}
 		})
@@ -205,6 +275,14 @@ func TestPanicOutsideTheCommitPath(t *testing.T) {
 			s.Step()
 			return s.Close()
 		}, false},
+		{"out of memory in a step whose statement is left open", nil, func(db *sqlite3.Conn) error {
+			s, _, err := db.Prepare(oom)
+			if err != nil {
+				return err
+			}
+			s.Step()
+			return s.Close()
+		}, false},
 		{"VFS panic in a checkpoint", func(file, op string, off int64, n int) error {
 			if file == "main" && op == "write" {
 				panic("injected")
@@ -255,6 +333,12 @@ func TestPanicOutsideTheCommitPath(t *testing.T) {
 				if _, err := exec(victim, "SELECT 1"); !errors.Is(err, ErrNotCommitted) || !strings.Contains(err.Error(), "closed") {
 					t.Fatalf("the discarded connection: %v", err)
 				}
+				l.cmu.Lock()
+				_, registered := l.conns[victim.n]
+				l.cmu.Unlock()
+				if registered {
+					t.Fatal("the discarded connection is still registered")
+				}
 			}
 			sql := "UPDATE t SET v = 'after' WHERE k % 7 = 0"
 			mustRun(t, w, sql)
@@ -273,6 +357,26 @@ func TestPanicOutsideTheCommitPath(t *testing.T) {
 				t.Fatal("durable state differs from the oracle")
 			}
 		})
+	}
+}
+
+// Covers: decision 6 for a panic outside the commit path on the leader's
+// own connection, here in maintenance's checkpoint: that connection is never
+// discarded, since maintenance needs it, so the database stops.
+func TestPanicOnMaintenanceConn(t *testing.T) {
+	_, _, _, l, c := setup(t)
+	mustRun(t, c, "INSERT INTO t VALUES (1)")
+	l.fault = func(file, op string, off int64, n int) error {
+		if file == "main" && op == "write" {
+			panic("injected")
+		}
+		return nil
+	}
+	startMaintenance(l)
+	waitMaintenance(t, l)
+	if !errors.Is(l.Err(), ErrStopped) {
+		_, err := exec(c, "SELECT 1")
+		t.Fatalf("the leader serves on after a panic on its own connection; a client's read: %v", err)
 	}
 }
 
@@ -313,17 +417,30 @@ func TestValueAndStatementLimits(t *testing.T) {
 // (the truncate and the engine's own fsync are in TestFailedTruncationStops)
 // and "A commit known not to have entered the durable history never
 // reappears ... after every connection closes and the database reopens",
-// for each failure of a WAL write or sync before the upload.
+// for each failure of a WAL write or sync before the upload. A full disk is
+// not reported as the temporary-file budget, also after the budget refused
+// a statement on the same connection.
 func TestLocalWALFailures(t *testing.T) {
-	for _, tc := range []string{"frame write", "full disk", "sync"} {
+	for _, tc := range []string{"frame write", "full disk", "full disk after a budget refusal", "sync"} {
 		t.Run(tc, func(t *testing.T) {
 			st, keys, o, l, c := setup(t)
+			if tc == "full disk after a budget refusal" {
+				l.cfg.TempBudget = 1 << 20
+				if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+					_, err := query(db, "SELECT count(*) FROM (SELECT randomblob(1000) AS x FROM generate_series(1, 5000) ORDER BY x)")
+					return err
+				}); !errors.Is(err, sqlite3.FULL) {
+					t.Fatalf("a sort past the budget: %v", err)
+				}
+				l.cfg.TempBudget = testConfig().TempBudget
+			}
+			full := strings.HasPrefix(tc, "full disk")
 			l.fault = func(file, op string, off int64, n int) error {
 				switch {
 				case file != "wal":
 				case tc == "frame write" && op == "write":
 					return errInjected
-				case tc == "full disk" && op == "write":
+				case full && op == "write":
 					return sqlite3.FULL
 				case tc == "sync" && op == "sync":
 					return errInjected
@@ -333,7 +450,7 @@ func TestLocalWALFailures(t *testing.T) {
 			st.resetCounts()
 			txn, err := exec(c, "INSERT INTO t VALUES (1)")
 			l.fault = nil
-			if err == nil || txn != 0 || errors.Is(err, sqlite3.BUSY) {
+			if err == nil || txn != 0 || errors.Is(err, sqlite3.BUSY) || full && strings.Contains(err.Error(), "temporary") {
 				t.Fatalf("commit: %d, %v", txn, err)
 			}
 			if _, creates, _ := st.counts(); creates != 0 {

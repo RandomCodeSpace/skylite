@@ -93,6 +93,18 @@ func hungReadSetup(t *testing.T, hang func(ctx context.Context, op string) bool)
 	return hs, l, w
 }
 
+// reached waits a few seconds for a call to reach hs, and fails if none
+// does.
+func reached(t *testing.T, hs *hangStore) {
+	t.Helper()
+	select {
+	case <-hs.reached:
+	case <-time.After(5 * time.Second):
+		hs.open()
+		t.Fatal("no storage call reached the hung store within 5s")
+	}
+}
+
 // within waits for done for a few seconds; on a timeout it releases hs, so
 // that cleanup does not hang, and fails.
 func within[T any](t *testing.T, hs *hangStore, done <-chan T, what string) T {
@@ -122,7 +134,7 @@ func TestRunContextEndsStorageRead(t *testing.T) {
 		})
 		done <- err
 	}()
-	<-hs.reached
+	reached(t, hs)
 	cancel()
 	if err := within(t, hs, done, "the cancelled Run"); !errors.Is(err, ErrNotCommitted) {
 		t.Fatalf("the cancelled Run: %v", err)
@@ -132,6 +144,30 @@ func TestRunContextEndsStorageRead(t *testing.T) {
 	}
 	if got := queryConn(t, r, "SELECT count(*) FROM t"); got[0] != "50" {
 		t.Fatalf("rows %v", got)
+	}
+}
+
+// spin is a statement that reads no storage and runs for some seconds, then
+// ends by itself: a test that waits for it to be interrupted fails, rather
+// than hangs, when the interrupt never reaches SQLite.
+const spin = "SELECT count(*) FROM generate_series(1, 100000000)"
+
+// Covers: Reads, the statement deadline on a statement that reads no
+// storage: the Run's context ends it, and the Run is not committed.
+func TestRunDeadlineEndsStatement(t *testing.T) {
+	_, _, _, l, c := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := c.Run(ctx, nil, func(db *sqlite3.Conn) error {
+		_, err := query(db, spin)
+		return err
+	})
+	if !errors.Is(err, ErrNotCommitted) || !errors.Is(err, sqlite3.INTERRUPT) {
+		t.Fatalf("the Run past its deadline, after %v: %v", time.Since(start), err)
+	}
+	if err := l.Err(); err != nil {
+		t.Fatalf("leader: %v", err)
 	}
 }
 
@@ -149,7 +185,7 @@ func TestReaderInStorageDoesNotBlockWriter(t *testing.T) {
 		})
 		rdone <- err
 	}()
-	<-hs.reached
+	reached(t, hs)
 	wdone := make(chan error, 1)
 	go func() {
 		_, err := exec(w, "INSERT INTO t VALUES (1000, 'w')")
@@ -188,7 +224,7 @@ func TestCloseCancelsHungStore(t *testing.T) {
 				})
 				done <- err
 			}()
-			<-hs.reached
+			reached(t, hs)
 			closed := make(chan error, 1)
 			go func() { closed <- l.Close() }()
 			if err := within(t, hs, closed, "Close"); err != nil {
@@ -216,22 +252,20 @@ func TestConnectionsShareTheIndex(t *testing.T) {
 	l.mu.RLock()
 	entries := len(l.tmpl.pages)
 	l.mu.RUnlock()
-	cs := make([]*Conn, 8)
-	for i := range cs {
-		cs[i] = open(t, l)
-	}
+	// Open and the first read together: a copy made at either is counted.
+	const n = 8
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	for _, c := range cs {
-		queryConn(t, c, q)
+	for range n {
+		queryConn(t, open(t, l), q)
 	}
 	runtime.ReadMemStats(&after)
 	// A copy of the index costs more than 40 bytes an entry.
-	per := (after.TotalAlloc - before.TotalAlloc) / uint64(len(cs))
+	per := (after.TotalAlloc - before.TotalAlloc) / n
 	if per > uint64(entries)*8 {
-		t.Fatalf("a connection's first read allocated %d bytes, with %d entries in the index", per, entries)
+		t.Fatalf("a connection's Open and first read allocated %d bytes, with %d entries in the index", per, entries)
 	}
-	t.Logf("%d bytes per connection's first read; %d entries in the index", per, entries)
+	t.Logf("%d bytes per connection's Open and first read; %d entries in the index", per, entries)
 }
 
 // runClass names the class of a Run's result, as Run documents them.
@@ -295,6 +329,16 @@ func TestRunClasses(t *testing.T) {
 			_, _, _, _, c := setup(t)
 			return c.Run(ctx, nil, func(db *sqlite3.Conn) error { return db.Exec("INSERT INTO t VALUES (1)") })
 		}, "not committed", nil},
+		{"empty identifier", func(t *testing.T) (uint64, error) {
+			_, _, _, _, c := setup(t)
+			return c.Run(ctx, []byte{}, func(db *sqlite3.Conn) error { return db.Exec("INSERT INTO t VALUES (1)") })
+		}, "not committed", nil},
+		{"commit, then an error of the unknown class", func(t *testing.T) (uint64, error) {
+			_, _, _, _, c := setup(t)
+			return c.Run(ctx, newID(), func(db *sqlite3.Conn) error {
+				return errors.Join(db.Exec("INSERT INTO t VALUES (1)"), fmt.Errorf("%w: later", ErrUnknown))
+			})
+		}, "committed", nil},
 		{"connection closed", func(t *testing.T) (uint64, error) {
 			_, _, _, _, c := setup(t)
 			_ = c.Close()
@@ -315,6 +359,39 @@ func TestRunClasses(t *testing.T) {
 			st, _, _, _, c := setup(t)
 			st.setRule(commitRules(fault{unknownNone: true}))
 			return exec(c, "INSERT INTO t VALUES (1)")
+		}, "unknown", []error{ErrStopped}},
+		{"unknown outcome, then a not-committed error", func(t *testing.T) (uint64, error) {
+			st, _, _, _, c := setup(t)
+			st.setRule(commitRules(fault{unknownNone: true}))
+			return c.Run(ctx, newID(), func(db *sqlite3.Conn) error {
+				return errors.Join(db.Exec("INSERT INTO t VALUES (1)"), fmt.Errorf("%w: later", ErrNotCommitted))
+			})
+		}, "unknown", nil},
+		{"unknown outcome, then a panic that discards the connection", func(t *testing.T) (uint64, error) {
+			st, _, _, _, c := setup(t)
+			st.setRule(commitRules(fault{unknownNone: true}))
+			txn, err := c.Run(ctx, newID(), func(db *sqlite3.Conn) error {
+				panic(fmt.Sprintf("after: %v", db.Exec("INSERT INTO t VALUES (1)")))
+			})
+			if !strings.Contains(err.Error(), "discarded") || strings.Contains(err.Error(), "nothing of this Run") {
+				t.Fatalf("not discarded, or said to have sent nothing: %v", err)
+			}
+			return txn, err
+		}, "unknown", []error{ErrStopped}},
+		{"unknown outcome, then a panic that leaves the connection unclosable", func(t *testing.T) (uint64, error) {
+			st, _, _, _, c := setup(t)
+			st.setRule(commitRules(fault{unknownNone: true}))
+			txn, err := c.Run(ctx, newID(), func(db *sqlite3.Conn) error {
+				e := db.Exec("INSERT INTO t VALUES (1)")
+				if err := db.CreateFunction("boom", 0, 0, func(sqlite3.Context, ...sqlite3.Value) { panic("boom") }); err != nil {
+					return errors.Join(e, err)
+				}
+				return errors.Join(e, db.Exec("SELECT boom()"))
+			})
+			if !strings.Contains(err.Error(), "could not be closed") || strings.Contains(err.Error(), "nothing of this Run") {
+				t.Fatalf("not unclosable, or said to have sent nothing: %v", err)
+			}
+			return txn, err
 		}, "unknown", []error{ErrStopped}},
 		{"stopped before the Run by another's unknown outcome", func(t *testing.T) (uint64, error) {
 			st, _, _, l, c := setup(t)
@@ -369,9 +446,9 @@ func TestRunClasses(t *testing.T) {
 }
 
 // Covers: decision 6 for a panic outside Run: one in Open, here from a
-// storage read, is returned as an error, leaves no connection registered,
-// and either the leader serves on, with a TRUNCATE checkpoint that needs
-// every reader slot, or it has stopped.
+// storage read inside sqlite3.Open, is returned as an error, leaves no
+// connection registered, and stops the leader, because a connection that
+// panicked inside sqlite3.Open cannot be closed.
 func TestPanicInOpen(t *testing.T) {
 	st, keys, o := newDatabase(t, 4096)
 	cfg := testConfig()
@@ -399,9 +476,132 @@ func TestPanicInOpen(t *testing.T) {
 	if m != n {
 		t.Fatalf("%d connections registered after the failed Open, %d before", m, n)
 	}
-	if l.Err() != nil {
-		t.Logf("the leader stopped: %v", l.Err())
-		return
+	if !errors.Is(l.Err(), ErrStopped) {
+		t.Fatalf("the leader serves on after a panic inside sqlite3.Open: %v", l.Err())
 	}
+}
+
+// Covers: decision 10's steps 4 and 5 for a connection still opening:
+// maintenance ends an Open parked in a storage read, as it ends a Run's,
+// and finishes; the leader serves on.
+func TestMaintenanceEndsHungOpen(t *testing.T) {
+	var armed atomic.Bool
+	hs, l, w := hungReadSetup(t, func(_ context.Context, op string) bool { return op == "getrange" && armed.Load() })
+	armed.Store(true)
+	opened := make(chan error, 1)
+	go func() {
+		c, err := l.Open()
+		if err == nil {
+			err = c.Close()
+		}
+		opened <- err
+	}()
+	reached(t, hs)
+	startMaintenance(l)
+	t.Logf("Open: %v", within(t, hs, opened, "the Open parked in a storage read"))
+	armed.Store(false)
+	waitMaintenance(t, l)
+	if got := queryConn(t, w, "SELECT count(*) FROM t"); got[0] != "50" || l.Err() != nil {
+		t.Fatalf("after maintenance: %v; leader: %v", got, l.Err())
+	}
+}
+
+// Covers: decision 6 for a failure outside Run: an Open whose setup fails
+// after maintenance listed its connection leaves maintenance nothing to
+// roll back, and the leader serves on.
+func TestOpenFailsDuringMaintenance(t *testing.T) {
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.Cache = NewCache(0)
+	l := lead(t, st, keys, o, cfg)
+	c := open(t, l)
+	mustRun(t, c, "CREATE TABLE t(x)")
 	checkpoint(t, c, sqlite3.CHECKPOINT_TRUNCATE)
+	g := newGate()
+	t.Cleanup(g.open)
+	var n atomic.Int64
+	// Open's first storage read is inside sqlite3.Open; the second, in
+	// setup, waits and fails.
+	st.setRule(func(op, key string) fault {
+		if op == "getrange" && n.Add(1) > 1 {
+			return fault{before: g, noEffect: true}
+		}
+		return fault{}
+	})
+	errc := make(chan error, 1)
+	go func() {
+		_, err := l.Open()
+		errc <- err
+	}()
+	select {
+	case <-g.reached:
+	case err := <-errc:
+		t.Fatalf("Open returned before its read in setup: %v", err)
+	}
+	startMaintenance(l)
+	for end := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		listed := false
+		l.cmu.Lock()
+		for _, x := range l.conns {
+			listed = listed || x != c && x != l.mconn && x.maint
+		}
+		l.cmu.Unlock()
+		if listed {
+			break
+		}
+		if time.Now().After(end) {
+			t.Fatal("maintenance did not list the opening connection")
+		}
+	}
+	g.open()
+	if err := <-errc; err == nil {
+		t.Fatal("Open succeeded through a failed read")
+	}
+	st.setRule(nil)
+	waitMaintenance(t, l)
+	if err := l.Err(); err != nil {
+		t.Fatalf("leader: %v", err)
+	}
+}
+
+// Covers: Close "closes every connection": a statement f left open, against
+// Run's rule, is finalized at Close, so the connection's read lock goes
+// with it and a TRUNCATE checkpoint, which needs every reader gone,
+// succeeds.
+func TestCloseFinalizesLeakedStatements(t *testing.T) {
+	_, _, _, l, c := setup(t)
+	w := open(t, l)
+	if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+		s, _, err := db.Prepare("SELECT x FROM t")
+		if err != nil {
+			return err
+		}
+		s.Step() // left open
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	checkpoint(t, w, sqlite3.CHECKPOINT_TRUNCATE)
+	if err := l.Err(); err != nil {
+		t.Fatalf("leader: %v", err)
+	}
+}
+
+// Covers: decision 6 for a panic outside Run, in Close: the connection may
+// keep its locks, so the leader stops. The panic is in a rollback hook f
+// set, which SQLite calls when it closes a connection in a transaction.
+func TestClosePanicStops(t *testing.T) {
+	_, _, _, l, c := setup(t)
+	if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+		db.RollbackHook(func() { panic("injected") })
+		return db.Exec("BEGIN; SELECT * FROM t")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); !errors.Is(err, ErrStopped) || !errors.Is(l.Err(), ErrStopped) {
+		t.Fatalf("Close: %v; leader: %v", err, l.Err())
+	}
 }
