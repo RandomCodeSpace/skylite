@@ -6,6 +6,12 @@ updates:
       interval: weekly
     commit-message:
       prefix: chore(deps)
+    ignore:
+      # azblob v1.8.1 and later add github.com/apache/arrow-go/v18 to the module
+      # graph (checked with go mod graph), which is far more code than a blob
+      # client needs; the bump in #11 also fails govulncheck. Stay on v1.8.0.
+      - dependency-name: github.com/Azure/azure-sdk-for-go/sdk/storage/azblob
+        versions: [">= 1.8.1"]
     groups:
       gomod-minor-patch:
         update-types: [minor, patch]
