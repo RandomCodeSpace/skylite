@@ -112,7 +112,7 @@ func apply(t testing.TB, raw *sqlite3.Conn, l Limits) *Conn {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := p.Apply(raw)
+	c, err := p.Apply(context.Background(), raw)
 	if err != nil {
 		t.Fatal(err)
 	}

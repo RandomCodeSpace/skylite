@@ -147,7 +147,14 @@ var ErrBroken = errors.New("sqlpolicy: connection unusable")
 // statement of its own through Privileged. Setting the authorizer expires
 // statements prepared on c before Apply, so SQLite compiles them again under
 // the policy if they are stepped.
-func (p *Policy) Apply(c *sqlite3.Conn) (*Conn, error) {
+//
+// Apply's first statement loads the database's schema, which a client wrote.
+// It is interrupted when ctx ends, and a panic in the engine is returned as an
+// error, as in Run; the connection is then unusable.
+func (p *Policy) Apply(ctx context.Context, c *sqlite3.Conn) (_ *Conn, err error) {
+	pc := &Conn{conn: c, limits: p.limits}
+	defer c.SetInterrupt(c.SetInterrupt(ctx))
+	defer pc.recoverEngine(&err)
 	for _, cfg := range []struct {
 		op   sqlite3.DBConfig
 		want bool
@@ -191,7 +198,6 @@ func (p *Policy) Apply(c *sqlite3.Conn) (*Conn, error) {
 			return nil, fmt.Errorf("sqlpolicy: limit on %s is %d, want %d", f.name, got, *f.value)
 		}
 	}
-	pc := &Conn{conn: c, limits: l}
 	for _, f := range refused {
 		if err := c.CreateFunction(f.name, f.narg, 0, pc.refuse); err != nil {
 			return nil, fmt.Errorf("sqlpolicy: %s: %w", f.name, err)
@@ -205,7 +211,7 @@ func (p *Policy) Apply(c *sqlite3.Conn) (*Conn, error) {
 		}
 	}
 	// Privileged installs the authorizer when it returns, on every path.
-	err := pc.Privileged(func(c *sqlite3.Conn) error {
+	err = pc.Privileged(func(c *sqlite3.Conn) error {
 		// Temporary tables, indices and statement journals stay in the
 		// connection's memory instead of unnamed files in the temporary
 		// directory.

@@ -167,7 +167,7 @@ func TestApplyReadsLimitsBack(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := p.Apply(raw); err == nil {
+		if _, err := p.Apply(context.Background(), raw); err == nil {
 			t.Errorf("Apply accepted %+v", p.limits)
 		}
 		_ = raw.Close()
@@ -187,8 +187,52 @@ func TestApplyFailsWhenTheDatabaseExceedsMaxPageCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Apply(raw); err == nil {
+	if _, err := p.Apply(context.Background(), raw); err == nil {
 		t.Fatal("Apply succeeded on a database larger than MaxPageCount")
+	}
+}
+
+// Apply's first statement loads the schema, which a client wrote: a schema
+// larger than the connection's memory is a memory refusal, not a panic, and
+// the load ends with ctx.
+func TestApplyContainsTheSchemaLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	raw, err := sqlite3.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cols := make([]string, 1000)
+	for i := range cols {
+		cols[i] = fmt.Sprint("c", i)
+	}
+	for i := range 400 {
+		if err := raw.Exec(fmt.Sprintf("CREATE TABLE t%d(%s)", i, strings.Join(cols, ", "))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	small, err := sqlite3.OpenContext(sqlite3.WithMaxMemory(context.Background(), 4<<20), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Apply(context.Background(), small)
+	wantRefused(t, err, ReasonMemory)
+
+	raw, err = sqlite3.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = raw.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := p.Apply(ctx, raw); !errors.Is(err, sqlite3.INTERRUPT) {
+		t.Fatalf("Apply with an ended context: got %v, want an interrupt", err)
 	}
 }
 
@@ -799,7 +843,8 @@ func TestFunctionAllowlist(t *testing.T) {
 
 // The authorizer does not see the functions in the CHECK constraint or
 // generated column of ALTER TABLE ADD COLUMN. Apply replaces every refused
-// function with one that is not innocuous, which SQLite refuses there.
+// function with one that is not innocuous, which SQLite refuses there on a
+// main table and which fails with reason function on a temp table.
 func TestRefusedFunctionsInAlterTableAddColumn(t *testing.T) {
 	raw, err := sqlite3.Open(":memory:")
 	if err != nil {
@@ -807,7 +852,7 @@ func TestRefusedFunctionsInAlterTableAddColumn(t *testing.T) {
 	}
 	defer func() { _ = raw.Close() }()
 	db := openDB(t, false, Limits{})
-	db.mustRun(t, "CREATE TABLE t(a, b); INSERT INTO t VALUES ('a', 'a')")
+	db.mustRun(t, "CREATE TABLE t(a, b); INSERT INTO t VALUES ('a', 'a'); CREATE TEMP TABLE e(a, b); INSERT INTO e VALUES ('a', 'a')")
 	err = rows(raw, "SELECT DISTINCT name, narg FROM pragma_function_list", func(s *sqlite3.Stmt) {
 		name, narg := s.ColumnText(0), s.ColumnInt(1)
 		if !slices.Contains(refusedFunctions, name) {
@@ -823,11 +868,17 @@ func TestRefusedFunctionsInAlterTableAddColumn(t *testing.T) {
 				t.Errorf("%s: %v", sql, err)
 			}
 		}
+		// SQLite's check does not cover a temp table, so the call reaches the
+		// stand-in, which refuses it.
+		wantRefused(t, db.run(fmt.Sprintf("ALTER TABLE e ADD COLUMN z CHECK (%s(%s) IS NULL)", name, args)), ReasonFunction)
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	db.mustRun(t, "ALTER TABLE t ADD COLUMN z AS (upper(a)); ALTER TABLE t ADD COLUMN y CHECK (length(a) > 0)")
+	// On an empty temp table, the CHECK is added and refuses the first row.
+	db.mustRun(t, "CREATE TEMP TABLE f(a, b); ALTER TABLE f ADD COLUMN z CHECK (regexp(b, a) IS NULL)")
+	wantRefused(t, db.run("INSERT INTO f(a, b) VALUES ('a', 'a')"), ReasonFunction)
 }
 
 func TestFunctionRegisteredLaterIsRefused(t *testing.T) {
