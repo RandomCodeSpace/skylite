@@ -10,6 +10,6 @@ skylite is pre-alpha. The repository contains project scaffolding and a binary t
 
 {{< roadmap >}}
 
-## Why the spike comes first
+## Why the order changed
 
-The whole design rests on two claims: no acknowledged write is lost when a pod dies, and a stale leader cannot commit. The spike tests both against Azurite, the Azure Storage emulator, before the later milestones start. It also decides whether Litebase is a suitable base. The [architecture](/docs/architecture/) is decided after this milestone, so everything on this site is design direction, subject to change.
+The spike tested the two claims the design rests on, that no acknowledged write is lost when a pod dies and that a stale leader cannot commit, against Azurite, the Azure Storage emulator. Its results are in [0002](/docs/decisions/0002-durability-spike/). The storage architecture that followed is [0004](/docs/decisions/0004-storage-engine/): skylite will build its own storage engine instead of embedding Litestream. That engine now comes straight after the storage interface, because leader failover and read replicas are planned on top of its commit log and manifest. Every milestone after the first is a plan, and the record lists what the engine's tests must prove before the design is relied on.

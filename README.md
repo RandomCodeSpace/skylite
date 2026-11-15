@@ -46,8 +46,8 @@ make build
 
 ## Design goals
 
-These are goals, not features. The architecture is design direction and
-subject to change after the first roadmap step.
+These are goals, not features. The planned storage design is recorded in
+[decision record 0004](https://randomcodespace.github.io/skylite/docs/decisions/0004-storage-engine/).
 
 - A write is acknowledged only after it is confirmed in object storage.
 - Pod disk is a cache only.
@@ -61,14 +61,14 @@ subject to change after the first roadmap step.
 ## Roadmap
 
 1. Evaluate Litebase as a base and run a durability spike against Azurite.
-   The architecture is decided after this step.
 2. Storage interface and four backends (Azure Blob, AWS S3, Google Cloud
    Storage, local filesystem) with an emulator test suite.
-3. HTTPS query API.
+3. Storage engine: commit log, paged reads, compaction.
 4. Leader lease and failover.
-5. On-demand readers.
-6. Clients: Go driver proven with GORM, JDBC driver proven with Spring Data JPA.
-7. Endpoint authentication, authorization and SQL lockdown.
+5. Read replicas.
+6. HTTPS query API and sessions.
+7. Clients: Go driver proven with GORM, JDBC driver proven with Spring Data JPA.
+8. Endpoint authentication, authorization and SQL lockdown.
 
 ## Links
 

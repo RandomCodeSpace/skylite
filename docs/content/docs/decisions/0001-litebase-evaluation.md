@@ -4,7 +4,7 @@ description: skylite will not reuse or fork Litebase; it will be built as a new 
 weight: 1
 ---
 
-**Status:** Accepted
+**Status:** Accepted. Its choice to embed Litestream is superseded by [0004](/docs/decisions/0004-storage-engine/); the decision not to use Litebase stands.
 
 **Date:** 2026-11-15
 

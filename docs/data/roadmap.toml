@@ -10,27 +10,32 @@ detail = "Project scaffolding, CI, this site, and a binary that prints its versi
 title = "Evaluate Litebase and run a durability spike"
 status = "planned"
 detail = "Evaluate Litebase, an existing MIT-licensed SQLite-on-object-storage database, as a base. Against Azurite: acknowledge only after upload, kill mid-write, restore on an empty disk, and prove that no acknowledged write is lost and a stale leader cannot commit."
-gate = "The architecture is decided after this milestone. Until then, everything on this site is design direction, subject to change."
+gate = "The storage architecture that follows from it is recorded in decision record 0004. It stays a plan until the storage engine's own tests prove it."
 
 [[items]]
 title = "Storage interface and four backends"
 status = "planned"
-detail = "One storage interface with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators."
+detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators."
 
 [[items]]
-title = "HTTPS query API"
+title = "Storage engine: commit log, paged reads, compaction"
 status = "planned"
-detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port."
+detail = "A storage layer under SQLite (ncruces/go-sqlite3) that uploads each commit from the write-ahead log as one create-if-absent object before acknowledging it, reads pages on demand from a paged base with a bounded cache, and folds the commit log into the base behind a compare-and-swap manifest."
 
 [[items]]
 title = "Leader lease and failover"
 status = "planned"
-detail = "One leader per database, chosen by a lease object in object storage. Conditional writes fence a stale leader."
+detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader."
 
 [[items]]
-title = "On-demand readers"
+title = "Read replicas"
 status = "planned"
-detail = "Followers fetch pages from object storage on demand, with a bounded cache, so reads scale by adding pods."
+detail = "Followers read pages from object storage on demand through a read-only storage layer, pin each read transaction to one version, and serve reads from a bounded cache, so reads scale by adding pods."
+
+[[items]]
+title = "HTTPS query API and sessions"
+status = "planned"
+detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests."
 
 [[items]]
 title = "Clients: Go driver, JDBC driver and Hibernate dialect"
