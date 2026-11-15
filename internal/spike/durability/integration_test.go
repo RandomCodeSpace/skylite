@@ -241,14 +241,11 @@ func TestEmulatorSemantics(t *testing.T) {
 			wg.Go(func() {
 				body := fmt.Appendf(nil, "writer-%d", i)
 				_, err := az.UploadBuffer(ctx, container, "contended", body, &azblob.UploadBufferOptions{AccessConditions: ifNoneMatchAny()})
-				switch {
-				case err == nil:
+				if err == nil {
 					wins.Add(1)
 					winner.Store(body)
-				default:
-					if status, code := respErr(err); status != http.StatusConflict || code != string(bloberror.BlobAlreadyExists) {
-						t.Errorf("writer %d: got %d %q (%v), want 409 BlobAlreadyExists", i, status, code, err)
-					}
+				} else if status, code := respErr(err); status != http.StatusConflict || code != string(bloberror.BlobAlreadyExists) {
+					t.Errorf("writer %d: got %d %q (%v), want 409 BlobAlreadyExists", i, status, code, err)
 				}
 			})
 		}
