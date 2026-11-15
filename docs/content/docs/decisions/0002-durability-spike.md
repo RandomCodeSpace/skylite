@@ -1,10 +1,10 @@
 ---
 title: "0002: Durability spike against Azurite"
-description: Results of a spike that tested acknowledged-write durability and stale-leader fencing with Litestream as a library against Azurite. Proposed; the architecture decision follows separately.
+description: Results of a spike that tested acknowledged-write durability and stale-leader fencing with Litestream as a library against Azurite. Accepted as evidence; the architecture decision follows separately.
 weight: 2
 ---
 
-**Status:** Proposed
+**Status:** Accepted
 
 **Date:** 2026-11-15
 
@@ -169,7 +169,18 @@ SKYLITE_SPIKE_KILL_ROUNDS=500 INTEGRATION_TIMEOUT=90m make integration   # the s
 
 ## Decision
 
-To be written by the project lead. The evidence supports only this:
+The results are accepted as evidence for the architecture decision, which is recorded separately. Three rules are adopted from them. Each is a requirement on whatever storage engine skylite builds, not a description of one:
+
+1. A commit is acknowledged only after skylite's own storage layer has confirmed the commit object in object storage. A nil return from a replication library is not that confirmation (finding 2).
+2. Every object that becomes part of the durable history is written with create-if-absent. A leader that loses a create to different content stops writing for good (findings 4 and 5). A new leader takes office by winning a create-if-absent for an epoch-bump commit.
+3. The lease is for liveness only. No safety argument may rest on it (finding 8).
+
+Two questions are left to the architecture decision on purpose:
+
+- **How to close the stale-mutation window** (finding 7). The tested client does not close it.
+- **Whether Litestream stays in the write path.** The spike shows it can be contained from outside without a fork, for a database whose files stay under the single-upload limit. It also shows that limit (finding 6), and that findings 2, 3 and 4 each needed a guard of our own. The spike kept a full local copy of the database; it did not test on-demand page reads or databases of the size skylite is planned for.
+
+The evidence supports only this:
 
 - Against Azurite, with Litestream v0.5.18 embedded as a library, the replica client and the acknowledgement rule described under Method, P1 held in the tested kill scenarios and P2 held in the six tested orderings. P2 does not hold for a stale leader paused between its admission checks and the storage request: storage accepted its stale snapshot, compaction file and deletes, although in the three tested orderings the restores were unaffected.
 - The early-acknowledgement control shows that acknowledging before the upload loses acknowledged writes on a kill, and that the checks detect it.
@@ -184,5 +195,5 @@ None were evaluated in this spike.
 ## Consequences
 
 - If the design goes ahead, the custom replica client and the acknowledgement check become product code with their own tests. The window in finding 7 must be closed with an atomic fence in storage, or accepted with its consequences stated. Choosing the fence is part of the architecture decision.
-- The architecture page stays design direction until the lead records a decision.
+- The architecture page stays design direction until the architecture decision is recorded.
 - On 2026-11-15 the project owner decided to do all development and testing on emulators for now, because real cloud accounts cost money. Verification against real Azure, S3 and Google Cloud Storage is deferred by that decision. Until it is done, every result on this page is emulator-only.
