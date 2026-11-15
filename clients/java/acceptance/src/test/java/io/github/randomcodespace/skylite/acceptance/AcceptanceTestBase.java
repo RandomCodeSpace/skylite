@@ -1,0 +1,47 @@
+package io.github.randomcodespace.skylite.acceptance;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import org.junit.jupiter.api.BeforeEach;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.jdbc.autoconfigure.DataSourceProperties;
+import org.springframework.boot.test.context.SpringBootTest;
+
+/** Shares one application context across test classes and empties the tables before each test. */
+@SpringBootTest
+abstract class AcceptanceTestBase {
+    @Autowired AuthorRepository authors;
+    @Autowired BookRepository books;
+    @Autowired AccountRepository accounts;
+    @Autowired SampleRepository samples;
+    @Autowired EventRepository events;
+    @Autowired DocumentRepository documents;
+    @Autowired DataSourceProperties dataSourceProperties;
+
+    @BeforeEach
+    void emptyTables() {
+        books.deleteAllInBatch();
+        authors.deleteAllInBatch();
+        accounts.deleteAllInBatch();
+        samples.deleteAllInBatch();
+        events.deleteAllInBatch();
+        documents.deleteAllInBatch();
+    }
+
+    /** A new physical connection, outside the application's pool and transactions. */
+    Connection secondConnection() throws SQLException {
+        return DriverManager.getConnection(
+                dataSourceProperties.determineUrl(),
+                dataSourceProperties.determineUsername(),
+                dataSourceProperties.determinePassword());
+    }
+
+    long countFromSecondConnection(String table) throws SQLException {
+        try (Connection c = secondConnection();
+                var rs = c.createStatement().executeQuery("select count(*) from " + table)) {
+            rs.next();
+            return rs.getLong(1);
+        }
+    }
+}

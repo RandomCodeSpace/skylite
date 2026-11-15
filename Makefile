@@ -72,3 +72,9 @@ docs-linkcheck:
 	  --include-fragments \
 	  --extensions html,css,xml \
 	  "$(DOCS_LINKROOT)/skylite"
+
+# JPA acceptance suite (clients/java/acceptance) against the reference SQLite JDBC driver.
+# Needs a JDK and Maven.
+.PHONY: java-acceptance
+java-acceptance:
+	mvn -B -ntp -f clients/java/acceptance/pom.xml test

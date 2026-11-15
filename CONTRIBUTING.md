@@ -45,6 +45,7 @@ You need Go (the version in `go.mod` or newer) and
 | `make lint`  | `golangci-lint run`                                  |
 | `make vuln`  | `govulncheck ./...` at the pinned version            |
 | `make check` | all of the above                                     |
+| `make java-acceptance` | JPA acceptance suite against sqlite-jdbc (needs a JDK and Maven) |
 
 Run `make check` before opening a pull request. CI runs the same checks plus
 `go mod tidy -diff` and workflow linting. CodeQL code scanning runs through

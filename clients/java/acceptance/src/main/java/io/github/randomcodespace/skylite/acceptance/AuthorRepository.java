@@ -1,0 +1,19 @@
+package io.github.randomcodespace.skylite.acceptance;
+
+import java.util.List;
+import java.util.Optional;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+public interface AuthorRepository extends JpaRepository<Author, Long> {
+    Optional<Author> findByEmail(String email);
+
+    List<Author> findByNameStartingWithOrderByNameAsc(String prefix);
+
+    @Query("select a from Author a where size(a.books) >= :min order by a.name")
+    List<Author> findWithAtLeastBooks(@Param("min") int min);
+
+    @Query(value = "select count(*) from author where lower(name) like lower(:pattern)", nativeQuery = true)
+    long countByNameLikeNative(@Param("pattern") String pattern);
+}
