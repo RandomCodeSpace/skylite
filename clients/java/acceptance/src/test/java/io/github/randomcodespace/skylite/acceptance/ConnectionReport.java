@@ -118,7 +118,8 @@ class ConnectionReport implements BeanPostProcessor, HibernatePropertiesCustomiz
     /**
      * A new physical connection outside the pool, opened with the requested driver class and URL that start-up
      * verified, never with Spring's separately bound {@code spring.datasource.*} values. The pool's user name and
-     * password, if any, are passed on; they do not choose the database.
+     * password, if any, are passed on. Start-up does not verify them: with a driver that authenticates they decide
+     * the principal, and with some drivers the default database or schema.
      */
     Connection openOutsidePool() throws SQLException {
         isBaseline(); // fails unless start-up verified the connection

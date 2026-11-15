@@ -61,6 +61,13 @@ driver class and URL, the values the check verified, and with the pool's user
 name and password if it has any. They do not use `spring.datasource.*`, which
 can differ from what the pool uses (see the `hikari.jdbc-url` row below).
 
+The check certifies that the URL, the driver class and the dialect in use are
+the requested ones. It does not certify the user name or password. SQLite
+ignores them; a driver that authenticates uses them to decide the principal,
+and some drivers use the user name to choose a default database or schema
+when the URL names none, so for such a driver the same URL can reach
+different data.
+
 When start-up fails, every test errors; none is skipped. When it succeeds, the
 log names the database the run certified:
 
@@ -440,6 +447,9 @@ The suite does not test these, so a driver can get them wrong and still pass:
   pooled connection, beyond what consecutive tests do anyway;
 - `BigDecimal` beyond 12 significant digits and scale 2, and `Instant` beyond
   millisecond precision;
+- the scale of a `BigDecimal`: decimals are compared by value, because
+  SQLite's numeric storage does not keep trailing zeros (`1.20` reads back
+  as `1.2`);
 - special `double` values (`NaN`, infinities, `-0.0`), dates before the
   Gregorian calendar's adoption, and strings with embedded NUL characters;
 - whether a unique, foreign-key or not-null violation carries the specific SQL

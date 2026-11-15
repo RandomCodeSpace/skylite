@@ -7,7 +7,8 @@ at a second SQLite file that holds a table `author` with one sentinel row,
 which Hibernate's ddl-auto=create would drop. Each case must end as expected:
 
   rejected   start-up fails with the configuration check's message
-  hibernate  start-up fails inside Hibernate, before any connection is opened
+  hibernate  start-up fails inside Hibernate with its own configuration error,
+             before any connection is opened
   requested  the tests pass, and the log names the requested database
   control    the second file is itself the requested database (it loses its row)
 
@@ -20,6 +21,7 @@ Case names given as arguments run only those cases.
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -38,6 +40,8 @@ simple = 'org.springframework.jdbc.datasource.SimpleDriverDataSource'
 h2 = 'org.hibernate.dialect.H2Dialect'
 provider = 'org.hibernate.engine.jdbc.connections.internal.DriverManagerConnectionProviderImpl'
 guard = ('the application is not connected to the requested database', 'not HikariCP')
+# What Hibernate raises when its own connection provider is selected without a URL.
+hibernate_refusal = 'ConnectionProviderConfigurationException'
 
 
 def json_env(settings):
@@ -147,10 +151,13 @@ def main():
         kept = sentinel()
         rejected = any(g in text for g in guard)
         connected = 'ConnectionReport' in text and 'Connected to ' in text
+        # Surefire's summary shows that the test JVM started and the tests ran: a fork
+        # or compilation failure must not count as the expected start-up failure.
+        ran = re.search(r'Tests run: [1-9]\d*, ', text) is not None
         actual = ('control' if exit_code == 0 and not kept and 'Connected to ' + other in text else
                   'requested' if exit_code == 0 and 'Connected to ' + requested in text else
-                  'rejected' if exit_code != 0 and rejected else
-                  'hibernate' if exit_code != 0 and not connected else
+                  'rejected' if exit_code != 0 and ran and rejected else
+                  'hibernate' if exit_code != 0 and ran and not connected and hibernate_refusal in text else
                   'other')
         ok = actual == expected and (kept or expected == 'control')
         if not ok:
