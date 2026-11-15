@@ -253,10 +253,23 @@ func TestForeignObjectAtNextNameStops(t *testing.T) {
 // commit (fourth review)".
 func TestDefinitelyFailedCommitReleasesNumber(t *testing.T) {
 	st, keys, o, l, c := setup(t)
+	walSize := func() int64 {
+		fi, err := os.Stat(l.path + "-wal")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Size()
+	}
+	before := walSize()
 	st.setRule(commitRules(fault{noEffect: true}))
 	txn, err := exec(c, "INSERT INTO t VALUES (1)")
 	if txn != 0 || !errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrUnknown) {
 		t.Fatalf("commit: %d, %v; want not committed", txn, err)
+	}
+	// The failed transaction's frames are gone from the local WAL, where
+	// SQLite's recovery could otherwise find them.
+	if after := walSize(); after != before {
+		t.Fatalf("WAL of %d bytes after the failed commit, %d before it", after, before)
 	}
 	if _, creates, _ := st.counts(); creates < createAttempts {
 		t.Fatalf("%d creates, want %d attempts", creates, createAttempts)

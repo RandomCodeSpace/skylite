@@ -65,7 +65,20 @@ func TestFailureAfterUpload(t *testing.T) {
 					return nil
 				}
 			}
-			txn, err := exec(w, "INSERT INTO t VALUES (1)")
+			// After SQLite rolls the uploaded transaction back, and before
+			// the Run ends, another connection must not commit on top of
+			// the image that lacks it.
+			var otherErr error
+			txn, err := w.Run(newID(), func(db *sqlite3.Conn) error {
+				err := db.Exec("INSERT INTO t VALUES (1)")
+				if tc == "SQLite error after upload" {
+					_, otherErr = exec(other, "INSERT INTO t VALUES (2)")
+				}
+				return err
+			})
+			if tc == "SQLite error after upload" && !errors.Is(otherErr, ErrStopped) {
+				t.Fatalf("another connection wrote after the rollback of an uploaded commit: %v", otherErr)
+			}
 			if !fired {
 				t.Fatal("the fault did not fire")
 			}

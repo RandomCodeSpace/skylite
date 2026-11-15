@@ -590,3 +590,21 @@ func TestCaptureRejectsCorruptFrames(t *testing.T) {
 		})
 	}
 }
+
+// Covers: Commit capture and failure, "No transaction number is ever given
+// a second, different commit object": a WAL write over frames of a commit
+// already in storage, which SQLite never makes, stops the database instead
+// of changing what the local image holds for that commit.
+func TestWALWriteOverCommittedFramesStops(t *testing.T) {
+	_, _, _, l, c := setup(t)
+	mustRun(t, c, "INSERT INTO t VALUES (1)")
+	l.cmu.Lock()
+	w := l.wal.writer
+	l.cmu.Unlock()
+	if _, err := w.WriteAt(make([]byte, frameHeaderSize), walHeaderSize); err == nil {
+		t.Fatal("a write over committed frames was accepted")
+	}
+	if !errors.Is(l.Err(), ErrStopped) {
+		t.Fatalf("leader: %v, want stopped", l.Err())
+	}
+}
