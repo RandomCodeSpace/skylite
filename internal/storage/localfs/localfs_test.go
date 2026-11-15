@@ -686,3 +686,31 @@ func TestSymlinkEscape(t *testing.T) {
 		})
 	}
 }
+
+// TestDirectoryAlias checks that Open refuses a root whose tmp and objects are
+// one directory, through a symbolic link either way, or where one is not a
+// directory: writes in progress would then be listed as objects.
+func TestDirectoryAlias(t *testing.T) {
+	for _, tc := range []struct{ name, real, alias string }{
+		{"objects links to tmp", tmpDir, objDir},
+		{"tmp links to objects", objDir, tmpDir},
+		{"objects is a file", "", objDir},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			var err error
+			if tc.real == "" {
+				err = os.WriteFile(filepath.Join(root, tc.alias), nil, 0o600)
+			} else if err = os.Mkdir(filepath.Join(root, tc.real), 0o700); err == nil {
+				err = os.Symlink(tc.real, filepath.Join(root, tc.alias))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s, err := Open(root); err == nil {
+				_ = s.Close()
+				t.Fatal("Open accepted the root")
+			}
+		})
+	}
+}

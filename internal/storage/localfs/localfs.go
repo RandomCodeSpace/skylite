@@ -125,17 +125,34 @@ type Store struct {
 var _ storage.Store = (*Store)(nil)
 
 // Open opens the store rooted at dir, which must exist. Several Stores, in
-// one process or several, may open the same directory at once.
+// one process or several, may open the same directory at once. Open fails if
+// tmp or objects is not a directory of its own (a symbolic link, or both
+// names for one directory), since that would make writes in progress visible
+// as objects.
 func Open(dir string) (*Store, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
 	}
+	var dirs []fs.FileInfo
 	for _, d := range []string{tmpDir, objDir} {
 		if err := root.Mkdir(d, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 			_ = root.Close()
 			return nil, err
 		}
+		fi, err := root.Lstat(d)
+		if err == nil && !fi.IsDir() {
+			err = fmt.Errorf("localfs: %s in %s is not a directory", d, dir)
+		}
+		if err != nil {
+			_ = root.Close()
+			return nil, err
+		}
+		dirs = append(dirs, fi)
+	}
+	if os.SameFile(dirs[0], dirs[1]) {
+		_ = root.Close()
+		return nil, fmt.Errorf("localfs: %s and %s in %s are the same directory", tmpDir, objDir, dir)
 	}
 	if err := syncDir(root, "."); err != nil {
 		_ = root.Close()
