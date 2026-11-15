@@ -526,6 +526,11 @@ func (c *Conn) rollbackHook() {
 	if c.uploaded != 0 {
 		c.outcome = l.stopLocked(fmt.Errorf("SQLite rolled back transaction %d after storage committed it", c.uploaded))
 	}
+	if w := l.wal.writer; w != nil && w.c == c {
+		// The frames since start are dead, and SQLite rewrites their
+		// checksums only at a commit: the next sync must not parse them.
+		l.wal.start = -1
+	}
 }
 
 // Close closes the connection, rolling back an open transaction.

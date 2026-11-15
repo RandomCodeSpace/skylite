@@ -632,3 +632,29 @@ func TestMainFileHoleReadsZeros(t *testing.T) {
 		}
 	}
 }
+
+// Covers: Commit capture and failure, "no object for anything else", for a
+// transaction that spills frames, rewrites some in place and rolls back:
+// the next WAL sync on that connection, here a checkpoint's, is not a
+// commit and must not read the dead frames, whose checksums SQLite only
+// rewrites at a commit. Found by TestModel with
+// SKYLITE_SEED=1794762404601344736 under SKYLITE_SOAK.
+func TestRollbackAfterSpillThenCheckpoint(t *testing.T) {
+	st, keys, _, l, c := setup(t)
+	for _, sql := range []string{
+		"PRAGMA cache_size=5; BEGIN; INSERT INTO t SELECT printf('%03000d', value) FROM generate_series(1, 200); UPDATE t SET x = 'again' || x; ROLLBACK",
+		"checkpoint passive",
+		"INSERT INTO t VALUES (1)",
+		"checkpoint truncate",
+	} {
+		if _, err := runScript(t, c, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := l.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,1" {
+		t.Fatalf("durable rows %s", got)
+	}
+}
