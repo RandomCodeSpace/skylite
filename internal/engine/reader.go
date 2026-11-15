@@ -23,9 +23,16 @@
 // beyond the database size at some commit after its last write, reads as
 // zeros. Each page costs one ranged read of its record, verified by the
 // record's checksum, which binds it to its page, object and database. Every
-// object read by key is checked against that key, every object against the
-// database identifier, and every log object's version token is pinned when
-// it is indexed and checked on every later read of it.
+// header read is checked against its key, every object against the database
+// identifier, and every log object's version token is pinned when it is
+// indexed and checked on every later read of it that reaches storage; a
+// cache hit returns the bytes of the version the reader pinned.
+//
+// Looking for the head, a reader probes one name above the first absent one:
+// a present name there is a gap in the log. A reader walks at most maxTail
+// commits and indexes at most maxTailPages page entries above the manifest,
+// and fails closed with ErrLimit beyond them. Readers whose manifests hold
+// equal group references share one copy of them.
 //
 // # Falling behind
 //
@@ -45,12 +52,16 @@ package engine
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 	"strconv"
+	"unique"
 
 	"github.com/RandomCodeSpace/skylite/internal/format"
 	"github.com/RandomCodeSpace/skylite/internal/storage"
@@ -59,18 +70,33 @@ import (
 var (
 	// ErrCorrupt means storage holds something that breaks a rule relating
 	// objects to each other: a gap in the log, a changed or missing object
-	// no newer manifest explains, a manifest that went backwards, or an
-	// object whose size or page size contradicts its header or manifest.
-	// Errors the decoders of package format find wrap their own classes
-	// instead.
+	// no newer manifest explains, a manifest that went backwards or that
+	// disagrees with the commit at its transaction number, or an object
+	// whose size or page size contradicts its header or manifest. Errors the
+	// decoders of package format find wrap their own classes instead.
 	ErrCorrupt = errors.New("engine: storage contradicts the log or the manifest")
 	// ErrCompacted means the requested transaction is below the base of the
 	// current manifest, so its state can no longer be built.
 	ErrCompacted = errors.New("engine: transaction is below the current base")
 	// ErrBeyondHead means the requested transaction is not in the log.
 	ErrBeyondHead = errors.New("engine: transaction is beyond the head of the log")
+	// ErrPageRange means a page number is 0 or above the database size.
+	ErrPageRange = errors.New("engine: page number out of range")
+	// ErrLimit means the log above the manifest has more commits or page
+	// entries than a reader indexes, or reaches the largest transaction
+	// number. The reader fails closed; a compaction brings the log back
+	// within the limits.
+	ErrLimit = errors.New("engine: the log above the manifest is beyond the reader's limits")
+)
 
-	errPageRange = errors.New("engine: page number out of range")
+// The reader's limits on the log above the manifest, record 0004 decision
+// 10: twice the leader's tail bound of 32,768 commits and 2,097,152 page
+// entries, so that the commit that crosses the leader's bound and the epoch
+// bumps of failed takeovers still fit. Variables so that tests can lower
+// them.
+var (
+	maxTail      = 1 << 16
+	maxTailPages = 1 << 22
 )
 
 // Reader reads the pages of one database as of one transaction number. A
@@ -89,12 +115,42 @@ type Reader struct {
 	// it were beyond the database size at some commit after a.m.Txn.
 	baseLimit uint32
 	pages     map[uint32]pageLoc // newest commit holding each page
+	// floors are the running minima of the database size after a.m.Txn:
+	// each is the smallest size of any commit from its transaction to txn,
+	// so they rise with the transaction number.
+	floors []floor
 }
 
-// anchor is a manifest and the version token it was read at.
+type floor struct {
+	txn  uint64
+	size uint32
+}
+
+// anchor is a manifest and the version token it was read at. Its group
+// references are interned, so anchors with equal references share one copy;
+// m.Groups is nil.
 type anchor struct {
 	m       format.Manifest
+	groups  unique.Handle[string] // per group, its transaction and tag, little-endian
 	version string
+}
+
+func newAnchor(m format.Manifest, version string) anchor {
+	b := make([]byte, 0, 16*len(m.Groups))
+	for _, g := range m.Groups {
+		b = binary.LittleEndian.AppendUint64(b, g.Txn)
+		b = binary.LittleEndian.AppendUint64(b, g.Tag)
+	}
+	m.Groups = nil
+	return anchor{m: m, groups: unique.Make(string(b)), version: version}
+}
+
+func (a anchor) groupCount() uint32 { return uint32(len(a.groups.Value()) / 16) } //nolint:gosec // at most MaxPages groups
+
+// group returns the reference of group g, which is below groupCount.
+func (a anchor) group(g uint32) format.GroupRef {
+	s := a.groups.Value()[16*int(g):]
+	return format.GroupRef{Txn: binary.LittleEndian.Uint64([]byte(s[:8])), Tag: binary.LittleEndian.Uint64([]byte(s[8:16]))}
 }
 
 // commit is one indexed commit-log object.
@@ -126,20 +182,20 @@ func (e *staleError) Error() string {
 	return fmt.Sprintf("engine: base object %d-%d-%016x missing", e.group, e.ref.Txn, e.ref.Tag)
 }
 
-func (e *staleError) explainedBy(m format.Manifest) bool {
+func (e *staleError) explainedBy(a anchor) bool {
 	if e.txn != 0 {
-		return m.Txn >= e.txn
+		return a.m.Txn >= e.txn
 	}
-	return int(e.group) >= len(m.Groups) || m.Groups[e.group] != e.ref
+	return e.group >= a.groupCount() || a.group(e.group) != e.ref
 }
 
 // Open opens the database under keys' prefix for reading as of transaction
 // txn, or as of the head of the log if txn is 0. A txn below the current
 // manifest's is ErrCompacted, and one above the head ErrBeyondHead. cache
-// may be shared between Readers.
+// may be shared between Readers; a nil cache caches nothing.
 func Open(ctx context.Context, st storage.Store, keys format.Keys, cache *Cache, txn uint64) (*Reader, error) {
 	r := &Reader{st: st, keys: keys, cache: cache}
-	a, err := r.readManifest(ctx, anchor{})
+	a, err := r.readManifest(ctx, anchor{}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +227,7 @@ func (r *Reader) PageSize() uint32 { return r.a.m.PageSize }
 // again.
 func (r *Reader) ReadPage(ctx context.Context, pgno uint32) ([]byte, error) {
 	if pgno == 0 || pgno > r.size {
-		return nil, fmt.Errorf("%w: page %d of %d at transaction %d", errPageRange, pgno, r.size, r.txn)
+		return nil, fmt.Errorf("%w: page %d of %d at transaction %d", ErrPageRange, pgno, r.size, r.txn)
 	}
 	for {
 		body, err := r.readPage(ctx, pgno)
@@ -182,7 +238,7 @@ func (r *Reader) ReadPage(ctx context.Context, pgno uint32) ([]byte, error) {
 			}
 			return bytes.Clone(body), nil
 		}
-		a, err := r.reanchor(ctx, r.a, stale)
+		a, err := r.reanchor(ctx, r.a, stale, r.commits)
 		if err != nil {
 			return nil, err
 		}
@@ -204,7 +260,7 @@ func (r *Reader) Advance(ctx context.Context) error {
 		return err
 	}
 	if info.Version != a.version {
-		if a, err = r.readManifest(ctx, a); err != nil {
+		if a, err = r.readManifest(ctx, a, r.commits); err != nil {
 			return err
 		}
 	}
@@ -224,30 +280,39 @@ func (r *Reader) Advance(ctx context.Context) error {
 
 // reset rebuilds the index from anchor a and the commits after it.
 func (r *Reader) reset(a anchor, cs []*commit) {
-	r.a, r.commits, r.pages = a, nil, make(map[uint32]pageLoc)
+	r.a, r.commits, r.pages, r.floors = a, nil, make(map[uint32]pageLoc), nil
 	r.txn, r.size, r.baseLimit = a.m.Txn, a.m.DBSize, a.m.DBSize
 	for _, c := range after(cs, a.m.Txn) {
 		r.add(c)
 	}
 }
 
-// add indexes c, the commit after r.txn.
+// add indexes c, which must be the commit after r.txn.
 func (r *Reader) add(c *commit) {
-	if c.h.DBSize < r.size {
-		// Pages beyond the new size are gone; if the database grows again
-		// they read as zeros until a commit writes them.
-		for p := range r.pages {
-			if p > c.h.DBSize {
-				delete(r.pages, p)
-			}
-		}
-		r.baseLimit = min(r.baseLimit, c.h.DBSize)
+	if r.txn == math.MaxUint64 || c.h.Txn != r.txn+1 {
+		panic(fmt.Sprintf("engine: commit %d indexed after transaction %d", c.h.Txn, r.txn))
 	}
+	// Pages beyond a smaller size are gone; if the database grows again they
+	// read as zeros until a commit writes them. The floors find the smallest
+	// size since a commit without visiting the index.
+	i := len(r.floors)
+	for i > 0 && r.floors[i-1].size >= c.h.DBSize {
+		i--
+	}
+	r.floors = append(r.floors[:i], floor{c.h.Txn, c.h.DBSize})
+	r.baseLimit = min(r.baseLimit, c.h.DBSize)
 	for i, e := range c.entries {
 		r.pages[e.Pgno] = pageLoc{c, i}
 	}
 	r.commits = append(r.commits, c)
 	r.txn, r.size = c.h.Txn, c.h.DBSize
+}
+
+// current reports whether page pgno as commit txn wrote it is still the
+// page: no commit after txn made the database smaller than pgno.
+func (r *Reader) current(pgno uint32, txn uint64) bool {
+	i, _ := slices.BinarySearchFunc(r.floors, txn+1, func(f floor, t uint64) int { return cmp.Compare(f.txn, t) })
+	return i == len(r.floors) || r.floors[i].size >= pgno
 }
 
 // after returns the commits of cs, which are in order, above txn.
@@ -258,16 +323,38 @@ func after(cs []*commit, txn uint64) []*commit {
 	return cs
 }
 
+// at returns the commit of cs, which are consecutive, at txn, or nil.
+func at(cs []*commit, txn uint64) *commit {
+	if len(cs) == 0 || txn < cs[0].h.Txn || txn-cs[0].h.Txn >= uint64(len(cs)) {
+		return nil
+	}
+	return cs[txn-cs[0].h.Txn]
+}
+
+func entryCount(cs []*commit) int {
+	n := 0
+	for _, c := range cs {
+		n += len(c.entries)
+	}
+	return n
+}
+
 // walk reads the commits after those in cs (after a's transaction if cs is
 // empty) up to target, or up to the head if target is 0, and returns the
 // anchor and commits to index. A retired or changed commit sends it to a
 // newer manifest.
 func (r *Reader) walk(ctx context.Context, a anchor, cs []*commit, target uint64) (anchor, []*commit, error) {
+	entries := entryCount(cs)
+	var retried uint64 // the name Head and GetRange last disagreed on
 	for {
-		next := a.m.Txn + uint64(len(cs)) + 1
-		if target != 0 && next > target {
+		last := a.m.Txn + uint64(len(cs))
+		if target != 0 && last >= target {
 			return a, cs, nil
 		}
+		if last >= math.MaxUint64-1 {
+			return anchor{}, nil, fmt.Errorf("%w: transaction numbers end at %d", ErrLimit, last)
+		}
+		next := last + 1
 		prevSize := a.m.DBSize
 		if len(cs) > 0 {
 			prevSize = cs[len(cs)-1].h.DBSize
@@ -276,37 +363,52 @@ func (r *Reader) walk(ctx context.Context, a anchor, cs []*commit, target uint64
 		var stale *staleError
 		switch {
 		case err == nil:
-			cs = append(cs, c)
-		case errors.Is(err, storage.ErrNotFound) && target == 0:
-			return a, cs, nil
-		case errors.Is(err, storage.ErrNotFound):
-			beyond := fmt.Errorf("%w: transaction %d, head at %d", ErrBeyondHead, target, next-1)
-			if next == target {
-				return anchor{}, nil, beyond
+			if len(cs) >= maxTail || entries+len(c.entries) > maxTailPages {
+				return anchor{}, nil, fmt.Errorf("%w: more than %d commits or %d page entries above the manifest at %d",
+					ErrLimit, maxTail, maxTailPages, a.m.Txn)
 			}
-			if _, err = r.st.Head(ctx, r.keys.Commit(a.m.DB, target)); err != nil {
-				if errors.Is(err, storage.ErrNotFound) {
-					return anchor{}, nil, beyond
+			cs = append(cs, c)
+			entries += len(c.entries)
+		case errors.Is(err, storage.ErrNotFound):
+			// One name above the first absent one tells a gap from the head.
+			probe := target
+			if target == 0 {
+				probe = next + 1
+			}
+			if probe != next {
+				_, err = r.st.Head(ctx, r.keys.Commit(a.m.DB, probe))
+			}
+			switch {
+			case probe == next || errors.Is(err, storage.ErrNotFound):
+				if target == 0 {
+					return a, cs, nil
 				}
+				return anchor{}, nil, fmt.Errorf("%w: transaction %d, head at %d", ErrBeyondHead, target, last)
+			case err != nil:
 				return anchor{}, nil, err
 			}
 			// The log is a contiguous prefix, so next was created before
-			// target, which exists: still absent now, it is a gap.
-			if _, err = r.st.Head(ctx, r.keys.Commit(a.m.DB, next)); err == nil {
-				continue
+			// probe, which exists: still absent now, it is a gap.
+			_, err = r.st.Head(ctx, r.keys.Commit(a.m.DB, next))
+			switch {
+			case err == nil && retried != next:
+				retried = next
+			case err == nil:
+				return anchor{}, nil, fmt.Errorf("%w: commit %d exists to Head and is absent to a read", ErrCorrupt, next)
+			case errors.Is(err, storage.ErrNotFound):
+				return anchor{}, nil, fmt.Errorf("%w: commit %d missing below commit %d", ErrCorrupt, next, probe)
+			default:
+				return anchor{}, nil, err
 			}
-			if errors.Is(err, storage.ErrNotFound) {
-				return anchor{}, nil, fmt.Errorf("%w: commit %d missing below commit %d", ErrCorrupt, next, target)
-			}
-			return anchor{}, nil, err
 		case errors.As(err, &stale):
-			if a, err = r.reanchor(ctx, a, stale); err != nil {
+			if a, err = r.reanchor(ctx, a, stale, cs); err != nil {
 				return anchor{}, nil, err
 			}
 			if target != 0 && a.m.Txn > target {
 				return anchor{}, nil, fmt.Errorf("%w: transaction %d, base now at %d", ErrCompacted, target, a.m.Txn)
 			}
 			cs = after(cs, a.m.Txn)
+			entries = entryCount(cs)
 		default:
 			return anchor{}, nil, err
 		}
@@ -357,27 +459,50 @@ func (r *Reader) fetchCommit(ctx context.Context, m format.Manifest, txn uint64,
 	return c, nil
 }
 
-// readPage returns page pgno, which is in range, possibly shared with the
-// cache.
-func (r *Reader) readPage(ctx context.Context, pgno uint32) ([]byte, error) {
-	if loc, ok := r.pages[pgno]; ok {
-		return r.commitPage(ctx, loc.c, loc.c.entries[loc.i])
+// source is where a page is read from: a commit's entry, a base object, or
+// neither, for zeros.
+type source struct {
+	c    *commit
+	e    format.PageEntry
+	base format.BaseHeader // Txn is 0 if the page is not in a base object
+}
+
+// locate finds where page pgno, which is in range, is read from. It reads
+// only the index, never storage.
+func (r *Reader) locate(pgno uint32) source {
+	if loc, ok := r.pages[pgno]; ok && r.current(pgno, loc.c.h.Txn) {
+		return source{c: loc.c, e: loc.c.entries[loc.i]}
 	}
 	m := r.a.m
 	if pgno > r.baseLimit {
-		return make([]byte, m.PageSize), nil
+		return source{}
 	}
 	g := (pgno - 1) / m.GroupSize
-	ref := m.Groups[g]
+	ref := r.a.group(g)
 	if ref.Txn == 0 {
-		return make([]byte, m.PageSize), nil
+		return source{}
 	}
-	h := format.BaseHeader{DB: m.DB, PageSize: m.PageSize, GroupSize: m.GroupSize, Group: g, Txn: ref.Txn, Tag: ref.Tag}
+	return source{base: format.BaseHeader{DB: m.DB, PageSize: m.PageSize, GroupSize: m.GroupSize, Group: g, Txn: ref.Txn, Tag: ref.Tag}}
+}
+
+// readPage returns page pgno, which is in range, possibly shared with the
+// cache.
+func (r *Reader) readPage(ctx context.Context, pgno uint32) ([]byte, error) {
+	switch s := r.locate(pgno); {
+	case s.c != nil:
+		return r.commitPage(ctx, s.c, s.e)
+	case s.base.Txn != 0:
+		return r.basePage(ctx, s.base, pgno)
+	}
+	return make([]byte, r.a.m.PageSize), nil
+}
+
+func (r *Reader) basePage(ctx context.Context, h format.BaseHeader, pgno uint32) ([]byte, error) {
 	off, n, err := h.PageRange(pgno)
 	if err != nil {
 		return nil, err
 	}
-	key := r.keys.Base(m.DB, g, ref.Txn, ref.Tag)
+	key := r.keys.Base(h.DB, h.Group, h.Txn, h.Tag)
 	// A base key's content never changes, so its pages need no version.
 	ck := cacheKey(key, "", off)
 	if body, ok := r.cache.get(ck); ok {
@@ -386,7 +511,7 @@ func (r *Reader) readPage(ctx context.Context, pgno uint32) ([]byte, error) {
 	b, info, err := r.getRange(ctx, key, off, n)
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
-		return nil, &staleError{group: g, ref: ref}
+		return nil, &staleError{group: h.Group, ref: format.GroupRef{Txn: h.Txn, Tag: h.Tag}}
 	case err != nil:
 		return nil, err
 	case info.Size != h.Size():
@@ -428,14 +553,14 @@ func cacheKey(key, version string, off int64) string {
 }
 
 // readManifest reads the manifest. With a zero prev it discovers the
-// database; otherwise the manifest must be a successor of prev's.
-func (r *Reader) readManifest(ctx context.Context, prev anchor) (anchor, error) {
+// database; otherwise the manifest must be a successor of prev's and agree
+// with cs, the commits the reader has indexed after prev's transaction.
+func (r *Reader) readManifest(ctx context.Context, prev anchor, cs []*commit) (anchor, error) {
 	rc, info, err := r.st.Get(ctx, r.keys.Manifest())
 	if err != nil {
 		return anchor{}, err
 	}
-	b, err := io.ReadAll(io.LimitReader(rc, format.MaxManifestSize+1))
-	_ = rc.Close()
+	b, err := readBody(rc, info, 0, format.MaxManifestSize+1)
 	if err != nil {
 		return anchor{}, err
 	}
@@ -447,35 +572,54 @@ func (r *Reader) readManifest(ctx context.Context, prev anchor) (anchor, error) 
 		return anchor{}, fmt.Errorf("%w: manifest at %d (page size %d, group size %d) replaced one at %d (%d, %d)",
 			ErrCorrupt, m.Txn, m.PageSize, m.GroupSize, prev.m.Txn, prev.m.PageSize, prev.m.GroupSize)
 	}
-	return anchor{m: m, version: info.Version}, nil
+	if c := at(cs, m.Txn); c != nil && c.h.DBSize != m.DBSize {
+		return anchor{}, fmt.Errorf("%w: manifest at %d has database size %d, the commit %d", ErrCorrupt, m.Txn, m.DBSize, c.h.DBSize)
+	}
+	return newAnchor(m, info.Version), nil
 }
 
 // reanchor reads the manifest that must explain stale, which a reader
-// anchored on a found.
-func (r *Reader) reanchor(ctx context.Context, a anchor, stale *staleError) (anchor, error) {
-	n, err := r.readManifest(ctx, a)
+// anchored on a found with cs indexed above a.
+func (r *Reader) reanchor(ctx context.Context, a anchor, stale *staleError, cs []*commit) (anchor, error) {
+	n, err := r.readManifest(ctx, a, cs)
 	if err != nil {
 		return anchor{}, err
 	}
 	// Only a compaction changes what the manifest covers, and it raises
 	// the transaction number; requiring that bounds re-anchoring.
-	if n.m.Txn <= a.m.Txn || !stale.explainedBy(n.m) {
+	if n.m.Txn <= a.m.Txn || !stale.explainedBy(n) {
 		return anchor{}, fmt.Errorf("%w: %v, and the manifest is at %d", ErrCorrupt, stale, n.m.Txn) //nolint:errorlint // wrapping stale would make callers re-anchor again
 	}
 	return n, nil
 }
 
-// getRange reads n bytes at off of key, fewer if the object ends sooner.
+// getRange reads n bytes at off of key, fewer only if the object ends
+// sooner.
 func (r *Reader) getRange(ctx context.Context, key string, off, n int64) ([]byte, storage.Info, error) {
 	rc, info, err := r.st.GetRange(ctx, key, off, n)
 	if err != nil {
 		return nil, storage.Info{}, err
 	}
-	defer func() { _ = rc.Close() }()
-	b := make([]byte, n)
-	got, err := io.ReadFull(rc, b)
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+	b, err := readBody(rc, info, off, n)
+	if err != nil {
 		return nil, storage.Info{}, err
 	}
-	return b[:got], info, nil
+	return b, info, nil
+}
+
+// readBody reads and closes the body of a read of n bytes at off of the
+// object info describes. A body that ends before the object does is a
+// failed read, never a short object: its error is the storage's, or
+// io.ErrUnexpectedEOF.
+func readBody(rc io.ReadCloser, info storage.Info, off, n int64) ([]byte, error) {
+	defer func() { _ = rc.Close() }()
+	b := make([]byte, min(n, max(0, info.Size-off)))
+	got, err := io.ReadFull(rc, b)
+	if errors.Is(err, io.EOF) {
+		err = fmt.Errorf("engine: body ended after %d of %d bytes: %w", got, len(b), io.ErrUnexpectedEOF)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
