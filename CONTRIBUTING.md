@@ -38,7 +38,8 @@ You need Go on the 1.26 line, at or above the version in `go.mod`, and
 [golangci-lint](https://golangci-lint.run/) v2. CI builds with the newest
 1.26 release. Do not use a toolchain newer than 1.27.1: that is the newest
 one this project is permitted to use, and CI stays on 1.26 because
-`govulncheck` reports standard-library advisories against 1.27.1.
+`govulncheck` reports standard-library advisories against 1.27.1. The `make`
+targets select Go 1.26.11 unless `GOTOOLCHAIN` is already set.
 
 | Command            | What it runs                                                    |
 |--------------------|-----------------------------------------------------------------|

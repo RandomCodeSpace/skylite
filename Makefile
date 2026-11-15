@@ -1,3 +1,8 @@
+# The newest Go this project may use is 1.27.1, and govulncheck reports
+# standard-library advisories against it, so builds stay on the 1.26 line.
+# CI sets GOTOOLCHAIN=local after installing the newest 1.26 release.
+export GOTOOLCHAIN ?= go1.26.11
+
 GOVULNCHECK_VERSION := v1.9.0
 
 # Azurite 3.37.0, pinned by the digest of its multi-architecture index.
