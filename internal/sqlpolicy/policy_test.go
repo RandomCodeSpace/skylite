@@ -52,6 +52,8 @@ func TestNewValidation(t *testing.T) {
 		{Limits{MaxLength: 1_000_000_000}, true},
 		{Limits{MaxLength: 1_000_000_001}, false},
 		{Limits{MaxLength: -1}, false},
+		{Limits{MaxLength: 30}, true}, // SQLITE_MIN_LENGTH
+		{Limits{MaxLength: 29}, false},
 		{Limits{MaxSQLLength: 1_000_000_000}, true},
 		{Limits{MaxSQLLength: 1_000_000_001}, false},
 		{Limits{MaxExprDepth: 3}, true},
@@ -145,6 +147,30 @@ func TestApplyConfiguresConnection(t *testing.T) {
 		if v := raw.Limit(id, -1); v != want {
 			t.Errorf("limit %d = %d, want %d", id, v, want)
 		}
+	}
+}
+
+// Apply fails if SQLite does not keep a limit as set, which New's ranges
+// otherwise prevent.
+func TestApplyReadsLimitsBack(t *testing.T) {
+	for _, set := range []func(*Limits){
+		func(l *Limits) { l.MaxLength = 29 }, // SQLite raises it to 30
+		func(l *Limits) { l.MaxExprDepth = 1001 },
+		func(l *Limits) { l.MaxVariableNumber = 32767 },
+	} {
+		p, err := New(Limits{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		set(&p.limits)
+		raw, err := sqlite3.Open(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Apply(raw); err == nil {
+			t.Errorf("Apply accepted %+v", p.limits)
+		}
+		_ = raw.Close()
 	}
 }
 
@@ -243,10 +269,15 @@ var refusals = []struct {
 	{ReasonFunction, "CREATE TABLE d(a DEFAULT (sqlite_source_id()))"},
 	{ReasonFunction, "CREATE TABLE g(a, b AS (sqlite_source_id()))"},
 	{ReasonFunction, "CREATE INDEX i ON t(sqlite_source_id())"},
-	{ReasonFunction, "CREATE VIEW v AS SELECT sqlite_source_id(); SELECT * FROM v"},
 	{ReasonFunction, "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u VALUES (sqlite_source_id()); END; INSERT INTO t VALUES (1)"},
 	{ReasonFunction, "CREATE TEMP TRIGGER tr AFTER INSERT ON main.t BEGIN SELECT sqlite_source_id(); END; INSERT INTO t VALUES (1)"},
 	{ReasonStatement, "CREATE VIRTUAL TABLE s2 USING generate_series"},
+	// SQLite checks the existing rows for these forms of ALTER TABLE with its
+	// own functions, which include its trim.
+	{ReasonStatement, "ALTER TABLE t ADD CONSTRAINT c1 CHECK (a > 0)"},
+	{ReasonStatement, "ALTER TABLE t ADD CHECK (a > 0)"},
+	{ReasonStatement, "ALTER TABLE t ALTER COLUMN a SET NOT NULL"},
+	{ReasonStatement, "ALTER TABLE t ALTER a SET NOT NULL ON CONFLICT FAIL"},
 	{ReasonPragma, "PRAGMA writable_schema = ON; UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a, b)' WHERE name = 't'"},
 	{ReasonPragma, "SELECT * FROM pragma_writable_schema"},
 	{ReasonPragma, "PRAGMA journal_mode = DELETE"},
@@ -331,6 +362,9 @@ var engineRefusals = []struct{ sql, msg string }{
 	// trusted_schema is off, so a view may use only functions that SQLite
 	// or their registration marks innocuous; base64 is not marked.
 	{"CREATE VIEW b AS SELECT base64(x'00'); SELECT * FROM b", "unsafe use of base64()"},
+	// Apply replaces each refused function with one that is not innocuous, and
+	// in a view of the main schema SQLite checks that before the authorizer.
+	{"CREATE VIEW v AS SELECT sqlite_source_id(); SELECT * FROM v", "unsafe use of sqlite_source_id()"},
 }
 
 func TestEngineRefuses(t *testing.T) {
@@ -436,8 +470,8 @@ func TestAllowed(t *testing.T) {
 // alterForms are the forms of ALTER TABLE in SQLite 3.54.1 (parse.y), run on
 // a database that holds t(a INTEGER), with one row, p(id INTEGER PRIMARY KEY),
 // the STRICT table s(a TEXT), ck(a CHECK (a > 0)) and a view and trigger on t.
-// Together they use every internal function in alterFunctions and the
-// quick_check that SQLite runs itself.
+// Together with the forms in refusals they use every internal function in
+// alterFunctions and the quick_check that SQLite runs itself.
 var alterForms = []string{
 	"ALTER TABLE t RENAME TO t2",         // sqlite_rename_table, sqlite_rename_test
 	"ALTER TABLE t RENAME COLUMN a TO b", // sqlite_rename_column, sqlite_rename_quotefix
@@ -449,12 +483,8 @@ var alterForms = []string{
 	"ALTER TABLE ck ADD COLUMN z TEXT",                        // quick_check, on a table with CHECK
 	"ALTER TABLE t ADD COLUMN z; ALTER TABLE t DROP COLUMN z", // sqlite_drop_column
 	"ALTER TABLE t ADD COLUMN z; ALTER TABLE t DROP z",
-	"ALTER TABLE t ADD CONSTRAINT c1 CHECK (a > 0)", // sqlite_find_constraint, sqlite_fail, sqlite_add_constraint
-	"ALTER TABLE t ADD CHECK (a > 0)",
-	"ALTER TABLE t ADD CONSTRAINT c1 CHECK (a > 0); ALTER TABLE t DROP CONSTRAINT c1", // sqlite_drop_constraint
-	"ALTER TABLE t ALTER COLUMN a SET NOT NULL",
-	"ALTER TABLE t ALTER a SET NOT NULL ON CONFLICT FAIL",
-	"ALTER TABLE t ALTER COLUMN a SET NOT NULL; ALTER TABLE t ALTER COLUMN a DROP NOT NULL",
+	"CREATE TABLE cn(a, CONSTRAINT c1 CHECK (a > 0)); ALTER TABLE cn DROP CONSTRAINT c1", // sqlite_drop_constraint
+	"CREATE TABLE nn(a NOT NULL); ALTER TABLE nn ALTER COLUMN a DROP NOT NULL",
 	"ALTER TABLE t ALTER a DROP NOT NULL",
 }
 
@@ -495,6 +525,39 @@ func TestSavepointsInsideAServerTransaction(t *testing.T) {
 		db.server(t, "COMMIT")
 		if r, err := db.rows("SELECT group_concat(a) FROM t"); err != nil || r[0][0] != "1,3" {
 			t.Fatalf("got %v %v", r, err)
+		}
+	})
+}
+
+// The authorizer does not see a rollback by a conflict action or by
+// RAISE(ROLLBACK), which ends the server's transaction, so the server reads
+// autocommit after every Run. A savepoint the server holds is the client's to
+// release, so the server never holds one while client SQL runs.
+func TestClientSQLCanEndTheServerTransaction(t *testing.T) {
+	for _, sql := range []string{"INSERT OR ROLLBACK INTO t VALUES (1)", "UPDATE OR ROLLBACK t SET a = 1 WHERE a = 2", "INSERT INTO g VALUES (1)"} {
+		t.Run(sql, func(t *testing.T) {
+			db := openDB(t, false, Limits{})
+			db.mustRun(t, "CREATE TABLE t(a PRIMARY KEY); INSERT INTO t VALUES (1); CREATE TABLE g(a); CREATE TRIGGER gr BEFORE INSERT ON g BEGIN SELECT RAISE(ROLLBACK, 'x'); END")
+			db.server(t, "BEGIN IMMEDIATE")
+			db.mustRun(t, "INSERT INTO t VALUES (2)")
+			if err := db.run(sql); err == nil {
+				t.Fatal("succeeded")
+			}
+			if !db.raw.GetAutocommit() {
+				t.Fatal("the server's transaction is still open")
+			}
+			if r, err := db.rows("SELECT count(*) FROM t"); err != nil || r[0][0] != "1" {
+				t.Fatalf("t holds %v rows (%v), want the transaction rolled back", r, err)
+			}
+		})
+	}
+	t.Run("RELEASE of the server's savepoint", func(t *testing.T) {
+		db := openDB(t, false, Limits{})
+		db.mustRun(t, "CREATE TABLE t(a)")
+		db.server(t, "SAVEPOINT srv")
+		db.mustRun(t, "INSERT INTO t VALUES (1); RELEASE srv")
+		if !db.raw.GetAutocommit() {
+			t.Fatal("the transaction the savepoint began is still open")
 		}
 	})
 }
@@ -734,6 +797,39 @@ func TestFunctionAllowlist(t *testing.T) {
 	}
 }
 
+// The authorizer does not see the functions in the CHECK constraint or
+// generated column of ALTER TABLE ADD COLUMN. Apply replaces every refused
+// function with one that is not innocuous, which SQLite refuses there.
+func TestRefusedFunctionsInAlterTableAddColumn(t *testing.T) {
+	raw, err := sqlite3.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = raw.Close() }()
+	db := openDB(t, false, Limits{})
+	db.mustRun(t, "CREATE TABLE t(a, b); INSERT INTO t VALUES ('a', 'a')")
+	err = rows(raw, "SELECT DISTINCT name, narg FROM pragma_function_list", func(s *sqlite3.Stmt) {
+		name, narg := s.ColumnText(0), s.ColumnInt(1)
+		if !slices.Contains(refusedFunctions, name) {
+			return
+		}
+		if narg < 0 {
+			narg = 1
+		}
+		args := strings.TrimSuffix(rep("a, ", narg), ", ")
+		for _, form := range []string{"ALTER TABLE t ADD COLUMN z CHECK (%s(%s) IS NULL)", "ALTER TABLE t ADD COLUMN z AS (%s(%s))"} {
+			sql := fmt.Sprintf(form, name, args)
+			if err := db.run(sql); err == nil || !strings.Contains(err.Error(), "unsafe use of "+name+"()") {
+				t.Errorf("%s: %v", sql, err)
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.mustRun(t, "ALTER TABLE t ADD COLUMN z AS (upper(a)); ALTER TABLE t ADD COLUMN y CHECK (length(a) > 0)")
+}
+
 func TestFunctionRegisteredLaterIsRefused(t *testing.T) {
 	both(t, Limits{}, func(t *testing.T, db *testDB) {
 		for _, name := range []string{"load_extension", "readfile", "writefile", "edit", "fts3_tokenizer"} {
@@ -887,8 +983,9 @@ func triggerChain(d int, body string) string {
 }
 
 // deepest runs gen(n) for n = 1, 2, ... on new connections under l until it
-// fails, and fails the test if the connection broke. It returns the last n
-// that succeeded and the error that stopped it.
+// fails, and fails the test if the connection broke or something other than
+// a depth limit stopped it. It returns the last n that succeeded and the
+// error that stopped it.
 func deepest(t *testing.T, l Limits, gen func(n int) string) (int, error) {
 	t.Helper()
 	for n := 1; ; n++ {
@@ -898,16 +995,21 @@ func deepest(t *testing.T, l Limits, gen func(n int) string) (int, error) {
 			t.Fatalf("n = %d: %v", n, err)
 		}
 		if err != nil {
+			if m := err.Error(); !strings.Contains(m, "too deep") && !strings.Contains(m, "Expression tree is too large") && !strings.Contains(m, "Recursion limit") {
+				t.Fatalf("n = %d: stopped by %v, want a depth limit", n, err)
+			}
 			return n - 1, err
 		}
 	}
 }
 
-// Every nesting, at the deepest the limits allow, fails with SQLite's error
-// and leaves the connection usable, at the defaults and at corners of the
-// range that New accepts. The figures in the comments are where the
-// connection broke with SQLite's own limits, measured on this build.
-func TestNestingAtTheLimitsStaysInsideTheStack(t *testing.T) {
+// Each kind of nesting alone, at the deepest the limits allow, fails with
+// SQLite's error and leaves the connection usable, at the defaults and at
+// corners of the range that New accepts. The figures in the comments are
+// where the connection broke with SQLite's own limits, measured on this
+// build. Kinds combined can still overflow the stack; see
+// TestStackOverflowBreaksTheConnection.
+func TestNestingStopsAtTheLimits(t *testing.T) {
 	for _, tc := range []struct {
 		l             Limits
 		views, nested int // deepest nesting of views and of subqueries in FROM
@@ -944,8 +1046,13 @@ func TestNestingAtTheLimitsStaysInsideTheStack(t *testing.T) {
 						}
 					}
 					// The same nesting inside the deepest trigger of a chain
-					// at the trigger limit.
-					if _, err := deepest(t, tc.l, func(n int) string { return triggerChain(d, sh.gen(tt, n, 0, op)) }); errors.As(err, &pe) {
+					// at the trigger limit; views are created first, since a
+					// trigger body cannot hold CREATE VIEW.
+					if _, err := deepest(t, tc.l, func(n int) string {
+						s := sh.gen(tt, n, 0, op)
+						i := strings.LastIndex(s, ";") + 1
+						return s[:i] + triggerChain(d, s[i:])
+					}); errors.As(err, &pe) {
 						t.Fatal(err)
 					}
 				})
@@ -978,12 +1085,89 @@ func TestEnginePanicBreaksOnlyItsConnection(t *testing.T) {
 	if err := db.run("SELECT 1" + rep(" + 1", 999)); !errors.Is(err, ErrBroken) {
 		t.Fatalf("got %v, want ErrBroken", err)
 	}
-	for _, err := range []error{db.run("SELECT 1"), db.conn.Privileged(func(*sqlite3.Conn) error { return nil }), db.conn.Reset(), db.conn.Close()} {
+	for _, err := range []error{db.run("SELECT 1"), db.conn.Privileged(func(*sqlite3.Conn) error { return nil }), db.conn.Reset(context.Background()), db.conn.Close()} {
 		if !errors.Is(err, ErrBroken) {
 			t.Fatalf("after the panic: got %v, want ErrBroken", err)
 		}
 	}
 	other.mustRun(t, "SELECT 1")
+}
+
+func TestPrivilegedContainsAnEnginePanic(t *testing.T) {
+	db := openDB(t, false, Limits{})
+	err := db.conn.Privileged(func(c *sqlite3.Conn) error {
+		c.Limit(sqlite3.LIMIT_EXPR_DEPTH, 1000)
+		return c.Exec("SELECT 1" + rep(" + 1", 999))
+	})
+	if !errors.Is(err, ErrBroken) || !db.conn.broken {
+		t.Fatalf("got %v, broken %t; want ErrBroken", err, db.conn.broken)
+	}
+	if err := db.run("SELECT 1"); !errors.Is(err, ErrBroken) {
+		t.Fatalf("after the panic: got %v, want ErrBroken", err)
+	}
+}
+
+// Statements within the default limits that overflow the C stack, measured
+// by the second review of record 0007. Each breaks only its connection: Run
+// returns ErrBroken, at once, and so does every later Run.
+func TestStackOverflowBreaksTheConnection(t *testing.T) {
+	// Views whose bodies nest subqueries in FROM: each body has its own
+	// parser depth, so the levels multiply.
+	views := "CREATE VIEW v0 AS SELECT 1 AS a;"
+	for i := 1; i <= 4; i++ {
+		s := fmt.Sprintf("SELECT * FROM v%d%s", i-1, terms(4, "INTERSECT"))
+		for range 12 {
+			s = "SELECT * FROM (" + s + ")" + terms(4, "INTERSECT")
+		}
+		views += fmt.Sprintf("CREATE VIEW v%d AS %s;", i, s)
+	}
+	// Flattening copies each level's expression into the next.
+	plus := "a" + rep(" + 1", 16)
+	flat := "CREATE TABLE q(a); CREATE VIEW v0 AS SELECT a FROM q;"
+	for i := 1; i <= 5; i++ {
+		flat += fmt.Sprintf("CREATE VIEW v%d AS SELECT %s AS a FROM v%d;", i, plus, i-1)
+	}
+	q := "SELECT " + plus + " AS a FROM v5"
+	for range 15 {
+		q = "SELECT " + plus + " AS a FROM (" + q + ")"
+	}
+	// The planner evaluates a constant LIKE against sqlite_stat4 samples while
+	// it compiles the deepest level of nesting.
+	ctes := "WITH c0 AS (SELECT a FROM s WHERE a > -like('" + rep("%a", 2048) + "', '" + rep("a", 2040) + "b')" + terms(4, "INTERSECT") + ")"
+	for i := 1; i <= 16; i++ {
+		ctes += fmt.Sprintf(", c%d AS (SELECT * FROM c%d%s)", i, i-1, terms(4, "INTERSECT"))
+	}
+	chain := triggerChain(8, ctes+" SELECT * FROM c16")
+	i := strings.LastIndex(chain, ";") + 1
+	stat4 := "CREATE TABLE s(a); CREATE INDEX si ON s(a); INSERT INTO s VALUES (1)" + rep(", (1)", 1999) + "; UPDATE s SET a = rowid; ANALYZE;"
+
+	for _, tc := range []struct{ name, setup, sql string }{
+		{"views over subqueries in FROM", views, "SELECT * FROM v4"},
+		{"flattened expressions", flat, q},
+		{"LIKE while planning", stat4 + chain[:i], chain[i:]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openDB(t, false, Limits{})
+			db.mustRun(t, tc.setup)
+			t.Logf("%d bytes of SQL, the last statement %d", len(tc.setup)+len(tc.sql), len(tc.sql))
+			errs := make(chan error, 2)
+			go func() {
+				errs <- db.run(tc.sql)
+				errs <- db.run("SELECT 1")
+			}()
+			for _, what := range []string{"the statement", "the next Run"} {
+				select {
+				case err := <-errs:
+					if !errors.Is(err, ErrBroken) {
+						t.Fatalf("%s: got %v, want ErrBroken", what, err)
+					}
+				case <-time.After(time.Minute):
+					t.Fatalf("%s did not return", what)
+				}
+			}
+			openDB(t, false, Limits{}).mustRun(t, "SELECT 1")
+		})
+	}
 }
 
 func TestCallerPanicIsNotABrokenEngine(t *testing.T) {
@@ -1028,22 +1212,35 @@ func TestPrivileged(t *testing.T) {
 	wantRefused(t, db.run("PRAGMA journal_mode"), ReasonPragma)
 }
 
+// A client's temp trigger runs inside the server's statement with no
+// authorizer; the functions that Apply replaces still fail there.
+func TestClientTriggerUnderPrivileged(t *testing.T) {
+	db := openDB(t, false, Limits{})
+	db.mustRun(t, "CREATE TABLE t(a); CREATE TABLE log(x); CREATE TEMP TRIGGER tr AFTER INSERT ON main.t BEGIN INSERT INTO log VALUES (regexp('a', new.a)); END")
+	err := db.conn.Privileged(func(c *sqlite3.Conn) error { return c.Exec("INSERT INTO main.t VALUES ('a')") })
+	if err == nil || !strings.Contains(err.Error(), "sqlpolicy: refused (function)") {
+		t.Fatalf("got %v, want the refused function's error", err)
+	}
+}
+
 func TestReset(t *testing.T) {
 	both(t, Limits{}, func(t *testing.T, db *testDB) {
-		db.mustRun(t, "CREATE TABLE t(a)")
+		db.mustRun(t, "CREATE TABLE t(a); CREATE TRIGGER tr2 AFTER INSERT ON t BEGIN SELECT 1; END")
 		before, schema := db.owned(t), db.schema(t)
 		db.mustRun(t, `
 			PRAGMA foreign_keys = OFF;
 			CREATE TEMP TABLE tt(a);
+			CREATE TEMP TRIGGER tr2 AFTER INSERT ON tt BEGIN SELECT 1; END;
 			CREATE TEMP TABLE "x""y"(id INTEGER PRIMARY KEY AUTOINCREMENT);
 			INSERT INTO "x""y" DEFAULT VALUES;
+			INSERT INTO temp.sqlite_sequence(name, seq) VALUES ('principal A', 'secret');
 			CREATE INDEX temp.tti ON tt(a);
 			CREATE TEMP VIEW tv AS SELECT * FROM tt;
 			CREATE TEMP TRIGGER tr AFTER INSERT ON main.t BEGIN INSERT INTO tt VALUES (new.a); END;
 			INSERT INTO t VALUES (1);
 			ANALYZE temp`)
 		db.server(t, "BEGIN")
-		if err := db.conn.Reset(); err != nil {
+		if err := db.conn.Reset(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		if !db.raw.GetAutocommit() || db.raw.LastInsertRowID() != 0 {
@@ -1054,6 +1251,11 @@ func TestReset(t *testing.T) {
 		}
 		if r, err := db.rows("PRAGMA foreign_keys"); err != nil || r[0][0] != "1" {
 			t.Errorf("foreign_keys after Reset: %v %v", r, err)
+		}
+		// Dropping the temp table drops its trigger tr2, so an unqualified
+		// DROP TRIGGER tr2 would reach main's.
+		if r, err := db.rows("SELECT type, name FROM main.sqlite_schema ORDER BY 2"); err != nil || !reflect.DeepEqual(r, [][]string{{"table", "t"}, {"trigger", "tr2"}}) {
+			t.Errorf("main schema after Reset: %v %v", r, err)
 		}
 		// SQLite does not let the temp schema's sqlite_sequence be dropped;
 		// Reset leaves it empty.
@@ -1068,7 +1270,7 @@ func TestResetDropsTablesThatReferenceEachOther(t *testing.T) {
 		CREATE TEMP TABLE child(p REFERENCES parent);
 		INSERT INTO parent VALUES (1);
 		INSERT INTO child VALUES (1)`)
-	if err := db.conn.Reset(); err != nil {
+	if err := db.conn.Reset(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	db.mustRun(t, "SELECT 1")
@@ -1086,18 +1288,28 @@ func TestRunReturnsAStepErrorThatFnIgnored(t *testing.T) {
 	}
 }
 
+// Reset is interrupted when the caller's context or the policy's timeout
+// ends, and the connection is then broken.
 func TestResetFailureBreaksTheConnection(t *testing.T) {
-	db := openDB(t, false, Limits{})
-	db.mustRun(t, "CREATE TEMP TABLE tt(a)")
-	ctx, cancel := context.WithCancel(context.Background())
+	ended, cancel := context.WithCancel(context.Background())
 	cancel()
-	db.raw.SetInterrupt(ctx) // every statement Reset runs is interrupted
-	if err := db.conn.Reset(); !errors.Is(err, ErrBroken) {
-		t.Fatalf("got %v, want ErrBroken", err)
-	}
-	db.raw.SetInterrupt(context.Background())
-	if err := db.run("SELECT 1"); !errors.Is(err, ErrBroken) {
-		t.Fatalf("after a failed Reset: got %v, want ErrBroken", err)
+	for name, tc := range map[string]struct {
+		l   Limits
+		ctx context.Context
+	}{
+		"caller's context": {Limits{}, ended},
+		"timeout":          {Limits{Timeout: time.Nanosecond}, context.Background()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := openDB(t, false, tc.l)
+			db.server(t, "CREATE TEMP TABLE tt(a)")
+			if err := db.conn.Reset(tc.ctx); !errors.Is(err, ErrBroken) {
+				t.Fatalf("got %v, want ErrBroken", err)
+			}
+			if err := db.run("SELECT 1"); !errors.Is(err, ErrBroken) {
+				t.Fatalf("after a failed Reset: got %v, want ErrBroken", err)
+			}
+		})
 	}
 }
 
@@ -1253,6 +1465,21 @@ func TestTrimMatchesSQLite(t *testing.T) {
 	db.mustRun(t, "SELECT trim('"+rep(" ", 100)+"')") // one argument is SQLite's
 	// Like SQLite's, the policy's trims may be used in schema objects.
 	db.mustRun(t, "CREATE VIEW tv AS SELECT trim('xax', 'x') AS a, ltrim('xa', 'x'), rtrim('ax', 'x'); SELECT * FROM tv")
+	// Deterministic, as SQLite's: a database whose index or generated column
+	// uses one would otherwise fail to load.
+	db.mustRun(t, "CREATE TABLE d(a, b AS (trim(a, 'x'))); CREATE INDEX di ON d(ltrim(a, 'x'), rtrim(a, 'x'))")
+	// SQL that ALTER TABLE compiles itself to check existing rows would run
+	// SQLite's trim, so those forms are refused.
+	db.mustRun(t, "CREATE TABLE r(a, b); INSERT INTO r VALUES ('a', '"+rep("b", 65)+"'); ALTER TABLE r ADD COLUMN c AS (trim(a, b))")
+	for _, sql := range []string{
+		"ALTER TABLE r ADD CONSTRAINT k CHECK (length(trim(a, b)) >= 0)",
+		"ALTER TABLE r ADD CHECK (length(ltrim(a, b)) >= 0)",
+		"ALTER TABLE r ALTER COLUMN c SET NOT NULL",
+	} {
+		wantRefused(t, db.run(sql), ReasonStatement)
+	}
+	// ADD COLUMN checks them with quick_check, which runs the policy's.
+	wantRefused(t, db.run("ALTER TABLE r ADD COLUMN e AS (rtrim(a, b)) NOT NULL"), ReasonFunction)
 }
 
 func bind(s *sqlite3.Stmt, i int, a any) error {

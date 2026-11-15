@@ -1,6 +1,8 @@
 package sqlpolicy
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -156,6 +158,48 @@ func TestGORMTableRebuild(t *testing.T) {
 					t.Fatalf("users: %v %v, want %s rows", r, err, want)
 				}
 			})
+		})
+	}
+}
+
+// Shapes that ORMs generate, at the largest size the default limits accept
+// and one larger, as the second review of record 0007 measured them, so that
+// a change of the limits shows up here.
+func TestORMShapesAtTheDefaultLimits(t *testing.T) {
+	list := func(n int, f func(i int) string, sep string) string {
+		p := make([]string, n)
+		for i := range p {
+			p[i] = f(i)
+		}
+		return strings.Join(p, sep)
+	}
+	db := openDB(t, false, Limits{})
+	db.mustRun(t, "CREATE TABLE t(id INTEGER PRIMARY KEY, "+list(30, func(i int) string { return fmt.Sprintf("c%d", i) }, ", ")+")")
+	for _, tc := range []struct {
+		name    string
+		largest int
+		gen     func(n int) string
+		msg     string
+	}{
+		{"WHERE terms", 17, func(n int) string {
+			return "SELECT id FROM t WHERE " + list(n, func(i int) string { return fmt.Sprintf("c%d = ?", i) }, " AND ")
+		}, "Expression tree is too large"},
+		{"composite-key pairs", 16, func(n int) string {
+			return "DELETE FROM t WHERE " + list(n, func(int) string { return "(c0 = ? AND c1 = ?)" }, " OR ")
+		}, "Expression tree is too large"},
+		{"joined tables", 17, func(n int) string {
+			return "SELECT t0.id FROM t t0 " + list(n-1, func(i int) string { return fmt.Sprintf("JOIN t t%d ON t%d.c0 = t%d.id", i+1, i+1, i) }, " ")
+		}, "Expression tree is too large"},
+		{"joined CTEs", 9, func(n int) string {
+			return "WITH " + list(n, func(i int) string { return fmt.Sprintf("x%d AS (SELECT id, c0 FROM t)", i) }, ", ") +
+				" SELECT x0.id FROM x0 " + list(n-1, func(i int) string { return fmt.Sprintf("JOIN x%d ON x%d.id = x%d.id", i+1, i+1, i) }, " ")
+		}, "nested too deep"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db.mustRun(t, tc.gen(tc.largest))
+			if err := db.run(tc.gen(tc.largest + 1)); err == nil || !strings.Contains(err.Error(), tc.msg) {
+				t.Fatalf("%d: got %v, want %q", tc.largest+1, err, tc.msg)
+			}
 		})
 	}
 }

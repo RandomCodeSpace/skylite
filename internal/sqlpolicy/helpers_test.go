@@ -192,6 +192,10 @@ func wantRefused(t testing.TB, err error, reason Reason) {
 	if pe.Reason != reason {
 		t.Fatalf("refused for %q, want %q: %v", pe.Reason, reason, err)
 	}
+	// A refusal carries no SQL text, which can hold secrets.
+	if got := err.Error(); got != "sqlpolicy: refused ("+string(reason)+")" {
+		t.Fatalf("error text %q", got)
+	}
 }
 
 // unrestricted runs f on db's connection with the authorizer suspended.
