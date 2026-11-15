@@ -430,33 +430,41 @@ func (c *Conn) admit(open bool) error {
 
 // finish ends a Run: it applies the rules for a panic or an error in the
 // commit path and reports the commit's outcome.
+//
+// Any panic stops the database on this node, not only one in the commit
+// path. Decision 6 left discarding just the panicked connection to a test,
+// and it fails: a panic that unwinds through SQLite leaves a statement
+// ncruces cannot finalize, so the connection cannot be closed, and its
+// shared-memory locks outlive its files because the mapping keeps the file
+// description open (TestExperimentPanickedConnectionKeepsLocks). The record
+// extends fail-stop to every panic in that case.
 func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	l := c.l
-	c.db.SetInterrupt(context.Background())
+	if p == nil {
+		c.db.SetInterrupt(context.Background())
+	}
 	l.cmu.Lock()
 	inCommit, uploaded, done, outcome, maint := c.inCommit, c.uploaded, c.done, c.outcome, c.maint
 	c.interrupt, c.id = nil, nil
-	if inCommit {
-		// The commit path ended without SQLite completing a commit whose
-		// create may have taken effect (decision 6): fail-stop.
-		cause := fmt.Errorf("%w: the commit path ended without completing (panic: %v, error: %v)", ErrUnknown, p, ferr)
+	switch {
+	case p != nil || inCommit:
+		// The Run ended in a panic, or the commit path ended without SQLite
+		// completing a commit whose create may have taken effect.
+		cause := fmt.Errorf("%w: a commit's create may have taken effect", ErrUnknown)
+		if !inCommit {
+			cause = fmt.Errorf("%w: nothing of this Run was sent to storage", ErrNotCommitted)
+		}
 		if uploaded != 0 {
-			cause = fmt.Errorf("transaction %d is committed in storage but SQLite did not complete it (panic: %v, error: %v)", uploaded, p, ferr)
+			cause = fmt.Errorf("transaction %d is committed in storage but SQLite did not complete it", uploaded)
 			done = uploaded
 		}
-		outcome = l.stopLocked(cause)
+		outcome = l.stopLocked(fmt.Errorf("%w (panic: %v, error: %v)", cause, p, ferr))
 		c.inCommit, c.uploaded = false, 0
 		l.uploading = false
 		l.cond.Broadcast()
 	}
 	l.cmu.Unlock()
-
-	if p != nil && !inCommit {
-		// A panic outside the commit path discards only this connection.
-		c.discard(fmt.Errorf("engine: connection discarded after a panic: %v", p))
-		return done, errors.Join(ferr, fmt.Errorf("%w: panic: %v", ErrNotCommitted, p))
-	}
-	if maint {
+	if p == nil && maint {
 		ferr = errors.Join(ferr, c.rollbackForMaintenance())
 	}
 	if outcome != nil {
@@ -499,27 +507,6 @@ func (c *Conn) rollbackHook() {
 	if c.uploaded != 0 {
 		c.outcome = l.stopLocked(fmt.Errorf("SQLite rolled back transaction %d after storage committed it", c.uploaded))
 	}
-}
-
-// discard drops a connection that panicked outside the commit path: it
-// truncates the WAL back to the last commit if the connection was writing,
-// and closes its files, which releases its locks.
-func (c *Conn) discard(cause error) {
-	l := c.l
-	l.cmu.Lock()
-	m := c.main
-	c.aborted = cause
-	if w := l.wal.writer; w != nil && w.c == c && l.wal.start >= 0 {
-		if err := l.truncateWAL(w, l.wal.start); err != nil {
-			l.stopLocked(err)
-		}
-	}
-	delete(l.conns, c.n)
-	l.cmu.Unlock()
-	if m != nil {
-		m.discard()
-	}
-	c.db = nil
 }
 
 // Close closes the connection, rolling back an open transaction.

@@ -119,17 +119,12 @@ type mainFile struct {
 	ckptDone bool // a checkpoint finished; it may now truncate the file
 }
 
-var errClosed = errors.New("engine: file discarded")
-
 func (f *mainFile) ReadAt(p []byte, off int64) (int, error) {
 	l := f.l
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	if err := l.err(); err != nil {
 		return 0, err
-	}
-	if f.File == nil {
-		return 0, errClosed
 	}
 	if f.r == nil || f.base != l.base {
 		f.r, f.base = l.tmpl.clone(), l.base
@@ -233,24 +228,7 @@ func (f *mainFile) Lock(lock vfs.LockLevel) error {
 	if err := f.l.err(); err != nil {
 		return err
 	}
-	if f.File == nil {
-		return errClosed
-	}
 	return f.File.Lock(lock)
-}
-
-func (f *mainFile) Unlock(lock vfs.LockLevel) error {
-	if f.File == nil {
-		return nil
-	}
-	return f.File.Unlock(lock)
-}
-
-func (f *mainFile) CheckReservedLock() (bool, error) {
-	if f.File == nil {
-		return false, errClosed
-	}
-	return f.File.CheckReservedLock()
 }
 
 func (f *mainFile) Close() error {
@@ -259,27 +237,10 @@ func (f *mainFile) Close() error {
 		f.c.main = nil
 	}
 	f.l.cmu.Unlock()
-	if f.File == nil {
-		return nil
-	}
 	return f.File.Close()
 }
 
-// discard closes the local file and with it the shared-memory index,
-// releasing every lock the connection held.
-func (f *mainFile) discard() {
-	f.l.mu.Lock()
-	defer f.l.mu.Unlock()
-	if f.File != nil {
-		_ = f.File.Close()
-		f.File = nil
-	}
-}
-
 func (f *mainFile) SharedMemory() vfs.SharedMemory {
-	if f.File == nil {
-		return nil
-	}
 	return f.File.(vfs.FileSharedMemory).SharedMemory()
 }
 
