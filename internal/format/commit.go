@@ -12,7 +12,7 @@ const (
 	commitMagic = "SKYLITEC"
 
 	// CommitHeaderSize is the size of the fixed header at the front of a commit object.
-	CommitHeaderSize = 128
+	CommitHeaderSize = 144
 	// PageEntrySize is the size of one page table entry.
 	PageEntrySize = 16
 	// MaxCommitIDLen is the longest client-supplied commit identifier.
@@ -23,6 +23,7 @@ const (
 
 // CommitHeader is the fixed-size front of a commit object.
 type CommitHeader struct {
+	DB        DatabaseID
 	PageSize  uint32
 	Txn       uint64
 	Epoch     uint64
@@ -52,6 +53,9 @@ func (h CommitHeader) Size() int64 {
 func (h CommitHeader) recordLen() int64 { return int64(h.PageSize) + recordTrailer }
 
 func (h CommitHeader) validate() error {
+	if err := checkDB(h.DB); err != nil {
+		return err
+	}
 	switch {
 	case !validPageSize(h.PageSize):
 		return invalid("page size %d", h.PageSize)
@@ -73,6 +77,16 @@ func (h CommitHeader) validate() error {
 	return nil
 }
 
+// CheckKey returns an ErrMisplaced error unless h belongs under the commit
+// key of transaction txn. Callers must check every commit header they
+// decode against the key they fetched it under.
+func (h CommitHeader) CheckKey(txn uint64) error {
+	if h.Txn != txn {
+		return misplaced("commit of transaction %d under the key of transaction %d", h.Txn, txn)
+	}
+	return nil
+}
+
 // checkPgno checks the page following prev (0 for the first page).
 func (h CommitHeader) checkPgno(prev, pgno uint32) error {
 	switch {
@@ -87,6 +101,10 @@ func (h CommitHeader) checkPgno(prev, pgno uint32) error {
 }
 
 func (h CommitHeader) tableSize() uint64 { return uint64(h.PageCount) * PageEntrySize }
+
+func (h CommitHeader) recordCRC(pgno uint32, body []byte) uint32 {
+	return recordCRC(commitMagic, h.DB, h.Txn, h.Epoch, uint64(pgno), body)
+}
 
 func (h CommitHeader) entry(i, pgno uint32) PageEntry {
 	return PageEntry{
@@ -116,9 +134,10 @@ func (h CommitHeader) encode(tableCRC uint32) []byte {
 	le.PutUint32(b[36:], h.PageCount)
 	le.PutUint64(b[40:], h.tableSize())
 	le.PutUint32(b[48:], tableCRC)
-	b[52] = byte(len(h.CommitID)) //nolint:gosec // validate bounds it by MaxCommitIDLen
-	copy(b[53:], h.CommitID)
-	le.PutUint32(b[124:], checksum(b[:124]))
+	copy(b[52:], h.DB[:])
+	b[68] = byte(len(h.CommitID)) //nolint:gosec // validate bounds it by MaxCommitIDLen
+	copy(b[69:], h.CommitID)
+	le.PutUint32(b[140:], checksum(b[:140]))
 	return b
 }
 
@@ -126,6 +145,9 @@ func (h CommitHeader) encode(tableCRC uint32) []byte {
 // ascending order and pages supplies their bodies, h.PageSize bytes each, in
 // the same order. Only one page body is held in memory at a time, and the
 // object is exactly h.Size() bytes. h.PageCount must equal len(pgnos).
+// EncodeCommit reads exactly len(pgnos)*h.PageSize bytes from pages and
+// nothing after them. Errors from w are returned unchanged; errors reading
+// pages are wrapped with the page number. Neither is a format class.
 func EncodeCommit(w io.Writer, h CommitHeader, pgnos []uint32, pages io.Reader) error {
 	if err := h.validate(); err != nil {
 		return err
@@ -166,7 +188,7 @@ func EncodeCommit(w io.Writer, h CommitHeader, pgnos []uint32, pages io.Reader) 
 		if _, err := io.ReadFull(pages, body); err != nil {
 			return fmt.Errorf("format: reading page %d: %w", p, err)
 		}
-		le.PutUint32(rec[h.PageSize:], checksum(body))
+		le.PutUint32(rec[h.PageSize:], h.recordCRC(p, body))
 		if _, err := bw.Write(rec); err != nil {
 			return err
 		}
@@ -174,19 +196,20 @@ func EncodeCommit(w io.Writer, h CommitHeader, pgnos []uint32, pages io.Reader) 
 	return bw.Flush()
 }
 
-// DecodeCommitHeader decodes the first CommitHeaderSize bytes of a commit object.
-func DecodeCommitHeader(b []byte) (CommitHeader, error) {
+// DecodeCommitHeader decodes the first CommitHeaderSize bytes of a commit
+// object of database db.
+func DecodeCommitHeader(b []byte, db DatabaseID) (CommitHeader, error) {
 	if err := checkHeader(b, commitMagic, CommitHeaderSize); err != nil {
 		return CommitHeader{}, err
 	}
 	if f := le.Uint16(b[10:]); f&^flagEpochBump != 0 {
 		return CommitHeader{}, fmt.Errorf("%w: flags %#x", ErrVersion, f)
 	}
-	idLen := int(b[52])
+	idLen := int(b[68])
 	if idLen > MaxCommitIDLen {
 		return CommitHeader{}, invalid("commit identifier of %d bytes", idLen)
 	}
-	if !allZero(b[53+idLen : 124]) {
+	if !allZero(b[69+idLen : 140]) {
 		return CommitHeader{}, invalid("nonzero padding")
 	}
 	h := CommitHeader{
@@ -198,14 +221,18 @@ func DecodeCommitHeader(b []byte) (CommitHeader, error) {
 		EpochBump: le.Uint16(b[10:])&flagEpochBump != 0,
 		tableCRC:  le.Uint32(b[48:]),
 	}
+	copy(h.DB[:], b[52:68])
 	if idLen > 0 {
-		h.CommitID = append([]byte(nil), b[53:53+idLen]...)
+		h.CommitID = append([]byte(nil), b[69:69+idLen]...)
 	}
 	if err := h.validate(); err != nil {
 		return CommitHeader{}, err
 	}
 	if ts := le.Uint64(b[40:]); ts != h.tableSize() {
 		return CommitHeader{}, invalid("table size %d for %d pages", ts, h.PageCount)
+	}
+	if h.DB != db {
+		return CommitHeader{}, misplaced("commit of database %x, want %x", h.DB, db)
 	}
 	return h, nil
 }
@@ -240,34 +267,44 @@ func DecodeCommitTable(h CommitHeader, b []byte) ([]PageEntry, error) {
 }
 
 // DecodeCommitPage verifies one page record, the e.Length bytes at e.Offset,
-// and returns the page body, which aliases b.
+// and returns the page body, which aliases b. h must come from
+// DecodeCommitHeader and e from DecodeCommitTable for the same object. A
+// record of another page, object or database fails its checksum.
 func DecodeCommitPage(h CommitHeader, e PageEntry, b []byte) ([]byte, error) {
 	if err := h.validate(); err != nil {
 		return nil, err
+	}
+	if err := h.checkPgno(0, e.Pgno); err != nil {
+		return nil, err
+	}
+	start, rl := CommitHeaderSize+h.tableSize(), uint64(h.PageSize)+recordTrailer
+	if e.Offset < start || (e.Offset-start)%rl != 0 || (e.Offset-start)/rl >= uint64(h.PageCount) {
+		return nil, invalid("page %d: offset %d is not a record position", e.Pgno, e.Offset)
 	}
 	if int64(e.Length) != h.recordLen() || int64(len(b)) != h.recordLen() {
 		return nil, invalid("page %d record is %d bytes, entry says %d, want %d", e.Pgno, len(b), e.Length, h.recordLen())
 	}
 	body := b[:h.PageSize]
-	if le.Uint32(b[h.PageSize:]) != checksum(body) {
+	if le.Uint32(b[h.PageSize:]) != h.recordCRC(e.Pgno, body) {
 		return nil, fmt.Errorf("%w: page %d", ErrChecksum, e.Pgno)
 	}
 	return body, nil
 }
 
-// DecodeCommit reads and verifies a whole commit object from r: header,
-// page table, every page, and that nothing follows the last page. It calls
-// fn, if not nil, with each page in order; the page slice is reused after fn
-// returns.
-func DecodeCommit(r io.Reader, fn func(pgno uint32, page []byte) error) (CommitHeader, []PageEntry, error) {
+// DecodeCommit reads and verifies a whole commit object of database db from
+// r: header, page table, every page, and that nothing follows the last page.
+// It calls fn, if not nil, with each page in order; the page slice is reused
+// after fn returns. Errors from r and from fn are returned unchanged, not
+// wrapped in a format class.
+func DecodeCommit(r io.Reader, db DatabaseID, fn func(pgno uint32, page []byte) error) (CommitHeader, []PageEntry, error) {
 	hb := make([]byte, CommitHeaderSize)
 	if n, err := io.ReadFull(r, hb); err != nil {
 		if short(err) {
-			_, err = DecodeCommitHeader(hb[:n])
+			_, err = DecodeCommitHeader(hb[:n], db)
 		}
 		return CommitHeader{}, nil, err
 	}
-	h, err := DecodeCommitHeader(hb)
+	h, err := DecodeCommitHeader(hb, db)
 	if err != nil {
 		return CommitHeader{}, nil, err
 	}

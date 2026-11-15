@@ -22,7 +22,7 @@ func FuzzDecodeCommit(f *testing.F) {
 			b = refixCommit(slices.Clone(b))
 		}
 		var pages []byte
-		h, entries, err := DecodeCommit(bytes.NewReader(b), func(_ uint32, p []byte) error {
+		h, entries, err := DecodeCommit(bytes.NewReader(b), goldenDB, func(_ uint32, p []byte) error {
 			pages = append(pages, p...)
 			return nil
 		})
@@ -43,9 +43,9 @@ func FuzzDecodeCommitHeader(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte, fix bool) {
 		if fix && len(b) >= CommitHeaderSize {
 			b = slices.Clone(b)
-			le.PutUint32(b[124:], checksum(b[:124]))
+			le.PutUint32(b[140:], checksum(b[:140]))
 		}
-		h, err := DecodeCommitHeader(b)
+		h, err := DecodeCommitHeader(b, goldenDB)
 		if err != nil {
 			checkClass(t, err)
 			return
@@ -61,7 +61,7 @@ func FuzzDecodeCommitTable(f *testing.F) {
 	f.Add(uint32(512), uint32(3), uint32(2), g[CommitHeaderSize:CommitHeaderSize+2*PageEntrySize])
 	f.Add(uint32(65536), uint32(16386), uint32(1), []byte{})
 	f.Fuzz(func(t *testing.T, ps, dbSize, count uint32, table []byte) {
-		h := CommitHeader{PageSize: ps, Txn: 1, Epoch: 1, DBSize: dbSize, PageCount: count, tableCRC: checksum(table)}
+		h := CommitHeader{DB: goldenDB, PageSize: ps, Txn: 1, Epoch: 1, DBSize: dbSize, PageCount: count, tableCRC: checksum(table)}
 		entries, err := DecodeCommitTable(h, table)
 		if err != nil {
 			checkClass(t, err)
@@ -78,19 +78,38 @@ func FuzzDecodeCommitTable(f *testing.F) {
 	})
 }
 
+// FuzzDecodeCommitPage hands DecodeCommitPage arbitrary entries for the
+// golden commit's header shape. With fix set, the record's checksum is
+// recomputed for the page number given, so the entry checks are reached.
 func FuzzDecodeCommitPage(f *testing.F) {
 	g := readGolden(f, "commit.bin")
 	page0 := CommitHeaderSize + 2*PageEntrySize
-	f.Add(uint32(512), uint32(516), g[page0:page0+516])
-	f.Fuzz(func(t *testing.T, ps, length uint32, rec []byte) {
-		h := CommitHeader{PageSize: ps, Txn: 1, Epoch: 1, DBSize: 1, PageCount: 1}
-		body, err := DecodeCommitPage(h, PageEntry{Pgno: 1, Length: length}, rec)
+	f.Add(uint32(3), uint32(2), uint32(1), uint64(page0), uint32(516), g[page0:page0+516], false)
+	f.Add(uint32(3), uint32(2), uint32(3), uint64(page0+516), uint32(516), g[page0+516:page0+2*516], false)
+	f.Add(uint32(3), uint32(2), uint32(3), uint64(page0), uint32(516), g[page0:page0+516], false)
+	f.Add(uint32(5), uint32(4), uint32(0), uint64(page0), uint32(516), g[page0:page0+516], true)
+	f.Fuzz(func(t *testing.T, dbSize, count, pgno uint32, offset uint64, length uint32, rec []byte, fix bool) {
+		h := CommitHeader{DB: goldenDB, PageSize: 512, Txn: 7, Epoch: 2, DBSize: dbSize, PageCount: count}
+		if fix && len(rec) >= recordTrailer {
+			rec = slices.Clone(rec)
+			n := len(rec) - recordTrailer
+			le.PutUint32(rec[n:], crc32cBitwise(identity("SKYLITEC", goldenDB, 7, 2, uint64(pgno)), rec[:n]))
+		}
+		body, err := DecodeCommitPage(h, PageEntry{Pgno: pgno, Length: length, Offset: offset}, rec)
 		if err != nil {
 			checkClass(t, err)
 			return
 		}
-		if !bytes.Equal(body, rec[:ps]) || le.Uint32(rec[ps:]) != checksum(body) {
-			t.Fatal("accepted a record that does not verify")
+		start := uint64(CommitHeaderSize) + 16*uint64(count)
+		switch {
+		case pgno == 0 || pgno > dbSize || pgno == LockPage(512):
+			t.Fatalf("accepted page %d in a database of %d pages", pgno, dbSize)
+		case offset < start || (offset-start)%516 != 0 || (offset-start)/516 >= uint64(count):
+			t.Fatalf("accepted offset %d, not a record position", offset)
+		case len(rec) != 516 || length != 516 || !bytes.Equal(body, rec[:512]):
+			t.Fatal("accepted a record of the wrong length")
+		case le.Uint32(rec[512:]) != crc32cBitwise(identity("SKYLITEC", goldenDB, 7, 2, uint64(pgno)), body):
+			t.Fatalf("accepted a record that is not page %d of this commit", pgno)
 		}
 	})
 }
@@ -102,7 +121,7 @@ func FuzzDecodeBase(f *testing.F) {
 		if fix {
 			b = refixBase(slices.Clone(b))
 		}
-		h, pages, err := DecodeBase(b)
+		h, pages, err := DecodeBase(b, goldenDB)
 		if err != nil {
 			checkClass(t, err)
 			return
@@ -120,7 +139,7 @@ func FuzzDecodeBaseHeader(f *testing.F) {
 			b = slices.Clone(b)
 			le.PutUint32(b[60:], checksum(b[:60]))
 		}
-		h, err := DecodeBaseHeader(b)
+		h, err := DecodeBaseHeader(b, goldenDB)
 		if err != nil {
 			checkClass(t, err)
 			return
@@ -131,22 +150,36 @@ func FuzzDecodeBaseHeader(f *testing.F) {
 	})
 }
 
+// FuzzDecodeBasePage hands DecodeBasePage arbitrary groups and pages. With
+// fix set, the record's checksum is recomputed for the page number given.
 func FuzzDecodeBasePage(f *testing.F) {
 	g := readGolden(f, "base.bin")
-	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097154), g[BaseHeaderSize+516:BaseHeaderSize+2*516])
-	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097153), g[BaseHeaderSize:BaseHeaderSize+516])
-	f.Fuzz(func(t *testing.T, ps, gs, group, pgno uint32, rec []byte) {
-		h := BaseHeader{PageSize: ps, GroupSize: gs, Group: group, Txn: 1, Epoch: 1}
+	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097154), g[BaseHeaderSize+516:BaseHeaderSize+2*516], false)
+	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097153), g[BaseHeaderSize:BaseHeaderSize+516], false)
+	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097155), g[BaseHeaderSize+516:BaseHeaderSize+2*516], false)
+	f.Add(uint32(512), uint32(4), uint32(1073741823), uint32(4294967294), g[BaseHeaderSize+516:BaseHeaderSize+2*516], true)
+	f.Fuzz(func(t *testing.T, ps, gs, group, pgno uint32, rec []byte, fix bool) {
+		h := BaseHeader{DB: goldenDB, PageSize: ps, GroupSize: gs, Group: group, Txn: 9, Epoch: 3}
+		if fix && len(rec) >= recordTrailer {
+			rec = slices.Clone(rec)
+			n := len(rec) - recordTrailer
+			le.PutUint32(rec[n:], crc32cBitwise(identity("SKYLITEB", goldenDB, 9, 3, uint64(pgno)), rec[:n]))
+		}
 		body, err := DecodeBasePage(h, pgno, rec)
 		if err != nil {
 			checkClass(t, err)
 			return
 		}
-		if off, n, err := h.PageRange(pgno); err != nil || n != int64(len(rec)) || off < BaseHeaderSize || off+n > h.Size() {
-			t.Fatalf("accepted page %d outside its range: %d %d %v", pgno, off, n, err)
-		}
-		if le.Uint32(rec[ps:]) != checksum(body) {
-			t.Fatal("accepted a record that does not verify")
+		first := uint64(group)*uint64(gs) + 1
+		switch p := uint64(pgno); {
+		case p < first || p >= first+uint64(gs) || p > MaxPages:
+			t.Fatalf("accepted page %d outside group %d", pgno, group)
+		case len(rec) != int(ps)+4 || !bytes.Equal(body, rec[:ps]):
+			t.Fatal("accepted a record of the wrong length")
+		case le.Uint32(rec[ps:]) != crc32cBitwise(identity("SKYLITEB", goldenDB, 9, 3, p), body):
+			t.Fatalf("accepted a record that is not page %d of this group object", pgno)
+		case pgno == LockPage(ps) && !allZero(body):
+			t.Fatal("accepted a nonzero lock page")
 		}
 	})
 }
@@ -158,7 +191,7 @@ func FuzzDecodeManifest(f *testing.F) {
 		if fix {
 			b = refixManifest(slices.Clone(b))
 		}
-		m, err := DecodeManifest(b)
+		m, err := DecodeManifest(b, goldenDB)
 		if err != nil {
 			checkClass(t, err)
 			return
@@ -173,6 +206,7 @@ func FuzzDecodeManifest(f *testing.F) {
 func FuzzDecodeLease(f *testing.F) {
 	f.Add(readGolden(f, "lease.json"))
 	f.Add([]byte(`{"format":"skylite-lease","version":2}`))
+	f.Add([]byte(`{"format":"skylite-lease","version":1,"holder":"x","epoch":18446744073709551615,"renewed":0}`))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		l, err := DecodeLease(b)
 		if err != nil {
