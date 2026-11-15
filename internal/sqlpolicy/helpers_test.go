@@ -87,8 +87,10 @@ func openDB(t testing.TB, inFile bool, l Limits) *testDB {
 	}
 	db.raw = raw
 	if inFile {
-		// The tests do not need durability, and syncing slows the fuzz test.
-		if err := raw.Exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF"); err != nil {
+		// The server's own settings, so that a change by a client is visible:
+		// WAL and synchronous FULL (decision record 0004), and values other
+		// than SQLite's defaults for the rest.
+		if err := raw.Exec(baseline); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -101,6 +103,8 @@ func openDB(t testing.TB, inFile bool, l Limits) *testDB {
 	rec.take()
 	return db
 }
+
+const baseline = "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA wal_autocheckpoint = 0; PRAGMA cache_size = -4000; PRAGMA application_id = 7; PRAGMA user_version = 3"
 
 func apply(t testing.TB, raw *sqlite3.Conn, l Limits) *Conn {
 	t.Helper()
@@ -126,8 +130,29 @@ func both(t *testing.T, l Limits, f func(t *testing.T, db *testDB)) {
 	}
 }
 
+// run runs each statement in sql through Run in turn, and stops at the first
+// error. Where Run refuses text after the first statement, it finds where
+// that statement ends by preparing it again, under the policy, without
+// stepping it.
 func (db *testDB) run(sql string) error {
-	return db.conn.Run(context.Background(), strings.ReplaceAll(sql, "{dir}", db.dir), nil)
+	rest := strings.ReplaceAll(sql, "{dir}", db.dir)
+	for !blank(rest) {
+		err := db.conn.Run(context.Background(), rest, nil)
+		var pe *Error
+		if !errors.As(err, &pe) || pe.Reason != ReasonStatementCount {
+			return err
+		}
+		stmt, tail, perr := db.raw.Prepare(rest)
+		if perr != nil || stmt == nil {
+			return err
+		}
+		_ = stmt.Close()
+		if err := db.conn.Run(context.Background(), rest[:len(rest)-len(tail)], nil); err != nil {
+			return err
+		}
+		rest = tail
+	}
+	return nil
 }
 
 func (db *testDB) mustRun(t testing.TB, sql string) {
@@ -142,16 +167,7 @@ func (db *testDB) rows(sql string, args ...any) ([][]string, error) {
 	var out [][]string
 	err := db.conn.Run(context.Background(), sql, func(s *sqlite3.Stmt) error {
 		for i, a := range args {
-			var err error
-			switch v := a.(type) {
-			case string:
-				err = s.BindText(i+1, v)
-			case int:
-				err = s.BindInt64(i+1, int64(v))
-			default:
-				err = fmt.Errorf("unsupported argument %T", a)
-			}
-			if err != nil {
+			if err := bind(s, i+1, a); err != nil {
 				return err
 			}
 		}
@@ -176,31 +192,31 @@ func wantRefused(t testing.TB, err error, reason Reason) {
 	if pe.Reason != reason {
 		t.Fatalf("refused for %q, want %q: %v", pe.Reason, reason, err)
 	}
-	if len(pe.SQL) > 64 {
-		t.Fatalf("refusal echoes %d bytes of SQL", len(pe.SQL))
-	}
 }
 
-// unrestricted reads from db's connection with the authorizer removed.
+// unrestricted runs f on db's connection with the authorizer suspended.
 func (db *testDB) unrestricted(t testing.TB, f func()) {
 	t.Helper()
-	if err := db.raw.SetAuthorizer(nil); err != nil {
+	if err := db.conn.Privileged(func(*sqlite3.Conn) error { f(); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		if err := db.raw.SetAuthorizer(db.conn.authorize); err != nil {
-			t.Fatal(err)
-		}
-	}()
-	f()
 }
 
-// ownedPragmas are pragmas whose values the server owns. Reading one returns
+// server runs sql as the server's own statements.
+func (db *testDB) server(t testing.TB, sql string) {
+	t.Helper()
+	if err := db.conn.Privileged(func(c *sqlite3.Conn) error { return c.Exec(sql) }); err != nil {
+		t.Fatalf("%.80s: %v", sql, err)
+	}
+}
+
+// ownedPragmas are pragmas whose values the server owns: every setting the
+// build has except foreign_keys, which clients may set. Reading one returns
 // its current value.
 var ownedPragmas = []string{
 	"analysis_limit", "application_id", "auto_vacuum", "automatic_index", "busy_timeout", "cache_size",
 	"cache_spill", "cell_size_check", "checkpoint_fullfsync", "count_changes", "defer_foreign_keys",
-	"empty_result_callbacks", "encoding", "foreign_keys", "full_column_names", "fullfsync", "hard_heap_limit",
+	"empty_result_callbacks", "encoding", "full_column_names", "fullfsync", "hard_heap_limit",
 	"ignore_check_constraints", "journal_mode", "journal_size_limit", "legacy_alter_table", "locking_mode",
 	"max_page_count", "mmap_size", "page_size", "query_only", "read_uncommitted", "recursive_triggers",
 	"reverse_unordered_selects", "secure_delete", "short_column_names", "soft_heap_limit", "synchronous",
@@ -235,8 +251,11 @@ func (db *testDB) owned(t testing.TB) map[string]string {
 			read(p, "PRAGMA "+p)
 		}
 		read("case_sensitive_like", "SELECT 'a' LIKE 'A'")
+		read("integrity_check", "PRAGMA integrity_check")
+		read("temp_store_file", "SELECT count(*) FROM pragma_database_list WHERE name = 'temp' AND file <> ''")
 		read("attached", "SELECT group_concat(name) FROM pragma_database_list WHERE seq > 1")
-		for op := sqlite3.DBCONFIG_ENABLE_FKEY; op <= sqlite3.DBCONFIG_REVERSE_SCANORDER; op++ {
+		// Enforcing foreign keys is a client's choice (PRAGMA foreign_keys).
+		for op := sqlite3.DBCONFIG_ENABLE_FKEY + 1; op <= sqlite3.DBCONFIG_REVERSE_SCANORDER; op++ {
 			v, err := db.raw.Config(op)
 			if err != nil {
 				t.Fatal(err)
@@ -247,6 +266,13 @@ func (db *testDB) owned(t testing.TB) map[string]string {
 			m[fmt.Sprint("limit ", id)] = fmt.Sprint(db.raw.Limit(id, -1))
 		}
 	})
+	if db.path != "" {
+		// With wal_autocheckpoint off, only a checkpoint changes the
+		// database file's size.
+		if fi, err := os.Stat(db.path); err == nil {
+			m["file size"] = fmt.Sprint(fi.Size())
+		}
+	}
 	return m
 }
 

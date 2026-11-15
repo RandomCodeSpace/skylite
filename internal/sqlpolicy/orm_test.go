@@ -121,3 +121,41 @@ func TestTempSchemaStaysInMemory(t *testing.T) {
 		db.checkFiles(t)
 	})
 }
+
+// GORM's AlterColumn on a table that others reference (gorm.io/driver/sqlite
+// v1.6.0, migrator.go RunWithoutForeignKey and recreateTable): it turns
+// foreign keys off, rebuilds the table in a transaction, which the driver
+// opens and commits through the protocol, and turns them on again. The
+// referencing rows survive. DropColumn, CreateConstraint and DropConstraint
+// rebuild the same way without turning foreign keys off, and the cascade
+// then deletes them.
+func TestGORMTableRebuild(t *testing.T) {
+	for _, fkOff := range []bool{true, false} {
+		t.Run(map[bool]string{true: "AlterColumn", false: "DropColumn"}[fkOff], func(t *testing.T) {
+			both(t, Limits{}, func(t *testing.T, db *testDB) {
+				db.mustRun(t, "CREATE TABLE `companies` (`id` integer PRIMARY KEY AUTOINCREMENT,`name` text);"+
+					"CREATE TABLE `users` (`id` integer PRIMARY KEY AUTOINCREMENT,`name` text,`company_id` integer,CONSTRAINT `fk_users_company` FOREIGN KEY (`company_id`) REFERENCES `companies`(`id`) ON DELETE CASCADE);"+
+					"INSERT INTO companies(name) VALUES ('c1'), ('c2'); INSERT INTO users(name, company_id) VALUES ('a', 1), ('b', 1), ('c', 2)")
+				if fkOff {
+					if r, err := db.rows("PRAGMA foreign_keys"); err != nil || r[0][0] != "1" {
+						t.Fatalf("PRAGMA foreign_keys: %v %v", r, err)
+					}
+					db.mustRun(t, "PRAGMA foreign_keys = OFF")
+				}
+				db.server(t, "BEGIN")
+				db.mustRun(t, "CREATE TABLE `companies__temp` (`id` integer PRIMARY KEY AUTOINCREMENT,`name` varchar(100))")
+				db.mustRun(t, "INSERT INTO `companies__temp`(`id`,`name`) SELECT `id`,`name` FROM `companies`")
+				db.mustRun(t, "DROP TABLE `companies`")
+				db.mustRun(t, "ALTER TABLE `companies__temp` RENAME TO `companies`")
+				db.server(t, "COMMIT")
+				if fkOff {
+					db.mustRun(t, "PRAGMA foreign_keys = ON")
+				}
+				want := map[bool]string{true: "3", false: "0"}[fkOff]
+				if r, err := db.rows("SELECT count(*) FROM users"); err != nil || r[0][0] != want {
+					t.Fatalf("users: %v %v, want %s rows", r, err, want)
+				}
+			})
+		})
+	}
+}

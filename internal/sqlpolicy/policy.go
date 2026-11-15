@@ -4,10 +4,12 @@
 package sqlpolicy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,18 +17,20 @@ import (
 )
 
 // Limits are the limits a Policy applies to a connection. A zero field takes
-// its default.
+// its default. The defaults suit tests; the server sets each field from its
+// own configuration.
 type Limits struct {
 	MaxLength            int           // bytes in one string or BLOB (SQLITE_LIMIT_LENGTH)
-	MaxSQLLength         int           // bytes of SQL text in one statement (SQLITE_LIMIT_SQL_LENGTH)
-	MaxExprDepth         int           // depth of an expression tree (SQLITE_LIMIT_EXPR_DEPTH)
+	MaxSQLLength         int           // bytes of SQL text given to one Run (SQLITE_LIMIT_SQL_LENGTH)
+	MaxExprDepth         int           // depth of an expression tree, and of nested views, CTEs and subqueries (SQLITE_LIMIT_EXPR_DEPTH)
 	MaxParserDepth       int           // depth of the parser's stack, which nesting in parentheses uses (SQLITE_LIMIT_PARSER_DEPTH)
 	MaxCompoundSelect    int           // terms in a compound SELECT (SQLITE_LIMIT_COMPOUND_SELECT)
 	MaxVDBEOps           int           // instructions in one compiled statement (SQLITE_LIMIT_VDBE_OP)
 	MaxFunctionArgs      int           // arguments to one SQL function (SQLITE_LIMIT_FUNCTION_ARG)
 	MaxLikePatternLength int           // bytes in a LIKE or GLOB pattern (SQLITE_LIMIT_LIKE_PATTERN_LENGTH)
 	MaxVariableNumber    int           // highest parameter number (SQLITE_LIMIT_VARIABLE_NUMBER)
-	MaxTriggerDepth      int           // nesting depth of triggers (SQLITE_LIMIT_TRIGGER_DEPTH)
+	MaxTriggerDepth      int           // nesting depth of triggers and foreign key actions (SQLITE_LIMIT_TRIGGER_DEPTH)
+	MaxPageCount         int           // pages the main database may hold (PRAGMA max_page_count); zero leaves SQLite's
 	Timeout              time.Duration // wall-clock time one Run may take
 }
 
@@ -34,22 +38,24 @@ type limit struct {
 	name          string
 	id            sqlite3.LimitCategory
 	value         *int
-	def, min, max int // max is the bound compiled into SQLite, above which sqlite3_limit silently clamps
+	def, min, max int // max is the bound compiled into SQLite, or the bound measured as safe for the C stack
 }
 
 func (l *Limits) limits() []limit {
 	return []limit{
-		{"MaxLength", sqlite3.LIMIT_LENGTH, &l.MaxLength, 16 << 20, 1, 1_000_000_000},
+		{"MaxLength", sqlite3.LIMIT_LENGTH, &l.MaxLength, 1 << 20, 1, 1_000_000_000},
 		{"MaxSQLLength", sqlite3.LIMIT_SQL_LENGTH, &l.MaxSQLLength, 1 << 20, 1, 1_000_000_000},
-		// The next five defaults are below SQLite's because, at SQLite's, one
-		// statement can overflow the 64 KiB C stack of the ncruces build.
-		{"MaxExprDepth", sqlite3.LIMIT_EXPR_DEPTH, &l.MaxExprDepth, 100, 1, 1000},
+		// The next five bound recursion in the C code, whose stack is a fixed
+		// 64 KiB in the ncruces build. New also bounds their combination; see
+		// stackCost.
+		{"MaxExprDepth", sqlite3.LIMIT_EXPR_DEPTH, &l.MaxExprDepth, 18, 3, 1000},
 		// The parser's first 50 stack entries are static, so a lower limit has no effect.
-		{"MaxParserDepth", sqlite3.LIMIT_PARSER_DEPTH, &l.MaxParserDepth, 200, 50, 2500},
-		{"MaxCompoundSelect", sqlite3.LIMIT_COMPOUND_SELECT, &l.MaxCompoundSelect, 100, 1, 500},
-		{"MaxLikePatternLength", sqlite3.LIMIT_LIKE_PATTERN_LENGTH, &l.MaxLikePatternLength, 4096, 1, 50000},
-		{"MaxTriggerDepth", sqlite3.LIMIT_TRIGGER_DEPTH, &l.MaxTriggerDepth, 32, 1, 1000},
-		{"MaxVDBEOps", sqlite3.LIMIT_VDBE_OP, &l.MaxVDBEOps, 1_000_000, 1, 250_000_000},
+		{"MaxParserDepth", sqlite3.LIMIT_PARSER_DEPTH, &l.MaxParserDepth, 100, 50, 2500},
+		{"MaxCompoundSelect", sqlite3.LIMIT_COMPOUND_SELECT, &l.MaxCompoundSelect, 4, 1, 500},
+		// Matching recurses once per wildcard; it overflowed from about 9,000 bytes.
+		{"MaxLikePatternLength", sqlite3.LIMIT_LIKE_PATTERN_LENGTH, &l.MaxLikePatternLength, 4096, 1, 4096},
+		{"MaxTriggerDepth", sqlite3.LIMIT_TRIGGER_DEPTH, &l.MaxTriggerDepth, 8, 1, 1000},
+		{"MaxVDBEOps", sqlite3.LIMIT_VDBE_OP, &l.MaxVDBEOps, 250_000_000, 1, 250_000_000},
 		{"MaxFunctionArgs", sqlite3.LIMIT_FUNCTION_ARG, &l.MaxFunctionArgs, 1000, 1, 1000},
 		{"MaxVariableNumber", sqlite3.LIMIT_VARIABLE_NUMBER, &l.MaxVariableNumber, 32766, 1, 32766},
 	}
@@ -57,13 +63,33 @@ func (l *Limits) limits() []limit {
 
 const defaultTimeout = 5 * time.Second
 
+// stackBudget and stackCost bound how deep one statement can drive the C
+// stack within the limits. The unit is what one term of a compound SELECT
+// costs at one level of nesting. Measured on SQLite 3.54.1 in ncruces
+// v0.37.0, a connection broke at about 180 units: nesting levels times terms,
+// whether the levels were views, CTEs or subqueries in FROM, plus about 2.5
+// units per level of trigger nesting. The budget is half of that, so any
+// statement within the limits uses at most about half the stack. Views and
+// CTEs nest to MaxExprDepth-2 levels; subqueries in FROM nest to about
+// MaxParserDepth/6.5. Re-measure on any upgrade of the binding.
+const stackBudget = 90
+
+func stackCost(l Limits) int {
+	levels := max(l.MaxExprDepth-2, l.MaxParserDepth/6)
+	return l.MaxCompoundSelect*levels + 5*l.MaxTriggerDepth/2
+}
+
+// maxPageCount is SQLITE_MAX_PAGE_COUNT, SQLite's default.
+const maxPageCount = 4294967294
+
 // Policy is a validated set of limits. Create one with New.
 type Policy struct {
 	limits Limits
 }
 
 // New returns a Policy with l's limits, using the default for each zero field.
-// It fails if a field is out of the range the SQLite build supports.
+// It fails if a field is out of the range the SQLite build supports, or if
+// the nesting limits together could overflow the C stack.
 func New(l Limits) (*Policy, error) {
 	for _, f := range l.limits() {
 		switch {
@@ -72,6 +98,13 @@ func New(l Limits) (*Policy, error) {
 		case *f.value < f.min || *f.value > f.max:
 			return nil, fmt.Errorf("sqlpolicy: %s is %d, want %d to %d", f.name, *f.value, f.min, f.max)
 		}
+	}
+	if c := stackCost(l); c > stackBudget {
+		return nil, fmt.Errorf("sqlpolicy: MaxCompoundSelect %d, MaxExprDepth %d, MaxParserDepth %d and MaxTriggerDepth %d together cost %d stack units, want at most %d",
+			l.MaxCompoundSelect, l.MaxExprDepth, l.MaxParserDepth, l.MaxTriggerDepth, c, stackBudget)
+	}
+	if l.MaxPageCount < 0 || l.MaxPageCount > maxPageCount {
+		return nil, fmt.Errorf("sqlpolicy: MaxPageCount is %d, want 0 to %d", l.MaxPageCount, maxPageCount)
 	}
 	switch {
 	case l.Timeout == 0:
@@ -83,23 +116,29 @@ func New(l Limits) (*Policy, error) {
 }
 
 // Conn is a SQLite connection with a Policy applied. Client SQL must run
-// through Run; like the connection it wraps, a Conn is not safe for
-// concurrent use.
+// through Run, and the server's own SQL through Privileged; like the
+// connection it wraps, a Conn is not safe for concurrent use.
 type Conn struct {
 	conn    *sqlite3.Conn
-	timeout time.Duration
+	limits  Limits
 	refused Reason // first refusal by the authorizer since Run started
-	broken  bool   // a Run recovered a panic from the engine
+	inTxn   bool   // a transaction was open when Run started
+	altered bool   // the authorizer has seen ALTER TABLE since Run started
+	broken  bool   // the engine panicked, or Reset failed
 }
 
-// ErrBroken reports that the engine panicked during a Run, which leaves the
-// connection in an unknown state. Close the Conn and open a new connection.
-var ErrBroken = errors.New("sqlpolicy: connection unusable after an engine panic")
+// ErrBroken reports that the engine panicked or a reset failed, which leaves
+// the connection in an unknown state. Whether a write transaction was open
+// cannot be known; the engine must assume that one was, and discard the
+// connection.
+var ErrBroken = errors.New("sqlpolicy: connection unusable")
 
 // Apply configures c for untrusted SQL: database configuration, temporary
-// storage in memory, limits, and the authorizer. Setting the authorizer
-// expires statements prepared on c before Apply, so SQLite compiles them
-// again under the policy if they are stepped.
+// storage in memory, limits, the optional page count, and the authorizer.
+// The engine calls Apply after its own set-up of c, and issues every later
+// statement of its own through Privileged. Setting the authorizer expires
+// statements prepared on c before Apply, so SQLite compiles them again under
+// the policy if they are stepped.
 func (p *Policy) Apply(c *sqlite3.Conn) (*Conn, error) {
 	for _, cfg := range []struct {
 		op   sqlite3.DBConfig
@@ -118,11 +157,6 @@ func (p *Policy) Apply(c *sqlite3.Conn) (*Conn, error) {
 			return nil, fmt.Errorf("sqlpolicy: db config %d is %t, want %t", cfg.op, got, cfg.want)
 		}
 	}
-	// Temporary tables, indices and statement journals stay in the
-	// connection's memory instead of unnamed files in the temporary directory.
-	if err := c.Exec("PRAGMA temp_store = MEMORY"); err != nil {
-		return nil, fmt.Errorf("sqlpolicy: temp_store: %w", err)
-	}
 	l := p.limits
 	noAttach := 0
 	for _, f := range append(l.limits(), limit{name: "attached databases", id: sqlite3.LIMIT_ATTACHED, value: &noAttach}) {
@@ -131,71 +165,151 @@ func (p *Policy) Apply(c *sqlite3.Conn) (*Conn, error) {
 			return nil, fmt.Errorf("sqlpolicy: limit on %s is %d, want %d", f.name, got, *f.value)
 		}
 	}
-	pc := &Conn{conn: c, timeout: l.Timeout}
-	if err := c.SetAuthorizer(pc.authorize); err != nil {
-		return nil, fmt.Errorf("sqlpolicy: authorizer: %w", err)
+	pc := &Conn{conn: c, limits: l}
+	// The two-argument trims replace SQLite's, whose time grows with the
+	// product of the lengths of their arguments.
+	for name, ends := range map[string][2]bool{"trim": {true, true}, "ltrim": {true, false}, "rtrim": {false, true}} {
+		if err := c.CreateFunction(name, 2, sqlite3.DETERMINISTIC|sqlite3.INNOCUOUS, pc.trim(ends[0], ends[1])); err != nil {
+			return nil, fmt.Errorf("sqlpolicy: %s: %w", name, err)
+		}
+	}
+	// Privileged installs the authorizer when it returns, on every path.
+	err := pc.Privileged(func(c *sqlite3.Conn) error {
+		// Temporary tables, indices and statement journals stay in the
+		// connection's memory instead of unnamed files in the temporary
+		// directory.
+		if err := c.Exec("PRAGMA temp_store = MEMORY"); err != nil {
+			return fmt.Errorf("temp_store: %w", err)
+		}
+		if l.MaxPageCount == 0 {
+			return nil
+		}
+		// SQLite keeps the current size if the database is already larger.
+		got, err := pragmaInt(c, fmt.Sprintf("PRAGMA main.max_page_count = %d", l.MaxPageCount))
+		if err == nil && got != l.MaxPageCount {
+			err = fmt.Errorf("max_page_count is %d, want %d", got, l.MaxPageCount)
+		}
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sqlpolicy: %w", err)
 	}
 	return pc, nil
 }
 
-// Run compiles and runs each statement in sql in turn, interrupting it when
-// the policy's timeout or ctx ends. For each statement it calls fn, which
-// binds parameters and steps the statement; a nil fn steps it to completion.
-// Run closes each statement after fn returns, and stops at the first error.
+// Run compiles the one statement in sql and runs it, interrupting it when
+// the policy's timeout or ctx ends. fn binds parameters and steps the
+// statement; a nil fn steps it to completion. Run closes the statement after
+// fn returns.
 //
-// A refusal by the policy, including the timeout and the memory limit, is
-// returned as *Error; any other error comes from SQLite or from fn. After a
-// panic in the engine, this Run and every later one return an error that
-// wraps ErrBroken, or *Error with ReasonMemory for the first.
+// Run refuses, before anything is compiled, SQL longer than MaxSQLLength or
+// holding a NUL byte; and, before any step, SQL that holds no statement or
+// anything after the first statement other than white space, comments and
+// the statement's own semicolon. A refusal by the policy, including the
+// timeout and the memory limit, is returned as *Error; any other error comes
+// from SQLite or from fn. After a panic in the engine, this Run and every
+// later one return an error that wraps ErrBroken, or *Error with
+// ReasonMemory for the first. A panic in fn's own code is not recovered.
 func (c *Conn) Run(ctx context.Context, sql string, fn func(*sqlite3.Stmt) error) (err error) {
-	if c.broken {
+	switch {
+	case c.broken:
 		return ErrBroken
+	case len(sql) > c.limits.MaxSQLLength:
+		return &Error{Reason: ReasonSQLLength}
+	case strings.IndexByte(sql, 0) >= 0:
+		return &Error{Reason: ReasonNUL}
 	}
-	ctx, cancel := context.WithTimeoutCause(ctx, c.timeout, errTimeLimit)
+	ctx, cancel := context.WithTimeoutCause(ctx, c.limits.Timeout, errTimeLimit)
 	defer cancel()
 	defer c.conn.SetInterrupt(c.conn.SetInterrupt(ctx))
-	c.refused = ""
+	defer c.recoverEngine(&err)
+	c.refused, c.altered, c.inTxn = "", false, !c.conn.GetAutocommit()
 
-	rest := sql
-	defer func() {
-		// ncruces panics with an "out of memory" error when SQLite reports
-		// SQLITE_NOMEM, which includes a statement over MaxVDBEOps, and with
-		// a runtime error when the translated C code overflows its stack.
-		// Either can leave the engine's state half-updated.
-		r := recover()
-		if r == nil {
-			return
-		}
-		// shortcut: the out-of-memory value's type is internal to ncruces, so it is matched by message; recheck on upgrade.
-		oom := fmt.Sprint(r) == "sqlite3: out of memory"
-		if _, ok := r.(runtime.Error); !ok && !oom {
-			panic(r)
-		}
-		c.broken = true
-		if oom {
-			err = &Error{Reason: ReasonMemory, SQL: prefix(rest)}
-		} else {
-			err = fmt.Errorf("%w: %v", ErrBroken, r)
-		}
-	}()
-	for rest != "" {
-		stmt, tail, err := c.conn.Prepare(rest)
-		if err == nil && stmt != nil {
-			err = run(stmt, fn)
-		}
-		if err != nil {
-			return c.classify(ctx, rest, err)
-		}
-		if stmt == nil {
-			break // only comments or white space remain
-		}
-		rest = tail
+	stmt, tail, err := c.conn.Prepare(sql)
+	switch {
+	case err != nil:
+		return c.classify(ctx, err)
+	case stmt == nil:
+		return &Error{Reason: ReasonStatementCount}
+	case !blank(tail):
+		return errors.Join(&Error{Reason: ReasonStatementCount}, stmt.Close())
+	}
+	if err := run(stmt, fn); err != nil {
+		return c.classify(ctx, err)
 	}
 	return nil
 }
 
+// Privileged runs fn with the authorizer suspended, for the server's own
+// statements: BEGIN, COMMIT, ROLLBACK, savepoints and its own pragmas. It
+// restores the authorizer when fn returns or panics. fn must close every
+// statement it prepares.
+func (c *Conn) Privileged(fn func(*sqlite3.Conn) error) (err error) {
+	if c.broken {
+		return ErrBroken
+	}
+	defer c.recoverEngine(&err)
+	if err := c.conn.SetAuthorizer(nil); err != nil {
+		return err
+	}
+	defer func() {
+		if aerr := c.conn.SetAuthorizer(c.authorize); aerr != nil {
+			c.broken = true
+			err = fmt.Errorf("%w: authorizer: %w", ErrBroken, aerr)
+		}
+	}()
+	return fn(c.conn)
+}
+
+// Reset returns everything a client can change on the connection to the
+// policy's defaults: it rolls back an open transaction, drops every object in
+// the temp schema, turns foreign key enforcement on and clears the last
+// inserted row id. If it fails, the connection is broken.
+func (c *Conn) Reset() error {
+	err := c.Privileged(func(c *sqlite3.Conn) error {
+		if !c.GetAutocommit() {
+			if err := c.Exec("ROLLBACK"); err != nil {
+				return err
+			}
+		}
+		// With foreign keys on, dropping a parent table deletes its rows first,
+		// which a child table's references refuse.
+		drops := []string{"PRAGMA foreign_keys = OFF"}
+		if err := rows(c, `SELECT type, name FROM temp.sqlite_schema WHERE type IN ('table', 'view', 'trigger') AND name <> 'sqlite_sequence'`, func(s *sqlite3.Stmt) {
+			drops = append(drops, fmt.Sprintf(`DROP %s IF EXISTS temp."%s"`, s.ColumnText(0), strings.ReplaceAll(s.ColumnText(1), `"`, `""`)))
+		}); err != nil {
+			return err
+		}
+		drops = append(drops, "PRAGMA foreign_keys = ON")
+		for _, d := range drops {
+			if err := c.Exec(d); err != nil {
+				return err
+			}
+		}
+		c.SetLastInsertRowID(0)
+		n, err := pragmaInt(c, "SELECT count(*) FROM temp.sqlite_schema WHERE name <> 'sqlite_sequence'")
+		if err == nil && n != 0 {
+			err = fmt.Errorf("%d temp objects left", n)
+		}
+		if err != nil {
+			return err
+		}
+		on, err := pragmaInt(c, "PRAGMA foreign_keys")
+		if err == nil && on != 1 {
+			err = fmt.Errorf("foreign_keys is %d", on)
+		}
+		return err
+	})
+	if err != nil && !errors.Is(err, ErrBroken) {
+		c.broken = true
+		err = fmt.Errorf("%w: reset: %w", ErrBroken, err)
+	}
+	return err
+}
+
 // Close closes the connection. After ErrBroken, SQLite may be unable to
-// close it, and its files are then released only when Go finalizes them.
+// close it, and its files are then released only when Go finalizes them,
+// which does not release its locks; see the record.
 func (c *Conn) Close() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -203,6 +317,98 @@ func (c *Conn) Close() (err error) {
 		}
 	}()
 	return c.conn.Close()
+}
+
+// recoverEngine turns a panic that the engine raised into an error and
+// marks the connection broken. ncruces panics with an "out of memory" error
+// when SQLite reports SQLITE_NOMEM, and with a runtime error when the
+// translated C code overflows its stack; either can leave the engine's state
+// half-updated. A panic raised anywhere else is passed on.
+func (c *Conn) recoverEngine(err *error) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	if !fromEngine() {
+		panic(r)
+	}
+	c.broken = true
+	// shortcut: the out-of-memory value's type is internal to ncruces, so it is matched by message; recheck on upgrade.
+	if fmt.Sprint(r) == "sqlite3: out of memory" {
+		*err = &Error{Reason: ReasonMemory}
+	} else {
+		*err = fmt.Errorf("%w: engine panic: %v", ErrBroken, r)
+	}
+}
+
+// fromEngine reports whether the panic being recovered was raised in the
+// ncruces packages, which include the translated SQLite code. It must be
+// called from the deferred function that recovers.
+func fromEngine() bool {
+	pcs := make([]uintptr, 64)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(3, pcs)])
+	panicking := false
+	for {
+		f, more := frames.Next()
+		switch {
+		case f.Function == "runtime.gopanic":
+			panicking = true
+		case panicking && !strings.HasPrefix(f.Function, "runtime."):
+			return strings.HasPrefix(f.Function, "github.com/ncruces/go-sqlite3")
+		}
+		if !more {
+			return false
+		}
+	}
+}
+
+// maxTrimChars bounds the character set of a two-argument trim, so that
+// it takes time linear in the length of its first argument.
+const maxTrimChars = 64
+
+// trim is SQLite's trimFunc (func.c) for two arguments, which compares each
+// end of the input with each character of the set in turn, refusing a set of
+// more than maxTrimChars characters.
+func (c *Conn) trim(left, right bool) sqlite3.ScalarFunction {
+	return func(ctx sqlite3.Context, arg ...sqlite3.Value) {
+		if arg[0].Type() == sqlite3.NULL || arg[1].Type() == sqlite3.NULL {
+			return
+		}
+		in, set := arg[0].RawText(), arg[1].RawText()
+		if i := bytes.IndexByte(set, 0); i >= 0 {
+			set = set[:i] // SQLite reads the set as a C string
+		}
+		var chars [][]byte
+		for len(set) > 0 {
+			n := 1 // SQLITE_SKIP_UTF8
+			if set[0] >= 0xc0 {
+				for n < len(set) && set[n]&0xc0 == 0x80 {
+					n++
+				}
+			}
+			if chars = append(chars, set[:n]); len(chars) > maxTrimChars {
+				c.refused = ReasonFunction
+				ctx.ResultError(&Error{Reason: ReasonFunction})
+				return
+			}
+			set = set[n:]
+		}
+		for left && len(in) > 0 {
+			i := slices.IndexFunc(chars, func(ch []byte) bool { return bytes.HasPrefix(in, ch) })
+			if i < 0 {
+				break
+			}
+			in = in[len(chars[i]):]
+		}
+		for right && len(in) > 0 {
+			i := slices.IndexFunc(chars, func(ch []byte) bool { return bytes.HasSuffix(in, ch) })
+			if i < 0 {
+				break
+			}
+			in = in[:len(in)-len(chars[i])]
+		}
+		ctx.ResultRawText(in)
+	}
 }
 
 func run(stmt *sqlite3.Stmt, fn func(*sqlite3.Stmt) error) (err error) {
@@ -217,20 +423,55 @@ func run(stmt *sqlite3.Stmt, fn func(*sqlite3.Stmt) error) (err error) {
 	return fn(stmt)
 }
 
+// rows calls f for each row of sql.
+func rows(c *sqlite3.Conn, sql string, f func(*sqlite3.Stmt)) error {
+	s, _, err := c.Prepare(sql)
+	if err != nil {
+		return err
+	}
+	for s.Step() {
+		f(s)
+	}
+	return errors.Join(s.Err(), s.Close())
+}
+
+func pragmaInt(c *sqlite3.Conn, sql string) (n int, err error) {
+	err = rows(c, sql, func(s *sqlite3.Stmt) { n = s.ColumnInt(0) })
+	return n, err
+}
+
+// blank reports whether s holds only white space and comments, as SQLite's
+// tokenizer reads them.
+func blank(s string) bool {
+	for s != "" {
+		switch {
+		case strings.IndexByte(" \t\n\f\r", s[0]) >= 0:
+			s = s[1:]
+		case strings.HasPrefix(s, "--"):
+			_, s, _ = strings.Cut(s, "\n")
+		case strings.HasPrefix(s, "/*"):
+			_, s, _ = strings.Cut(s[2:], "*/")
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 var errTimeLimit = errors.New("sqlpolicy: time limit")
 
-func (c *Conn) classify(ctx context.Context, sql string, err error) error {
+func (c *Conn) classify(ctx context.Context, err error) error {
 	switch {
 	case c.refused != "":
-		return &Error{Reason: c.refused, SQL: prefix(sql)}
+		return &Error{Reason: c.refused}
 	case errors.Is(err, sqlite3.INTERRUPT) && errors.Is(context.Cause(ctx), errTimeLimit):
-		return &Error{Reason: ReasonTimeLimit, SQL: prefix(sql)}
+		return &Error{Reason: ReasonTimeLimit}
 	}
 	return err
 }
 
 func (c *Conn) authorize(action sqlite3.AuthorizerActionCode, name3rd, name4th, _, _ string) sqlite3.AuthorizerReturnCode {
-	r := decide(action, name3rd, name4th)
+	r := c.decide(action, name3rd, name4th)
 	if r == "" {
 		return sqlite3.AUTH_OK
 	}
@@ -242,20 +483,32 @@ func (c *Conn) authorize(action sqlite3.AuthorizerActionCode, name3rd, name4th, 
 
 // decide is the authorizer's rule table. SQLite calls it while it compiles a
 // statement, and again for statements it compiles while one runs (a pragma
-// table-valued function, and the ATTACH inside VACUUM).
-func decide(action sqlite3.AuthorizerActionCode, name3rd, name4th string) Reason {
+// table-valued function, the ATTACH inside VACUUM, and the SQL of ALTER
+// TABLE).
+func (c *Conn) decide(action sqlite3.AuthorizerActionCode, name3rd, name4th string) Reason {
 	switch action {
 	case sqlite3.AUTH_SELECT, sqlite3.AUTH_READ, sqlite3.AUTH_RECURSIVE,
 		sqlite3.AUTH_INSERT, sqlite3.AUTH_UPDATE, sqlite3.AUTH_DELETE,
-		sqlite3.AUTH_TRANSACTION, sqlite3.AUTH_SAVEPOINT,
 		sqlite3.AUTH_CREATE_TABLE, sqlite3.AUTH_CREATE_INDEX, sqlite3.AUTH_CREATE_VIEW, sqlite3.AUTH_CREATE_TRIGGER,
 		sqlite3.AUTH_CREATE_TEMP_TABLE, sqlite3.AUTH_CREATE_TEMP_INDEX, sqlite3.AUTH_CREATE_TEMP_VIEW, sqlite3.AUTH_CREATE_TEMP_TRIGGER,
 		sqlite3.AUTH_DROP_TABLE, sqlite3.AUTH_DROP_INDEX, sqlite3.AUTH_DROP_VIEW, sqlite3.AUTH_DROP_TRIGGER,
 		sqlite3.AUTH_DROP_TEMP_TABLE, sqlite3.AUTH_DROP_TEMP_INDEX, sqlite3.AUTH_DROP_TEMP_VIEW, sqlite3.AUTH_DROP_TEMP_TRIGGER,
-		sqlite3.AUTH_ALTER_TABLE, sqlite3.AUTH_REINDEX, sqlite3.AUTH_ANALYZE:
+		sqlite3.AUTH_REINDEX, sqlite3.AUTH_ANALYZE:
 		return ""
+	case sqlite3.AUTH_ALTER_TABLE:
+		c.altered = true
+		return ""
+	case sqlite3.AUTH_TRANSACTION:
+		return ReasonTransaction
+	case sqlite3.AUTH_SAVEPOINT:
+		// Outside a transaction, SAVEPOINT would begin one.
+		if c.inTxn {
+			return ""
+		}
+		return ReasonTransaction
 	case sqlite3.AUTH_PRAGMA:
-		if allowedPragmas[strings.ToLower(name3rd)] {
+		name := strings.ToLower(name3rd)
+		if allowedPragmas[name] || name == "quick_check" && c.altered {
 			return ""
 		}
 		return ReasonPragma
@@ -273,23 +526,28 @@ func decide(action sqlite3.AuthorizerActionCode, name3rd, name4th string) Reason
 }
 
 // allowedPragmas are the read-only schema introspection pragmas that JDBC
-// metadata and GORM's migrator issue, and quick_check, which SQLite runs
-// itself in ALTER TABLE ADD COLUMN on a STRICT table or one with CHECK
-// constraints. Every other pragma is refused.
+// metadata and GORM's migrator issue, and foreign_keys, a session setting
+// clients may read and change. quick_check, which SQLite runs itself in
+// ALTER TABLE ADD COLUMN on a STRICT table or one with CHECK constraints, is
+// allowed only after the authorizer has seen ALTER TABLE in the same Run.
+// Every other pragma is refused.
 var allowedPragmas = set(
-	"table_info", "table_xinfo", "index_list", "index_info", "foreign_key_list", "quick_check",
+	"table_info", "table_xinfo", "index_list", "index_info", "foreign_key_list", "foreign_keys",
 )
 
 // allowedFunctions are the SQL functions registered by ncruces v0.37.0 that
-// compute only on their arguments. Every other function is refused, including
-// sqlite_log, sqlite_compileoption_get, sqlite_compileoption_used,
-// sqlite_source_id and match, and any function registered later.
+// compute only on their arguments, in time close to linear in their size or,
+// for replace and instr, bounded by MaxLength. Every other function is
+// refused, including sqlite_log, sqlite_compileoption_get,
+// sqlite_compileoption_used, sqlite_source_id, match, regexp, regexpi, unhex,
+// json_patch, jsonb_patch and the decimal functions, and any function
+// registered later. Two-argument trim, ltrim and rtrim are the policy's own.
 var allowedFunctions = set(
 	// Core scalar functions.
 	"abs", "changes", "char", "coalesce", "concat", "concat_ws", "format", "glob", "hex", "if", "ifnull", "iif",
 	"instr", "last_insert_rowid", "length", "like", "likelihood", "likely", "lower", "ltrim", "max", "min", "nullif",
 	"octet_length", "printf", "quote", "random", "randomblob", "replace", "round", "rtrim", "sign", "soundex",
-	"sqlite_version", "substr", "substring", "subtype", "total_changes", "trim", "typeof", "unhex", "unicode",
+	"sqlite_version", "substr", "substring", "subtype", "total_changes", "trim", "typeof", "unicode",
 	"unistr", "unistr_quote", "unlikely", "upper", "zeroblob",
 	// Aggregate and window functions.
 	"avg", "count", "group_concat", "string_agg", "sum", "total",
@@ -304,14 +562,13 @@ var allowedFunctions = set(
 	"tanh", "trunc",
 	// JSON.
 	"->", "->>", "json", "json_array", "json_array_insert", "json_array_length", "json_error_position",
-	"json_extract", "json_group_array", "json_group_object", "json_insert", "json_object", "json_patch",
+	"json_extract", "json_group_array", "json_group_object", "json_insert", "json_object",
 	"json_pretty", "json_quote", "json_remove", "json_replace", "json_set", "json_type", "json_valid",
 	"jsonb", "jsonb_array", "jsonb_array_insert", "jsonb_extract", "jsonb_group_array", "jsonb_group_object",
-	"jsonb_insert", "jsonb_object", "jsonb_patch", "jsonb_remove", "jsonb_replace", "jsonb_set",
+	"jsonb_insert", "jsonb_object", "jsonb_remove", "jsonb_replace", "jsonb_set",
 	// Extensions that ncruces registers on every connection.
-	"base64", "decimal", "decimal_add", "decimal_cmp", "decimal_exp", "decimal_mul", "decimal_pow2", "decimal_sub",
-	"decimal_sum", "ieee754", "ieee754_exponent", "ieee754_from_blob", "ieee754_from_int", "ieee754_inc",
-	"ieee754_mantissa", "ieee754_to_blob", "ieee754_to_int", "regexp", "regexpi",
+	"base64", "ieee754", "ieee754_exponent", "ieee754_from_blob", "ieee754_from_int", "ieee754_inc",
+	"ieee754_mantissa", "ieee754_to_blob", "ieee754_to_int",
 )
 
 // alterFunctions are SQLite's internal functions for ALTER TABLE, which it
@@ -336,29 +593,25 @@ type Reason string
 
 // Reasons.
 const (
-	ReasonAttach    Reason = "attach"     // ATTACH, and VACUUM, which attaches its output
-	ReasonDetach    Reason = "detach"     // DETACH
-	ReasonPragma    Reason = "pragma"     // a pragma outside the allowlist, in any form
-	ReasonFunction  Reason = "function"   // an SQL function outside the allowlist
-	ReasonStatement Reason = "statement"  // any other kind of statement, such as CREATE VIRTUAL TABLE
-	ReasonTimeLimit Reason = "time_limit" // the statement ran past the policy's timeout
-	ReasonMemory    Reason = "memory"     // the connection's memory, or MaxVDBEOps; the Conn is then broken
+	ReasonAttach         Reason = "attach"          // ATTACH, and VACUUM, which attaches its output
+	ReasonDetach         Reason = "detach"          // DETACH
+	ReasonTransaction    Reason = "transaction"     // BEGIN, COMMIT, END, ROLLBACK; SAVEPOINT, RELEASE and ROLLBACK TO outside a transaction
+	ReasonPragma         Reason = "pragma"          // a pragma outside the allowlist, in any form
+	ReasonFunction       Reason = "function"        // an SQL function outside the allowlist
+	ReasonStatement      Reason = "statement"       // any other kind of statement, such as CREATE VIRTUAL TABLE
+	ReasonStatementCount Reason = "statement_count" // no statement, or text after the first one
+	ReasonNUL            Reason = "nul"             // a NUL byte in the SQL
+	ReasonSQLLength      Reason = "sql_length"      // SQL longer than MaxSQLLength
+	ReasonTimeLimit      Reason = "time_limit"      // the statement ran past the policy's timeout
+	ReasonMemory         Reason = "memory"          // the connection's memory; the Conn is then broken
 )
 
-// Error is a refusal by the policy.
+// Error is a refusal by the policy. It carries no SQL text, which can hold
+// secrets.
 type Error struct {
 	Reason Reason
-	SQL    string // at most the first 64 bytes of the refused statement's text
 }
 
 func (e *Error) Error() string {
-	return fmt.Sprintf("sqlpolicy: refused (%s): %q", e.Reason, e.SQL)
-}
-
-func prefix(sql string) string {
-	const n = 64
-	if len(sql) > n {
-		sql = sql[:n]
-	}
-	return strings.ToValidUTF8(sql, "")
+	return "sqlpolicy: refused (" + string(e.Reason) + ")"
 }
