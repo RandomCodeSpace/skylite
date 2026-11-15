@@ -16,7 +16,8 @@
 // every backend can use a key as its native object name without encoding.
 // Every backend calls [ValidateKey] on every key it receives, before any other
 // work and before any I/O, and returns its error unchanged inside an
-// [*Error]. A key is valid if and only if:
+// [*Error], so an invalid key fails with [ErrInvalidKey] whatever the other
+// arguments and the context are. A key is valid if and only if:
 //
 //   - it is 1 to [MaxKeyLen] bytes long;
 //   - it consists of 1 to [MaxKeySegments] segments separated by "/", so it
@@ -110,7 +111,14 @@
 // condition: repeating it until it succeeds leaves the key missing when it
 // returns, but the first request may still remove an object created at the key
 // afterwards, so a caller does not create a key again after a Delete of it
-// whose outcome was unknown, unless that removal would not matter.
+// whose outcome was unknown, unless that removal would not matter. Create has
+// the same gap: its condition, that the key is absent, holds again whenever
+// the key is deleted. Finding out what the key holds now, by a definite answer
+// or a read, does not stop an earlier Create attempt that is still in flight:
+// if the key later becomes absent again, that attempt can still succeed. So a
+// caller that deletes a key, or lets it be deleted, first makes sure that no
+// earlier Create of it whose outcome was unknown can still land, unless that
+// would not matter.
 //
 // Publication begins when a write has read its body to its end, or when a
 // Delete sends the request or makes the system call that removes the object.
@@ -187,6 +195,13 @@
 // version it never saw. The token and the write condition must name the same
 // per-write identity.
 //
+// Implementation note for Azure Blob Storage: the service documents that a
+// blob's ETag changes on every write, but not that an ETag never recurs for a
+// blob name across a delete and a re-create. An Azure backend that uses the
+// ETag as the token must justify that it never repeats for a key, or use
+// another mechanism, such as a per-write identity stored with the blob and
+// compared under a blob lease.
+//
 // # Reads
 //
 // [Store.Get] returns the whole object. [Store.GetRange] returns length bytes
@@ -207,7 +222,9 @@
 // a bounded range; so a caller can tell whether the object changed between two
 // reads. A missing key fails with [ErrNotFound]. The caller must close the
 // body. Errors while reading the body, including the end of the context the
-// body was opened with, are returned by the body's Read.
+// body was opened with, are returned by the body's Read; once that context has
+// ended, Read fails with an error err for which errors.Is(err, ctx.Err()) is
+// true.
 //
 // An open body belongs to one version: every byte it returns comes from the
 // version its Info describes, whenever it is read. If that version is
