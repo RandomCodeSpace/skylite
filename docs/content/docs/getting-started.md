@@ -38,4 +38,4 @@ make build
 
 ## What comes next
 
-There is nothing to configure or connect to yet. To follow the work, read the [architecture direction](/docs/architecture/) and the [roadmap](/docs/roadmap/). The first milestone is a durability spike, and the architecture is decided after it.
+There is nothing to configure or connect to yet. To follow the work, read the [architecture direction](/docs/architecture/) and the [roadmap](/docs/roadmap/). The planned storage design is recorded in [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/).
