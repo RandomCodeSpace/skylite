@@ -61,7 +61,11 @@ public final class FaultyDriver implements Driver {
             "params-swapped", "null-param-as-zero-or-empty",
             "limit-ignored", "offset-ignored", "order-by-ignored", "result-stops-early", "duplicate-rows",
             "label-last-column", "constraint-wrong-state", "error-swallowed",
-            "product-name-wrong", "product-version-wrong");
+            "product-name-wrong", "product-version-wrong", "ddl-unsupported", "uuid-altered",
+            "pagination-params-swapped", "multirow-update-count-one", "null-rebind-ignored", "quote-string-corrupted",
+            "int-truncated-to-short", "negative-numeric-absolute", "pre-epoch-shifted", "null-lob-as-empty",
+            "empty-binary-as-null", "constraint-wrong-class", "generated-key-last-on-connection",
+            "string-supplementary-corrupted", "long-string-truncated");
 
     private static final String FAULT = System.getProperty("acceptance.fault", "none");
     private static final AtomicInteger injected = new AtomicInteger();
@@ -150,7 +154,10 @@ public final class FaultyDriver implements Driver {
         } catch (InvocationTargetException e) {
             if (e.getCause() instanceof SQLException sql && (sql.getErrorCode() & 0xff) == 19) {
                 if (is("constraint-wrong-state")) {
-                    throw inject(new SQLException(sql.getMessage(), "42000", sql.getErrorCode(), sql));
+                    throw inject(new SQLIntegrityConstraintViolationException(sql.getMessage(), "42000", sql.getErrorCode(), sql));
+                }
+                if (is("constraint-wrong-class")) {
+                    throw inject(new SQLException(sql.getMessage(), "23000", sql.getErrorCode(), sql));
                 }
                 throw new SQLIntegrityConstraintViolationException(sql.getMessage(), "23000", sql.getErrorCode(), sql);
             }
@@ -182,6 +189,7 @@ public final class FaultyDriver implements Driver {
         private final Connection real;
         private final String url;
         private final Map<String, Object> firstReads = new HashMap<>();
+        private Statement lastInsertHere;
         private boolean requestedAutoCommit = true;
 
         ConnectionHandler(Connection real, String url) {
@@ -322,6 +330,11 @@ public final class FaultyDriver implements Driver {
                 args[0] = rewrite(sql);
                 lastSql = (String) args[0];
             }
+            String sql = preparedSql != null ? preparedSql : args != null && args.length > 0 && args[0] instanceof String text ? text : null;
+            if (is("ddl-unsupported") && name.startsWith("execute") && sql != null
+                    && sql.stripLeading().toLowerCase().matches("(?s)(create|drop|alter)\\s.*")) {
+                throw inject(new SQLFeatureNotSupportedException("DDL is not supported"));
+            }
             if (name.startsWith("set") && args != null && args.length >= 2 && args[0] instanceof Integer && preparedSql != null) {
                 return bind(method, args);
             }
@@ -343,6 +356,10 @@ public final class FaultyDriver implements Driver {
                 if (other != null && other != real) {
                     return results((ResultSet) call(inject(other), method, args), true);
                 }
+            }
+            if (name.equals("getGeneratedKeys") && is("generated-key-last-on-connection")
+                    && owner.lastInsertHere != null && owner.lastInsertHere != real) {
+                return results((ResultSet) call(inject(owner.lastInsertHere), method, args), true);
             }
             int pending = added;
             if (name.equals("executeBatch") || name.equals("clearBatch")) {
@@ -366,6 +383,7 @@ public final class FaultyDriver implements Driver {
             }
             if (name.startsWith("execute") && lastSql != null && lastSql.stripLeading().toLowerCase().startsWith("insert")) {
                 lastInsert.set(real);
+                owner.lastInsertHere = real;
             }
             if ((name.equals("executeUpdate") || name.equals("getUpdateCount")) && result instanceof Integer count && count >= 0) {
                 if (is("update-count-one") && count != 1) {
@@ -373,6 +391,9 @@ public final class FaultyDriver implements Driver {
                 }
                 if (is("update-count-zero") && count != 0) {
                     return inject(0);
+                }
+                if (is("multirow-update-count-one") && count > 1) {
+                    return inject(1);
                 }
             }
             if (name.equals("executeLargeUpdate") && result instanceof Long count && count >= 0) {
@@ -401,6 +422,16 @@ public final class FaultyDriver implements Driver {
             int index = (Integer) args[0];
             if (is("params-swapped") && (index == 1 || index == 2) && placeholders(preparedSql) >= 2) {
                 args[0] = inject(3 - index);
+            }
+            String sql = preparedSql.toLowerCase();
+            if (is("pagination-params-swapped") && (index == 1 || index == 2) && sql.contains(" limit ") && sql.contains(" offset ")) {
+                args[0] = inject(3 - index);
+            }
+            if (is("quote-string-corrupted") && args[1] instanceof String text && text.contains("'")) {
+                args[1] = inject(text.replace("'", ""));
+            }
+            if (is("null-rebind-ignored") && method.getName().equals("setNull") && currentRow.containsKey(index)) {
+                return inject(null);
             }
             if (is("null-param-as-zero-or-empty") && (method.getName().equals("setNull")
                     || (args[1] == null && method.getName().startsWith("setObject")))) {
@@ -518,6 +549,9 @@ public final class FaultyDriver implements Driver {
                 }
                 case "getBlob" -> {
                     byte[] bytes = bytes(args[0] instanceof Integer i ? real.getBytes(i) : real.getBytes((String) args[0]));
+                    if (is("null-lob-as-empty") && bytes == null) {
+                        bytes = inject(new byte[0]);
+                    }
                     wasNull = bytes == null;
                     return bytes == null ? null : new SerialBlob(bytes);
                 }
@@ -562,6 +596,10 @@ public final class FaultyDriver implements Driver {
                     default -> n.longValue() + 1000;
                 };
             }
+            if (is("empty-binary-as-null") && value instanceof byte[] b && b.length == 0) {
+                wasNull = true;
+                return inject(null);
+            }
             if (value == null) {
                 if (is("null-as-empty-string") && name.equals("getString")) {
                     wasNull = false;
@@ -572,7 +610,33 @@ public final class FaultyDriver implements Driver {
             if (real.wasNull()) {
                 return value;
             }
+            if (is("negative-numeric-absolute")) {
+                switch (value) {
+                    case Integer v when v < 0 -> { return inject(Math.abs(v)); }
+                    case Long v when v < 0 -> { return inject(Math.abs(v)); }
+                    case Double v when v < 0 -> { return inject(Math.abs(v)); }
+                    case BigDecimal v when v.signum() < 0 -> { return inject(v.abs()); }
+                    default -> { }
+                }
+            }
+            if (is("pre-epoch-shifted")) {
+                switch (value) {
+                    case Timestamp t when t.getTime() < 0 -> {
+                        Timestamp shifted = new Timestamp(t.getTime() + 86_400_000L);
+                        shifted.setNanos(t.getNanos());
+                        return inject(shifted);
+                    }
+                    case Date d when d.toLocalDate().isBefore(LocalDate.EPOCH) -> { return inject(Date.valueOf(d.toLocalDate().plusDays(1))); }
+                    default -> { }
+                }
+            }
             switch (name) {
+                case "getInt" -> {
+                    int v = (Integer) value;
+                    if (is("int-truncated-to-short") && v != (short) v) {
+                        return inject((int) (short) v);
+                    }
+                }
                 case "getLong" -> {
                     long v = (Long) value;
                     if (is("long-truncated") && v != (int) v) {
@@ -603,6 +667,13 @@ public final class FaultyDriver implements Driver {
                     String v = (String) value;
                     if (is("string-non-ascii-corrupted") && v.chars().anyMatch(c -> c > 127)) {
                         return inject(v.replaceAll("[^\\x00-\\x7f]", "?"));
+                    }
+                    if (is("string-supplementary-corrupted") && v.codePoints().anyMatch(Character::isSupplementaryCodePoint)) {
+                        return inject(v.codePoints().map(c -> Character.isSupplementaryCodePoint(c) ? '\uFFFD' : c)
+                                .collect(StringBuilder::new, StringBuilder::appendCodePoint, StringBuilder::append).toString());
+                    }
+                    if (is("long-string-truncated") && v.length() > 65_535) {
+                        return inject(v.substring(0, 65_535));
                     }
                     if (is("empty-string-as-null") && v.isEmpty()) {
                         wasNull = true;
@@ -654,6 +725,14 @@ public final class FaultyDriver implements Driver {
             if (is("blob-altered") && value.length > 0) {
                 byte[] altered = value.clone();
                 altered[altered.length / 2] ^= 1;
+                return inject(altered);
+            }
+            if (is("empty-binary-as-null") && value.length == 0) {
+                return inject(null);
+            }
+            if (is("uuid-altered") && value.length == 16) {
+                byte[] altered = value.clone();
+                altered[0] ^= 1;
                 return inject(altered);
             }
             if (is("blob-truncated") && value.length > 0) {

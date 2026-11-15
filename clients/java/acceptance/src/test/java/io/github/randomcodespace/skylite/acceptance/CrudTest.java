@@ -12,6 +12,7 @@ class CrudTest extends AcceptanceTestBase {
         Author b = authors.save(new Author("Brian", "brian@example.com"));
         assertThat(a.getId()).isNotNull();
         assertThat(b.getId()).isNotNull().isNotEqualTo(a.getId());
+        assertThat(authors.findById(b.getId()).orElseThrow().getName()).isEqualTo("Brian");
 
         Author read = authors.findById(a.getId()).orElseThrow();
         assertThat(read.getName()).isEqualTo("Ada");
@@ -22,6 +23,6 @@ class CrudTest extends AcceptanceTestBase {
 
         authors.deleteById(a.getId());
         assertThat(authors.findById(a.getId())).isEmpty();
-        assertThat(authors.count()).isEqualTo(1);
+        assertThat(authors.findAll()).extracting(Author::getName).containsExactly("Brian");
     }
 }

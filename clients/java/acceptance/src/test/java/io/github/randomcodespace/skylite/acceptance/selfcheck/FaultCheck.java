@@ -2,13 +2,13 @@ package io.github.randomcodespace.skylite.acceptance.selfcheck;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -29,6 +29,12 @@ class FaultCheck {
     private static final Pattern INJECTED = Pattern.compile("^FAULT \\S+ injected=(\\d+)$", Pattern.MULTILINE);
     private static final Pattern FAILED = Pattern.compile("^FAILED (\\S+?):", Pattern.MULTILINE);
 
+    /**
+     * Faults that break DDL start from a copy of the control run's database, which holds the whole schema, so that
+     * only Hibernate halting on the failed statements can make them fail; on an empty file the missing tables would.
+     */
+    private static final Set<String> FROM_CONTROL_DATABASE = Set.of("ddl-unsupported");
+
     record Run(String fault, int found, int failed, int skipped, int injected, List<String> caughtBy, Path log) {}
 
     @Test
@@ -43,7 +49,8 @@ class FaultCheck {
         ExecutorService pool = Executors.newFixedThreadPool(parallel);
         Map<String, Future<Run>> futures = new LinkedHashMap<>();
         for (String fault : faults) {
-            futures.put(fault, pool.submit(() -> run(fault, dir)));
+            Future<Run> control = futures.get("none");
+            futures.put(fault, pool.submit(() -> run(fault, dir, FROM_CONTROL_DATABASE.contains(fault) ? control : null)));
         }
         pool.shutdown();
         List<Run> runs = new ArrayList<>();
@@ -72,18 +79,22 @@ class FaultCheck {
         }
     }
 
-    private static Run run(String fault, Path dir) throws IOException, InterruptedException {
+    private static Run run(String fault, Path dir, Future<Run> control) throws Exception {
         Path log = dir.resolve(fault + ".log");
         Path db = dir.resolve(fault + ".db");
         for (String suffix : List.of("", "-wal", "-shm")) {
             Files.deleteIfExists(Path.of(db + suffix));
         }
+        if (control != null) {
+            control.get();
+            Files.copy(dir.resolve("none.db"), db);
+        }
         Process p = new ProcessBuilder(
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                 "-cp", System.getProperty("java.class.path"),
-                "-Dspring.datasource.url=" + FaultyDriver.PREFIX + "jdbc:sqlite:" + db + "?journal_mode=WAL&busy_timeout=5000",
-                "-Dspring.datasource.driver-class-name=" + FaultyDriver.class.getName(),
-                "-Dspring.jpa.database-platform=org.hibernate.community.dialect.SQLiteDialect",
+                "-Djdbc.url=" + FaultyDriver.PREFIX + "jdbc:sqlite:" + db + "?journal_mode=WAL&busy_timeout=5000",
+                "-Djdbc.driver=" + FaultyDriver.class.getName(),
+                "-Djdbc.dialect=org.hibernate.community.dialect.SQLiteDialect",
                 "-Dacceptance.fault=" + fault,
                 SuiteMain.class.getName())
                 .redirectErrorStream(true).redirectOutput(log.toFile()).start();

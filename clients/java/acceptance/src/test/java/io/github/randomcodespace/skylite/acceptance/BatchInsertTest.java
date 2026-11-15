@@ -1,6 +1,7 @@
 package io.github.randomcodespace.skylite.acceptance;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 import jakarta.persistence.EntityManagerFactory;
 import java.util.List;
@@ -26,19 +27,17 @@ class BatchInsertTest extends AcceptanceTestBase {
         Statistics stats = sf.getStatistics();
         stats.clear();
 
-        events.saveAll(IntStream.range(0, ROWS).mapToObj(Event::new).toList());
+        List<Event> saved = events.saveAll(IntStream.range(0, ROWS).mapToObj(Event::new).toList());
 
         assertThat(stats.getEntityInsertCount()).isEqualTo(ROWS);
         // Unbatched, Hibernate prepares the insert once per row; batched, it reuses one statement across batches.
         assertThat(stats.getPrepareStatementCount()).isLessThanOrEqualTo(ROWS / BATCH_SIZE);
         assertThat(events.count()).isEqualTo(ROWS);
 
-        // Read back outside the saving transaction, so through a fresh persistence context: every value bound in
-        // the batch arrives, once, unchanged, and in the order the rows were added to the batch.
-        List<Event> stored = events.findAll();
-        List<Integer> expected = IntStream.range(0, ROWS).boxed().toList();
-        assertThat(stored).extracting(Event::getSeq).containsExactlyInAnyOrderElementsOf(expected);
-        assertThat(stored).extracting(Event::getId).doesNotContainNull().doesNotHaveDuplicates();
-        assertThat(events.seqInInsertionOrder()).isEqualTo(expected);
+        // Read back outside the saving transaction, so through a fresh persistence context: every (id, seq) pair
+        // bound in the batch arrives, once, unchanged, and in the order the rows were added to the batch.
+        assertThat(events.findAll()).extracting(Event::getId, Event::getSeq)
+                .containsExactlyInAnyOrderElementsOf(saved.stream().map(e -> tuple(e.getId(), e.getSeq())).toList());
+        assertThat(events.seqInInsertionOrder()).isEqualTo(IntStream.range(0, ROWS).boxed().toList());
     }
 }

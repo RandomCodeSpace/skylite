@@ -26,7 +26,7 @@ class OptimisticLockingTest extends AcceptanceTestBase {
 
         first.setBalance(150);
         Account saved = accounts.save(first);
-        assertThat(saved.getVersion()).isGreaterThan(stale.getVersion());
+        assertThat(saved.getVersion()).isEqualTo(stale.getVersion() + 1);
 
         stale.setBalance(50);
         assertThatThrownBy(() -> accounts.save(stale)).isInstanceOf(ObjectOptimisticLockingFailureException.class);

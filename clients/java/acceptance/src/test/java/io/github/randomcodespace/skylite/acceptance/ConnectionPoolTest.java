@@ -7,6 +7,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.List;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -60,23 +61,26 @@ class ConnectionPoolTest extends AcceptanceTestBase {
         }
     }
 
-    /** Two connections insert one after the other; each statement's generated key is the id of its own row. */
+    /**
+     * Two statements on one connection insert, then a statement on another connection; only then is each
+     * statement's generated key read, first statement first, and each is the id of that statement's own row.
+     */
     @Test
     void generatedKeyBelongsToTheStatementsOwnInsert() throws Exception {
         try (Connection first = dataSource.getConnection();
                 Connection second = dataSource.getConnection();
-                PreparedStatement insertFirst = first.prepareStatement(INSERT, Statement.RETURN_GENERATED_KEYS);
-                PreparedStatement insertSecond = second.prepareStatement(INSERT, Statement.RETURN_GENERATED_KEYS)) {
-            bind(insertFirst, "first@example.com");
-            assertThat(insertFirst.executeUpdate()).isEqualTo(1);
-            bind(insertSecond, "second@example.com");
-            assertThat(insertSecond.executeUpdate()).isEqualTo(1);
-
-            long firstId = generatedKey(insertFirst);
-            long secondId = generatedKey(insertSecond);
-            assertThat(firstId).isNotEqualTo(secondId);
-            assertThat(authors.findById(firstId).orElseThrow().getEmail()).isEqualTo("first@example.com");
-            assertThat(authors.findById(secondId).orElseThrow().getEmail()).isEqualTo("second@example.com");
+                PreparedStatement one = first.prepareStatement(INSERT, Statement.RETURN_GENERATED_KEYS);
+                PreparedStatement two = first.prepareStatement(INSERT, Statement.RETURN_GENERATED_KEYS);
+                PreparedStatement three = second.prepareStatement(INSERT, Statement.RETURN_GENERATED_KEYS)) {
+            List<PreparedStatement> inserts = List.of(one, two, three);
+            for (int i = 0; i < inserts.size(); i++) {
+                bind(inserts.get(i), "insert" + i + "@example.com");
+                assertThat(inserts.get(i).executeUpdate()).isEqualTo(1);
+            }
+            for (int i = 0; i < inserts.size(); i++) {
+                long id = generatedKey(inserts.get(i));
+                assertThat(authors.findById(id).orElseThrow().getEmail()).isEqualTo("insert" + i + "@example.com");
+            }
         }
     }
 

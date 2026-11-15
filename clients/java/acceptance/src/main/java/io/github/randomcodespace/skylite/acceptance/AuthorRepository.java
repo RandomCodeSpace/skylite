@@ -1,5 +1,6 @@
 package io.github.randomcodespace.skylite.acceptance;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -24,6 +25,6 @@ public interface AuthorRepository extends JpaRepository<Author, Long> {
 
     @Transactional
     @Modifying
-    @Query("update Author a set a.name = :name where a.id = :id")
-    int rename(@Param("id") Long id, @Param("name") String name);
+    @Query("update Author a set a.name = :name where a.id in :ids")
+    int rename(@Param("ids") Collection<Long> ids, @Param("name") String name);
 }

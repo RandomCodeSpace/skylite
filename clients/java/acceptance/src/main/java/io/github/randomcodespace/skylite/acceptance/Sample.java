@@ -16,7 +16,9 @@ public class Sample {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    @Column(length = 1024 * 1024)
     private String text;
+
     private Long number;
     private Double ratio;
     private Boolean flag;

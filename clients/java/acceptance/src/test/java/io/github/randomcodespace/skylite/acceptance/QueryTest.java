@@ -1,9 +1,13 @@
 package io.github.randomcodespace.skylite.acceptance;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -48,19 +52,24 @@ class QueryTest extends AcceptanceTestBase {
 
     @Test
     void paginationAndSorting() {
-        Page<Author> page = authors.findAll(PageRequest.of(1, 3, Sort.by("name").descending())); // Frank Eve Dave | Carol Bob Alice | Alan
+        // Limit 2 and offset 4 differ, so a driver that swaps them returns another page.
+        Page<Author> page = authors.findAll(PageRequest.of(2, 2, Sort.by("name").descending())); // Frank Eve | Dave Carol | Bob Alice | Alan
         assertThat(page.getTotalElements()).isEqualTo(7);
-        assertThat(page.getTotalPages()).isEqualTo(3);
-        assertThat(page.getContent()).extracting(Author::getName).containsExactly("Carol", "Bob", "Alice");
+        assertThat(page.getTotalPages()).isEqualTo(4);
+        assertThat(page.getContent()).extracting(Author::getName).containsExactly("Bob", "Alice");
     }
 
     @Test
     void bulkUpdateReportsAffectedRows() {
-        Long id = authors.findByEmail("bob@example.com").orElseThrow().getId();
-        // The JPQL update returns the driver's update count unchanged.
-        assertThat(authors.rename(id, "Robert")).isEqualTo(1);
-        assertThat(authors.rename(-1L, "Nobody")).isZero();
-        assertThat(authors.findById(id).orElseThrow().getName()).isEqualTo("Robert");
+        Map<String, Long> ids = authors.findAll().stream().collect(Collectors.toMap(Author::getName, Author::getId));
+        // The JPQL update returns the driver's update count unchanged: here 3, 1 and 0 rows.
+        assertThat(authors.rename(List.of(ids.get("Carol"), ids.get("Eve"), ids.get("Frank")), "Renamed")).isEqualTo(3);
+        assertThat(authors.rename(List.of(ids.get("Bob")), "Robert")).isEqualTo(1);
+        assertThat(authors.rename(List.of(-1L), "Nobody")).isZero();
+        assertThat(authors.findAll()).extracting(Author::getEmail, Author::getName).containsExactlyInAnyOrder(
+                tuple("carol@example.com", "Renamed"), tuple("eve@example.com", "Renamed"),
+                tuple("frank@example.com", "Renamed"), tuple("bob@example.com", "Robert"),
+                tuple("alice@example.com", "Alice"), tuple("dave@example.com", "Dave"), tuple("alan@example.com", "Alan"));
     }
 
     /**

@@ -55,9 +55,10 @@
         <configuration>
           <argLine>${jdbc.argLine}</argLine>
           <systemPropertyVariables>
-            <spring.datasource.url>${jdbc.url}</spring.datasource.url>
-            <spring.datasource.driver-class-name>${jdbc.driver}</spring.datasource.driver-class-name>
-            <spring.jpa.database-platform>${jdbc.dialect}</spring.jpa.database-platform>
+            <!-- application.properties maps these to spring.*; ConnectionReport checks the application against them. -->
+            <jdbc.url>${jdbc.url}</jdbc.url>
+            <jdbc.driver>${jdbc.driver}</jdbc.driver>
+            <jdbc.dialect>${jdbc.dialect}</jdbc.dialect>
           </systemPropertyVariables>
         </configuration>
       </plugin>

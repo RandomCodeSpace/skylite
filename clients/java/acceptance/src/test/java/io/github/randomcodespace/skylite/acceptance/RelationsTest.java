@@ -1,6 +1,7 @@
 package io.github.randomcodespace.skylite.acceptance;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 import java.util.List;
 import org.hibernate.Hibernate;
@@ -31,7 +32,8 @@ class RelationsTest extends AcceptanceTestBase {
             assertThat(book.getAuthor().getEmail()).isEqualTo("ursula@example.com");
             Author loaded = authors.findById(authorId).orElseThrow();
             assertThat(Hibernate.isInitialized(loaded.getBooks())).isFalse();
-            assertThat(loaded.getBooks()).hasSize(2);
+            assertThat(loaded.getBooks()).extracting(Book::getTitle)
+                    .containsExactlyInAnyOrder("The Dispossessed", "A Wizard of Earthsea");
         });
 
         assertThat(library.bookTitles(authorId)).isEqualTo(List.of("A Wizard of Earthsea", "The Dispossessed"));
@@ -42,16 +44,18 @@ class RelationsTest extends AcceptanceTestBase {
         Author author = new Author("Iris", "iris@example.com");
         author.addBook("Under the Net");
         author.addBook("The Sea, the Sea");
-        Long authorId = authors.save(author).getId();
+        Author saved = authors.save(author);
+        Long authorId = saved.getId();
 
         // Outside a transaction, so a fresh persistence context; each result row holds author and book columns.
         Author loaded = authors.findWithBooksByEmail("iris@example.com").orElseThrow();
         assertThat(loaded.getId()).isEqualTo(authorId);
         assertThat(loaded.getName()).isEqualTo("Iris");
         assertThat(Hibernate.isInitialized(loaded.getBooks())).isTrue();
+        assertThat(loaded.getBooks()).extracting(Book::getId, Book::getTitle).containsExactlyInAnyOrderElementsOf(
+                saved.getBooks().stream().map(b -> tuple(b.getId(), b.getTitle())).toList());
         assertThat(loaded.getBooks()).extracting(Book::getTitle)
                 .containsExactlyInAnyOrder("Under the Net", "The Sea, the Sea");
-        assertThat(loaded.getBooks()).extracting(Book::getId).doesNotContainNull().doesNotHaveDuplicates();
         assertThat(loaded.getBooks()).allSatisfy(b -> assertThat(b.getAuthor()).isSameAs(loaded));
     }
 
