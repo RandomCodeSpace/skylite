@@ -19,8 +19,8 @@ to check that a change fits.
 A ruleset on `main` enforces the following, with no bypass for anyone:
 
 - Required status checks, on the pull request and again on the merge queue's
-  combined commit: `build`, `vet`, `lint`, `test`, `govulncheck`, `actionlint`
-  and `docs`.
+  combined commit: `build`, `vet`, `lint`, `test`, `govulncheck`, `actionlint`,
+  `docs`, `integration` and `java-acceptance`.
 - CodeQL code scanning must report no new alert of severity error, or security
   severity high or above, before a pull request can enter the queue. Merge
   queue groups are not scanned again; GitHub does not apply this rule to them,
