@@ -20,7 +20,8 @@ make java-acceptance
 
 Against another driver, set the three properties on the Maven command line.
 This is the only supported way: the Surefire configuration in `pom.xml` passes
-them to the tests as the system properties `spring.datasource.url`,
+them to the tests as system properties of the same names, and
+`application.properties` maps them to `spring.datasource.url`,
 `spring.datasource.driver-class-name` and `spring.jpa.database-platform`.
 
 ```sh
@@ -29,17 +30,24 @@ mvn -f clients/java/acceptance/pom.xml test \
   -Djdbc.dialect=org.hibernate.community.dialect.SQLiteDialect
 ```
 
-Spring Boot reads connection settings from other sources too, and some of
-them, such as `SPRING_APPLICATION_JSON`, outrank system properties. So each time
-the application starts, `ConnectionReport` compares what the application is
-actually connected to with those three system properties, read from the JVM and
-not from Spring's environment, and fails start-up on any difference. It checks:
+Spring Boot reads connection settings from many other sources, and most of
+them outrank `application.properties`: other system properties (Surefire also
+passes every Maven `-D` property to the tests, so
+`-Dspring.datasource.url=...` arrives as one), environment variables,
+`SPRING_APPLICATION_JSON` and configuration files; Hibernate reads its own
+connection settings as well. So each time the application starts,
+`ConnectionReport` compares what the application uses with the system
+properties `jdbc.url`, `jdbc.driver` and `jdbc.dialect`, read from the JVM and
+not from Spring's environment, and fails start-up on any difference. It checks
+in two steps, both before anything is sent to the database:
 
-- the URL the driver reports for a pooled connection (`DatabaseMetaData.getURL()`);
-- the JDBC URL and driver class HikariCP was configured with, and that HikariCP
-  uses that driver rather than a `DataSource` class;
-- the class of the dialect Hibernate built;
-- that Hibernate takes its connections from that HikariCP pool.
+- when the pool is created, before it opens a connection: that it is HikariCP,
+  configured with the requested JDBC URL and driver class rather than a
+  `DataSource` class;
+- when Hibernate builds its session factory, before it drops or creates any
+  table: that Hibernate takes its connections from that pool, that it built the
+  requested dialect, and that the driver reports the requested URL for a pooled
+  connection (`DatabaseMetaData.getURL()`).
 
 When start-up fails, every test errors; none is skipped. When it succeeds, the
 log names the database the run certified:
@@ -83,34 +91,51 @@ mvn -f clients/java/acceptance/pom.xml test -Dacceptance.include-baseline-failur
 ## Configuration
 
 `src/main/resources/application.properties` holds the settings every run
-shares: `ddl-auto=create`, JDBC batch size 50 with ordered inserts, and a
-HikariCP pool of up to 4 connections.
+shares: `ddl-auto=create`, with `hibernate.hbm2ddl.halt_on_error=true` so that
+a failed `CREATE`, `DROP` or `ALTER` fails start-up instead of being logged and
+skipped, JDBC batch size 50 with ordered inserts, and a HikariCP pool of up to
+4 connections.
 
 ### Configuration that was tried
 
-On 2026-11-15, each of these was used on a baseline run to point the suite at
-another SQLite file (and, where noted, through another driver class) instead of
-`target/baseline.db`. "Rejected" means start-up failed with `the application is
-not connected to the requested database` and all 28 tests errored, none
-skipped. "Outranked" means Spring read the setting, but a higher-priority
-source (the system properties from Surefire) won, so the application stayed on
-the requested database, which the log line named, and the run passed as usual.
+On 2026-11-15, after the guard was moved ahead of schema processing, each of
+these was used on a baseline run of `CrudTest` to point the suite at another
+SQLite file (and, where noted, through another driver class or dialect)
+instead of `target/baseline.db`. That file held a table `author` with one
+sentinel row, which Hibernate's `ddl-auto=create` would have dropped.
+"Rejected" means start-up failed with `the application is not connected to the
+requested database`, naming the check, and the test errored. "Outranked" means
+Spring read the setting, but a higher-priority source (the `jdbc.*` system
+properties from Surefire) won, so the application stayed on the requested
+database, which the log line named, and the test passed. In every row the
+sentinel row was still there afterwards. As a control, the same file given as
+`-Djdbc.url` itself, the requested database, lost its sentinel row.
 
 | Source | Setting | Result |
 |---|---|---|
+| Maven property, which Surefire passes on as a system property | `spring.datasource.url`, `driver-class-name` and `spring.jpa.database-platform` together, a wrapper driver on another file, with `jdbc.*` set to a database that does not exist (the bypass found in review) | Rejected (pool JDBC URL) |
+| Maven property | `spring.datasource.url` | Rejected (pool JDBC URL) |
+| Maven property | `spring.datasource.url` and `driver-class-name`, a wrapper driver on another file | Rejected (pool JDBC URL) |
+| Maven property | `spring.datasource.hikari.jdbc-url` | Rejected (pool JDBC URL) |
+| Maven property | `spring.jpa.database-platform` set to another dialect | Rejected (Hibernate dialect) |
+| Maven property | `spring.datasource.type` set to Spring's `SimpleDriverDataSource` | Rejected (not HikariCP) |
+| Maven property | Hibernate's own `hibernate.connection.provider_class` with `hibernate.connection.url`, or with `jakarta.persistence.jdbc.url` | Start-up failed in Hibernate, which took the provider class but no URL from system properties; no connection was opened |
 | `SPRING_APPLICATION_JSON` | `spring.datasource.url` | Rejected (pool JDBC URL) |
 | `SPRING_APPLICATION_JSON` | `spring.datasource.url` and `driver-class-name`, a wrapper driver on another file | Rejected (pool JDBC URL) |
 | `SPRING_APPLICATION_JSON` | `spring.datasource.hikari.jdbc-url` | Rejected (pool JDBC URL) |
-| `SPRING_APPLICATION_JSON` | `spring.jpa.properties.hibernate.dialect` | Rejected (Hibernate dialect) |
+| `SPRING_APPLICATION_JSON` | `jdbc.url`, which `application.properties` refers to | Rejected (pool JDBC URL) |
+| `SPRING_APPLICATION_JSON` | `spring.jpa.database-platform`, and separately `spring.jpa.properties.hibernate.dialect` | Rejected (Hibernate dialect) |
 | `SPRING_APPLICATION_JSON` | `spring.datasource.type` set to Spring's `SimpleDriverDataSource` | Rejected (not HikariCP) |
-| `SPRING_APPLICATION_JSON` | Hibernate's own `connection.provider_class` and `connection.url` | Rejected (Hibernate not using the pool) |
-| Environment variables | `SPRING_DATASOURCE_URL` and `SPRING_DATASOURCE_HIKARI_JDBC_URL` | Rejected (pool JDBC URL, from the second variable) |
-| `JAVA_TOOL_OPTIONS` | `-Dspring.datasource.url=...` | Outranked: Surefire sets the system property again |
-| Extra JVM argument (`-Djdbc.argLine`) | `-Dspring.datasource.url=...` | Outranked, as above |
-| `spring.config.additional-location` | a file with `spring.datasource.url` | Outranked |
-| `spring.config.additional-location` | a file with `spring.datasource.hikari.jdbc-url` | Rejected (pool JDBC URL) |
-| Profile-specific file on the class path (`application-evil.properties`, profile activated) | `spring.datasource.url` and `driver-class-name` | Outranked |
-| `application.properties` in the working directory | `spring.datasource.hikari.jdbc-url` | Rejected (pool JDBC URL) |
+| `SPRING_APPLICATION_JSON` | Hibernate's own `connection.provider_class` and `connection.url` | Rejected (Hibernate not using the pool); Hibernate had connected to the other file to read its metadata, and the check stopped it before any DDL |
+| Environment variable | `SPRING_DATASOURCE_URL`, and separately `SPRING_DATASOURCE_HIKARI_JDBC_URL` | Rejected (pool JDBC URL) |
+| Environment variable | `JDBC_URL` | Outranked |
+| `JAVA_TOOL_OPTIONS` | `-Dspring.datasource.url=...` | Rejected (pool JDBC URL) |
+| `JAVA_TOOL_OPTIONS` | `-Djdbc.url=...` | Outranked: Surefire sets the system property again |
+| Extra JVM argument (`-Djdbc.argLine`) | `-Dspring.datasource.url=...` | Rejected (pool JDBC URL) |
+| Extra JVM argument (`-Djdbc.argLine`) | `-Djdbc.url=...` | Outranked, as above |
+| `spring.config.additional-location` | a file with `spring.datasource.url`, and separately one with `spring.datasource.hikari.jdbc-url` | Rejected (pool JDBC URL) |
+| Profile-specific file on the class path (`application-evil.properties`, profile activated) | `spring.datasource.url` | Rejected (pool JDBC URL) |
+| `application.properties` in the working directory | `spring.datasource.url` | Rejected (pool JDBC URL) |
 | `config/application.properties` in the working directory | `spring.datasource.hikari.jdbc-url` | Rejected (pool JDBC URL) |
 
 Command-line arguments to the application cannot be passed through Surefire:
@@ -121,9 +146,9 @@ the tests start the application themselves.
 | Test | What it checks | Why an ORM needs it |
 |---|---|---|
 | `SchemaLifecycleTest.createThenValidate` | Start with `ddl-auto=create`, write a row, stop; start again with `ddl-auto=validate` and read the row back | Hibernate generates DDL from the entities, and `validate` compares the entities with the database's JDBC metadata (`getTables`, `getColumns`); applications commonly validate on start |
-| `CrudTest.createReadUpdateDelete` | Insert two rows with `IDENTITY` ids, read, update and delete one | Database-generated ids reach Hibernate through `getGeneratedKeys`, `RETURNING` or an identity select, depending on dialect and driver |
-| `RelationsTest.lazyAssociationsLoadInsideTransaction` | `@OneToMany` and lazy `@ManyToOne` are uninitialised after load and load on first access inside a transaction | Lazy loading issues further queries on the same connection and persistence context |
-| `RelationsTest.joinFetchLoadsParentAndChildren` | A JPQL `join fetch` loads an author and its books in a fresh persistence context; the collection is initialised, and each book has its id and points to the same author instance | One result row holds columns of two tables, with several identifier columns, which Hibernate reads by alias and assembles into a parent and its children |
+| `CrudTest.createReadUpdateDelete` | Insert two rows with `IDENTITY` ids and read each back by its id, update and delete one; the other is the only row left | Database-generated ids reach Hibernate through `getGeneratedKeys`, `RETURNING` or an identity select, depending on dialect and driver |
+| `RelationsTest.lazyAssociationsLoadInsideTransaction` | `@OneToMany` and lazy `@ManyToOne` are uninitialised after load and load on first access inside a transaction, with the right author and titles | Lazy loading issues further queries on the same connection and persistence context |
+| `RelationsTest.joinFetchLoadsParentAndChildren` | A JPQL `join fetch` loads an author and its books in a fresh persistence context; the collection is initialised, each book has the id and title it was saved with, and each points to the same author instance | One result row holds columns of two tables, with several identifier columns, which Hibernate reads by alias and assembles into a parent and its children |
 | `RelationsTest.cascadeAndOrphanRemovalDeleteBooks` | Removing a book from an author's collection deletes it, and deleting the author deletes its remaining books, checked from a new connection | `CascadeType.ALL` with `orphanRemoval` turns collection changes into `delete` statements |
 | `TransactionTest.commitIsVisibleFromSecondConnection` | A `@Transactional` service method saves an author and then each book in separate repository calls; a new connection outside the pool sees all rows | One transaction spans several statements, and a commit must make them all durable together |
 | `TransactionTest.exceptionRollsBackEveryWrite` | The same writes, flushed, then an exception; a new connection outside the pool sees no rows | Spring rolls back on a runtime exception; a driver whose `rollback()` does nothing would leave partial writes behind |
@@ -132,21 +157,22 @@ the tests start the application themselves.
 | `QueryTest.derivedQuery` | `findByEmail`, `findByNameStartingWithOrderByNameAsc` | Spring Data turns method names into JPQL with `LIKE` and `ORDER BY` |
 | `QueryTest.jpqlQuery` | `@Query` with `size()` on a collection | JPQL is translated to SQL with a correlated subquery |
 | `QueryTest.nativeQuery` | `@Query(nativeQuery = true)` with a named parameter | Native SQL goes to the driver as written |
-| `QueryTest.paginationAndSorting` | `findAll(PageRequest.of(1, 3, Sort...))` | Paging issues `LIMIT`/`OFFSET` from the dialect plus a `count` query |
-| `QueryTest.bulkUpdateReportsAffectedRows` | A JPQL bulk update returns 1 for an existing row and 0 for a missing one | `@Modifying` queries return the driver's update count from `executeUpdate`; Hibernate's own entity updates go through `executeBatch` instead |
+| `QueryTest.paginationAndSorting` | `findAll(PageRequest.of(2, 2, Sort...))`: limit 2 and offset 4, which differ, so swapping them returns another page | Paging issues `LIMIT`/`OFFSET` from the dialect plus a `count` query |
+| `QueryTest.bulkUpdateReportsAffectedRows` | A JPQL bulk update returns 3, 1 and 0 for updates of three rows, one row and a missing row, and every row then holds the expected name | `@Modifying` queries return the driver's update count from `executeUpdate`; Hibernate's own entity updates go through `executeBatch` instead |
 | `QueryTest.duplicateColumnLabelReadsTheFirstColumn` | In a join whose two columns share the label `name`, `findColumn("name")` is 1 and `getString("name")` is the first column's value | JDBC returns the first matching column for a label ([`java.sql.ResultSet`](https://docs.oracle.com/en/java/javase/25/docs/api/java.sql/java/sql/ResultSet.html)); code that reads by label relies on it |
-| `OptimisticLockingTest.versionIncrementsAndStaleUpdateFails` | `@Version` increments, and saving a stale detached copy raises `ObjectOptimisticLockingFailureException` | Saving a detached copy goes through Hibernate's merge, which loads the current row and rejects the version before any `UPDATE` is sent; this test does not reach the driver's update count |
+| `OptimisticLockingTest.versionIncrementsAndStaleUpdateFails` | `@Version` increments by one, and saving a stale detached copy raises `ObjectOptimisticLockingFailureException` | Saving a detached copy goes through Hibernate's merge, which loads the current row and rejects the version before any `UPDATE` is sent; this test does not reach the driver's update count |
 | `OptimisticLockingTest.updateMatchingNoRowFailsOnFlush` | Inside a transaction, a managed account is loaded, its stored version is advanced by plain JDBC on the same connection, and the entity is changed and flushed; the flush raises `ObjectOptimisticLockingFailureException` and the row keeps its balance | The flush sends `update ... where id = ? and version = ?`, which matches no row; only the update count of 0 from the driver tells Hibernate the update failed. A driver that reports 1 for every update fails this test |
-| `BatchInsertTest.insertsAreBatched` | 500 inserts with JDBC batching on; Hibernate prepares the insert at most once per batch of 50; read back through a fresh persistence context, the sequence values are exactly 0 to 499, once each, with distinct ids, and in `rowid` order they are in the order they were added to the batch | Batching uses `addBatch`/`executeBatch` on a prepared statement; ids are application-generated UUIDs because Hibernate does not batch `IDENTITY` inserts |
-| `ColumnTypesTest.valuesRoundTrip` | String (non-ASCII), long, double, boolean, `BigDecimal`, `Instant`, `LocalDate` and a 300 KiB `byte[]` in a `blob` column round-trip; a second row with `false`, an empty string and a different 3-byte payload round-trips too | Each Java type goes through a dialect type mapping and a specific `ResultSet` getter |
+| `BatchInsertTest.insertsAreBatched` | 500 inserts with JDBC batching on; Hibernate prepares the insert at most once per batch of 50; read back through a fresh persistence context, the (id, sequence value) pairs are exactly the 500 that were saved, and in `rowid` order the sequence values are in the order they were added to the batch | Batching uses `addBatch`/`executeBatch` on a prepared statement; ids are application-generated UUIDs because Hibernate does not batch `IDENTITY` inserts |
+| `ColumnTypesTest.valuesRoundTrip` | String, long, double, boolean, `BigDecimal`, `Instant`, `LocalDate` and `byte[]` in a `blob` column round-trip in three rows: the top of each range (`Long.MAX_VALUE`, a string with an apostrophe, accented letters, `✓` and `😀`, now, a 300 KiB payload); the bottom (`Long.MIN_VALUE`, `-Double.MAX_VALUE`, a negative decimal, a string of 90,000 characters, a date and a time in 1969, 3 bytes); and small values (-42, `-Math.E`, -0.01, `false`, the epoch, an empty string, an empty payload). An `int` column, in `Event`, round-trips `Integer.MIN_VALUE`, -7 and `Integer.MAX_VALUE` | Each Java type goes through a dialect type mapping and a specific `ResultSet` getter; drivers that convert values get signs, ranges, long strings, characters outside 16 bits and dates before 1970 wrong |
 | `ColumnTypesTest.nullsRoundTrip` | The same columns, all null | Binding null needs the right SQL type from the dialect |
-| `LobTest.lobRoundTrips` | A 300 KiB `@Lob byte[]` round-trips | With the community dialect, Hibernate reads this mapping through `ResultSet.getBlob`; see "Known baseline failures" |
-| `ConstraintTest.duplicateUniqueValueIsDataIntegrityViolation` | A duplicate unique value raises Spring's `DataIntegrityViolationException` | Applications catch this exception; Hibernate has to recognise the driver's error as a constraint violation |
-| `ConstraintTest.referenceToMissingRowIsDataIntegrityViolation` | Saving a book whose author id does not exist raises `DataIntegrityViolationException`, and no book is stored | The schema Hibernate generates must declare the foreign key, and the database must enforce it |
-| `ConstraintTest.nullInRequiredColumnIsDataIntegrityViolation` | A JPQL update that sets a `nullable = false` column to null raises `DataIntegrityViolationException`, and the row is unchanged | Hibernate checks nulls itself before an insert, but not in a JPQL update, so here the database's `not null` constraint and the error conversion are tested |
+| `ColumnTypesTest.parameterReboundToNullBindsNull` | One prepared statement inserts a string and a long, then, with both parameters set to null, inserts again; the second row is null in both | Applications and Hibernate reuse prepared statements; a driver that skips `setNull` on a parameter already set sends the old value |
+| `LobTest.lobRoundTrips` | A 300 KiB, an empty and a null `@Lob byte[]` round-trip | With the community dialect, Hibernate reads this mapping through `ResultSet.getBlob`; see "Known baseline failures" |
+| `ConstraintTest.duplicateUniqueValueIsDataIntegrityViolation` | A duplicate unique value raises Spring's `DataIntegrityViolationException`, and behind it the driver's exception is a `SQLIntegrityConstraintViolationException` with an SQL state of class 23 | Applications catch this exception; Hibernate has to recognise the driver's error as a constraint violation. Hibernate accepts either the class or the state, so the test checks both itself: the JDBC API specifies that class for SQL state class 23 ([`SQLIntegrityConstraintViolationException`](https://docs.oracle.com/en/java/javase/25/docs/api/java.sql/java/sql/SQLIntegrityConstraintViolationException.html)) |
+| `ConstraintTest.referenceToMissingRowIsDataIntegrityViolation` | Saving a book whose author id does not exist raises the same exceptions, and no book is stored | The schema Hibernate generates must declare the foreign key, and the database must enforce it |
+| `ConstraintTest.nullInRequiredColumnIsDataIntegrityViolation` | A JPQL update that sets a `nullable = false` column to null raises the same exceptions, and the row is unchanged | Hibernate checks nulls itself before an insert, but not in a JPQL update, so here the database's `not null` constraint and the error conversion are tested |
 | `ConnectionPoolTest.uncommittedWriteIsInvisibleToAnotherPooledConnection` | Two HikariCP connections held at once; an uncommitted insert on one is not visible on the other, and rollback removes it | A pool shares one database between threads, which relies on transaction isolation |
 | `ConnectionPoolTest.commitIsVisibleToAnOpenPooledConnection` | Two pooled connections held open: the reader, in autocommit, reads 0; the writer inserts and calls `commit()`; the reader then reads 1, before either connection is closed or has its autocommit reset | Closing a connection or resetting its autocommit also commits, so tests that check from a new connection cannot tell a working `commit()` from one that does nothing; a reader that keeps returning its first result is caught too |
-| `ConnectionPoolTest.generatedKeyBelongsToTheStatementsOwnInsert` | Two pooled connections each insert, one after the other; each statement's `getGeneratedKeys` returns the id of its own row | Identity ids reach Hibernate through the connection that inserted; a driver that asks the server for "the last inserted id" outside that connection returns another thread's id |
+| `ConnectionPoolTest.generatedKeyBelongsToTheStatementsOwnInsert` | Two statements on one pooled connection insert, then a statement on a second connection; only then are the keys read, the first statement's first, and each statement's `getGeneratedKeys` returns the id of its own row | Identity ids reach Hibernate through the statement that inserted; a driver that asks for "the last inserted id" of the connection, or of the server, returns another statement's id |
 | `MetadataTest.productNameAndVersionMatchTheEngine` | `DatabaseMetaData` reports the product name `SQLite`, and a product version and major and minor version that match `select sqlite_version()` | Anything that chooses behaviour by product or version is misled by a driver that misreports them; the test pins both to the engine the connection actually reaches |
 
 ## Faults the suite is known to catch
@@ -162,59 +188,76 @@ wraps sqlite-jdbc. It first repairs the five known baseline failures on the
 JDBC side (it turns foreign keys on and declares the `book` foreign key,
 reports `id` columns as `BIGINT`, implements `getBlob`, and raises constraint
 errors as `SQLIntegrityConstraintViolationException` with SQL state 23000), so
-that with no fault all 28 tests run and pass. Then it injects the one fault
+that with no fault all 29 tests run and pass. Then it injects the one fault
 named by `-Dacceptance.fault`. `FaultCheck` runs the whole suite in a separate
 JVM once with no fault, which must pass every test with none skipped, and once
 per fault, which must fail at least one test and must have applied the fault
-at least once. The `java-acceptance` CI job runs it after the baseline; it
-took 242 seconds on an 8-core machine. `-Dacceptance.faults=a,b` runs a
-subset.
+at least once. A fault that breaks DDL starts from a copy of the control
+run's database, which already holds the schema, so that only
+`halt_on_error` can make it fail: with `halt_on_error=false`,
+`ddl-unsupported` was applied 36 times and failed no test. The
+`java-acceptance` CI job runs the check after the baseline; it took 266
+seconds on an 8-core machine. `-Dacceptance.faults=a,b` runs a subset.
 
-The table below is from the run on 2026-11-15 at commit 9756b83. "Applied" is
+The table below is from the run on 2026-11-15 at commit 9f5e203. "Applied" is
 how many times the fault changed a call or its result; each run has its own
 database file.
 
 | Fault | What the wrapper does | Applied | Tests failed | Caught by |
 |---|---|---|---|---|
-| none (control) | Repairs only | 0 | 0 of 28 | |
-| `commit-noop` | `commit()` returns without committing | 263 | 1 | `ConnectionPoolTest.commitIsVisibleToAnOpenPooledConnection` |
-| `rollback-noop` | `rollback()` returns without rolling back | 7 | 2 | `ConnectionPoolTest.uncommittedWriteIsInvisibleToAnotherPooledConnection`, `TransactionTest.exceptionRollsBackEveryWrite` |
-| `autocommit-ignored` | `setAutoCommit(false)` is ignored, `getAutoCommit()` reports what was asked, `commit()` and `rollback()` do nothing | 539 | 2 | `ConnectionPoolTest.uncommittedWriteIsInvisibleToAnotherPooledConnection`, `TransactionTest.exceptionRollsBackEveryWrite` |
-| `stale-read` | On a connection in autocommit, a repeated query with the same parameters returns the values it returned the first time | 1 | 1 | `ConnectionPoolTest.commitIsVisibleToAnOpenPooledConnection` |
-| `dirty-read` | Connections share SQLite's cache with `read_uncommitted`, so one reads another's uncommitted rows | 19 | 1 | `ConnectionPoolTest.uncommittedWriteIsInvisibleToAnotherPooledConnection` |
-| `update-count-one` | `executeUpdate` and `getUpdateCount` return 1 | 158 | 1 | `QueryTest.bulkUpdateReportsAffectedRows` |
-| `update-count-zero` | `executeUpdate` and `getUpdateCount` return 0 | 143 | 4 | `QueryTest.bulkUpdateReportsAffectedRows` and three `ConnectionPoolTest` tests |
-| `batch-count-one` | Every count from `executeBatch` is 1 | 1 | 1 | `OptimisticLockingTest.updateMatchingNoRowFailsOnFlush` |
-| `batch-drop-row` | The first row of each batch is not executed; the counts still cover every row | 10 | 1 | `BatchInsertTest.insertsAreBatched` |
-| `batch-wrong-values` | In a batch, every `setInt` value is bound as 0 | 499 | 1 | `BatchInsertTest.insertsAreBatched` |
-| `batch-reordered` | The rows of each batch are executed in reverse order | 10 | 1 | `BatchInsertTest.insertsAreBatched` |
-| `generated-key-wrong` | Generated keys, and results of inserts and `last_insert_rowid()`, are 1000 too high | 30 | 19 | 19 tests, including `CrudTest.createReadUpdateDelete` and `ConnectionPoolTest.generatedKeyBelongsToTheStatementsOwnInsert` |
-| `generated-key-other-connection` | `getGeneratedKeys` returns the keys of the most recent insert on any connection | 1 | 1 | `ConnectionPoolTest.generatedKeyBelongsToTheStatementsOwnInsert` |
-| `long-truncated` | `getLong` truncates to an `int` | 1 | 1 | `ColumnTypesTest.valuesRoundTrip` |
-| `double-rounded` | `getDouble` rounds to `float` precision | 1 | 1 | `ColumnTypesTest.valuesRoundTrip` |
-| `boolean-inverted` | `getBoolean` returns the opposite | 1 | 1 | `ColumnTypesTest.valuesRoundTrip` |
-| `decimal-scale-lost` | `getBigDecimal` rounds to scale 0 | 1 | 1 | `ColumnTypesTest.valuesRoundTrip` |
-| `decimal-precision-lost` | `getBigDecimal` rounds to 6 significant digits | 1 | 1 | `ColumnTypesTest.valuesRoundTrip` |
-| `instant-shifted` | `getTimestamp` and `getObject` for date-times add two hours | 1 | 1 | `ColumnTypesTest.valuesRoundTrip` |
-| `date-off-by-one` | `getDate` and `getObject` for dates return the day before | 1 | 1 | `ColumnTypesTest.valuesRoundTrip` |
-| `string-non-ascii-corrupted` | `getString` replaces non-ASCII characters with `?` | 1 | 1 | `ColumnTypesTest.valuesRoundTrip` |
-| `empty-string-as-null` | `getString` returns null for an empty string, and `wasNull()` agrees | 1 | 1 | `ColumnTypesTest.valuesRoundTrip` |
-| `null-as-empty-string` | `getString` returns an empty string for null, and `wasNull()` agrees | 1 | 1 | `ColumnTypesTest.nullsRoundTrip` |
-| `blob-altered` | `getBytes` and `getBlob` flip one bit | 502 | 2 | `ColumnTypesTest.valuesRoundTrip`, `LobTest.lobRoundTrips` |
-| `blob-truncated` | `getBytes` and `getBlob` drop the last byte | 502 | 2 | `ColumnTypesTest.valuesRoundTrip`, `LobTest.lobRoundTrips` |
-| `blob-wrong-row` | `getBytes` and `getBlob` return the bytes read before, from another row | 501 | 1 | `ColumnTypesTest.valuesRoundTrip` |
-| `params-swapped` | Parameters 1 and 2 of a prepared statement are bound to each other's position | 1094 | 22 | 22 tests, including `CrudTest.createReadUpdateDelete` and `BatchInsertTest.insertsAreBatched` |
-| `null-param-as-zero-or-empty` | `setNull` and a null `setObject` bind `''` for character types, empty bytes for binary types and 0 otherwise | 14 | 2 | `ColumnTypesTest.nullsRoundTrip`, `ConstraintTest.nullInRequiredColumnIsDataIntegrityViolation` |
-| `limit-ignored` | `limit ?` becomes no limit | 1 | 1 | `QueryTest.paginationAndSorting` |
-| `offset-ignored` | `offset ?` becomes offset 0 | 1 | 1 | `QueryTest.paginationAndSorting` |
-| `order-by-ignored` | `order by` is removed from queries, so rows come in storage order | 5 | 3 | `QueryTest.derivedQuery`, `QueryTest.jpqlQuery`, `QueryTest.paginationAndSorting` |
-| `result-stops-early` | `next()` returns false after 100 rows | 1 | 1 | `BatchInsertTest.insertsAreBatched` |
-| `duplicate-rows` | Each result set returns its first row twice | 127 | 22 | 22 tests, including `BatchInsertTest.insertsAreBatched` and `ColumnTypesTest.valuesRoundTrip` |
-| `label-last-column` | `findColumn` and getters by label use the last column with that label, not the first | 1 | 1 | `QueryTest.duplicateColumnLabelReadsTheFirstColumn` |
-| `constraint-wrong-state` | A constraint error is a plain `SQLException` with SQL state 42000 (syntax error) | 4 | 3 | the three `ConstraintTest` tests |
-| `error-swallowed` | A failing `execute`, `executeUpdate` or `executeBatch` reports success (count 1) | 4 | 4 | the three `ConstraintTest` tests, `TransactionTest.failedStatementLeavesTransactionUsable` |
-| `product-name-wrong` | `getDatabaseProductName()` returns `PostgreSQL` | 13 | 1 | `MetadataTest.productNameAndVersionMatchTheEngine` |
-| `product-version-wrong` | `getDatabaseProductVersion()` returns `3.8.0` and `getDatabaseMinorVersion()` 8 | 25 | 1 | `MetadataTest.productNameAndVersionMatchTheEngine` |
+| `commit-noop` | `commit()` returns without committing | 282 | 1 of 29 | `ConnectionPoolTest.commitIsVisibleToAnOpenPooledConnection` |
+| `rollback-noop` | `rollback()` returns without rolling back | 7 | 2 of 29 | `ConnectionPoolTest.uncommittedWriteIsInvisibleToAnotherPooledConnection`, `TransactionTest.exceptionRollsBackEveryWrite` |
+| `autocommit-ignored` | `setAutoCommit(false)` is ignored, `getAutoCommit()` reports what was asked, `commit()` and `rollback()` do nothing | 577 | 2 of 29 | `ConnectionPoolTest.uncommittedWriteIsInvisibleToAnotherPooledConnection`, `TransactionTest.exceptionRollsBackEveryWrite` |
+| `stale-read` | On a connection in autocommit, a repeated query with the same parameters returns the values it returned the first time | 1 | 1 of 29 | `ConnectionPoolTest.commitIsVisibleToAnOpenPooledConnection` |
+| `dirty-read` | Connections share SQLite's cache with `read_uncommitted`, so one reads another's uncommitted rows | 19 | 1 of 29 | `ConnectionPoolTest.uncommittedWriteIsInvisibleToAnotherPooledConnection` |
+| `update-count-one` | `executeUpdate` and `getUpdateCount` return 1 | 165 | 1 of 29 | `QueryTest.bulkUpdateReportsAffectedRows` |
+| `update-count-zero` | `executeUpdate` and `getUpdateCount` return 0 | 150 | 4 of 29 | `ConnectionPoolTest.commitIsVisibleToAnOpenPooledConnection`, `ConnectionPoolTest.generatedKeyBelongsToTheStatementsOwnInsert`, `ConnectionPoolTest.uncommittedWriteIsInvisibleToAnotherPooledConnection`, `QueryTest.bulkUpdateReportsAffectedRows` |
+| `batch-count-one` | Every count from `executeBatch` is 1 | 1 | 1 of 29 | `OptimisticLockingTest.updateMatchingNoRowFailsOnFlush` |
+| `batch-drop-row` | The first row of each batch is not executed; the counts still cover every row | 11 | 2 of 29 | `BatchInsertTest.insertsAreBatched`, `ColumnTypesTest.valuesRoundTrip` |
+| `batch-wrong-values` | In a batch, every `setInt` value is bound as 0 | 502 | 2 of 29 | `BatchInsertTest.insertsAreBatched`, `ColumnTypesTest.valuesRoundTrip` |
+| `batch-reordered` | The rows of each batch are executed in reverse order | 11 | 1 of 29 | `BatchInsertTest.insertsAreBatched` |
+| `generated-key-wrong` | Generated keys, and results of inserts and `last_insert_rowid()`, are 1000 too high | 30 | 19 of 29 | 19 tests, including `CrudTest.createReadUpdateDelete` and `ConnectionPoolTest.generatedKeyBelongsToTheStatementsOwnInsert` |
+| `generated-key-other-connection` | `getGeneratedKeys` returns the keys of the most recent insert on any connection | 1 | 1 of 29 | `ConnectionPoolTest.generatedKeyBelongsToTheStatementsOwnInsert` |
+| `long-truncated` | `getLong` truncates to an `int` | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `double-rounded` | `getDouble` rounds to `float` precision | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `boolean-inverted` | `getBoolean` returns the opposite | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `decimal-scale-lost` | `getBigDecimal` rounds to scale 0 | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `decimal-precision-lost` | `getBigDecimal` rounds to 6 significant digits | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `instant-shifted` | `getTimestamp` and `getObject` for date-times add two hours | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `date-off-by-one` | `getDate` and `getObject` for dates return the day before | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `string-non-ascii-corrupted` | `getString` replaces non-ASCII characters with `?` | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `empty-string-as-null` | `getString` returns null for an empty string, and `wasNull()` agrees | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `null-as-empty-string` | `getString` returns an empty string for null, and `wasNull()` agrees | 2 | 2 of 29 | `ColumnTypesTest.nullsRoundTrip`, `ColumnTypesTest.parameterReboundToNullBindsNull` |
+| `blob-altered` | `getBytes` and `getBlob` flip one bit | 502 | 3 of 29 | `BatchInsertTest.insertsAreBatched`, `ColumnTypesTest.valuesRoundTrip`, `LobTest.lobRoundTrips` |
+| `blob-truncated` | `getBytes` and `getBlob` drop the last byte | 502 | 3 of 29 | `BatchInsertTest.insertsAreBatched`, `ColumnTypesTest.valuesRoundTrip`, `LobTest.lobRoundTrips` |
+| `blob-wrong-row` | `getBytes` and `getBlob` return the bytes read before, from another row | 502 | 3 of 29 | `BatchInsertTest.insertsAreBatched`, `ColumnTypesTest.valuesRoundTrip`, `LobTest.lobRoundTrips` |
+| `params-swapped` | Parameters 1 and 2 of a prepared statement are bound to each other's position | 1096 | 23 of 29 | 23 tests, including `CrudTest.createReadUpdateDelete` and `BatchInsertTest.insertsAreBatched` |
+| `null-param-as-zero-or-empty` | `setNull` and a null `setObject` bind `''` for character types, empty bytes for binary types and 0 otherwise | 12 | 4 of 29 | `ColumnTypesTest.nullsRoundTrip`, `ColumnTypesTest.parameterReboundToNullBindsNull`, `ConstraintTest.nullInRequiredColumnIsDataIntegrityViolation`, `LobTest.lobRoundTrips` |
+| `limit-ignored` | `limit ?` becomes no limit | 1 | 1 of 29 | `QueryTest.paginationAndSorting` |
+| `offset-ignored` | `offset ?` becomes offset 0 | 1 | 1 of 29 | `QueryTest.paginationAndSorting` |
+| `order-by-ignored` | `order by` is removed from queries, so rows come in storage order | 6 | 3 of 29 | `QueryTest.derivedQuery`, `QueryTest.jpqlQuery`, `QueryTest.paginationAndSorting` |
+| `result-stops-early` | `next()` returns false after 100 rows | 1 | 1 of 29 | `BatchInsertTest.insertsAreBatched` |
+| `duplicate-rows` | Each result set returns its first row twice | 129 | 23 of 29 | 23 tests, including `BatchInsertTest.insertsAreBatched` and `ColumnTypesTest.valuesRoundTrip` |
+| `label-last-column` | `findColumn` and getters by label use the last column with that label, not the first | 1 | 1 of 29 | `QueryTest.duplicateColumnLabelReadsTheFirstColumn` |
+| `constraint-wrong-state` | A constraint error is a `SQLIntegrityConstraintViolationException` with SQL state 42000 (syntax error): the class is right, the state is not | 4 | 3 of 29 | `ConstraintTest.duplicateUniqueValueIsDataIntegrityViolation`, `ConstraintTest.nullInRequiredColumnIsDataIntegrityViolation`, `ConstraintTest.referenceToMissingRowIsDataIntegrityViolation` |
+| `error-swallowed` | A failing `execute`, `executeUpdate` or `executeBatch` reports success (count 1) | 4 | 4 of 29 | `ConstraintTest.duplicateUniqueValueIsDataIntegrityViolation`, `ConstraintTest.nullInRequiredColumnIsDataIntegrityViolation`, `ConstraintTest.referenceToMissingRowIsDataIntegrityViolation`, `TransactionTest.failedStatementLeavesTransactionUsable` |
+| `product-name-wrong` | `getDatabaseProductName()` returns `PostgreSQL` | 13 | 1 of 29 | `MetadataTest.productNameAndVersionMatchTheEngine` |
+| `product-version-wrong` | `getDatabaseProductVersion()` returns `3.8.0` and `getDatabaseMinorVersion()` 8 | 25 | 1 of 29 | `MetadataTest.productNameAndVersionMatchTheEngine` |
+| `ddl-unsupported` | Every `CREATE`, `DROP` and `ALTER` throws `SQLFeatureNotSupportedException`; the run starts from a copy of the control run's database, so the schema already exists | 2 | 29 of 29 | every test: start-up fails |
+| `uuid-altered` | `getBytes` flips one bit of every 16-byte value, such as a UUID id | 503 | 2 of 29 | `BatchInsertTest.insertsAreBatched`, `ColumnTypesTest.valuesRoundTrip` |
+| `pagination-params-swapped` | In a query with `limit ?` and `offset ?`, the two parameters are bound to each other's position | 2 | 1 of 29 | `QueryTest.paginationAndSorting` |
+| `multirow-update-count-one` | `executeUpdate` and `getUpdateCount` return 1 when more than one row changed | 23 | 1 of 29 | `QueryTest.bulkUpdateReportsAffectedRows` |
+| `null-rebind-ignored` | `setNull` on a parameter already set in that statement is ignored, so the old value is sent again | 2 | 1 of 29 | `ColumnTypesTest.parameterReboundToNullBindsNull` |
+| `quote-string-corrupted` | Apostrophes are removed from string parameters | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `int-truncated-to-short` | `getInt` truncates to a `short` | 2 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `negative-numeric-absolute` | Negative `int`, `long`, `double` and `BigDecimal` values are read as their absolute value | 3 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `pre-epoch-shifted` | Timestamps and dates before 1970 are read one day later | 2 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `null-lob-as-empty` | `getBlob` returns an empty blob for null | 1 | 1 of 29 | `LobTest.lobRoundTrips` |
+| `empty-binary-as-null` | `getBytes` and `getBlob` return null for an empty value, and `wasNull()` agrees | 2 | 2 of 29 | `ColumnTypesTest.valuesRoundTrip`, `LobTest.lobRoundTrips` |
+| `constraint-wrong-class` | A constraint error is a plain `SQLException` with SQL state 23000: the state is right, the class is not | 4 | 3 of 29 | `ConstraintTest.duplicateUniqueValueIsDataIntegrityViolation`, `ConstraintTest.nullInRequiredColumnIsDataIntegrityViolation`, `ConstraintTest.referenceToMissingRowIsDataIntegrityViolation` |
+| `generated-key-last-on-connection` | `getGeneratedKeys` returns the keys of the most recent insert on the same connection, by any statement | 1 | 1 of 29 | `ConnectionPoolTest.generatedKeyBelongsToTheStatementsOwnInsert` |
+| `string-supplementary-corrupted` | `getString` replaces characters outside the 16-bit range, such as `😀`, with U+FFFD | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
+| `long-string-truncated` | `getString` truncates strings to 65,535 characters | 1 | 1 of 29 | `ColumnTypesTest.valuesRoundTrip` |
 
 Notes on how the faults were expressed:
 
@@ -229,6 +272,16 @@ Notes on how the faults were expressed:
   insertion order.
 - `stale-read` replays results only on connections in autocommit; in this
   run only the JDBC-level reader in `ConnectionPoolTest` met it.
+- `uuid-altered`, `blob-altered`, `blob-truncated` and `blob-wrong-row` are
+  also caught by `BatchInsertTest`, because `Event` ids are UUIDs stored as
+  16-byte blobs and the test compares each id read back with the one saved.
+- `constraint-wrong-state` and `constraint-wrong-class` each still reach the
+  application as Spring's `DataIntegrityViolationException`: Hibernate
+  recognises a constraint violation by the exception class or by the SQL
+  state. Only the test's own check of the driver's exception catches them.
+- `negative-numeric-absolute` changes nothing for `Long.MIN_VALUE` and
+  `Integer.MIN_VALUE`, whose absolute values overflow to themselves; the
+  smaller negative values catch it.
 - Each fault is injected alone. Combinations were not tried.
 
 ## Known baseline failures
@@ -321,6 +374,13 @@ except where a test result is quoted.
   precision was not tested.
 - The baseline database is a file in WAL mode with a busy timeout, set in the
   JDBC URL, so that a reader does not block on the other connection's write.
+- With the community dialect, an entity with an `IDENTITY` id and an
+  `Integer` field gets a `create table` statement whose `id` column has no
+  type (`... created_at timestamp, id, number bigint, ...`), seen on
+  2026-11-15 with Hibernate ORM 7.4.13 when an `Integer` field was added to
+  `Sample`. SQLite then does not make `id` an alias of `rowid`, so ids stay
+  null and every lookup by id fails. The cause was not traced. The `int`
+  column is therefore tested in `Event`, which has a UUID id.
 - `Statement.setQueryTimeout(1)` did not stop a CPU-bound query (an unbounded
   recursive CTE) within 30 seconds on sqlite-jdbc 3.53.4.0, so statement
   timeouts cannot be tested deterministically on the baseline.
@@ -338,6 +398,10 @@ The suite does not test these, so a driver can get them wrong and still pass:
   pooled connection, beyond what consecutive tests do anyway;
 - `BigDecimal` beyond 12 significant digits and scale 2, and `Instant` beyond
   millisecond precision;
+- special `double` values (`NaN`, infinities, `-0.0`), dates before the
+  Gregorian calendar's adoption, and strings with embedded NUL characters;
+- whether a unique, foreign-key or not-null violation carries the specific SQL
+  state (23505, 23503, 23502) rather than any state of class 23;
 - `LocalDateTime` and `OffsetDateTime` columns, enums, embeddables,
   `@ElementCollection`, inheritance, many-to-many associations;
 - pessimistic locking, isolation levels other than the default, and
