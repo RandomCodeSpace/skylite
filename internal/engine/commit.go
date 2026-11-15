@@ -173,7 +173,7 @@ func (l *Leader) build(w *walFile, cp *capture, h format.CommitHeader) (*built, 
 }
 
 type offsetWriter struct {
-	f   interface{ WriteAt([]byte, int64) (int, error) }
+	f   io.WriterAt
 	off int64
 }
 

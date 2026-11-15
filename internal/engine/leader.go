@@ -316,14 +316,14 @@ type Conn struct {
 	db *sqlite3.Conn
 
 	// Guarded by l.cmu.
-	main     *mainFile
-	id       []byte // the commit identifier for this Run
-	idUsed   bool
-	inCommit bool   // from the first create until the commit completes locally
-	uploaded uint64 // committed in storage, not yet completed by SQLite
-	done     uint64 // committed during this Run
-	outcome  error  // why a commit during this Run failed
-	retired  bool   // the uploaded commit was found retired: the leader is deposed
+	main      *mainFile
+	id        []byte // the commit identifier for this Run
+	idUsed    bool
+	inCommit  bool   // from the first create until the commit completes locally
+	uploaded  uint64 // committed in storage, not yet completed by SQLite
+	done      uint64 // committed during this Run
+	outcome   error  // why a commit during this Run failed
+	retired   bool   // the uploaded commit was found retired: the leader is deposed
 	interrupt context.CancelFunc
 	maint     bool  // maintenance asked this connection to give up its transaction
 	aborted   error // maintenance rolled this connection's transaction back
