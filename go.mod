@@ -6,6 +6,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.24.0
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.0
 	github.com/benbjohnson/litestream v0.5.18
+	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/ncruces/go-sqlite3 v0.37.0
 	github.com/superfly/ltx v0.5.2
 	modernc.org/sqlite v1.49.1
