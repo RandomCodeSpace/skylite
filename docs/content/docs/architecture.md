@@ -58,7 +58,7 @@ The goal is to support every authentication method each cloud offers. For Azure 
 
 ## Open questions
 
-These are undecided. Each one will be settled by an entry in [Decisions](/docs/decisions/).
+Each question is settled by an entry in [Decisions](/docs/decisions/). A settled question says so and links its record; the others are undecided.
 
 ### Database size and restore on start
 
@@ -70,7 +70,7 @@ Is ephemeral `emptyDir` disk acceptable for the leader's working copy and the re
 
 ### Wire protocol for JDBC
 
-Should the JDBC driver use the same HTTP API as everything else, or a protocol such as gRPC or Arrow Flight SQL?
+Settled by [0003: JDBC transport](/docs/decisions/0003-jdbc-transport/). skylite plans to ship its own JDBC driver, and a Hibernate dialect, over the same HTTPS API as everything else, rather than serve Arrow Flight SQL for the Apache Arrow Flight SQL JDBC driver, which did not pass the project's Spring Data JPA acceptance suite. That suite, in `clients/java/acceptance/`, is the requirement the planned driver and dialect have to meet.
 
 ### Client authentication
 

@@ -1,0 +1,54 @@
+name: Java acceptance
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel superseded runs for pull requests only; main and merge-group runs each get a unique group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  java-acceptance:
+    name: java-acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "25.0.5+8"
+
+      # Every event restores the Maven repository, but only pushes to main save it,
+      # so a pull request or merge-group run cannot write an entry that main reads.
+      - name: Restore Maven repository
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('clients/java/acceptance/pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+
+      - name: Run the acceptance suite against sqlite-jdbc
+        run: |
+          mvn -v
+          make java-acceptance
+
+      - name: Check that the suite catches injected driver faults
+        run: make java-fault-check
+
+      - name: Save Maven repository
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('clients/java/acceptance/pom.xml') }}

@@ -19,3 +19,23 @@ updates:
     groups:
       actions-minor-patch:
         update-types: [minor, patch]
+
+  - package-ecosystem: maven
+    directory: /clients/java/acceptance
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      maven-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: gomod
+    directory: /internal/spike/flightsql
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      spike-gomod-minor-patch:
+        update-types: [minor, patch]
