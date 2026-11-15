@@ -608,3 +608,27 @@ func TestWALWriteOverCommittedFramesStops(t *testing.T) {
 		t.Fatalf("leader: %v, want stopped", l.Err())
 	}
 }
+
+// Covers: Reads, "return each page as of the base version, or as written
+// locally by a checkpoint since then", for a page above the base version's
+// size that no checkpoint has written yet: it reads as zeros, as the
+// sparse local file would, and never from storage.
+func TestMainFileHoleReadsZeros(t *testing.T) {
+	_, _, _, l, c := setup(t)
+	l.cmu.Lock()
+	f := c.main
+	l.cmu.Unlock()
+	l.ovMu.Lock()
+	limit := l.baseLimit
+	l.size = int64(limit+2) * l.ps // as after a checkpoint wrote only page limit+2
+	l.ovMu.Unlock()
+	b := make([]byte, l.ps)
+	if n, err := f.ReadAt(b, int64(limit)*l.ps); err != nil || int64(n) != l.ps {
+		t.Fatalf("page %d: %d bytes, %v", limit+1, n, err)
+	}
+	for _, x := range b {
+		if x != 0 {
+			t.Fatalf("page %d is not zero", limit+1)
+		}
+	}
+}
