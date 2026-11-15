@@ -9,7 +9,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.Random;
 import org.junit.jupiter.api.Test;
 
-/** Each mapped column type round-trips, and so does null in each column. */
+/** Each mapped column type round-trips, and so do false, the empty string, and null in each column. */
 class ColumnTypesTest extends AcceptanceTestBase {
     @Test
     void valuesRoundTrip() {
@@ -29,6 +29,13 @@ class ColumnTypesTest extends AcceptanceTestBase {
         s.setPayload(payload);
         Long id = samples.save(s).getId();
 
+        // A second row with false, an empty string and a different payload.
+        Sample f = new Sample();
+        f.setText("");
+        f.setFlag(false);
+        f.setPayload(new byte[] {1, 2, 3});
+        Long falseId = samples.save(f).getId();
+
         Sample r = samples.findById(id).orElseThrow();
         assertThat(r.getText()).isEqualTo("héllo, wörld ✓");
         assertThat(r.getNumber()).isEqualTo(Long.MAX_VALUE - 1);
@@ -38,6 +45,11 @@ class ColumnTypesTest extends AcceptanceTestBase {
         assertThat(r.getCreatedAt()).isEqualTo(now);
         assertThat(r.getDay()).isEqualTo(LocalDate.of(2026, 2, 28));
         assertThat(r.getPayload()).isEqualTo(payload);
+
+        Sample rf = samples.findById(falseId).orElseThrow();
+        assertThat(rf.getText()).isNotNull().isEmpty();
+        assertThat(rf.getFlag()).isNotNull().isFalse();
+        assertThat(rf.getPayload()).isEqualTo(new byte[] {1, 2, 3});
     }
 
     @Test

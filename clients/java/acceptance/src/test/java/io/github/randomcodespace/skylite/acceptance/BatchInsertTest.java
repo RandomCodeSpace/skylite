@@ -3,6 +3,7 @@ package io.github.randomcodespace.skylite.acceptance;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import jakarta.persistence.EntityManagerFactory;
+import java.util.List;
 import java.util.stream.IntStream;
 import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
@@ -31,5 +32,13 @@ class BatchInsertTest extends AcceptanceTestBase {
         // Unbatched, Hibernate prepares the insert once per row; batched, it reuses one statement across batches.
         assertThat(stats.getPrepareStatementCount()).isLessThanOrEqualTo(ROWS / BATCH_SIZE);
         assertThat(events.count()).isEqualTo(ROWS);
+
+        // Read back outside the saving transaction, so through a fresh persistence context: every value bound in
+        // the batch arrives, once, unchanged, and in the order the rows were added to the batch.
+        List<Event> stored = events.findAll();
+        List<Integer> expected = IntStream.range(0, ROWS).boxed().toList();
+        assertThat(stored).extracting(Event::getSeq).containsExactlyInAnyOrderElementsOf(expected);
+        assertThat(stored).extracting(Event::getId).doesNotContainNull().doesNotHaveDuplicates();
+        assertThat(events.seqInInsertionOrder()).isEqualTo(expected);
     }
 }

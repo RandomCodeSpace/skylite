@@ -39,6 +39,12 @@
       <artifactId>spring-boot-starter-test</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- Runs the suite inside the fault check's child JVMs (selfcheck/SuiteMain). -->
+    <dependency>
+      <groupId>org.junit.platform</groupId>
+      <artifactId>junit-platform-launcher</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
@@ -96,6 +102,24 @@
           <scope>runtime</scope>
         </dependency>
       </dependencies>
+    </profile>
+
+    <!-- Checks the suite itself: runs it once per injected driver fault (selfcheck/FaultCheck). Use with sqlite. -->
+    <profile>
+      <id>fault-check</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <includes>
+                <include>**/selfcheck/FaultCheck.java</include>
+              </includes>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
     </profile>
   </profiles>
 </project>

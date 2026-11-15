@@ -8,7 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.support.TransactionTemplate;
 
-/** One-to-many and many-to-one associations, loaded lazily inside a transaction. */
+/** One-to-many and many-to-one associations: lazy loading, join fetch, cascade and orphan removal. */
 class RelationsTest extends AcceptanceTestBase {
     @Autowired LibraryService library;
     @Autowired TransactionTemplate tx;
@@ -53,5 +53,24 @@ class RelationsTest extends AcceptanceTestBase {
                 .containsExactlyInAnyOrder("Under the Net", "The Sea, the Sea");
         assertThat(loaded.getBooks()).extracting(Book::getId).doesNotContainNull().doesNotHaveDuplicates();
         assertThat(loaded.getBooks()).allSatisfy(b -> assertThat(b.getAuthor()).isSameAs(loaded));
+    }
+
+    /** Author.books cascades every operation and removes orphans. */
+    @Test
+    void cascadeAndOrphanRemovalDeleteBooks() throws Exception {
+        Author author = new Author("Ted", "ted@example.com");
+        author.addBook("Stories of Your Life");
+        author.addBook("Exhalation");
+        Long authorId = authors.save(author).getId();
+        assertThat(countFromSecondConnection("book")).isEqualTo(2);
+
+        tx.executeWithoutResult(status -> authors.findById(authorId).orElseThrow().getBooks()
+                .removeIf(b -> b.getTitle().equals("Exhalation")));
+        assertThat(countFromSecondConnection("book")).isEqualTo(1);
+        assertThat(library.bookTitles(authorId)).containsExactly("Stories of Your Life");
+
+        authors.deleteById(authorId);
+        assertThat(countFromSecondConnection("author")).isZero();
+        assertThat(countFromSecondConnection("book")).isZero();
     }
 }

@@ -78,3 +78,8 @@ docs-linkcheck:
 .PHONY: java-acceptance
 java-acceptance:
 	mvn -B -ntp -f clients/java/acceptance/pom.xml test
+
+# Checks the suite itself: runs it once per injected driver fault, each of which must fail a test.
+.PHONY: java-fault-check
+java-fault-check:
+	mvn -B -ntp -f clients/java/acceptance/pom.xml test -Psqlite,fault-check

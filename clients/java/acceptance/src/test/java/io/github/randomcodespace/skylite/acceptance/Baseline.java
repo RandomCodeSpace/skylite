@@ -3,6 +3,7 @@ package io.github.randomcodespace.skylite.acceptance;
 import java.util.Optional;
 import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestWatcher;
+import org.springframework.test.context.junit.jupiter.SpringExtension;
 
 /**
  * The reference stack: sqlite-jdbc with the Hibernate community SQLite dialect. Tests known to fail on it
@@ -13,11 +14,12 @@ import org.junit.jupiter.api.extension.TestWatcher;
 class Baseline implements TestWatcher {
     static final String CONDITION = "io.github.randomcodespace.skylite.acceptance.Baseline#excludesKnownFailures";
 
-    static boolean excludesKnownFailures() {
-        // Surefire sets these system properties from -Djdbc.driver and -Djdbc.dialect (pom.xml).
-        return "org.sqlite.JDBC".equals(System.getProperty("spring.datasource.driver-class-name"))
-                && "org.hibernate.community.dialect.SQLiteDialect".equals(System.getProperty("spring.jpa.database-platform"))
-                && !Boolean.getBoolean("acceptance.include-baseline-failures");
+    /** Decided from the connection {@link ConnectionReport} verified at start-up, not from configuration. */
+    static boolean excludesKnownFailures(ExtensionContext context) {
+        if (Boolean.getBoolean("acceptance.include-baseline-failures")) {
+            return false;
+        }
+        return SpringExtension.getApplicationContext(context).getBean(ConnectionReport.class).isBaseline();
     }
 
     @Override

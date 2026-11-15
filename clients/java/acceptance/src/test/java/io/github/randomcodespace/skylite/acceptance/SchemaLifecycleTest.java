@@ -4,14 +4,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledIf;
-import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 
-/** Hibernate creates the schema on a first start and validates it against database metadata on a second. */
-@ExtendWith(Baseline.class)
-class SchemaLifecycleTest {
+/**
+ * Hibernate creates the schema on a first start and validates it against database metadata on a second. It
+ * extends the shared base so that the baseline exclusion can read the connection verified at start-up.
+ */
+class SchemaLifecycleTest extends AcceptanceTestBase {
     private static ConfigurableApplicationContext start(String ddlAuto) {
         return new SpringApplicationBuilder(AcceptanceApplication.class)
                 .web(WebApplicationType.NONE)
