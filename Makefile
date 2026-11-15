@@ -99,3 +99,20 @@ docs-linkcheck:
 	  --include-fragments \
 	  --extensions html,css,xml \
 	  "$(DOCS_LINKROOT)/skylite"
+
+# JPA acceptance suite (clients/java/acceptance) against the reference SQLite JDBC driver.
+# Needs a JDK and Maven.
+.PHONY: java-acceptance
+java-acceptance:
+	mvn -B -ntp -f clients/java/acceptance/pom.xml test
+
+# Checks the suite itself: runs it once per injected driver fault, each of which must fail a test.
+.PHONY: java-fault-check
+java-fault-check:
+	mvn -B -ntp -f clients/java/acceptance/pom.xml test -Psqlite,fault-check
+
+# Checks that the suite rejects, or ignores, connection settings from sources other than -Djdbc.*.
+# Needs Python 3 as well; not run in CI (about 13 minutes).
+.PHONY: java-config-check
+java-config-check:
+	python3 clients/java/acceptance/config-check.py

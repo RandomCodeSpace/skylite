@@ -41,15 +41,17 @@ one this project is permitted to use, and CI stays on 1.26 because
 `govulncheck` reports standard-library advisories against 1.27.1. The `make`
 targets select Go 1.26.11 unless `GOTOOLCHAIN` is already set.
 
-| Command            | What it runs                                                    |
-|--------------------|-----------------------------------------------------------------|
-| `make build`       | `CGO_ENABLED=0` build of `bin/skylite`                          |
-| `make test`        | `go test -race -count=1 ./...`                                  |
-| `make vet`         | `go vet ./...`                                                  |
-| `make lint`        | `golangci-lint run`                                             |
-| `make vuln`        | `govulncheck ./...` at the pinned version                       |
-| `make check`       | all of the above                                                |
-| `make integration` | Azurite in Docker, then `go test -race -tags integration ./...` |
+| Command                 | What it runs                                                                            |
+|-------------------------|-----------------------------------------------------------------------------------------|
+| `make build`            | `CGO_ENABLED=0` build of `bin/skylite`                                                  |
+| `make test`             | `go test -race -count=1 ./...`                                                          |
+| `make vet`              | `go vet ./...`                                                                          |
+| `make lint`             | `golangci-lint run`                                                                     |
+| `make vuln`             | `govulncheck ./...` at the pinned version                                               |
+| `make check`            | all of the above                                                                        |
+| `make integration`      | Azurite in Docker, then `go test -race -tags integration ./...`                         |
+| `make java-acceptance`  | JPA acceptance suite against sqlite-jdbc (needs a JDK and Maven)                        |
+| `make java-fault-check` | checks that the acceptance suite catches injected driver faults (needs a JDK and Maven) |
 
 Run `make check` before opening a pull request. `make integration` needs
 Docker; it picks a free local port and removes its Azurite container when it
