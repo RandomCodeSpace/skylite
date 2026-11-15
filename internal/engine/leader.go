@@ -631,6 +631,7 @@ func (l *Leader) maintain() {
 	l.cmu.Lock()
 	defer l.cmu.Unlock()
 	l.maintaining = false
+	l.cond.Broadcast()
 	if l.head-l.manifestTxn < l.cfg.TailBound {
 		l.admitClosed, l.noCreates = false, false
 	}

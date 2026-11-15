@@ -44,6 +44,9 @@ type fault struct {
 	unknownNone   bool  // fail it with an unknown outcome, but with no effect
 	drop          bool  // let it take effect and return an unknown outcome
 	err           error // with noEffect: the error to return
+	// late: return an unknown outcome at once; the call takes effect only
+	// when the gate opens, as a request still in flight would.
+	late *gate
 }
 
 // faultStore wraps a store. Each call asks rule what to do; it also counts
@@ -51,6 +54,8 @@ type fault struct {
 type faultStore struct {
 	storage.Store
 	dir string
+
+	late sync.WaitGroup
 
 	mu       sync.Mutex
 	rule     func(op, key string) fault
@@ -71,7 +76,9 @@ func newFaultStore(t *testing.T) (*faultStore, format.Keys) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &faultStore{Store: fs, dir: dir}, keys
+	s := &faultStore{Store: fs, dir: dir}
+	t.Cleanup(s.late.Wait)
+	return s, keys
 }
 
 func (s *faultStore) setRule(r func(op, key string) fault) {
@@ -108,7 +115,7 @@ func (s *faultStore) fault(op, key string) fault {
 
 var errNoEffect = errors.New("injected failure with no effect")
 
-func (s *faultStore) mutate(ctx context.Context, op, key string, body io.Reader, do func(io.Reader) (string, error)) (string, error) {
+func (s *faultStore) mutate(ctx context.Context, op, key string, body io.Reader, do func(context.Context, io.Reader) (string, error)) (string, error) {
 	f := s.fault(op, key)
 	if f.before != nil {
 		f.before.wait()
@@ -129,7 +136,15 @@ func (s *faultStore) mutate(ctx context.Context, op, key string, body io.Reader,
 	if body != nil {
 		body = &countReader{r: body, s: s}
 	}
-	v, err := do(body)
+	if f.late != nil {
+		b, _ := io.ReadAll(body)
+		s.late.Go(func() {
+			f.late.wait()
+			_, _ = do(context.WithoutCancel(ctx), bytes.NewReader(b))
+		})
+		return "", &storage.Error{Op: op, Key: key, Err: fmt.Errorf("%w: injected request still in flight", storage.ErrOutcomeUnknown)}
+	}
+	v, err := do(ctx, body)
 	if f.after != nil {
 		f.after.wait()
 	}
@@ -153,47 +168,52 @@ func (c *countReader) Read(p []byte) (int, error) {
 }
 
 func (s *faultStore) Create(ctx context.Context, key string, body io.Reader) (string, error) {
-	return s.mutate(ctx, "create", key, body, func(b io.Reader) (string, error) { return s.Store.Create(ctx, key, b) })
+	return s.mutate(ctx, "create", key, body, func(ctx context.Context, b io.Reader) (string, error) { return s.Store.Create(ctx, key, b) })
 }
 
 func (s *faultStore) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
-	return s.mutate(ctx, "replace", key, body, func(b io.Reader) (string, error) { return s.Store.Replace(ctx, key, version, b) })
+	return s.mutate(ctx, "replace", key, body, func(ctx context.Context, b io.Reader) (string, error) { return s.Store.Replace(ctx, key, version, b) })
 }
 
-func (s *faultStore) read(op, key string) error {
+func (s *faultStore) read(op, key string) (fault, error) {
 	f := s.fault(op, key)
 	if f.before != nil {
 		f.before.wait()
 	}
 	if f.noEffect {
-		return &storage.Error{Op: op, Key: key, Err: errNoEffect}
+		return f, &storage.Error{Op: op, Key: key, Err: errNoEffect}
 	}
-	return nil
+	return f, nil
 }
 
 func (s *faultStore) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
-	if err := s.read("get", key); err != nil {
+	f, err := s.read("get", key)
+	if err != nil {
 		return nil, storage.Info{}, err
 	}
-	return s.Store.Get(ctx, key)
+	rc, info, err := s.Store.Get(ctx, key)
+	if f.after != nil {
+		f.after.wait() // the body is open, as of the version it reports
+	}
+	return rc, info, err
 }
 
 func (s *faultStore) GetRange(ctx context.Context, key string, off, n int64) (io.ReadCloser, storage.Info, error) {
-	if err := s.read("getrange", key); err != nil {
+	if _, err := s.read("getrange", key); err != nil {
 		return nil, storage.Info{}, err
 	}
 	return s.Store.GetRange(ctx, key, off, n)
 }
 
 func (s *faultStore) Head(ctx context.Context, key string) (storage.Info, error) {
-	if err := s.read("head", key); err != nil {
+	if _, err := s.read("head", key); err != nil {
 		return storage.Info{}, err
 	}
 	return s.Store.Head(ctx, key)
 }
 
 func (s *faultStore) List(ctx context.Context, prefix, after string, limit int) ([]storage.Entry, error) {
-	if err := s.read("list", prefix); err != nil {
+	if _, err := s.read("list", prefix); err != nil {
 		return nil, err
 	}
 	return s.Store.List(ctx, prefix, after, limit)

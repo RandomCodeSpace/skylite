@@ -21,6 +21,11 @@ const (
 	walVersion      = 3007000
 )
 
+// maxCommitSize is format.MaxCommitSize.
+// shortcut: a variable so tests can reach the limit without a 1 GiB
+// transaction; the full-size test runs behind SKYLITE_SOAK.
+var maxCommitSize int64 = format.MaxCommitSize
+
 // capture is one transaction's frames, read back from the WAL at the sync
 // that ends its commit.
 type capture struct {
@@ -213,8 +218,8 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 		DB: l.office.DB, PageSize: uint32(l.ps), Txn: l.head + 1, Epoch: l.office.Epoch, //nolint:gosec // a page size
 		DBSize: cp.size, PageCount: uint32(len(cp.pgnos)), CommitID: c.id, //nolint:gosec // at most the database size
 	}
-	if refuse == nil && h.Size() > format.MaxCommitSize {
-		refuse = fmt.Errorf("%w: %w: a commit object of %d bytes, above %d", ErrNotCommitted, ErrTooLarge, h.Size(), format.MaxCommitSize)
+	if refuse == nil && h.Size() > maxCommitSize {
+		refuse = fmt.Errorf("%w: %w: a commit object of %d bytes, above %d", ErrNotCommitted, ErrTooLarge, h.Size(), maxCommitSize)
 	}
 	if refuse == nil {
 		c.idUsed = true
