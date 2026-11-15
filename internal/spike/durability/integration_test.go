@@ -245,9 +245,10 @@ func TestEmulatorSemantics(t *testing.T) {
 				case err == nil:
 					wins.Add(1)
 					winner.Store(body)
-				case bloberror.HasCode(err, bloberror.BlobAlreadyExists):
 				default:
-					t.Errorf("writer %d: unexpected error %v", i, err)
+					if status, code := respErr(err); status != http.StatusConflict || code != string(bloberror.BlobAlreadyExists) {
+						t.Errorf("writer %d: got %d %q (%v), want 409 BlobAlreadyExists", i, status, code, err)
+					}
 				}
 			})
 		}
@@ -324,8 +325,8 @@ func TestEmulatorSemantics(t *testing.T) {
 			t.Fatal("upload from a failing reader succeeded")
 		}
 		_, err = az.ServiceClient().NewContainerClient(container).NewBlobClient("interrupted").GetProperties(ctx, nil)
-		if !bloberror.HasCode(err, bloberror.BlobNotFound) {
-			t.Fatalf("after an interrupted upload, Get Blob Properties = %v, want BlobNotFound", err)
+		if status, code := respErr(err); status != http.StatusNotFound || code != string(bloberror.BlobNotFound) {
+			t.Fatalf("after an interrupted upload, Get Blob Properties = %d %q (%v), want 404 BlobNotFound", status, code, err)
 		}
 		if _, ok := listing(t, az, container)["interrupted"]; ok {
 			t.Fatal("interrupted upload is visible in the listing")

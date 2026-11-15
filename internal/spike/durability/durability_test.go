@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"os/exec"
 	"slices"
@@ -401,7 +402,10 @@ func runRound(t *testing.T, container, mode string, index int, rng *rand.Rand, p
 				_ = cmd.Wait()
 				t.Fatalf("helper exited before %q: %s", policy.after, stderr.String())
 			case <-timeout:
+				// Reap the helper before reading stderr: os/exec is still copying into it.
 				_ = cmd.Process.Kill()
+				<-eof
+				_ = cmd.Wait()
 				t.Fatalf("helper did not print %q in time: %s", policy.after, stderr.String())
 			}
 		}
@@ -845,11 +849,10 @@ func staleLeaderScenario(t *testing.T, sc staleCase) staleResult {
 		phase()
 		listings = append(listings, listing(t, az, container))
 	}
-	switch err := leaseA.Renew(ctx, az, container); {
-	case err == nil:
+	if err := leaseA.Renew(ctx, az, container); err == nil {
 		res.violations = append(res.violations, "A renewed a lease B had taken over")
-	case !bloberror.HasCode(err, bloberror.ConditionNotMet):
-		t.Fatalf("A's lease renewal failed with %v, want ConditionNotMet", err)
+	} else if status, code := respErr(err); status != http.StatusPreconditionFailed || code != string(bloberror.ConditionNotMet) {
+		t.Fatalf("A's lease renewal failed with %d %q (%v), want 412 ConditionNotMet", status, code, err)
 	}
 	if !sc.unsafe {
 		switch fenced := a.Fenced(); {
