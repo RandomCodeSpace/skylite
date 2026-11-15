@@ -875,11 +875,15 @@ func testListBeyondMaxLimit(t reporter, s storage.Store) {
 // another client creates and deletes keys between the listed ones. A listing
 // is not a snapshot, but a key that exists unchanged for the whole call must
 // appear exactly once, entries must be strictly ascending, and a key that
-// comes and goes may appear only as it was while it existed. It makes 60
-// Creates, at most 2,000 Creates and Deletes while it lists, and 20 rounds of
-// one full and about ten paged Lists.
+// comes and goes may appear only as it was while it existed. A backend that
+// fills a page from several service calls goes wrong only when the keys
+// before its position change between two of them, so the other client writes
+// for as long as the listings run, and the listings run for at least 20
+// rounds and until 240 of those writes have been made. It makes 60 Creates
+// and at least 20 rounds of one full and about ten paged Lists; the number of
+// Creates and Deletes beside them depends on how fast the backend writes.
 func testListDuringWrites(t reporter, open func() storage.Store) {
-	const stableKeys, listRounds, churnPairs, pageLimit = 60, 20, 1000, 7
+	const stableKeys, minListRounds, minWrites, pageLimit = 60, 20, 4 * 60, 7
 	w, r := open(), open()
 	stable := make([]string, stableKeys)
 	for i := range stable {
@@ -891,19 +895,26 @@ func testListDuringWrites(t reporter, open func() storage.Store) {
 	stop := sync.OnceFunc(func() { close(done); wg.Wait() })
 	defer stop() // also when a check calls Fatal
 	var churned atomic.Int64
+	finished := make(chan struct{})
 	wg.Go(func() {
-		for i := range churnPairs {
+		defer close(finished)
+		for i := 0; ; i++ {
 			select {
 			case <-done:
 				return
 			default:
 			}
-			k := fmt.Sprintf("s/%03d", 2*(i%stableKeys)+1)
-			if _, err := w.Create(ctx, k, strings.NewReader("yy")); err != nil {
-				t.Errorf("Create(%q): %v", k, err)
-				return
-			}
-			if err := w.Delete(ctx, k); err != nil {
+			// One pass creates every odd key, the next deletes them, both in a
+			// scattered order: a key lives for about stableKeys writes, long
+			// enough to be listed, and the number of keys before any position
+			// changes with every write.
+			k := fmt.Sprintf("s/%03d", 2*(i*37%stableKeys)+1)
+			if i/stableKeys%2 == 0 {
+				if _, err := w.Create(ctx, k, strings.NewReader("yy")); err != nil {
+					t.Errorf("Create(%q): %v", k, err)
+					return
+				}
+			} else if err := w.Delete(ctx, k); err != nil {
 				t.Errorf("Delete(%q): %v", k, err)
 				return
 			}
@@ -929,7 +940,15 @@ func testListDuringWrites(t reporter, open func() storage.Store) {
 			t.Fatalf("%s listed %d of the %d keys that existed, unchanged, throughout", how, listed, stableKeys)
 		}
 	}
-	for range listRounds {
+	churning := func() bool {
+		select {
+		case <-finished:
+			return false
+		default:
+			return true
+		}
+	}
+	for round := 0; round < minListRounds || churned.Load() < minWrites && churning(); round++ {
 		entries, err := r.List(ctx, "s/", "", storage.MaxListLimit)
 		if err != nil {
 			t.Fatal(err)
@@ -957,7 +976,7 @@ func testListDuringWrites(t reporter, open func() storage.Store) {
 	}
 	stop()
 	if churned.Load() == 0 {
-		t.Fatal("no key was created and deleted while the listings ran; the test proved nothing")
+		t.Fatal("no key was created or deleted while the listings ran; the test proved nothing")
 	}
 }
 
