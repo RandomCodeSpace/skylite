@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,7 +18,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-jose/go-jose/v4"
 )
@@ -315,6 +318,8 @@ func TestParseKeySetRules(t *testing.T) {
 		jwk(pub, "ops-empty", map[string]any{"key_ops": []string{}}),
 		jwk(pub, "ops-not-a-list", map[string]any{"key_ops": "verify"}),
 		jwk(pub, "ops-verify", map[string]any{"key_ops": []string{"sign", "verify"}}),
+		jwk(pub, "ops-verify-only", map[string]any{"key_ops": []string{"verify"}}),
+		jwk(pub, "ops-sign-only", map[string]any{"key_ops": []string{"sign"}}),
 		jwk(&p384.PublicKey, "dup", nil), // not usable, so the next key with this id is kept
 		jwk(pub, "dup", nil),
 		jwk(pub, "dup2", nil),
@@ -328,7 +333,7 @@ func TestParseKeySetRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]bool{"rsa-2048": true, "ops-verify": true, "dup": true, "dup2": true}
+	want := map[string]bool{"rsa-2048": true, "ops-verify": true, "ops-verify-only": true, "dup": true, "dup2": true}
 	for kid := range keys {
 		if !want[kid] {
 			t.Errorf("key %q accepted", kid)
@@ -410,5 +415,36 @@ func TestColdRequestWaitsForTheRunningRefresh(t *testing.T) {
 	verifyOK(t, g, ti, c, k, "first token")
 	if err := <-second; err != nil {
 		t.Errorf("token that arrived during the first fetch: %v", err)
+	}
+}
+
+// A logged value of exactly 200 bytes is whole, a longer one is cut to 200
+// bytes, and a cut never leaves half a character.
+func TestClip(t *testing.T) {
+	whole := strings.Repeat("a", 200)
+	if got := clip(whole); got != whole {
+		t.Errorf("a 200-byte value was changed to %d bytes", len(got))
+	}
+	if got := clip(whole + "b"); got != whole+"..." {
+		t.Errorf("a 201-byte value became %q", got)
+	}
+	got := clip(strings.Repeat("a", 199) + "\u20ac" + "tail") // the cut falls inside the three-byte character
+	if got != strings.Repeat("a", 199)+"..." || !utf8.ValidString(got) {
+		t.Errorf("a value cut inside a character became %q", got)
+	}
+}
+
+// The name of a document that cannot be read or is too large is cut before it
+// reaches an error.
+func TestReadLimitedClipsTheName(t *testing.T) {
+	name := "https://issuer.example/" + strings.Repeat("k", 500)
+	for what, r := range map[string]io.Reader{
+		"too large":  strings.NewReader(strings.Repeat("x", 1<<20+1)),
+		"read error": iotest.ErrReader(errors.New(strings.Repeat("e", 500))),
+	} {
+		_, err := readLimited(r, name)
+		if err == nil || len(err.Error()) > 500 || strings.Contains(err.Error(), name) {
+			t.Errorf("%s: error of %d bytes: %.80v", what, len(fmt.Sprint(err)), err)
+		}
 	}
 }

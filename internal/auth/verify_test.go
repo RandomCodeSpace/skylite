@@ -73,7 +73,7 @@ func TestVerifyAcceptsEachAlgorithm(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Verify: %v", err)
 			}
-			if want := time.Unix(claims["exp"].(int64), 0); !p.Expires.Equal(want) {
+			if want := time.Unix(claims["exp"].(int64), 0).Add(60 * time.Second); !p.Expires.Equal(want) {
 				t.Errorf("Expires %v, want %v", p.Expires, want)
 			}
 			if p.Issuer != ti.url || p.Subject != "system:serviceaccount:apps:orders" {

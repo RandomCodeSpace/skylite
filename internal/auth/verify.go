@@ -68,8 +68,9 @@ type Principal struct {
 	Issuer  string
 	Subject string
 	Claims  map[string]any
-	// Expires is the token's exp. The principal must not be used after it,
-	// for example on a long-lived connection.
+	// Expires is the token's exp plus ClockSkew: the time from which Verify
+	// refuses the token. The principal must not be used after it, for example
+	// on a long-lived connection.
 	Expires time.Time
 }
 
@@ -164,7 +165,7 @@ func (g *Guard) Verify(ctx context.Context, token string) (*Principal, error) {
 	err = std.ValidateWithLeeway(jwt.Expected{Issuer: src.issuer.Issuer, AnyAudience: jwt.Audience{src.issuer.Audience}, Time: g.now()}, ClockSkew)
 	switch {
 	case err == nil:
-		return &Principal{Issuer: std.Issuer, Subject: std.Subject, Claims: all, Expires: std.Expiry.Time()}, nil
+		return &Principal{Issuer: std.Issuer, Subject: std.Subject, Claims: all, Expires: std.Expiry.Time().Add(ClockSkew)}, nil
 	case errors.Is(err, jwt.ErrInvalidAudience):
 		return nil, e.with(CodeInvalidAudience)
 	case errors.Is(err, jwt.ErrExpired):

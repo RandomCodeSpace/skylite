@@ -56,11 +56,11 @@ The HTTP client is supplied by the server. As built, it trusts the system roots,
 - A token with an unknown key id triggers a refresh, but skylite makes at most one fetch attempt per issuer per minute, whether the attempt succeeds or fails. A stream of tokens with made-up key ids therefore costs at most one fetch per issuer per minute, and those tokens are rejected. A key that an issuer starts using within a minute of the last attempt is rejected until the minute has passed. Microsoft's key rollover guidance asks for a refresh on an unknown key "no more frequently than 5 mins" ([signing-key-rollover#best-practices-for-keys-metadata-caching-and-validation](https://learn.microsoft.com/en-us/entra/identity-platform/signing-key-rollover#best-practices-for-keys-metadata-caching-and-validation)); skylite's one minute fetches from Entra ID more often than that, in exchange for picking up a new key sooner.
 - A failed refresh keeps the previous keys. Known keys are used for up to 24 hours after the last successful fetch. After that, every token from that issuer is rejected until a fetch succeeds. A token with an unknown key id is always rejected while the issuer is unreachable, so the cache fails closed.
 - A key set with no usable key counts as a failed fetch, so it does not replace the cached keys.
-- skylite starts no goroutine for this. A refresh runs in the request that needs it and has its own timeout, so it is not cancelled when that request gives up, because other requests may be waiting on it.
+- skylite starts no goroutine for this. A refresh runs in the request that needs it and has its own timeout, so it is not cancelled when that request gives up, because other requests may be waiting on it. A request that waits for a running refresh, because its key is not cached, waits until that refresh ends, at most the refresh timeout, even if the request itself is cancelled first.
 
 ### Principal and logging
 
-A principal is the pair (issuer, subject). The verified token's claims travel with it, for the authorisation rules, and so does the token's `exp`. The server must not use a principal after that time, for example on a long-lived connection.
+A principal is the pair (issuer, subject). The verified token's claims travel with it, for the authorisation rules, and so does its expiry: the token's `exp` plus the clock skew above, which is the time from which verification refuses the token. The server must not use a principal after that time, for example on a long-lived connection.
 
 A token's string form is not unique: the same signed content can be written as more than one string. The token string must never be used as a key for revocation or replay detection.
 
@@ -70,7 +70,7 @@ A token, any segment of a token, its signature and the raw `Authorization` heade
 
 ### HTTP behaviour
 
-The request must carry one `Authorization` header with the `Bearer` scheme, then one or more spaces, as [RFC 7235](https://www.rfc-editor.org/rfc/rfc7235#section-2.1) allows, then exactly one token. Anything after the token is refused. The scheme is matched case-insensitively. Responses follow [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750#section-3) and say nothing more about the cause:
+The request must carry one `Authorization` header with the `Bearer` scheme, then one or more spaces, as [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#section-11.4) allows, then exactly one token. Anything after the token is refused. The scheme is matched case-insensitively. Responses follow [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750#section-3) and say nothing more about the cause:
 
 | Situation | Status | `WWW-Authenticate` | Body |
 |---|---|---|---|
@@ -84,7 +84,7 @@ The log records the specific reason: `token_too_large`, `malformed_token`, `unsu
 
 Access is denied by default. Server configuration holds rules, and each rule grants one role on a database name or a pattern to principals of one issuer. A rule matches principals either by subject or by a claim: a top-level claim that equals the rule's value or, if it is an array, contains it, for example a `groups` or `roles` entry. A request is allowed if any rule grants the required role or a higher one. Configuration that names an unconfigured issuer, sets both or neither of subject and claim, has a database that is not a valid name or pattern, or names an unknown role is rejected at start-up.
 
-A database name is 1 to 63 characters of lower-case ASCII letters, digits, `-` and `_`, and starts with a letter or a digit. This is a requirement on the server, which must refuse any other name, and on storage naming, which must not map two names to one database. `internal/auth` denies any name outside that set before it reads a rule. A pattern is a name in which `*` may also appear, matching any run of characters, and `?`, matching exactly one. It is 1 to 63 characters long and starts with a letter, a digit, `*` or `?`, so every pattern matches some valid name. Character classes, escapes and every other character are configuration errors, so a malformed pattern is never a rule that silently matches nothing or everything. Subjects, claim values, names and patterns are compared exactly, byte for byte, with no case or Unicode folding.
+A database name is 1 to 63 characters of lower-case ASCII letters, digits, `-` and `_`, and starts with a letter or a digit. This is a requirement on the server, which must refuse any other name, and on storage naming, which must not map two names to one database. `internal/auth` denies any name outside that set before it reads a rule. A pattern is a name in which `*` may also appear, matching zero or more characters, and `?`, matching exactly one. It is 1 to 63 characters long and starts with a letter, a digit, `*` or `?`, so every pattern matches some valid name. Character classes, escapes and every other character are configuration errors, so a malformed pattern is never a rule that silently matches nothing or everything. Subjects, claim values, names and patterns are compared exactly, byte for byte, with no case or Unicode folding.
 
 There are three roles, in increasing order: `read`, then `write`, which includes read, then `admin`, which includes write and is reserved for schema changes and administrative endpoints. Which role each endpoint and statement requires is decided with the query API.
 
@@ -99,7 +99,7 @@ Checks made before adding it:
 - Licence: [Apache-2.0](https://github.com/go-jose/go-jose/blob/v4.1.9/LICENSE).
 - Dependencies: none. Its `go.mod` has no `require` block.
 - Maintenance: actively maintained, with v4.1.9 released ten days before this record. It is also the JOSE library under `github.com/coreos/go-oidc/v3`.
-- Advisories: neither the OSV database nor the go-jose repository's advisory list names one affecting v4.1.9. The newest fixes it includes are the five advisories published on 2026-10-30 and fixed in v4.1.7: GHSA-p9j4-2j95-j4rv, GHSA-27pc-rm86-68pq, GHSA-r39w-98wm-9pp6, GHSA-c67m-wr4h-2ccg and GHSA-v6h2-qj3f-2h6v. No advisory names a fix in a later release. `govulncheck` reports no vulnerabilities in this module.
+- Advisories: the go-jose repository's advisory list names none affecting v4.1.9. The OSV database returns none either, but on the date of this record it had not indexed the newest five, so the repository's list is the evidence. The newest fixes it includes are the five advisories published on 2026-10-30 and fixed in v4.1.7: GHSA-p9j4-2j95-j4rv, GHSA-27pc-rm86-68pq, GHSA-r39w-98wm-9pp6, GHSA-c67m-wr4h-2ccg and GHSA-v6h2-qj3f-2h6v. No advisory names a fix in a later release. `govulncheck` reports no vulnerabilities in this module.
 - Pure Go: it builds with `CGO_ENABLED=0`.
 
 ## Alternatives considered

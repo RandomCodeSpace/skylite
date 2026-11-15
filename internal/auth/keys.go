@@ -55,7 +55,8 @@ func clip(s string) string {
 	if len(s) <= maxLoggedValue {
 		return s
 	}
-	return s[:maxLoggedValue] + "..."
+	// A cut inside a multi-byte character would leave invalid UTF-8.
+	return strings.ToValidUTF8(s[:maxLoggedValue], "") + "..."
 }
 
 // keySource holds one issuer's signing keys and refreshes them on demand.

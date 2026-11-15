@@ -37,5 +37,5 @@ func (r Rule) matches(p *Principal) bool {
 
 func matchDatabase(pattern, name string) bool {
 	ok, err := path.Match(pattern, name)
-	return err == nil && ok // Config.Validate rejects bad patterns; one that slips through grants nothing
+	return err == nil && ok // Config.Validate allows only * and ? in a pattern, so this cannot fail
 }

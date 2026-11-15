@@ -74,6 +74,8 @@ func TestRequire(t *testing.T) {
 		{"write", []string{"Bearer " + bob}, 204, "", "", ""},
 		{"lower-case scheme", []string{"bearer " + bob}, 204, "", "", ""},
 		{"several spaces after the scheme", []string{"Bearer   " + bob}, 204, "", "", ""},
+		{"tab after the scheme", []string{"Bearer\t" + bob}, 401, "Bearer", "missing_token", CodeMissingToken},
+		{"tab after a space", []string{"Bearer \t" + bob}, 401, `Bearer error="invalid_token"`, "invalid_token", CodeMalformed},
 		{"something after the token", []string{"Bearer " + bob + " " + bob}, 401, `Bearer error="invalid_token"`, "invalid_token", CodeMalformed},
 	}
 	for _, tc := range cases {
