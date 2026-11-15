@@ -21,6 +21,17 @@ import (
 	"github.com/RandomCodeSpace/skylite/internal/storage/localfs"
 )
 
+// TestMain shortens the suite's large bodies to 256 KiB and 3 bytes. The
+// catalogue runs the suite 73 times, and at the full size the large rounds
+// of the race tests alone would write over 5 GiB each time. The shorter size
+// still crosses every buffer of localfs and of the wrong backends below,
+// whose size-dependent paths are set relative to largeSize; localfs's own
+// conformance test runs the suite at the full size.
+func TestMain(m *testing.M) {
+	largeSize = 256<<10 + 3
+	os.Exit(m.Run())
+}
+
 // recorder is a reporter that records failures instead of failing the test
 // that runs it, so the suite can be run against a backend that must fail it.
 // Like *testing.T, Fatal ends the calling goroutine, and each subtest runs on
@@ -173,6 +184,42 @@ var wrongBackends = []struct {
 	{"error text contains body bytes", "Errors", func(_ *shared, s storage.Store) storage.Store { return leakyErrors{s} }},
 	{"Delete fails on a missing key", "Delete", func(_ *shared, s storage.Store) storage.Store { return strictDelete{s} }},
 	{"ignores an already-cancelled context", "CancelledContext", func(_ *shared, s storage.Store) storage.Store { return ignoresCancelled{s} }},
+	// Found by the third review.
+	{"stores half of a large body (Create)", "CreateExisting", func(_ *shared, s storage.Store) storage.Store { return bySize{s, "create", isLarge, truncate} }},
+	{"lets two empty Creates of one key win across clients", "ConcurrentCreate", func(_ *shared, s storage.Store) storage.Store { return bySize{s, "create", isEmpty, checkThenPut} }},
+	{"a large Replace returns success without the effect", "Replace", func(_ *shared, s storage.Store) storage.Store { return bySize{s, "replace", isLarge, noEffect} }},
+	{"an empty Replace ignores its condition", "Replace", func(_ *shared, s storage.Store) storage.Store { return bySize{s, "replace", isEmpty, unconditional} }},
+	{"error text contains the body read before the reader failed", "BodyErrorText", func(_ *shared, s storage.Store) storage.Store { return leakReadBody{s} }},
+	{"returns context errors without a *storage.Error", "CancelledContext", func(_ *shared, s storage.Store) storage.Store { return rawContextErrors{s} }},
+	{"returns a *storage.BodyError without a *storage.Error", "BodyErrorText", func(_ *shared, s storage.Store) storage.Store { return rawBodyError{s} }},
+	{"range bodies ignore their context", "BodyHonoursContext", func(_ *shared, s storage.Store) storage.Store { return rangeIgnoresContext{s} }},
+	{"a bounded range of a large object reports its length as the size, and another token", "RangeReads", func(_ *shared, s storage.Store) storage.Store { return largeRangeInfo{s} }},
+	{"Head adds a byte to a large object's size", "CreateExisting", func(_ *shared, s storage.Store) storage.Store { return largeHeadSize{s} }},
+	{"rejects List selectors that are not valid keys", "ListOrder", func(_ *shared, s storage.Store) storage.Store { return strictSelectors{s} }},
+	{"List adds a byte to a large object's size", "CreateExisting", func(_ *shared, s storage.Store) storage.Store { return largeListSize{s} }},
+	{"Delete of an empty object returns success without the effect", "Delete", func(_ *shared, s storage.Store) storage.Store { return deleteBySize{s, isEmpty} }},
+	{"Delete of a large object returns success without the effect", "Delete", func(_ *shared, s storage.Store) storage.Store { return deleteBySize{s, isLarge} }},
+	{"Head answers from the client's last Get", "Replace", func(_ *shared, s storage.Store) storage.Store {
+		return &cachedHead{Store: s, cache: map[string]storage.Info{}}
+	}},
+	{"a large body fetches its tail at the current version", "OpenBodyKeepsItsVersion", func(_ *shared, s storage.Store) storage.Store { return pagedBody{s} }},
+	{"empty objects share one version token", "VersionTokens", func(_ *shared, s storage.Store) storage.Store { return emptyTokens{s} }},
+	{"ignores startAfter", "ListPagination", func(_ *shared, s storage.Store) storage.Store { return listIgnoresStartAfter{s} }},
+	// Found by the sweep.
+	{"lets two large Creates of one key win across clients", "ConcurrentCreate", func(_ *shared, s storage.Store) storage.Store { return bySize{s, "create", isLarge, checkThenPut} }},
+	{"lets two large Replaces of one version win across clients", "ConcurrentReplace", func(_ *shared, s storage.Store) storage.Store { return bySize{s, "replace", isLarge, checkThenPut} }},
+	{"a large Replace ignores its condition", "Replace", func(_ *shared, s storage.Store) storage.Store { return bySize{s, "replace", isLarge, unconditional} }},
+	{"a large Create overwrites an existing object", "CreateExisting", func(_ *shared, s storage.Store) storage.Store { return bySize{s, "create", isLarge, unconditional} }},
+	{"an empty Replace resurrects a deleted object", "ReplaceDeleteRace", func(_ *shared, s storage.Store) storage.Store { return emptyResurrect{s} }},
+	{"keeps the token on an identical large rewrite", "VersionTokens", func(_ *shared, s storage.Store) storage.Store { return bySize{s, "replace", isLarge, keepToken} }},
+	{"commits a large body without its context and reports the context's error", "EndOfBody", func(_ *shared, s storage.Store) storage.Store {
+		return bySize{s, "create", isLarge, commitWithoutContext}
+	}},
+	{"publishes the first half of a large body before the body ends", "WriteInProgress", func(_ *shared, s storage.Store) storage.Store { return halfPublish{s} }},
+	{"GetRange answers from the client's last Get", "Replace", func(_ *shared, s storage.Store) storage.Store {
+		return &rangeCache{Store: s, objects: map[string]cachedObject{}}
+	}},
+	{"fills a page by position", "ListDuringWrites", func(_ *shared, s storage.Store) storage.Store { return listByPosition{s} }},
 }
 
 // TestSuiteRejectsWrongBackends runs the whole suite against every wrong
@@ -1082,6 +1129,494 @@ type ignoresCancelled struct{ storage.Store }
 
 func (s ignoresCancelled) Create(ctx context.Context, key string, body io.Reader) (string, error) {
 	return s.Store.Create(context.WithoutCancel(ctx), key, body)
+}
+
+// Wrong backends that break a rule only for some body sizes, through one read
+// path, on a client that had earlier state, or in an error's form.
+
+func isEmpty(n int) bool { return n == 0 }
+
+func isLarge(n int) bool { return n >= largeSize }
+
+// bySize reads a write's whole body and then writes it with wrong if the
+// operation is op and the body's length matches at, and correctly otherwise:
+// a backend that takes another path for some sizes and gets only that path
+// wrong.
+type bySize struct {
+	storage.Store
+	op    string // "create" or "replace"
+	at    func(n int) bool
+	wrong func(ctx context.Context, s storage.Store, key, version string, replace bool, data []byte) (string, error)
+}
+
+func (s bySize) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	return s.write(ctx, key, "", false, body)
+}
+
+func (s bySize) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	return s.write(ctx, key, version, true, body)
+}
+
+func (s bySize) write(ctx context.Context, key, version string, replace bool, body io.Reader) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	data, err := readBody(ctx, body)
+	if err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	if opName(replace) == s.op && s.at(len(data)) {
+		return s.wrong(ctx, s.Store, key, version, replace, data)
+	}
+	return write(ctx, s.Store, key, version, replace, bytes.NewReader(data))
+}
+
+// The wrong writes bySize uses.
+
+func truncate(ctx context.Context, s storage.Store, key, version string, replace bool, data []byte) (string, error) {
+	return write(ctx, s, key, version, replace, bytes.NewReader(data[:len(data)/2]))
+}
+
+func checkThenPut(ctx context.Context, s storage.Store, key, version string, replace bool, data []byte) (string, error) {
+	info, err := s.Head(ctx, key)
+	if replace && (err != nil || info.Version != version) || !replace && err == nil {
+		return "", fail(opName(replace), key, storage.ErrPreconditionFailed)
+	}
+	time.Sleep(time.Millisecond) // the window a network round trip would leave
+	return put(ctx, s, key, data)
+}
+
+func unconditional(ctx context.Context, s storage.Store, key, _ string, _ bool, data []byte) (string, error) {
+	return put(ctx, s, key, data)
+}
+
+func noEffect(context.Context, storage.Store, string, string, bool, []byte) (string, error) {
+	return "invented-version", nil
+}
+
+func keepToken(ctx context.Context, s storage.Store, key, version string, replace bool, data []byte) (string, error) {
+	if cur, info, err := s.Get(ctx, key); err == nil {
+		b, _ := io.ReadAll(cur)
+		_ = cur.Close()
+		if info.Version == version && bytes.Equal(b, data) {
+			return version, nil
+		}
+	}
+	return write(ctx, s, key, version, replace, bytes.NewReader(data))
+}
+
+func commitWithoutContext(ctx context.Context, s storage.Store, key, version string, replace bool, data []byte) (string, error) {
+	v, err := write(context.WithoutCancel(ctx), s, key, version, replace, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	return v, nil
+}
+
+// emptyResurrect checks the version when a Replace starts and, if the body
+// turns out to be empty, writes it unconditionally once it has been read.
+type emptyResurrect struct{ storage.Store }
+
+func (s emptyResurrect) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", fail("replace", key, err)
+	}
+	info, herr := s.Head(ctx, key)
+	data, err := readBody(ctx, body)
+	if err != nil {
+		return "", fail("replace", key, err)
+	}
+	if len(data) > 0 || herr != nil || info.Version != version {
+		return s.Store.Replace(ctx, key, version, bytes.NewReader(data))
+	}
+	return put(ctx, s.Store, key, data)
+}
+
+// halfPublish creates an object from the first half of a large body as soon
+// as it has read it, and replaces it with the whole body at the end.
+type halfPublish struct{ storage.Store }
+
+func (s halfPublish) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", fail("create", key, err)
+	}
+	first, err := readBody(ctx, io.LimitReader(body, int64(largeSize/2)))
+	if err != nil {
+		return "", fail("create", key, err)
+	}
+	if len(first) < largeSize/2 {
+		return s.Store.Create(ctx, key, bytes.NewReader(first))
+	}
+	v, err := s.Store.Create(ctx, key, bytes.NewReader(first))
+	if err != nil {
+		return "", err
+	}
+	rest, err := readBody(ctx, body)
+	if err != nil {
+		return "", fail("create", key, err)
+	}
+	return s.Replace(ctx, key, v, bytes.NewReader(append(first, rest...)))
+}
+
+// leakReadBody puts the bytes it read before the reader failed into the
+// error's text, keeping the *storage.BodyError.
+type leakReadBody struct{ storage.Store }
+
+func (s leakReadBody) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	return s.write(ctx, key, "", false, body)
+}
+
+func (s leakReadBody) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	return s.write(ctx, key, version, true, body)
+}
+
+func (s leakReadBody) write(ctx context.Context, key, version string, replace bool, body io.Reader) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	data, err := readBody(ctx, body)
+	if err != nil {
+		return "", fail(opName(replace), key, fmt.Errorf("%w after %q", err, data))
+	}
+	return write(ctx, s.Store, key, version, replace, bytes.NewReader(data))
+}
+
+// rawContextErrors returns Head's context errors without their
+// *storage.Error.
+type rawContextErrors struct{ storage.Store }
+
+func (s rawContextErrors) Head(ctx context.Context, key string) (storage.Info, error) {
+	info, err := s.Store.Head(ctx, key)
+	var se *storage.Error
+	if errors.As(err, &se) && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return info, se.Err
+	}
+	return info, err
+}
+
+// rawBodyError returns a Create's *storage.BodyError without its
+// *storage.Error.
+type rawBodyError struct{ storage.Store }
+
+func (s rawBodyError) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	v, err := s.Store.Create(ctx, key, body)
+	var be *storage.BodyError
+	if errors.As(err, &be) {
+		return "", be
+	}
+	return v, err
+}
+
+// rangeIgnoresContext honours a context when GetRange is called and then
+// detaches the body from it.
+type rangeIgnoresContext struct{ storage.Store }
+
+func (s rangeIgnoresContext) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, storage.Info, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return nil, storage.Info{}, fail("get", key, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, storage.Info{}, fail("get", key, err)
+	}
+	return s.Store.GetRange(context.WithoutCancel(ctx), key, offset, length)
+}
+
+// largeRangeInfo returns, for a bounded range of a large object, the range's
+// length as the size and another version token.
+type largeRangeInfo struct{ storage.Store }
+
+func (s largeRangeInfo) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, storage.Info, error) {
+	body, info, err := s.Store.GetRange(ctx, key, offset, length)
+	if err == nil && isLarge(int(info.Size)) && length < info.Size {
+		info = storage.Info{Size: length, Version: "a-different-version"}
+	}
+	return body, info, err
+}
+
+// largeHeadSize adds a byte to the size Head reports for a large object.
+type largeHeadSize struct{ storage.Store }
+
+func (s largeHeadSize) Head(ctx context.Context, key string) (storage.Info, error) {
+	info, err := s.Store.Head(ctx, key)
+	if err == nil && isLarge(int(info.Size)) {
+		info.Size++
+	}
+	return info, err
+}
+
+// largeListSize adds a byte to the size List reports for a large object.
+type largeListSize struct{ storage.Store }
+
+func (s largeListSize) List(ctx context.Context, prefix, startAfter string, limit int) ([]storage.Entry, error) {
+	entries, err := s.Store.List(ctx, prefix, startAfter, limit)
+	for i := range entries {
+		if isLarge(int(entries[i].Size)) {
+			entries[i].Size++
+		}
+	}
+	return entries, err
+}
+
+// strictSelectors rejects a prefix or startAfter that is not a valid key,
+// after removing a trailing "/" from the prefix.
+type strictSelectors struct{ storage.Store }
+
+func (s strictSelectors) List(ctx context.Context, prefix, startAfter string, limit int) ([]storage.Entry, error) {
+	for _, selector := range []string{strings.TrimSuffix(prefix, "/"), startAfter} {
+		if selector == "" {
+			continue
+		}
+		if err := storage.ValidateKey(selector); err != nil {
+			return nil, fail("list", "", err)
+		}
+	}
+	return s.Store.List(ctx, prefix, startAfter, limit)
+}
+
+// listIgnoresStartAfter lists from the beginning whatever the cursor.
+type listIgnoresStartAfter struct{ storage.Store }
+
+func (s listIgnoresStartAfter) List(ctx context.Context, prefix, _ string, limit int) ([]storage.Entry, error) {
+	return s.Store.List(ctx, prefix, "", limit)
+}
+
+// listByPosition fills a page in chunks of ten, asking each time for the
+// entries after the first ones by their position, as a service paged by
+// offset would: a key created or deleted ahead of the position in between
+// shifts the rest.
+type listByPosition struct{ storage.Store }
+
+func (s listByPosition) List(ctx context.Context, prefix, startAfter string, limit int) ([]storage.Entry, error) {
+	if limit < 1 || limit > storage.MaxListLimit {
+		return s.Store.List(ctx, prefix, startAfter, limit)
+	}
+	var out []storage.Entry
+	for len(out) < limit {
+		all, err := s.Store.List(ctx, prefix, startAfter, min(len(out)+10, limit))
+		if err != nil {
+			return nil, err
+		}
+		if len(all) <= len(out) {
+			break
+		}
+		out = append(out, all[len(out):]...)
+	}
+	return out, nil
+}
+
+// deleteBySize returns success without deleting an object whose size matches
+// at.
+type deleteBySize struct {
+	storage.Store
+	at func(n int) bool
+}
+
+func (s deleteBySize) Delete(ctx context.Context, key string) error {
+	if info, err := s.Head(ctx, key); err == nil && s.at(int(info.Size)) {
+		return nil
+	}
+	return s.Store.Delete(ctx, key)
+}
+
+// cachedHead answers Head from the Info of the client's last Get of the key,
+// and forgets it only when the client deletes the key.
+type cachedHead struct {
+	storage.Store
+	mu    sync.Mutex
+	cache map[string]storage.Info
+}
+
+func (s *cachedHead) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	body, info, err := s.Store.Get(ctx, key)
+	if err == nil {
+		s.mu.Lock()
+		s.cache[key] = info
+		s.mu.Unlock()
+	}
+	return body, info, err
+}
+
+func (s *cachedHead) Head(ctx context.Context, key string) (storage.Info, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return storage.Info{}, fail("head", key, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return storage.Info{}, fail("head", key, err)
+	}
+	s.mu.Lock()
+	info, ok := s.cache[key]
+	s.mu.Unlock()
+	if ok {
+		return info, nil
+	}
+	return s.Store.Head(ctx, key)
+}
+
+func (s *cachedHead) Delete(ctx context.Context, key string) error {
+	err := s.Store.Delete(ctx, key)
+	if err == nil {
+		s.mu.Lock()
+		delete(s.cache, key)
+		s.mu.Unlock()
+	}
+	return err
+}
+
+// rangeCache serves GetRange from the object the client last read whole with
+// Get, and forgets it only on the client's own writes, so that another
+// client's write leaves it stale.
+type rangeCache struct {
+	storage.Store
+	mu      sync.Mutex
+	objects map[string]cachedObject
+}
+
+type cachedObject struct {
+	info storage.Info
+	data []byte
+}
+
+func (s *rangeCache) forget() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clear(s.objects)
+}
+
+func (s *rangeCache) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	defer s.forget()
+	return s.Store.Create(ctx, key, body)
+}
+
+func (s *rangeCache) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	defer s.forget()
+	return s.Store.Replace(ctx, key, version, body)
+}
+
+func (s *rangeCache) Delete(ctx context.Context, key string) error {
+	defer s.forget()
+	return s.Store.Delete(ctx, key)
+}
+
+func (s *rangeCache) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	body, info, err := s.Store.Get(ctx, key)
+	if err != nil {
+		return body, info, err
+	}
+	var buf bytes.Buffer
+	return readCloser{readerFunc(func(p []byte) (int, error) {
+		n, err := body.Read(p)
+		buf.Write(p[:n])
+		if err == io.EOF { //nolint:errorlint // localfs returns io.EOF itself
+			s.mu.Lock()
+			s.objects[key] = cachedObject{info, bytes.Clone(buf.Bytes())}
+			s.mu.Unlock()
+		}
+		return n, err
+	}), body.Close}, info, nil
+}
+
+func (s *rangeCache) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, storage.Info, error) {
+	s.mu.Lock()
+	c, ok := s.objects[key]
+	s.mu.Unlock()
+	if !ok || offset < 0 || length < 0 || ctx.Err() != nil || storage.ValidateKey(key) != nil {
+		return s.Store.GetRange(ctx, key, offset, length)
+	}
+	start := min(offset, c.info.Size)
+	return io.NopCloser(bytes.NewReader(c.data[start : start+min(length, c.info.Size-start)])), c.info, nil
+}
+
+// pagedBody fetches a body longer than a quarter of largeSize in two
+// requests, the second when the first quarter has been read, without pinning
+// it to the version of the first.
+type pagedBody struct{ storage.Store }
+
+func (s pagedBody) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	return s.GetRange(ctx, key, 0, 1<<63-1)
+}
+
+func (s pagedBody) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, storage.Info, error) {
+	chunk := int64(largeSize / 4)
+	if offset < 0 || length <= chunk {
+		return s.Store.GetRange(ctx, key, offset, length)
+	}
+	first, info, err := s.Store.GetRange(ctx, key, offset, chunk)
+	if err != nil || offset >= info.Size || info.Size-offset <= chunk {
+		return first, info, err
+	}
+	var rest io.ReadCloser
+	second := readerFunc(func(p []byte) (int, error) {
+		if rest == nil {
+			var err error
+			if rest, _, err = s.Store.GetRange(ctx, key, offset+chunk, length-chunk); err != nil {
+				return 0, err
+			}
+		}
+		return rest.Read(p)
+	})
+	return readCloser{io.MultiReader(first, second), func() error {
+		if rest != nil {
+			_ = rest.Close()
+		}
+		return first.Close()
+	}}, info, nil
+}
+
+// emptyTokens gives every empty object the same version token, as a token
+// derived from the content would, and maps it back on Replace.
+type emptyTokens struct{ storage.Store }
+
+const emptyToken = "empty-content-token"
+
+func (s emptyTokens) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	return s.write(ctx, key, "", false, body)
+}
+
+func (s emptyTokens) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	return s.write(ctx, key, version, true, body)
+}
+
+func (s emptyTokens) write(ctx context.Context, key, version string, replace bool, body io.Reader) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	data, err := readBody(ctx, body)
+	if err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	if replace && version == emptyToken {
+		if info, err := s.Store.Head(ctx, key); err == nil && info.Size == 0 {
+			version = info.Version
+		}
+	}
+	v, err := write(ctx, s.Store, key, version, replace, bytes.NewReader(data))
+	if err == nil && len(data) == 0 {
+		v = emptyToken
+	}
+	return v, err
+}
+
+func (s emptyTokens) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	return s.GetRange(ctx, key, 0, 1<<63-1)
+}
+
+func (s emptyTokens) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, storage.Info, error) {
+	body, info, err := s.Store.GetRange(ctx, key, offset, length)
+	if err == nil && info.Size == 0 {
+		info.Version = emptyToken
+	}
+	return body, info, err
+}
+
+func (s emptyTokens) Head(ctx context.Context, key string) (storage.Info, error) {
+	info, err := s.Store.Head(ctx, key)
+	if err == nil && info.Size == 0 {
+		info.Version = emptyToken
+	}
+	return info, err
 }
 
 // Correct backends that must pass.
