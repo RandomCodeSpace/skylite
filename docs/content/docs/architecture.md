@@ -87,4 +87,4 @@ Settled by [0003: JDBC transport](/docs/decisions/0003-jdbc-transport/). skylite
 
 ### Client authentication
 
-How do clients authenticate to the query endpoint?
+Settled by [0006: Authentication](/docs/decisions/0006-authentication/). Clients authenticate to the query endpoint with OIDC JWT bearer tokens only, from issuers in the server's configuration, such as a Kubernetes cluster's service-account issuer or Microsoft Entra ID. Access is denied by default and granted by rules that give a `read`, `write` or `admin` role on a database. No server uses this yet.
