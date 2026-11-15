@@ -8,6 +8,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.0
 	github.com/benbjohnson/litestream v0.5.18
 	github.com/go-jose/go-jose/v4 v4.1.9
+	github.com/ncruces/go-sqlite3 v0.37.0
 	github.com/superfly/ltx v0.5.2
 	google.golang.org/api v0.307.0
 	modernc.org/sqlite v1.49.1
@@ -48,7 +49,9 @@ require (
 	github.com/markusmobius/go-dateparser v1.2.4 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
+	github.com/ncruces/go-sqlite3-wasm/v6 v6.5.35401 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.28 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/prometheus/client_golang v1.17.0 // indirect
