@@ -12,8 +12,10 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -23,8 +25,9 @@ import (
 )
 
 // TestMain shortens the suite's large bodies to 256 KiB and 3 bytes. The
-// catalogue runs the suite 85 times, and at the full size the large rounds
-// of the race tests alone would write over 5 GiB each time. The shorter size
+// self-test runs the whole suite against three correct backends and one
+// subtest against each of 93 wrong ones, and at the full size the large
+// rounds of the race tests alone would write over 5 GiB each time. The shorter size
 // still crosses every buffer of localfs and of the wrong backends below,
 // whose size-dependent paths are set relative to largeSize; localfs's own
 // conformance test runs the suite at the full size.
@@ -81,11 +84,12 @@ func (r *recorder) run(name string, fn func(reporter)) {
 	<-done
 }
 
-// runRecorded runs the suite against wrap(localfs clients) and returns the
+// runRecorded runs the suite's top-level subtest named only, or the whole
+// suite if only is "", against wrap(localfs clients) and returns the
 // failures, each prefixed with the top-level subtest's path.
-func runRecorded(t *testing.T, wrap func(ns *shared, s storage.Store) storage.Store) []string {
+func runRecorded(t *testing.T, only string, wrap func(ns *shared, s storage.Store) storage.Store) []string {
 	r := &recorder{failures: &failures{}}
-	run(r, func(rt reporter) func() storage.Store {
+	newNamespace := func(rt reporter) func() storage.Store {
 		dir := tempDir(t)
 		ns := &shared{}
 		return func() storage.Store {
@@ -96,13 +100,18 @@ func runRecorded(t *testing.T, wrap func(ns *shared, s storage.Store) storage.St
 			rt.Cleanup(func() { _ = s.Close() })
 			return wrap(ns, s)
 		}
-	})
+	}
+	for _, tc := range tests {
+		if only == "" || tc.name == only {
+			subtest(r, tc.name, func(rt reporter) { tc.fn(rt, newNamespace) })
+		}
+	}
 	return r.failures.list
 }
 
 // tempDir returns a new directory, on tmpfs if /dev/shm exists: the
-// catalogue runs the suite dozens of times, and on a disk localfs's fsyncs
-// make that about four times slower.
+// self-test runs the suite or one of its subtests nearly a hundred times, and
+// on a disk localfs's fsyncs make that about four times slower.
 func tempDir(t *testing.T) string {
 	if dir, err := os.MkdirTemp("/dev/shm", "storagetest-"); err == nil {
 		t.Cleanup(func() { _ = os.RemoveAll(dir) })
@@ -130,6 +139,7 @@ type shared struct {
 	listWrite bool                     // a write has completed while a List was in progress
 	reads     int                      // reads begun
 	lastRead  int                      // the number of the latest-begun read that has returned
+	bodies    int                      // writes reading their body
 }
 
 func (ns *shared) put(k, v string) {
@@ -207,7 +217,7 @@ func (ns *shared) change(f func()) {
 }
 
 // wrongBackends breaks one rule each. want is the top-level subtest that must
-// reject it; others may reject it too.
+// reject it, and the only one the self-test runs against it.
 var wrongBackends = []struct {
 	name, want string
 	wrap       func(ns *shared, s storage.Store) storage.Store
@@ -314,10 +324,24 @@ var wrongBackends = []struct {
 	{"checks Head's deadline before the key", "InvalidKeys", func(_ *shared, s storage.Store) storage.Store { return deadlineBeforeKey{s} }},
 	{"a second Delete of a key created again does nothing", "Delete", func(ns *shared, s storage.Store) storage.Store { return deleteOnce{s, ns} }},
 	{"Replace deletes the object and creates it again", "ConcurrentReadsSeeWholeVersions", func(ns *shared, s storage.Store) storage.Store { return deleteThenCreate{s, ns} }},
+	// Found by the fifth review.
+	{"reads wait while a write reads its body", "WriteInProgress", func(ns *shared, s storage.Store) storage.Store { return readsWaitForWrites{s, ns} }},
+	{"List with an empty prefix reports the size a key was created with", "FreshReads", func(ns *shared, s storage.Store) storage.Store { return listCreatedSize{s, ns} }},
+	{"drops the last byte of a body whose length is a multiple of 32 KiB", "ExactMultiples", func(_ *shared, s storage.Store) storage.Store { return exactMultiple{s} }},
+	{"a failed write stops other clients' writes of the key", "WriteInProgress", func(ns *shared, s storage.Store) storage.Store { return &poisonOthers{Store: s, ns: ns} }},
+	{"Replace of a missing key wraps ErrNotFound as well", "NotFound", func(_ *shared, s storage.Store) storage.Store { return replaceMissingNotFound{s} }},
+	{"Get, GetRange and List answer a key seen deleted as missing until Head", "FreshReads", func(_ *shared, s storage.Store) storage.Store {
+		return &tombstones{Store: s, seen: map[string]bool{}, gone: map[string]bool{}}
+	}},
+	{"Delete folds the key to lower case", "ValidKeys", func(_ *shared, s storage.Store) storage.Store { return deleteFoldsCase{s} }},
+	{"closing a body before its end breaks the client's next read", "RangeReads", func(_ *shared, s storage.Store) storage.Store { return &closeUnread{Store: s} }},
+	{"a failed Replace creates another object", "Replace", func(_ *shared, s storage.Store) storage.Store { return replaceGhost{s} }},
+	{"a deadline passing during the body gives outcome-unknown", "WriteInProgress", func(_ *shared, s storage.Store) storage.Store { return deadlineUnknown{s} }},
+	{"Create of an existing key with the same content succeeds", "CreateExisting", func(_ *shared, s storage.Store) storage.Store { return idempotentCreate{s} }},
 }
 
-// TestSuiteRejectsWrongBackends runs the whole suite against every wrong
-// backend and requires the subtest it names to fail.
+// TestSuiteRejectsWrongBackends runs against every wrong backend the subtest
+// it names, and requires that subtest to fail.
 func TestSuiteRejectsWrongBackends(t *testing.T) {
 	// A wrong backend that blocks a call costs overlapTimeout per blocked call;
 	// these backends are expected to fail, so a shorter wait is enough.
@@ -327,20 +351,9 @@ func TestSuiteRejectsWrongBackends(t *testing.T) {
 	for _, tc := range wrongBackends {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			failed := map[string]bool{}
-			var top []string
-			for _, f := range runRecorded(t, tc.wrap) {
-				name, _, _ := strings.Cut(f, "/")
-				name, _, _ = strings.Cut(name, ":")
-				if !failed[name] {
-					top = append(top, name)
-				}
-				failed[name] = true
+			if len(runRecorded(t, tc.want, tc.wrap)) == 0 {
+				t.Fatalf("the suite did not reject it in %s", tc.want)
 			}
-			if !failed[tc.want] {
-				t.Fatalf("the suite did not reject it in %s; failing subtests: %q", tc.want, top)
-			}
-			t.Logf("%s: rejected by %q", tc.name, top)
 		})
 	}
 }
@@ -359,7 +372,7 @@ func TestSuiteAcceptsCorrectBackends(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if failures := runRecorded(t, func(_ *shared, s storage.Store) storage.Store { return tc.wrap(s) }); len(failures) > 0 {
+			if failures := runRecorded(t, "", func(_ *shared, s storage.Store) storage.Store { return tc.wrap(s) }); len(failures) > 0 {
 				t.Fatalf("the suite rejected a correct backend:\n%s", strings.Join(failures, "\n"))
 			}
 		})
@@ -2115,6 +2128,386 @@ func (s deleteThenCreate) Replace(ctx context.Context, key, version string, body
 		}
 	}
 	return s.Create(ctx, key, bytes.NewReader(data))
+}
+
+// readsWaitForWrites makes every read wait while a write on any client of the
+// namespace is reading its body. It blocks no mutation.
+type readsWaitForWrites struct {
+	storage.Store
+	ns *shared
+}
+
+func (s readsWaitForWrites) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	return s.write(ctx, key, "", false, body)
+}
+
+func (s readsWaitForWrites) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	return s.write(ctx, key, version, true, body)
+}
+
+func (s readsWaitForWrites) write(ctx context.Context, key, version string, replace bool, body io.Reader) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	s.ns.change(func() { s.ns.bodies++ })
+	data, err := readBody(ctx, body)
+	s.ns.change(func() { s.ns.bodies-- })
+	if err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	return write(ctx, s.Store, key, version, replace, bytes.NewReader(data))
+}
+
+// wait returns once no write is reading its body, or ctx has ended.
+func (s readsWaitForWrites) wait(ctx context.Context) {
+	for {
+		changed := s.ns.changes()
+		s.ns.mu.Lock()
+		busy := s.ns.bodies > 0
+		s.ns.mu.Unlock()
+		if !busy {
+			return
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s readsWaitForWrites) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	s.wait(ctx)
+	return s.Store.Get(ctx, key)
+}
+
+func (s readsWaitForWrites) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, storage.Info, error) {
+	s.wait(ctx)
+	return s.Store.GetRange(ctx, key, offset, length)
+}
+
+func (s readsWaitForWrites) Head(ctx context.Context, key string) (storage.Info, error) {
+	s.wait(ctx)
+	return s.Store.Head(ctx, key)
+}
+
+func (s readsWaitForWrites) List(ctx context.Context, prefix, startAfter string, limit int) ([]storage.Entry, error) {
+	s.wait(ctx)
+	return s.Store.List(ctx, prefix, startAfter, limit)
+}
+
+// listCreatedSize lists every key with the size it was created with when the
+// prefix is empty, as a backend whose full listings come from a stale index
+// would.
+type listCreatedSize struct {
+	storage.Store
+	ns *shared
+}
+
+func (s listCreatedSize) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	v, err := s.Store.Create(ctx, key, body)
+	if err == nil {
+		if info, err := s.Head(ctx, key); err == nil {
+			s.ns.put("created size\x00"+key, strconv.FormatInt(info.Size, 10))
+		}
+	}
+	return v, err
+}
+
+func (s listCreatedSize) List(ctx context.Context, prefix, startAfter string, limit int) ([]storage.Entry, error) {
+	entries, err := s.Store.List(ctx, prefix, startAfter, limit)
+	if prefix == "" {
+		for i, e := range entries {
+			if size, ok := s.ns.get("created size\x00" + e.Key); ok {
+				entries[i].Size, _ = strconv.ParseInt(size, 10, 64)
+			}
+		}
+	}
+	return entries, err
+}
+
+// exactMultiple drops the last byte of a body whose length is a positive
+// multiple of its 32 KiB buffer, as a chunked upload that mishandles a full
+// last chunk would.
+type exactMultiple struct{ storage.Store }
+
+func (s exactMultiple) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	return s.write(ctx, key, "", false, body)
+}
+
+func (s exactMultiple) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	return s.write(ctx, key, version, true, body)
+}
+
+func (s exactMultiple) write(ctx context.Context, key, version string, replace bool, body io.Reader) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	data, err := readBody(ctx, body)
+	if err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	if len(data) > 0 && len(data)%(32<<10) == 0 {
+		data = data[:len(data)-1]
+	}
+	return write(ctx, s.Store, key, version, replace, bytes.NewReader(data))
+}
+
+// poisonOthers marks a key when a write of it fails reading its body, and then
+// fails every write of that key through another client with
+// ErrPreconditionFailed.
+type poisonOthers struct {
+	storage.Store
+	ns *shared
+}
+
+func (s *poisonOthers) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	return s.write(ctx, key, "", false, body)
+}
+
+func (s *poisonOthers) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	return s.write(ctx, key, version, true, body)
+}
+
+func (s *poisonOthers) write(ctx context.Context, key, version string, replace bool, body io.Reader) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	me := fmt.Sprintf("%p", s)
+	if who, ok := s.ns.get("poisoned\x00" + key); ok && who != me {
+		return "", fail(opName(replace), key, storage.ErrPreconditionFailed)
+	}
+	data, err := readBody(ctx, body)
+	if err != nil {
+		s.ns.put("poisoned\x00"+key, me)
+		return "", fail(opName(replace), key, err)
+	}
+	return write(ctx, s.Store, key, version, replace, bytes.NewReader(data))
+}
+
+// replaceMissingNotFound fails a Replace of a missing key with an error that
+// wraps ErrNotFound as well as ErrPreconditionFailed.
+type replaceMissingNotFound struct{ storage.Store }
+
+func (s replaceMissingNotFound) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	v, err := s.Store.Replace(ctx, key, version, body)
+	if errors.Is(err, storage.ErrPreconditionFailed) {
+		if _, herr := s.Head(ctx, key); errors.Is(herr, storage.ErrNotFound) {
+			return v, fail("replace", key, fmt.Errorf("%w: %w", storage.ErrPreconditionFailed, storage.ErrNotFound))
+		}
+	}
+	return v, err
+}
+
+// tombstones remembers the keys its client has seen exist and then seen
+// missing, and answers Get, GetRange and List as if they were still missing
+// until the client calls Head on the key or writes it.
+type tombstones struct {
+	storage.Store
+	mu         sync.Mutex
+	seen, gone map[string]bool
+}
+
+// saw records what a read or write of key returned.
+func (s *tombstones) saw(key string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case err == nil:
+		s.seen[key] = true
+		delete(s.gone, key)
+	case errors.Is(err, storage.ErrNotFound) && s.seen[key]:
+		s.gone[key] = true
+	}
+}
+
+func (s *tombstones) isGone(ctx context.Context, key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return ctx.Err() == nil && s.gone[key]
+}
+
+func (s *tombstones) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	v, err := s.Store.Create(ctx, key, body)
+	if err == nil {
+		s.saw(key, nil)
+	}
+	return v, err
+}
+
+func (s *tombstones) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	v, err := s.Store.Replace(ctx, key, version, body)
+	if err == nil {
+		s.saw(key, nil)
+	}
+	return v, err
+}
+
+func (s *tombstones) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	if s.isGone(ctx, key) {
+		return nil, storage.Info{}, fail("get", key, storage.ErrNotFound)
+	}
+	body, info, err := s.Store.Get(ctx, key)
+	s.saw(key, err)
+	return body, info, err
+}
+
+func (s *tombstones) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, storage.Info, error) {
+	if offset >= 0 && length >= 0 && s.isGone(ctx, key) {
+		return nil, storage.Info{}, fail("get", key, storage.ErrNotFound)
+	}
+	body, info, err := s.Store.GetRange(ctx, key, offset, length)
+	s.saw(key, err)
+	return body, info, err
+}
+
+func (s *tombstones) Head(ctx context.Context, key string) (storage.Info, error) {
+	info, err := s.Store.Head(ctx, key)
+	s.saw(key, err)
+	return info, err
+}
+
+func (s *tombstones) List(ctx context.Context, prefix, startAfter string, limit int) ([]storage.Entry, error) {
+	entries, err := s.Store.List(ctx, prefix, startAfter, limit)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.DeleteFunc(entries, func(e storage.Entry) bool { return s.gone[e.Key] }), err
+}
+
+// deleteFoldsCase deletes the lower-case form of the key.
+type deleteFoldsCase struct{ storage.Store }
+
+func (s deleteFoldsCase) Delete(ctx context.Context, key string) error {
+	if storage.ValidateKey(key) == nil {
+		key = strings.ToLower(key)
+	}
+	return s.Store.Delete(ctx, key)
+}
+
+// closeUnread fails its client's next read, once, after a body was closed
+// before its end, as a client whose connection is left in a bad state would.
+type closeUnread struct {
+	storage.Store
+	broken atomic.Bool
+}
+
+func (s *closeUnread) check(op, key string) error {
+	if s.broken.CompareAndSwap(true, false) {
+		return fail(op, key, errors.New("connection reset"))
+	}
+	return nil
+}
+
+func (s *closeUnread) wrap(body io.ReadCloser, info storage.Info, err error) (io.ReadCloser, storage.Info, error) {
+	if err != nil {
+		return body, info, err
+	}
+	var ended atomic.Bool
+	return readCloser{readerFunc(func(p []byte) (int, error) {
+		n, err := body.Read(p)
+		if err != nil {
+			ended.Store(true)
+		}
+		return n, err
+	}), func() error {
+		if !ended.Load() {
+			s.broken.Store(true)
+		}
+		return body.Close()
+	}}, info, nil
+}
+
+func (s *closeUnread) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	if err := s.check("get", key); err != nil {
+		return nil, storage.Info{}, err
+	}
+	return s.wrap(s.Store.Get(ctx, key))
+}
+
+func (s *closeUnread) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, storage.Info, error) {
+	if err := s.check("get", key); err != nil {
+		return nil, storage.Info{}, err
+	}
+	return s.wrap(s.Store.GetRange(ctx, key, offset, length))
+}
+
+func (s *closeUnread) Head(ctx context.Context, key string) (storage.Info, error) {
+	if err := s.check("head", key); err != nil {
+		return storage.Info{}, err
+	}
+	return s.Store.Head(ctx, key)
+}
+
+func (s *closeUnread) List(ctx context.Context, prefix, startAfter string, limit int) ([]storage.Entry, error) {
+	if err := s.check("list", ""); err != nil {
+		return nil, err
+	}
+	return s.Store.List(ctx, prefix, startAfter, limit)
+}
+
+// replaceGhost creates another object beside the key when a Replace fails its
+// condition, as a backend that stages the new version under its own name and
+// does not remove it would.
+type replaceGhost struct{ storage.Store }
+
+func (s replaceGhost) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	v, err := s.Store.Replace(ctx, key, version, body)
+	if errors.Is(err, storage.ErrPreconditionFailed) {
+		_, _ = s.Create(ctx, key+"-staged", strings.NewReader("staged"))
+	}
+	return v, err
+}
+
+// deadlineUnknown returns ErrOutcomeUnknown when its context's deadline
+// passes while it reads the body, before publication.
+type deadlineUnknown struct{ storage.Store }
+
+func (s deadlineUnknown) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	return s.write(ctx, key, "", false, body)
+}
+
+func (s deadlineUnknown) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	return s.write(ctx, key, version, true, body)
+}
+
+func (s deadlineUnknown) write(ctx context.Context, key, version string, replace bool, body io.Reader) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	data, err := readBody(ctx, body)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "", fail(opName(replace), key, fmt.Errorf("%w: %w", storage.ErrOutcomeUnknown, err))
+	}
+	if err != nil {
+		return "", fail(opName(replace), key, err)
+	}
+	return write(ctx, s.Store, key, version, replace, bytes.NewReader(data))
+}
+
+// idempotentCreate lets a Create of an existing key whose content equals the
+// body succeed, with the existing token, as a backend that treats a repeated
+// upload as done would.
+type idempotentCreate struct{ storage.Store }
+
+func (s idempotentCreate) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	if err := storage.ValidateKey(key); err != nil {
+		return "", fail("create", key, err)
+	}
+	data, err := readBody(ctx, body)
+	if err != nil {
+		return "", fail("create", key, err)
+	}
+	v, err := s.Store.Create(ctx, key, bytes.NewReader(data))
+	if errors.Is(err, storage.ErrPreconditionFailed) && len(data) > 0 {
+		if cur, info, gerr := s.Get(ctx, key); gerr == nil {
+			b, rerr := io.ReadAll(cur)
+			_ = cur.Close()
+			if rerr == nil && bytes.Equal(b, data) {
+				return info.Version, nil
+			}
+		}
+	}
+	return v, err
 }
 
 // Correct backends that must pass.

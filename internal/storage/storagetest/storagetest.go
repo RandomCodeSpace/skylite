@@ -7,18 +7,22 @@
 //
 // The suite covers what can be checked through the interface from one
 // process: key validation, conditional writes and version tokens, range
-// reads, listing order, selectors that are not keys, pagination (including a
-// listing longer than storage.MaxListLimit) and listing while other keys come
-// and go, every read path on its own after another client's mutation, failed
-// and cancelled writes (including a context cancelled, or a reader failing, at
-// the very end of the body), contexts cancelled or past their deadline, what
-// readers and other writers on the same and on other clients see while a
-// write is stopped before and inside its body, open bodies across a Replace or
-// Delete, error types, operations, keys and texts, the precedence of an
-// invalid key over every other argument, that a failed write returns no
-// token, reader errors that are storage sentinels, and races between
-// independent clients: Create against Create, Replace against Replace,
-// Replace against Delete and Create against Delete.
+// reads, bodies whose length is an exact multiple of 32 KiB, 1 MiB and 5 MiB,
+// listing order, selectors that are not keys, pagination (including a listing
+// longer than storage.MaxListLimit) and listing while other keys come and go,
+// every read path on its own after another client's mutation, failed,
+// cancelled and timed-out writes (including a context cancelled, or a reader
+// failing, at the very end of the body, and a deadline passing inside it),
+// contexts cancelled or past their deadline, what readers and other writers on
+// the same and on other clients see while a write is stopped before and inside
+// its body, and that their calls return, open bodies across a Replace or
+// Delete, bodies closed before their end, error types, operations, keys and
+// texts, that an error wraps only one of the storage sentinels other than
+// ErrOutcomeUnknown, the precedence of an invalid key over every other
+// argument, that a failed write returns no token and leaves no other object,
+// reader errors that are storage sentinels, and races between independent
+// clients: Create against Create, Replace against Replace, Replace against
+// Delete and Create against Delete.
 //
 // Every test of conditional writes (the race tests included), version
 // tokens, deletion, open bodies, range reads and the end of a body runs at
@@ -51,31 +55,34 @@
 // accepted, not sufficient.
 //
 // Counted on localfs with a wrapper that counts calls and body bytes, a full
-// run makes about 5,800 storage requests outside ListDuringWrites and
-// ConcurrentReadsSeeWholeVersions, sends about 6.9 GiB of bodies to writes
-// and reads about 2.0 GiB. The large rounds of ConcurrentCreate and
+// run makes about 6,300 storage requests outside ListDuringWrites and
+// ConcurrentReadsSeeWholeVersions, sends about 7.0 GiB of bodies to writes
+// and reads about 2.1 GiB. The large rounds of ConcurrentCreate and
 // ConcurrentReplace (16 writers, 10 rounds, 17 MiB each) send 5.3 GiB of
-// that. ListDuringWrites lists for as long as its writer needs to make 240
-// writes, so its count follows the backend's speed (about 8,000 requests on
-// localfs). The four readers of ConcurrentReadsSeeWholeVersions read as fast
-// as the backend lets them while it makes 41 writes of 0.2 GiB, at most 2,000
-// reads each (on localfs about 10,000 requests and 0.3 to 0.5 GiB).
+// that; ExactMultiples sends 12 MiB and reads 16 MiB in 30 requests.
+// ListDuringWrites lists for as long as its writer needs to make 240 writes,
+// so its count follows the backend's speed (760 to 1,020 requests in four
+// runs on localfs). The four readers of ConcurrentReadsSeeWholeVersions read
+// as fast as the backend lets them while it makes 41 writes of 0.2 GiB, at
+// most 2,000 reads each (on localfs about 10,000 requests, reading 0.1 to
+// 0.3 GiB).
 //
 // Every wait that involves a write stopped in its body, or calls racing one,
 // is bounded by a timer, not by the backend honouring its context: for the
-// write to reach its stop, for calls that the stopped write must not block,
-// for the write and the calls racing it to return once released, and for the
-// goroutines a test leaves behind when it ends. Every other call is made
-// directly, so a backend that hangs in one hangs the test until go test's own
-// timeout.
+// write to reach its stop, for calls, reads included, that the stopped write
+// must not block, for the write and the calls racing it to return once
+// released, and for the goroutines a test leaves behind when it ends. Every
+// other call is made directly, so a backend that hangs in one hangs the test
+// until go test's own timeout.
 //
 // The suite tests itself: selftest_test.go runs it, with a shorter large
 // size, against a catalogue of wrong backends, each a thin wrapper around
 // package localfs that breaks one rule, and requires every one of them to be
 // rejected by the subtest it names, and against correct but slow or fragile
-// backends that must pass. A wrong backend whose fault shows only under an
-// interleaving forces that interleaving with a barrier of its own, so that its
-// rejection does not depend on scheduling.
+// backends that must pass. It runs only the named subtest against a wrong
+// backend, and the whole suite against a correct one. A wrong backend whose
+// fault shows only under an interleaving forces that interleaving with a
+// barrier of its own, so that its rejection does not depend on scheduling.
 package storagetest
 
 import (
@@ -86,6 +93,7 @@ import (
 	"io"
 	"math"
 	"math/rand/v2"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -146,6 +154,7 @@ var tests = []struct {
 	{"Delete", sized(testDelete)},
 	{"FreshReads", sized(testFreshReads)},
 	{"RangeReads", sized(testRangeReads)},
+	{"ExactMultiples", one(testExactMultiples)},
 	{"ListOrder", one(testListOrder)},
 	{"ListPagination", one(testListPagination)},
 	{"ListLimits", one(testListLimits)},
@@ -279,6 +288,11 @@ func expectError(t reporter, err error, op, key string, want error) {
 		t.Fatalf("%s %q error %v has Op %q and Key %q", op, key, err, se.Op, se.Key)
 	case !errors.Is(err, want):
 		t.Fatalf("%s %q error = %v, want it to wrap %v", op, key, err, want)
+	}
+	for _, other := range []error{storage.ErrNotFound, storage.ErrPreconditionFailed, storage.ErrInvalidKey, storage.ErrInvalidArgument} {
+		if errors.Is(err, other) && !errors.Is(want, other) {
+			t.Fatalf("%s %q error = %v wraps %v as well as %v; it wraps only one of them", op, key, err, other, want)
+		}
 	}
 }
 
@@ -513,15 +527,18 @@ var validKeys = []string{
 	strings.Repeat(strings.Repeat("m", 31)+"/", storage.MaxKeySegments-1) + strings.Repeat("m", 32),
 }
 
+// testValidKeys creates, replaces and deletes every valid key, reading each
+// back and listing the namespace after each Delete.
 func testValidKeys(t reporter, s storage.Store) {
 	if k := validKeys[len(validKeys)-1]; len(k) != storage.MaxKeyLen || strings.Count(k, "/") != storage.MaxKeySegments-1 {
 		t.Fatalf("fixture: longest key has %d bytes and %d segments", len(k), strings.Count(k, "/")+1)
 	}
+	versions := make([]string, len(validKeys))
 	for i, k := range validKeys {
 		if err := storage.ValidateKey(k); err != nil {
 			t.Fatalf("ValidateKey(%.40q): %v", k, err)
 		}
-		create(t, s, k, fmt.Sprint(i))
+		versions[i] = create(t, s, k, fmt.Sprint(i))
 	}
 	for i, k := range validKeys {
 		expectContent(t, s, k, fmt.Sprint(i), "")
@@ -530,6 +547,21 @@ func testValidKeys(t reporter, s storage.Store) {
 	slices.Sort(want)
 	if got := keys(listAll(t, s, "")); !slices.Equal(got, want) {
 		t.Fatalf("List = %q, want %q", got, want)
+	}
+	for i, k := range validKeys {
+		versions[i] = replace(t, s, k, versions[i], fmt.Sprint(i, " replaced"))
+	}
+	for i, k := range validKeys {
+		expectContent(t, s, k, fmt.Sprint(i, " replaced"), versions[i])
+	}
+	for _, k := range validKeys {
+		if err := s.Delete(ctx, k); err != nil {
+			t.Fatalf("Delete(%.40q): %v", k, err)
+		}
+		want = slices.DeleteFunc(want, func(w string) bool { return w == k })
+		if got := keys(listAll(t, s, "")); !slices.Equal(got, want) {
+			t.Fatalf("after Delete(%.40q) List = %q, want %q", k, got, want)
+		}
 	}
 }
 
@@ -544,7 +576,8 @@ func testNotFound(t reporter, s storage.Store) {
 }
 
 // testCreateExisting creates a key that another client has seen missing and
-// then creates it again through both clients.
+// then creates it again through both clients, with other and with the same
+// content.
 func testCreateExisting(t reporter, open func() storage.Store, n int) {
 	w, r := open(), open()
 	first, second := content("first", n), content("second", n)
@@ -553,8 +586,10 @@ func testCreateExisting(t reporter, open func() storage.Store, n int) {
 	expectContent(t, r, "k", first, v)
 	expectContent(t, w, "k", first, v)
 	for _, s := range []storage.Store{w, r} {
-		v, err := s.Create(ctx, "k", strings.NewReader(second))
-		expectWriteError(t, v, err, "create", "k", storage.ErrPreconditionFailed)
+		for _, c := range []string{second, first} {
+			v, err := s.Create(ctx, "k", strings.NewReader(c))
+			expectWriteError(t, v, err, "create", "k", storage.ErrPreconditionFailed)
+		}
 	}
 	expectContent(t, r, "k", first, v)
 	expectContent(t, w, "k", first, v)
@@ -583,6 +618,9 @@ func testReplace(t reporter, open func() storage.Store, n int) {
 	}
 	for _, s := range both {
 		expectContent(t, s, "k", second, v2)
+		if got := keys(listAll(t, s, "")); !slices.Equal(got, []string{"k"}) {
+			t.Fatalf("after failed Replaces List = %q, want [k]", got)
+		}
 	}
 	expectMissing(t, r, "missing")
 	for _, s := range both {
@@ -706,7 +744,7 @@ func testDelete(t reporter, open func() storage.Store, n int) {
 // through another path: Head, Get, a bounded GetRange and List. A client that
 // answers one path from what it read before, and refreshes it only when
 // another path is used, fails here. The replacements change the size, so that
-// a stale size shows.
+// a stale size shows, and after the Delete the key is created again.
 func testFreshReads(t reporter, open func() storage.Store, n int) {
 	w := open()
 	readers := openClients(open, 4)
@@ -735,11 +773,15 @@ func testFreshReads(t reporter, open func() storage.Store, n int) {
 		t.Fatal(err)
 	}
 	expectFirstReads(t, readers, "after a Delete by another client", "k", "", "")
+	prime("", "")
+	v = create(t, w, "k", c1)
+	expectFirstReads(t, readers, "after another client created the deleted key again", "k", c1, v)
 }
 
 // expectFirstReads checks that key holds content at version, or is missing if
 // version is "", with one read on each of four clients: Head, Get, a bounded
-// GetRange and List, in that order of clients.
+// GetRange and a List of the whole namespace, which holds no other key, in
+// that order of clients.
 func expectFirstReads(t reporter, clients []storage.Store, when, key, content, version string) {
 	t.Helper()
 	want := storage.Info{Size: int64(len(content)), Version: version}
@@ -767,16 +809,16 @@ func expectFirstReads(t reporter, clients []storage.Store, when, key, content, v
 	} else if got := readAll(t, body); got != content[off:min(off+length, len(content))] || info != want {
 		t.Fatalf("%s, GetRange(%q, %d, %d) = %d bytes, %+v; want bytes [%d, %d) of the content, %+v", when, key, off, length, len(got), info, off, min(off+length, len(content)), want)
 	}
-	entries, err := clients[3].List(ctx, key, "", 1)
+	entries, err := clients[3].List(ctx, "", "", storage.MaxListLimit)
 	if err != nil {
-		t.Fatalf("%s, List(%q, \"\", 1): %v", when, key, err)
+		t.Fatalf("%s, List: %v", when, err)
 	}
 	if version == "" {
-		if len(entries) > 0 && entries[0].Key == key {
-			t.Fatalf("%s, List(%q, \"\", 1) = %+v, which lists the deleted key", when, key, entries)
+		if len(entries) > 0 {
+			t.Fatalf("%s, List = %+v, want no entries", when, entries)
 		}
 	} else if wantEntry := (storage.Entry{Key: key, Size: want.Size}); len(entries) != 1 || entries[0] != wantEntry {
-		t.Fatalf("%s, List(%q, \"\", 1) = %+v, want [%+v]", when, key, entries, wantEntry)
+		t.Fatalf("%s, List = %+v, want [%+v]", when, entries, wantEntry)
 	}
 }
 
@@ -827,6 +869,31 @@ func testRangeReads(t reporter, open func() storage.Store, n int) {
 		expectError(t, err, "get", "k", storage.ErrInvalidArgument)
 	}
 	expectContent(t, s, "k", c, v)
+	// A body closed before its end must leave the client working.
+	for range 3 {
+		body, _, err := s.Get(ctx, "k")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		readStart(t, body)
+		_ = body.Close()
+		expectContent(t, s, "k", c, v)
+	}
+}
+
+// testExactMultiples creates, reads and replaces bodies whose length is an
+// exact multiple of 32 KiB, 1 MiB and 5 MiB, so that the last buffer or chunk
+// of a chunked path is exactly full.
+func testExactMultiples(t reporter, s storage.Store) {
+	for _, n := range []int{32 << 10, 1 << 20, 5 << 20} {
+		key := fmt.Sprint("m", n)
+		c := content(key, n)
+		v := create(t, s, key, c)
+		expectContent(t, s, key, c, v)
+		c = content(key+" replaced", n)
+		v = replace(t, s, key, v, c)
+		expectContent(t, s, key, c, v)
+	}
 }
 
 // expectList is the reference listing: the keys with prefix after startAfter,
@@ -1284,10 +1351,39 @@ func within(t reporter, bg *background, what string, fn func() error) error {
 		case <-time.After(completionTimeout):
 			err = fmt.Errorf("nothing within %v", completionTimeout)
 		}
-		t.Fatalf("%s did not return within %v while a write was reading its body (it returned %v once the write was released); a write must not block other mutations while it reads its body", what, overlapTimeout, err)
+		t.Fatalf("%s did not return within %v while a write was reading its body (it returned %v once the write was released); a write must not block other calls while it reads its body", what, overlapTimeout, err)
 		return nil
 	}
 }
+
+// checkWithin runs check through within, on another goroutine, so that a
+// backend whose calls wait for a stopped write fails the test instead of
+// hanging it. A Fatal in check ends that goroutine and is reported on t's.
+func checkWithin(t reporter, bg *background, what string, check func(t reporter)) {
+	t.Helper()
+	off := &offGoroutine{reporter: t}
+	_ = within(t, bg, what, func() error {
+		done := make(chan struct{})
+		go func() { defer close(done); check(off) }()
+		<-done
+		return nil
+	})
+	if off.fatal != "" {
+		t.Fatal(off.fatal)
+	}
+}
+
+// offGoroutine is a reporter for a check that runs on a goroutine other than
+// the test's, where *testing.T does not allow Fatal: Fatal records its message
+// and ends the goroutine.
+type offGoroutine struct {
+	reporter
+	fatal string
+}
+
+func (o *offGoroutine) Fatal(args ...any) { o.fatal = fmt.Sprint(args...); runtime.Goexit() }
+
+func (o *offGoroutine) Fatalf(format string, args ...any) { o.Fatal(fmt.Sprintf(format, args...)) }
 
 // pending is a write running in the background with a gated body.
 type pending struct {
@@ -1875,17 +1971,48 @@ func readerError(err error) error {
 	return nil
 }
 
+// deadlineContext is a context whose deadline the test makes pass on demand.
+// Until expire is called it is not done; from then on Done is closed and Err
+// returns context.DeadlineExceeded. Deadline reports a fixed time an hour
+// after the context was made, which only gives a backend that reads it more
+// time than it gets.
+type deadlineContext struct {
+	context.Context // ctx, for Value
+	deadline        time.Time
+	done            chan struct{}
+}
+
+func newDeadlineContext() (c *deadlineContext, expire func()) {
+	c = &deadlineContext{Context: ctx, deadline: time.Now().Add(time.Hour), done: make(chan struct{})}
+	return c, sync.OnceFunc(func() { close(c.done) })
+}
+
+func (c *deadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
+
+func (c *deadlineContext) Done() <-chan struct{} { return c.done }
+
+func (c *deadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
 // testWriteInProgress stops a Create or Replace twice inside its body: before
 // the first byte, and after a prefix. The prefix is either largeSize bytes,
 // past every chunk a backend may upload separately, or a short read: a first
 // Read that returns five bytes and no error, which a backend must not take
 // for the whole body. At each stop it checks with Get, Head and List, from the
-// writer's client and from another one, that nothing of the write is visible,
-// and requires mutations through the writer's own client, of an unrelated key
-// and of the key itself, to complete. Then it lets the write succeed (the body
-// ends with io.EOF), fail by a reader error or fail by cancellation, each from
-// the second stop, and checks the outcome and that a failed write does not
-// block the next one.
+// writer's client and from another one, that nothing of the write is visible
+// and that those reads return, and requires mutations through the writer's own
+// client, of an unrelated key and of the key itself, to complete. Then it lets
+// the write succeed (the body ends with io.EOF), fail by a reader error, fail
+// by cancellation or fail by its context's deadline passing, each from the
+// second stop, and checks the outcome and that a failed write does not block a
+// later write of the key, through another client and then through the
+// writer's.
 func testWriteInProgress(t reporter, open func() storage.Store) {
 	w, r := open(), open()
 	prefixes := []struct{ name, prefix string }{
@@ -1894,7 +2021,7 @@ func testWriteInProgress(t reporter, open func() storage.Store) {
 	}
 	for _, op := range []string{"Create", "Replace"} {
 		for _, stop := range prefixes {
-			for _, outcome := range []string{"succeeds", "fails", "cancelled"} {
+			for _, outcome := range []string{"succeeds", "fails", "cancelled", "times out"} {
 				subtest(t, op+" "+outcome+stop.name, func(t reporter) {
 					bg := newBackground(t)
 					key := strings.ReplaceAll(strings.ToLower(op+"-"+outcome+stop.name), " ", "-")
@@ -1906,18 +2033,26 @@ func testWriteInProgress(t reporter, open func() storage.Store) {
 					before := listAll(t, r, "")
 					unchanged := func(when string) {
 						t.Helper()
-						for _, s := range []storage.Store{w, r} {
-							if op == "Create" {
-								expectMissing(t, s, key)
-							} else {
-								expectContent(t, s, key, "old", old)
+						checkWithin(t, bg, "Head, GetRange, Get and List "+when, func(t reporter) {
+							for _, s := range []storage.Store{w, r} {
+								if op == "Create" {
+									expectMissing(t, s, key)
+								} else {
+									expectContent(t, s, key, "old", old)
+								}
+								if got := listAll(t, s, ""); !slices.Equal(got, before) {
+									t.Fatalf("%s: List = %+v, want %+v", when, got, before)
+								}
 							}
-							if got := listAll(t, s, ""); !slices.Equal(got, before) {
-								t.Fatalf("%s: List = %+v, want %+v", when, got, before)
-							}
-						}
+						})
 					}
-					cctx, cancel := context.WithCancel(ctx)
+					var cctx context.Context
+					var cancel func()
+					if outcome == "times out" {
+						cctx, cancel = newDeadlineContext()
+					} else {
+						cctx, cancel = context.WithCancel(ctx)
+					}
 					defer cancel()
 					var rest io.Reader
 					switch outcome {
@@ -1925,7 +2060,7 @@ func testWriteInProgress(t reporter, open func() storage.Store) {
 						rest = strings.NewReader("new")
 					case "fails":
 						rest = iotest.ErrReader(errReader)
-					case "cancelled": // the body keeps returning data, so only the store can stop the write
+					case "cancelled", "times out": // the body keeps returning data, so only the store can stop the write
 						rest = io.LimitReader(readerFunc(func(p []byte) (int, error) { clear(p); return len(p), nil }), 64<<20)
 					}
 					inner, openInner := bg.gate()
@@ -1950,9 +2085,9 @@ func testWriteInProgress(t reporter, open func() storage.Store) {
 					}
 					unchanged("while the write is stopped inside its body")
 					mutateDuring(t, bg, w, key, key+"-other2", op == "Replace")
-					if outcome == "cancelled" {
+					if outcome == "cancelled" || outcome == "times out" {
 						cancel()
-						unchanged("after the write's context was cancelled")
+						unchanged("after the write's context ended")
 					}
 					openInner()
 					await(t, p.done, op)
@@ -1968,17 +2103,20 @@ func testWriteInProgress(t reporter, open func() storage.Store) {
 						expectBodyError(t, v, err, strings.ToLower(op), key, errReader)
 					case "cancelled":
 						expectWriteError(t, v, err, strings.ToLower(op), key, context.Canceled)
+					case "times out":
+						expectWriteError(t, v, err, strings.ToLower(op), key, context.DeadlineExceeded)
 					}
 					if errors.Is(err, storage.ErrOutcomeUnknown) {
 						t.Fatalf("%s failed before publication, but its error %v wraps ErrOutcomeUnknown", op, err)
 					}
 					unchanged("after the write failed")
 					if op == "Create" {
-						v = create(t, w, key, "after")
+						v = create(t, r, key, "after")
 					} else {
-						v = replace(t, w, key, old, "after")
+						v = replace(t, r, key, old, "after")
 					}
-					expectContent(t, r, key, "after", v)
+					v = replace(t, w, key, v, "after, again")
+					expectContent(t, r, key, "after, again", v)
 				})
 			}
 		}

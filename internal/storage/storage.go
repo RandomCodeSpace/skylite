@@ -66,9 +66,10 @@
 // other writers, and a write that stops there (the body's Read fails, the
 // context ends, the process is killed, the upload fails) does not stop a later
 // Create of the same key from succeeding. While it reads the body, a write
-// must not hold anything that blocks other mutations: cancellation cannot
+// blocks no other call, reads included: it holds nothing that another
+// mutation, Get, GetRange, Head or List waits for. Cancellation cannot
 // interrupt a Read of the caller's body (see below), so such a hold would let
-// one stalled caller stop every writer.
+// one stalled caller stop every other caller.
 //
 // Among any number of concurrent Create calls for one absent key, exactly one
 // succeeds; among concurrent Replace calls with the same current version,
@@ -106,8 +107,9 @@
 // written the same bytes. The caller then does one of two things. Either it
 // repeats the same conditional write until it gets a definite answer: success,
 // or [ErrPreconditionFailed] followed by a read that shows whose content is
-// there. Or it arranges that the outstanding request can no longer matter, for
-// example by making sure its condition can never hold again. Delete has no
+// there (for Create, definite only until the key is deleted; see below). Or
+// it arranges that the outstanding request can no longer matter, for example
+// by making sure its condition can never hold again. Delete has no
 // condition: repeating it until it succeeds leaves the key missing when it
 // returns, but the first request may still remove an object created at the key
 // afterwards, so a caller does not create a key again after a Delete of it
@@ -223,8 +225,8 @@
 // reads. A missing key fails with [ErrNotFound]. The caller must close the
 // body. Errors while reading the body, including the end of the context the
 // body was opened with, are returned by the body's Read; once that context has
-// ended, Read fails with an error err for which errors.Is(err, ctx.Err()) is
-// true.
+// ended, a Read that would return more data fails with an error err for which
+// errors.Is(err, ctx.Err()) is true.
 //
 // An open body belongs to one version: every byte it returns comes from the
 // version its Info describes, whenever it is read. If that version is
