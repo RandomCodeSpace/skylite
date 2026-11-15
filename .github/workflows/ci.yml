@@ -114,6 +114,24 @@ jobs:
         env:
           SKYLITE_SPIKE_KILL_ROUNDS: "20"
 
+  integration-s3:
+    name: integration-s3
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+          cache-dependency-path: go.mod
+      # Starts RustFS (image pinned by digest in the Makefile), waits for it and
+      # runs the S3 backend's tests, the conformance suite included, with the
+      # race detector.
+      - run: make integration-s3
+
   actionlint:
     name: actionlint
     runs-on: ubuntu-latest
