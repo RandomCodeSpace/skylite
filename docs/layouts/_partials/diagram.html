@@ -156,9 +156,9 @@
     <ol>
       <li>Go services (through the <code>database/sql</code> driver) and Java services (through the JDBC driver) send SQL over HTTPS, through ingress or Istio.</li>
       <li>A group of skylite pods serves one database. The pods have no persistent volumes.</li>
-      <li>One pod is the leader. It takes all writes and keeps a working copy on ephemeral disk.</li>
+      <li>One pod is the leader. It takes all writes. Its ephemeral disk holds only a cache and its local write-ahead log; it reads pages from object storage on demand.</li>
       <li>The other pods are followers. They forward writes to the leader and serve reads by fetching pages from object storage on demand, with a bounded cache.</li>
-      <li>The leader uploads change files and snapshots to object storage. A write is acknowledged only after the upload is confirmed.</li>
+      <li>The leader uploads each commit to object storage as one commit-log object and later folds the log into base page groups named by a manifest. A write is acknowledged only after the commit object is confirmed.</li>
       <li>Object storage (Azure Blob, S3, GCS or local filesystem) also holds the lease object. Conditional writes fence a stale leader; the lease only helps a takeover make progress.</li>
     </ol>
   </details>

@@ -26,13 +26,13 @@ The cost is write latency. Every acknowledged write includes an object storage r
 skylite plans its own storage engine under SQLite, using the pure-Go engine [`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3). Litestream is not used in the product. Each database is planned to have four kinds of object in storage:
 
 - A **commit log**: one object per transaction, named by its transaction number and created only if absent. That create is the commit point and the acknowledgement point. A name in the log is never freed: once the base covers a commit, garbage collection replaces the object with a small retired form that keeps its header and drops its pages.
-- A **base**: the database's pages in fixed-size groups of consecutive page numbers, each an immutable object.
-- A **manifest**: one object, changed only by compare-and-swap, that names the database identifier, the base objects, the transaction number they are current to, the epoch and the current leader's writer nonce.
-
-The database identifier is part of the key of every log and base object, so a delayed request from an old process lands in the namespace of the database it was working on.
+- A **base**: the database's pages in fixed-size groups of consecutive page numbers, each an immutable object whose name belongs to the one compaction attempt that created it.
+- A **manifest**: one object, changed only by compare-and-swap, that names the database identifier, the base objects, the transaction number they are current to, how far the commit log has been retired, the epoch and the current leader's writer nonce.
 - A **lease** object, used so that a takeover makes progress.
 
-On the leader, SQLite is planned to run in WAL mode. The plan is for the storage engine to turn each commit in the write-ahead log into one commit object and upload it before `COMMIT` returns. A client is told one of three outcomes: committed, not committed, or unknown when the upload's result cannot be established. After an unknown outcome, and after any failure in the commit path once an upload may have started, the pod stops serving that database until a takeover reads the durable history. The leader is to fold the commit log into new base objects and then swap the manifest.
+The database identifier is part of the key of every log and base object, so a delayed request from an old process lands in the namespace of the database it was working on.
+
+On the leader, SQLite is planned to run in WAL mode. The plan is for the storage engine to turn each commit in the write-ahead log into one commit object and upload it before `COMMIT` returns. A client is told one of three outcomes: committed, not committed, or unknown when the upload's result cannot be established. An upload known to have had no effect, followed by a successful truncation of the local log, rolls the transaction back and the pod keeps serving. After an unknown outcome, a failed truncation, or any other failure in the commit path once an upload may have started, the pod stops serving that database until a takeover reads the durable history. The leader is to fold the commit log into new base objects and then swap the manifest.
 
 The first version accepts these limits: one upload per commit; a maximum transaction size, which makes `VACUUM` and large index builds unsupported on large databases; a maximum manifest size; bounds on the leader's local log and on its uncompacted commit log; one small retired object kept per transaction for the life of the database; takeover latency that is not bounded; and followers whose lag is not bounded by their polling interval. The [decision record](/docs/decisions/0004-storage-engine/#10-limits-accepted-in-the-first-version) states each one.
 
@@ -40,7 +40,7 @@ The first version accepts these limits: one upload per commit; a maximum transac
 
 Each database is to have exactly one leader, and other pods forward writes to it. A lease object in object storage lets a new leader take over, but the lease is not what keeps a stale leader out. A lease on its own cannot stop a leader that has paused, lost its network or missed its expiry from writing again.
 
-The fence is the storage layout. Commits are created only if absent, so a stale leader's next commit meets the new leader's epoch-bump commit at its name, and the stale leader stops. No commit-log object is ever deleted, so this holds even after old commits have been folded into the base. Compaction and the start of a takeover change the manifest by compare-and-swap, and a takeover changes it first, so a stale leader's compaction cannot win. Lease updates and garbage collection do not go through the manifest: the lease carries no safety, and garbage collection only retires commits the base already covers and deletes base objects that no manifest can reference again. Two pods may briefly both believe they lead; the design prevents conflicting history, not that belief. A takeover downloads no database content, but it reads the manifest, which grows with the number of base groups.
+The fence is the storage layout. Commits are created only if absent, so a stale leader's next commit meets the new leader's epoch-bump commit at its name, and the stale leader stops. No commit-log object is ever deleted, so this holds even after old commits have been folded into the base. Compaction and the start of a takeover change the manifest by compare-and-swap, and a takeover changes it first, so a stale leader's compaction cannot win. Lease updates and garbage collection do not go through the manifest: the lease carries no safety, and garbage collection only retires commits the base already covers and deletes base objects that no current or future manifest can reference. Two pods may briefly both believe they lead; the design prevents conflicting history, not that belief. A takeover downloads no database content, but it reads the manifest, which grows with the number of base groups.
 
 ## Reads
 
@@ -57,7 +57,7 @@ Two client libraries are planned:
 
 ## Storage backends
 
-All storage access goes through one storage interface whose only writes are create-if-absent and compare-and-swap. Azure Blob Storage comes first, then AWS S3, Google Cloud Storage and the local filesystem. The backends are meant to share one test suite that runs against storage emulators.
+All storage access goes through one storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete; there is no unconditional put. Azure Blob Storage comes first, then AWS S3, Google Cloud Storage and the local filesystem. The backends are meant to share one test suite that runs against storage emulators.
 
 ## Cloud authentication
 

@@ -15,7 +15,7 @@ gate = "The storage architecture that follows from it is recorded in decision re
 [[items]]
 title = "Storage interface and four backends"
 status = "planned"
-detail = "One storage interface whose only writes are create-if-absent and compare-and-swap, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators."
+detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators."
 
 [[items]]
 title = "Storage engine: commit log, paged reads, compaction"
