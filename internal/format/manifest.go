@@ -9,7 +9,7 @@ const MaxManifestSize = 16 << 20
 
 const (
 	manifestMagic      = "SKYLITEM"
-	manifestHeaderSize = 76
+	manifestHeaderSize = 84
 	groupRefSize       = 16
 )
 
@@ -21,7 +21,10 @@ type Manifest struct {
 	GroupSize uint32
 	DBSize    uint32 // database size in pages at Txn
 	Txn       uint64 // transaction number the base is current to; 0 before the first compaction
-	Epoch     uint64 // epoch of the writer
+	// RetiredThrough is at most Txn: every commit-log object at or below
+	// it is retired or is an epoch bump. 0 when the database is created.
+	RetiredThrough uint64
+	Epoch          uint64 // epoch of the writer
 	// Nonce is random, never all zeros, set by the candidate that swapped
 	// the manifest to Epoch and kept by that leader's later manifests.
 	Nonce [16]byte
@@ -30,11 +33,12 @@ type Manifest struct {
 }
 
 // GroupRef names a base group object by the transaction number it is
-// current to and its writer's epoch. The zero GroupRef means the group has
-// no object and all its pages read as zeros.
+// current to and the tag of the compaction attempt that wrote it. Txn 0
+// means the group has no object and all its pages read as zeros; Tag is
+// then 0 too, so the zero GroupRef is the only such entry.
 type GroupRef struct {
-	Txn   uint64
-	Epoch uint64
+	Txn uint64
+	Tag uint64
 }
 
 // GroupCount is the number of groups that hold a database of dbSize pages.
@@ -60,6 +64,8 @@ func (m Manifest) validate() error {
 		return invalid("group size %d at page size %d", m.GroupSize, m.PageSize)
 	case m.DBSize > MaxPages:
 		return invalid("database size %d pages exceeds %d", m.DBSize, uint32(MaxPages))
+	case m.RetiredThrough > m.Txn:
+		return invalid("retired through %d after transaction %d", m.RetiredThrough, m.Txn)
 	case m.Epoch == 0:
 		return invalid("epoch 0")
 	case m.Nonce == [16]byte{}:
@@ -69,12 +75,10 @@ func (m Manifest) validate() error {
 	}
 	for g, r := range m.Groups {
 		switch {
-		case (r.Txn == 0) != (r.Epoch == 0):
-			return invalid("group %d: transaction %d epoch %d", g, r.Txn, r.Epoch)
+		case r.Txn == 0 && r.Tag != 0:
+			return invalid("group %d: no object but tag %016x", g, r.Tag)
 		case r.Txn > m.Txn:
 			return invalid("group %d: transaction %d after manifest transaction %d", g, r.Txn, m.Txn)
-		case r.Epoch > m.Epoch:
-			return invalid("group %d: epoch %d after manifest epoch %d", g, r.Epoch, m.Epoch)
 		}
 	}
 	return nil
@@ -100,11 +104,12 @@ func EncodeManifest(m Manifest) ([]byte, error) {
 	le.PutUint64(b[32:], m.Epoch)
 	copy(b[40:], m.DB[:])
 	copy(b[56:], m.Nonce[:])
-	le.PutUint32(b[72:], uint32(len(m.Groups))) //nolint:gosec // bounded by MaxManifestSize
+	le.PutUint64(b[72:], m.RetiredThrough)
+	le.PutUint32(b[80:], uint32(len(m.Groups))) //nolint:gosec // bounded by MaxManifestSize
 	x := b[manifestHeaderSize:]
 	for _, r := range m.Groups {
 		le.PutUint64(x, r.Txn)
-		le.PutUint64(x[8:], r.Epoch)
+		le.PutUint64(x[8:], r.Tag)
 		x = x[groupRefSize:]
 	}
 	n := len(b) - 4
@@ -126,7 +131,7 @@ func DecodeManifest(b []byte, db DatabaseID) (Manifest, error) {
 	if len(b) < manifestHeaderSize+4 {
 		return Manifest{}, invalid("manifest truncated at %d bytes", len(b))
 	}
-	groups := le.Uint32(b[72:])
+	groups := le.Uint32(b[80:])
 	if want := manifestSize(int64(groups)); int64(len(b)) != want {
 		return Manifest{}, invalid("manifest is %d bytes, %d groups need %d", len(b), groups, want)
 	}
@@ -138,11 +143,12 @@ func DecodeManifest(b []byte, db DatabaseID) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("%w: flags %#x", ErrVersion, f)
 	}
 	m := Manifest{
-		PageSize:  le.Uint32(b[12:]),
-		GroupSize: le.Uint32(b[16:]),
-		DBSize:    le.Uint32(b[20:]),
-		Txn:       le.Uint64(b[24:]),
-		Epoch:     le.Uint64(b[32:]),
+		PageSize:       le.Uint32(b[12:]),
+		GroupSize:      le.Uint32(b[16:]),
+		DBSize:         le.Uint32(b[20:]),
+		Txn:            le.Uint64(b[24:]),
+		RetiredThrough: le.Uint64(b[72:]),
+		Epoch:          le.Uint64(b[32:]),
 	}
 	copy(m.DB[:], b[40:56])
 	copy(m.Nonce[:], b[56:72])
@@ -151,7 +157,7 @@ func DecodeManifest(b []byte, db DatabaseID) (Manifest, error) {
 	if groups > 0 {
 		m.Groups = make([]GroupRef, groups)
 		for g := range m.Groups {
-			m.Groups[g] = GroupRef{Txn: le.Uint64(x), Epoch: le.Uint64(x[8:])}
+			m.Groups[g] = GroupRef{Txn: le.Uint64(x), Tag: le.Uint64(x[8:])}
 			x = x[groupRefSize:]
 		}
 	}

@@ -21,7 +21,7 @@ type BaseHeader struct {
 	GroupSize uint32 // pages per group
 	Group     uint32
 	Txn       uint64 // transaction number the group is current to
-	Epoch     uint64 // epoch of the writer
+	Tag       uint64 // random, drawn by the compaction attempt that wrote the object
 	DBSize    uint32 // database size in pages after transaction Txn
 }
 
@@ -49,8 +49,6 @@ func (h BaseHeader) validate() error {
 		return invalid("group %d starts beyond page %d", h.Group, uint32(MaxPages))
 	case h.Txn == 0:
 		return invalid("transaction number 0")
-	case h.Epoch == 0:
-		return invalid("epoch 0")
 	}
 	return nil
 }
@@ -71,19 +69,19 @@ func (h BaseHeader) validateObject() error {
 }
 
 // CheckKey returns an ErrMisplaced error unless h belongs under the base
-// key of database db, group, txn and epoch, as Keys.ParseBase returns them.
+// key of database db, group, txn and tag, as Keys.ParseBase returns them.
 // Callers must check every base header they decode against the key they
 // fetched it under.
-func (h BaseHeader) CheckKey(db DatabaseID, group uint32, txn, epoch uint64) error {
-	if h.DB != db || h.Group != group || h.Txn != txn || h.Epoch != epoch {
-		return misplaced("database %x group %d at transaction %d epoch %d under the key of database %x group %d at transaction %d epoch %d",
-			h.DB, h.Group, h.Txn, h.Epoch, db, group, txn, epoch)
+func (h BaseHeader) CheckKey(db DatabaseID, group uint32, txn, tag uint64) error {
+	if h.DB != db || h.Group != group || h.Txn != txn || h.Tag != tag {
+		return misplaced("database %x group %d at transaction %d tag %016x under the key of database %x group %d at transaction %d tag %016x",
+			h.DB, h.Group, h.Txn, h.Tag, db, group, txn, tag)
 	}
 	return nil
 }
 
 func (h BaseHeader) recordCRC(pgno uint64, body []byte) uint32 {
-	return recordCRC(baseMagic, h.DB, h.Txn, h.Epoch, pgno, body)
+	return recordCRC(baseMagic, h.DB, h.Txn, h.Tag, pgno, body)
 }
 
 // checkSlot checks that the body of the slot for page p is zeros if p is
@@ -100,7 +98,7 @@ func (h BaseHeader) checkSlot(p uint64, body []byte) error {
 
 // PageRange returns the byte range [off, off+n) of page pgno's record in
 // the group object h describes. h may be built from a manifest: DB,
-// PageSize, GroupSize, Group, Txn and Epoch must be set, DBSize is not
+// PageSize, GroupSize, Group, Txn and Tag must be set, DBSize is not
 // used, and the header need not have been read.
 func (h BaseHeader) PageRange(pgno uint32) (off, n int64, err error) {
 	if err := h.validate(); err != nil {
@@ -121,7 +119,7 @@ func (h BaseHeader) encode() []byte {
 	le.PutUint32(b[16:], h.GroupSize)
 	le.PutUint32(b[20:], h.Group)
 	le.PutUint64(b[24:], h.Txn)
-	le.PutUint64(b[32:], h.Epoch)
+	le.PutUint64(b[32:], h.Tag)
 	copy(b[40:], h.DB[:])
 	le.PutUint32(b[56:], h.DBSize)
 	le.PutUint32(b[60:], checksum(b[:60]))
@@ -175,7 +173,7 @@ func DecodeBaseHeader(b []byte, db DatabaseID) (BaseHeader, error) {
 		GroupSize: le.Uint32(b[16:]),
 		Group:     le.Uint32(b[20:]),
 		Txn:       le.Uint64(b[24:]),
-		Epoch:     le.Uint64(b[32:]),
+		Tag:       le.Uint64(b[32:]),
 		DBSize:    le.Uint32(b[56:]),
 	}
 	copy(h.DB[:], b[40:56])

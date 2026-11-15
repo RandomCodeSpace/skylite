@@ -281,6 +281,7 @@ func TestEncodeCommitRejects(t *testing.T) {
 		{"page count mismatch", with(g, func(c *commitCase) { c.pgnos = []uint32{1} })},
 		{"more pages than the count", with(g, func(c *commitCase) { c.pgnos = []uint32{1, 2, 3}; c.pages = pattern(3*512, 1) })},
 		{"epoch bump with one page", with(g, func(c *commitCase) { c.h.EpochBump, c.h.PageCount, c.pgnos = true, 1, []uint32{1} })},
+		{"epoch bump with a commit identifier", with(goldenBump(), func(c *commitCase) { c.h.CommitID = []byte("x") })},
 		{"not ascending", with(g, func(c *commitCase) { c.pgnos = []uint32{3, 1} })},
 		{"duplicate", with(g, func(c *commitCase) { c.pgnos = []uint32{1, 1} })},
 		{"page 0", with(g, func(c *commitCase) { c.pgnos = []uint32{0, 1} })},
@@ -318,7 +319,7 @@ func TestEncodersPassCallerErrors(t *testing.T) {
 		big.pgnos = append(big.pgnos, p+1)
 	}
 	big.pages = pattern(40*4096, 9)
-	bigBase := BaseHeader{DB: goldenDB, PageSize: 4096, GroupSize: 32, Group: 0, Txn: 1, Epoch: 1, DBSize: 32}
+	bigBase := BaseHeader{DB: goldenDB, PageSize: 4096, GroupSize: 32, Group: 0, Txn: 1, Tag: 1, DBSize: 32}
 	basePages := pattern(32*4096, 5)
 
 	encoders := []struct {
@@ -392,7 +393,7 @@ func TestBaseRejects(t *testing.T) {
 		{"group too many bytes", golden, fixed(then(set32(12, 65536), set32(16, 2048))), ErrInvalid},
 		{"group beyond largest database", golden, fixed(set32(20, 1<<30)), ErrInvalid},
 		{"transaction 0", golden, fixed(set64(24, 0)), ErrInvalid},
-		{"epoch 0", golden, fixed(set64(32, 0)), ErrInvalid},
+		{"tag 0", golden, fixed(set64(32, 0)), nil},
 		{"database too large", golden, fixed(set32(56, MaxPages+1)), ErrInvalid},
 		{"group beyond the database", golden, fixed(set32(56, 2097152)), ErrInvalid},
 		{"database ends at the group's first page", golden, fixed(set32(56, 2097153)), ErrInvalid}, // slots 1 and 2 hold data
@@ -402,7 +403,8 @@ func TestBaseRejects(t *testing.T) {
 		{"page checksum corrupt", golden, flip(slot1 + 513), ErrChecksum},
 		{"slots swapped", golden, swap(slot1, slot1+516, 516), ErrChecksum},
 		{"records of another transaction", golden, headerOnly(set64(24, 10)), ErrChecksum},
-		{"records of another epoch", golden, headerOnly(set64(32, 2)), ErrChecksum},
+		{"records of another tag", golden, headerOnly(set64(32, goldenTag^1)), ErrChecksum},
+		{"records with tag and transaction swapped", golden, headerOnly(then(set64(24, goldenTag), set64(32, 9))), ErrChecksum},
 		{"records of another group", golden, headerOnly(then(set32(20, 524289), set32(56, MaxPages))), ErrChecksum},
 		{"lock page not zero", golden, fixed(func(b []byte) []byte { b[BaseHeaderSize+3] = 1; return b }), ErrInvalid},
 		{"page beyond the database not zero", golden, fixed(func(b []byte) []byte { b[BaseHeaderSize+3*516+511] = 1; return b }), ErrInvalid},
@@ -414,6 +416,12 @@ func TestBaseRejects(t *testing.T) {
 				b = c.mut(b)
 			}
 			_, _, err := DecodeBase(b, goldenDB)
+			if c.want == nil {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
 			wantClass(t, err, c.want)
 			if len(b) < BaseHeaderSize {
 				_, err := DecodeBaseHeader(b, goldenDB)
@@ -427,7 +435,7 @@ func TestBaseRejects(t *testing.T) {
 // group 1073741823 holds pages 4294967293 to 4294967296, and the last two
 // are beyond the largest database.
 func TestBasePadding(t *testing.T) {
-	h := BaseHeader{DB: goldenDB, PageSize: 512, GroupSize: 4, Group: 1073741823, Txn: 1, Epoch: 1, DBSize: MaxPages}
+	h := BaseHeader{DB: goldenDB, PageSize: 512, GroupSize: 4, Group: 1073741823, Txn: 1, Tag: 1, DBSize: MaxPages}
 	zero := encodeBase(t, h, make([]byte, 4*512))
 	for slot := range 4 {
 		pages := make([]byte, 4*512)
@@ -459,7 +467,7 @@ func TestBasePadding(t *testing.T) {
 		t.Fatal("short source accepted")
 	}
 	// The slot of page 2^32 has its own record identity, not page 0's.
-	b := encodeBase(t, BaseHeader{DB: goldenDB, PageSize: 512, GroupSize: 4, Group: 1073741823, Txn: 1, Epoch: 1, DBSize: MaxPages}, make([]byte, 4*512))
+	b := encodeBase(t, BaseHeader{DB: goldenDB, PageSize: 512, GroupSize: 4, Group: 1073741823, Txn: 1, Tag: 1, DBSize: MaxPages}, make([]byte, 4*512))
 	if want := record("SKYLITEB", goldenDB, 1, 1, 1<<32, make([]byte, 512)); !bytes.Equal(b[BaseHeaderSize+3*516:], want) {
 		t.Fatal("record of page 4294967296 differs from the specified identity")
 	}
@@ -512,8 +520,12 @@ func TestBasePageRejects(t *testing.T) {
 			_, err := DecodeBasePage(with(func(h *BaseHeader) { h.Txn++ }), lock+1, rec(lock+1))
 			return err
 		}, ErrChecksum},
-		{"record of another epoch", func() error {
-			_, err := DecodeBasePage(with(func(h *BaseHeader) { h.Epoch++ }), lock+1, rec(lock+1))
+		{"record of another tag", func() error {
+			_, err := DecodeBasePage(with(func(h *BaseHeader) { h.Tag++ }), lock+1, rec(lock+1))
+			return err
+		}, ErrChecksum},
+		{"record with tag and transaction swapped", func() error {
+			_, err := DecodeBasePage(with(func(h *BaseHeader) { h.Txn, h.Tag = h.Tag, h.Txn }), lock+1, rec(lock+1))
 			return err
 		}, ErrChecksum},
 		{"record of another database", func() error {
@@ -527,7 +539,7 @@ func TestBasePageRejects(t *testing.T) {
 		}, ErrChecksum},
 		{"record of a commit object", func() error {
 			r := rec(lock + 1)
-			le.PutUint32(r[512:], recordCRC(commitMagic, h.DB, h.Txn, h.Epoch, uint64(lock+1), r[:512]))
+			le.PutUint32(r[512:], recordCRC(commitMagic, h.DB, h.Txn, h.Tag, uint64(lock+1), r[:512]))
 			_, err := DecodeBasePage(h, lock+1, r)
 			return err
 		}, ErrChecksum},
@@ -558,13 +570,14 @@ func TestCheckKey(t *testing.T) {
 	wantClass(t, c.CheckKey(goldenDB, 6), ErrMisplaced)
 	wantClass(t, c.CheckKey(otherDB, 7), ErrMisplaced)
 	b, _ := goldenBase()
-	if err := b.CheckKey(goldenDB, 524288, 9, 3); err != nil {
+	if err := b.CheckKey(goldenDB, 524288, 9, goldenTag); err != nil {
 		t.Fatal(err)
 	}
-	wantClass(t, b.CheckKey(goldenDB, 524289, 9, 3), ErrMisplaced)
-	wantClass(t, b.CheckKey(goldenDB, 524288, 8, 3), ErrMisplaced)
-	wantClass(t, b.CheckKey(goldenDB, 524288, 9, 4), ErrMisplaced)
-	wantClass(t, b.CheckKey(otherDB, 524288, 9, 3), ErrMisplaced)
+	wantClass(t, b.CheckKey(goldenDB, 524289, 9, goldenTag), ErrMisplaced)
+	wantClass(t, b.CheckKey(goldenDB, 524288, 8, goldenTag), ErrMisplaced)
+	wantClass(t, b.CheckKey(goldenDB, 524288, 9, goldenTag^1), ErrMisplaced)
+	wantClass(t, b.CheckKey(goldenDB, 524288, goldenTag, 9), ErrMisplaced)
+	wantClass(t, b.CheckKey(otherDB, 524288, 9, goldenTag), ErrMisplaced)
 
 	// A header checked against the key it was parsed from.
 	k, err := NewKeys("db")
@@ -577,6 +590,16 @@ func TestCheckKey(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := c.CheckKey(db, txn); (key == k.Commit(goldenDB, 7)) != (err == nil) {
+			t.Fatalf("%s: %v", key, err)
+		}
+	}
+	own := k.Base(goldenDB, 524288, 9, goldenTag)
+	for _, key := range []string{own, k.Base(goldenDB, 524288, 9, goldenTag^1), k.Base(goldenDB, 524288, 9, 0)} {
+		db, group, txn, tag, err := k.ParseBase(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.CheckKey(db, group, txn, tag); (key == own) != (err == nil) {
 			t.Fatalf("%s: %v", key, err)
 		}
 	}
@@ -617,11 +640,15 @@ func TestManifestRejects(t *testing.T) {
 		{"version 2", golden, set16(8, 2), ErrVersion},
 		{"one byte short", golden, func(b []byte) []byte { return b[:len(b)-1] }, ErrInvalid},
 		{"trailing byte", golden, func(b []byte) []byte { return append(b, 0) }, ErrInvalid},
-		{"group count", golden, fixed(set32(72, 2)), ErrInvalid},
-		{"group count with the bytes to match", golden, fixed(func(b []byte) []byte { le.PutUint32(b[72:], 4); return append(b, make([]byte, 16)...) }), ErrInvalid},
+		{"group count", golden, fixed(set32(80, 2)), ErrInvalid},
+		{"group count with the bytes to match", golden, fixed(func(b []byte) []byte { le.PutUint32(b[80:], 4); return append(b, make([]byte, 16)...) }), ErrInvalid},
 		{"corrupt", golden, flip(30), ErrChecksum},
 		{"nonce corrupt", golden, flip(60), ErrChecksum},
 		{"reference corrupt", golden, flip(ref0 + 9), ErrChecksum},
+		{"retired through corrupt", golden, flip(72), ErrChecksum},
+		{"retired through above transaction", golden, fixed(set64(72, 10)), ErrInvalid},
+		{"retired through at transaction", golden, fixed(set64(72, 9)), nil},
+		{"retired through 0", golden, fixed(set64(72, 0)), nil},
 		{"nonce zero", golden, fixed(func(b []byte) []byte { clear(b[56:72]); return b }), ErrInvalid},
 		{"nonce one bit", golden, fixed(func(b []byte) []byte { clear(b[56:72]); b[71] = 0x80; return b }), nil},
 		{"checksum corrupt", golden, func(b []byte) []byte { b[len(b)-1] ^= 1; return b }, ErrChecksum},
@@ -636,13 +663,15 @@ func TestManifestRejects(t *testing.T) {
 		{"epoch 0", golden, fixed(set64(32, 0)), ErrInvalid},
 		{"database identifier zero", golden, fixed(setDB(40, DatabaseID{})), ErrInvalid},
 		{"other database", golden, fixed(setDB(40, otherDB)), ErrMisplaced},
-		{"reference with transaction 0", golden, fixed(set64(ref0, 0)), ErrInvalid},
-		{"reference with epoch 0", golden, fixed(set64(ref0+8, 0)), ErrInvalid},
+		{"reference with transaction 0 and a tag", golden, fixed(set64(ref0, 0)), ErrInvalid},
+		{"reference with transaction 0 and tag 0", golden, fixed(then(set64(ref0, 0), set64(ref0+8, 0))), nil},
+		{"reference with tag 0", golden, fixed(set64(ref0+8, 0)), nil},
+		{"reference with the largest tag", golden, fixed(set64(ref0+8, math.MaxUint64)), nil},
 		{"reference after manifest transaction", golden, fixed(set64(ref0, 10)), ErrInvalid},
-		{"reference after manifest epoch", golden, fixed(set64(ref0+8, 4)), ErrInvalid},
-		{"last reference after manifest epoch", golden, fixed(set64(ref0+2*16+8, 4)), ErrInvalid},
-		{"empty reference with a transaction", golden, fixed(set64(ref0+16, 1)), ErrInvalid},
-		{"empty reference with an epoch", golden, fixed(set64(ref0+16+8, 1)), ErrInvalid},
+		{"last reference after manifest transaction", golden, fixed(set64(ref0+2*16, 10)), ErrInvalid},
+		{"empty reference with a transaction", golden, fixed(set64(ref0+16, 1)), nil},
+		{"empty reference with a tag", golden, fixed(set64(ref0+16+8, 1)), ErrInvalid},
+		{"last reference with transaction 0 and a tag", golden, fixed(then(set64(ref0+2*16, 0), set64(ref0+2*16+8, 1))), ErrInvalid},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -682,10 +711,9 @@ func TestManifestRejects(t *testing.T) {
 		"nonce zero":              with(func(m *Manifest) { m.Nonce = [16]byte{} }),
 		"too few groups":          with(func(m *Manifest) { m.Groups = m.Groups[:2] }),
 		"too many groups":         with(func(m *Manifest) { m.Groups = append(m.Groups, GroupRef{}) }),
-		"half a reference":        with(func(m *Manifest) { m.Groups[1].Txn = 1 }),
 		"reference too new":       with(func(m *Manifest) { m.Groups[0].Txn = 10 }),
-		"reference epoch new":     with(func(m *Manifest) { m.Groups[0].Epoch = 4 }),
-		"half a reference, epoch": with(func(m *Manifest) { m.Groups[1].Epoch = 1 }),
+		"tag without an object":   with(func(m *Manifest) { m.Groups[1].Tag = 1 }),
+		"retired through too new": with(func(m *Manifest) { m.RetiredThrough = m.Txn + 1 }),
 	} {
 		t.Run("encode "+name, func(t *testing.T) {
 			_, err := EncodeManifest(m)
@@ -699,7 +727,7 @@ func TestManifestRejects(t *testing.T) {
 
 // rawManifest encodes m without validating it.
 func rawManifest(m Manifest) []byte {
-	b := make([]byte, 80+16*len(m.Groups))
+	b := make([]byte, 88+16*len(m.Groups))
 	copy(b, "SKYLITEM")
 	putN(b, 8, 2, 1)
 	putN(b, 12, 4, uint64(m.PageSize))
@@ -709,10 +737,11 @@ func rawManifest(m Manifest) []byte {
 	putN(b, 32, 8, m.Epoch)
 	copy(b[40:], m.DB[:])
 	copy(b[56:], m.Nonce[:])
-	putN(b, 72, 4, uint64(len(m.Groups)))
+	putN(b, 72, 8, m.RetiredThrough)
+	putN(b, 80, 4, uint64(len(m.Groups)))
 	for i, r := range m.Groups {
-		putN(b, 76+16*i, 8, r.Txn)
-		putN(b, 84+16*i, 8, r.Epoch)
+		putN(b, 84+16*i, 8, r.Txn)
+		putN(b, 92+16*i, 8, r.Tag)
 	}
 	putN(b, len(b)-4, 4, uint64(crc32cBitwise(b[:len(b)-4])))
 	return b
@@ -730,6 +759,7 @@ func TestHeaderRules(t *testing.T) {
 		"page size 131072":        commit(func(h *CommitHeader) { h.PageSize = 131072 }),
 		"more pages than the db":  commit(func(h *CommitHeader) { h.PageCount, h.DBSize = 4, 3 }),
 		"epoch bump with a page":  commit(func(h *CommitHeader) { h.EpochBump, h.PageCount = true, 1 }),
+		"epoch bump with an id":   commit(func(h *CommitHeader) { h.EpochBump, h.PageCount, h.DBSize = true, 0, 3 }), // keeps "client-42"
 		"database too large":      commit(func(h *CommitHeader) { h.DBSize = MaxPages + 1 }),
 		"commit without any page": commit(func(h *CommitHeader) { h.PageCount = 0 }),
 	} {
@@ -775,6 +805,7 @@ func TestHeaderRules(t *testing.T) {
 		"epoch 0":            manifest(func(m *Manifest) { m.Epoch = 0 }),
 		"database too large": manifest(func(m *Manifest) { m.PageSize, m.GroupSize, m.DBSize = 512, 131072, MaxPages+1 }),
 		"nonce zero":         manifest(func(m *Manifest) { m.Nonce = [16]byte{} }),
+		"retired through 1":  manifest(func(m *Manifest) { m.RetiredThrough = 1 }),
 	} {
 		t.Run("manifest "+name, func(t *testing.T) {
 			_, err := DecodeManifest(rawManifest(m), goldenDB)
@@ -791,12 +822,15 @@ func TestHeaderRules(t *testing.T) {
 }
 
 // TestManifestSizeLimit builds the largest manifest the format allows,
-// 1048571 groups in exactly MaxManifestSize bytes, and one group more.
+// 1048570 groups in 16777208 bytes, and one group more.
 func TestManifestSizeLimit(t *testing.T) {
-	const most = (MaxManifestSize - 80) / 16
+	const most = (MaxManifestSize - 88) / 16
+	if most != 1048570 || 88+16*most != MaxManifestSize-8 {
+		t.Fatalf("the specification says 1048570 groups in 16777208 bytes, not %d", most)
+	}
 	m := Manifest{DB: goldenDB, PageSize: 512, GroupSize: 1, DBSize: most, Txn: 1, Epoch: 1, Nonce: goldenNonce, Groups: make([]GroupRef, most)}
 	b, err := EncodeManifest(m)
-	if err != nil || len(b) != MaxManifestSize {
+	if err != nil || len(b) != MaxManifestSize-8 {
 		t.Fatalf("largest manifest: %d bytes, %v", len(b), err)
 	}
 	if got, err := DecodeManifest(b, goldenDB); err != nil || len(got.Groups) != most {
@@ -810,7 +844,7 @@ func TestManifestSizeLimit(t *testing.T) {
 		t.Fatalf("encode: %v, want ErrManifestTooLarge", err)
 	}
 	// Decoding checks the size before the counts, the checksum or any field.
-	big := append(slices.Clone(b), make([]byte, 16)...)
+	big := append(slices.Clone(b), make([]byte, 24)...)
 	_, err = DecodeManifest(big, goldenDB)
 	wantClass(t, err, ErrInvalid)
 	if !errors.Is(err, ErrManifestTooLarge) {
@@ -943,8 +977,8 @@ func TestKeysReject(t *testing.T) {
 			t.Errorf("longest key %q is invalid", key)
 		}
 	}
-	if MaxKeyLen-longestSuffix != 933 {
-		t.Errorf("longest prefix is %d bytes, the specification says 933", MaxKeyLen-longestSuffix)
+	if MaxKeyLen-longestSuffix != 937 {
+		t.Errorf("longest prefix is %d bytes, the specification says 937", MaxKeyLen-longestSuffix)
 	}
 
 	k, err := NewKeys("db")
@@ -955,8 +989,8 @@ func TestKeysReject(t *testing.T) {
 	if got := k.Commit(goldenDB, 42); got != "db/"+id+"/log/00000000000000000042" {
 		t.Errorf("Commit(42) = %q", got)
 	}
-	if got := k.Base(goldenDB, 3, 42, 7); got != "db/"+id+"/base/0000000003-00000000000000000042-00000000000000000007" {
-		t.Errorf("Base(3, 42, 7) = %q", got)
+	if got := k.Base(goldenDB, 3, 42, 0x7a); got != "db/"+id+"/base/0000000003-00000000000000000042-000000000000007a" {
+		t.Errorf("Base(3, 42, 0x7a) = %q", got)
 	}
 	if k.Manifest() != "db/manifest" || k.Lease() != "db/lease" {
 		t.Errorf("Manifest, Lease = %q, %q", k.Manifest(), k.Lease())
@@ -989,17 +1023,23 @@ func TestKeysReject(t *testing.T) {
 			wantClass(t, err, ErrInvalid)
 		}
 	}
-	const name = "0000000003-00000000000000000042-00000000000000000007"
-	base := k.Base(goldenDB, 3, 42, 7)
+	const name = "0000000003-00000000000000000042-000000000000007a"
+	base := k.Base(goldenDB, 3, 42, 0x7a)
 	for _, key := range []string{
 		"", "db/" + id + "/base/", base[:len(base)-1], base + "0", commit,
 		strings.Replace(base, "-", "_", 1),
-		"db/" + id + "/base/4294967296-00000000000000000042-00000000000000000007",
-		"db/" + id + "/base/0000000003-99999999999999999999-00000000000000000007",
-		"db/" + id + "/base/0000000003-00000000000000000042-99999999999999999999",
-		"db/" + id + "/base/000000000a-00000000000000000042-00000000000000000007",
-		"db/" + id + "/base/0000000003-00000000000000000042-0000000000000000000x",
-		"db/" + id + "/base/00000000003-0000000000000000042-00000000000000000007",
+		"db/" + id + "/base/4294967296-00000000000000000042-000000000000007a",
+		"db/" + id + "/base/0000000003-99999999999999999999-000000000000007a",
+		"db/" + id + "/base/000000000a-00000000000000000042-000000000000007a",
+		"db/" + id + "/base/00000000003-0000000000000000042-000000000000007a",
+		"db/" + id + "/base/0000000003-00000000000000000042-000000000000007A", // uppercase tag
+		"db/" + id + "/base/0000000003-00000000000000000042-000000000000007x",
+		"db/" + id + "/base/0000000003-00000000000000000042-+00000000000007a",
+		"db/" + id + "/base/0000000003-00000000000000000042-00000000000007a",      // 15 digits
+		"db/" + id + "/base/0000000003-00000000000000000042-0000000000000007a",    // 17 digits
+		"db/" + id + "/base/0000000003-00000000000000000042-00000000000000000122", // the old decimal epoch
+		"db/" + id + "/base/0000000003-000000000000000042-000000000000007a00",
+		"db/" + id + "/base/0000000003-00000000000000000042",
 		"db/base/" + name,
 		"db/" + upper + "/base/" + name,
 		"db/" + zero + "/base/" + name,
@@ -1015,7 +1055,7 @@ func TestKeysReject(t *testing.T) {
 	if db, _, err := k.ParseCommit(k.Commit(otherDB, 42)); err != nil || db != otherDB {
 		t.Errorf("ParseCommit of another database: %x, %v", db, err)
 	}
-	if db, _, _, _, err := k.ParseBase(k.Base(otherDB, 3, 42, 7)); err != nil || db != otherDB {
+	if db, _, _, _, err := k.ParseBase(k.Base(otherDB, 3, 42, 0x7a)); err != nil || db != otherDB {
 		t.Errorf("ParseBase of another database: %x, %v", db, err)
 	}
 }

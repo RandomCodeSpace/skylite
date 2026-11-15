@@ -156,10 +156,14 @@ func lockCommit() commitCase {
 	}
 }
 
+// goldenTag is the tag of the golden base object and of the manifest's
+// reference to it.
+const goldenTag = 0x9e3779b97f4a7c15
+
 // goldenBase is the group holding the lock page at 512-byte pages
 // (2097153) in slot 0; slot 3 is beyond the database size.
 func goldenBase() (BaseHeader, []byte) {
-	h := BaseHeader{DB: goldenDB, PageSize: 512, GroupSize: 4, Group: 524288, Txn: 9, Epoch: 3, DBSize: 2097155}
+	h := BaseHeader{DB: goldenDB, PageSize: 512, GroupSize: 4, Group: 524288, Txn: 9, Tag: goldenTag, DBSize: 2097155}
 	pages := slices.Concat(make([]byte, 512), pattern(512, 2), pattern(512, 4), make([]byte, 512))
 	return h, pages
 }
@@ -175,9 +179,25 @@ func encodeBase(t testing.TB, h BaseHeader, pages []byte) []byte {
 
 func goldenManifest() Manifest {
 	return Manifest{
-		DB: goldenDB, PageSize: 4096, GroupSize: 256, DBSize: 600, Txn: 9, Epoch: 3,
+		DB: goldenDB, PageSize: 4096, GroupSize: 256, DBSize: 600, Txn: 9, RetiredThrough: 6, Epoch: 3,
 		Nonce:  goldenNonce,
-		Groups: []GroupRef{{Txn: 9, Epoch: 3}, {}, {Txn: 5, Epoch: 2}},
+		Groups: []GroupRef{{Txn: 9, Tag: goldenTag}, {}, {Txn: 5, Tag: 0}}, // a tag of zero is valid
+	}
+}
+
+// creationManifest and creationCommit are the first objects of a database:
+// the manifest a creator writes after its first commit, and that commit,
+// the empty database at transaction 1 and epoch 1 (page 1 here is a zero
+// stand-in for SQLite's empty WAL-mode database header).
+func creationManifest() Manifest {
+	return Manifest{DB: goldenDB, PageSize: 4096, GroupSize: 256, Epoch: 1, Nonce: goldenNonce}
+}
+
+func creationCommit() commitCase {
+	return commitCase{
+		h:     CommitHeader{DB: goldenDB, PageSize: 4096, Txn: 1, Epoch: 1, DBSize: 1, PageCount: 1},
+		pgnos: []uint32{1},
+		pages: make([]byte, 4096),
 	}
 }
 
@@ -219,11 +239,11 @@ func refixBase(b []byte) []byte {
 	le.PutUint32(b[60:], checksum(b[:60]))
 	var db DatabaseID
 	copy(db[:], b[40:56])
-	txn, epoch := le.Uint64(b[24:]), le.Uint64(b[32:])
+	txn, tag := le.Uint64(b[24:]), le.Uint64(b[32:])
 	pgno := uint64(le.Uint32(b[20:]))*uint64(le.Uint32(b[16:])) + 1
 	if ps := uint64(le.Uint32(b[12:])); ps <= MaxPageSize {
 		for off := uint64(BaseHeaderSize); off+ps+recordTrailer <= uint64(len(b)); off += ps + recordTrailer {
-			le.PutUint32(b[off+ps:], recordCRC(baseMagic, db, txn, epoch, pgno, b[off:off+ps]))
+			le.PutUint32(b[off+ps:], recordCRC(baseMagic, db, txn, tag, pgno, b[off:off+ps]))
 			pgno++
 		}
 	}
@@ -332,13 +352,13 @@ func randCommit(r *rand.Rand) commitCase {
 	ps := randPageSize(r)
 	lock := LockPage(ps)
 	h := CommitHeader{DB: randDB(r), PageSize: ps, Txn: 1 + r.Uint64N(math.MaxUint64), Epoch: 1 + r.Uint64N(math.MaxUint64)}
-	if n := r.IntN(MaxCommitIDLen + 1); n > 0 {
-		h.CommitID = randBytes(r, n)
-	}
 	if r.IntN(8) == 0 {
 		h.EpochBump = true
 		h.DBSize = r.Uint32N(MaxPages + 1)
 		return commitCase{h: h}
+	}
+	if n := r.IntN(MaxCommitIDLen + 1); n > 0 {
+		h.CommitID = randBytes(r, n)
 	}
 	switch r.IntN(3) {
 	case 0:
@@ -446,7 +466,7 @@ func TestCommitRoundTrip(t *testing.T) {
 func randBase(r *rand.Rand) (BaseHeader, []byte) {
 	ps := randPageSize(r)
 	gs := uint32(1) << r.IntN(bitsLen((128<<10)/ps)) // at most 128 KiB per group, to stay fast
-	h := BaseHeader{DB: randDB(r), PageSize: ps, GroupSize: gs, Txn: 1 + r.Uint64N(math.MaxUint64), Epoch: 1 + r.Uint64N(math.MaxUint64)}
+	h := BaseHeader{DB: randDB(r), PageSize: ps, GroupSize: gs, Txn: 1 + r.Uint64N(math.MaxUint64), Tag: r.Uint64()}
 	switch r.IntN(3) {
 	case 0:
 		h.Group = (LockPage(ps) - 1) / gs
@@ -527,6 +547,7 @@ func randManifest(r *rand.Rand) Manifest {
 	m.Nonce[r.IntN(16)] |= 1
 	if r.IntN(4) != 0 {
 		m.Txn = 1 + r.Uint64N(math.MaxUint64)
+		m.RetiredThrough = r.Uint64N(m.Txn + 1)
 	}
 	m.DBSize = gs*r.Uint32N(2000) + r.Uint32N(gs) // at most 2^17*2000, far below MaxPages
 	if r.IntN(10) == 0 {
@@ -538,7 +559,7 @@ func randManifest(r *rand.Rand) Manifest {
 	for range GroupCount(m.DBSize, gs) {
 		var g GroupRef
 		if m.Txn > 0 && r.IntN(10) != 0 {
-			g = GroupRef{Txn: 1 + r.Uint64N(m.Txn), Epoch: 1 + r.Uint64N(m.Epoch)}
+			g = GroupRef{Txn: 1 + r.Uint64N(m.Txn), Tag: r.Uint64()}
 		}
 		m.Groups = append(m.Groups, g)
 	}
@@ -637,8 +658,8 @@ func TestKeysRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: %v", prefix, err)
 		}
-		db, txn, epoch, group := randDB(r), r.Uint64(), r.Uint64(), r.Uint32()
-		for _, key := range []string{k.Commit(db, txn), k.Base(db, group, txn, epoch), k.Manifest(), k.Lease()} {
+		db, txn, tag, group := randDB(r), r.Uint64(), r.Uint64(), r.Uint32()
+		for _, key := range []string{k.Commit(db, txn), k.Base(db, group, txn, tag), k.Manifest(), k.Lease()} {
 			if !validKey(key) {
 				t.Fatalf("built invalid key %q", key)
 			}
@@ -646,8 +667,8 @@ func TestKeysRoundTrip(t *testing.T) {
 		if gd, got, err := k.ParseCommit(k.Commit(db, txn)); err != nil || gd != db || got != txn {
 			t.Fatalf("ParseCommit = %x %d, %v; want %x %d", gd, got, err, db, txn)
 		}
-		gd, g, tx, e, err := k.ParseBase(k.Base(db, group, txn, epoch))
-		if err != nil || gd != db || g != group || tx != txn || e != epoch {
+		gd, g, tx, e, err := k.ParseBase(k.Base(db, group, txn, tag))
+		if err != nil || gd != db || g != group || tx != txn || e != tag {
 			t.Fatalf("ParseBase = %x %d %d %d, %v", gd, g, tx, e, err)
 		}
 		a, b := r.Uint64(), r.Uint64()
@@ -668,9 +689,9 @@ func TestHugeLengthsAllocateLittle(t *testing.T) {
 	m := make([]byte, manifestHeaderSize+4+100)
 	copy(m, manifestMagic)
 	le.PutUint16(m[8:], Version)
-	le.PutUint32(m[72:], math.MaxUint32)
+	le.PutUint32(m[80:], math.MaxUint32)
 
-	bh := BaseHeader{DB: goldenDB, PageSize: 65536, GroupSize: 1024, Group: 0, Txn: 1, Epoch: 1, DBSize: 1}.encode()
+	bh := BaseHeader{DB: goldenDB, PageSize: 65536, GroupSize: 1024, Group: 0, Txn: 1, Tag: 1, DBSize: 1}.encode()
 
 	cases := []struct {
 		name  string
@@ -721,5 +742,33 @@ func TestDecodeCommitPassesReadErrors(t *testing.T) {
 	_, _, err := DecodeCommit(bytes.NewReader(b), goldenDB, func(uint32, []byte) error { return errBoom })
 	if err != errBoom { //nolint:errorlint // must be returned unchanged
 		t.Fatalf("callback error changed: %v", err)
+	}
+}
+
+// TestCreation shows that the format accepts the first objects of a
+// database: the commit at transaction 1 and epoch 1, and the manifest at
+// transaction 0, retired through 0, epoch 1, with no group references.
+func TestCreation(t *testing.T) {
+	c := creationCommit()
+	b := c.encode(t)
+	h, entries, err := DecodeCommit(bytes.NewReader(b), goldenDB, func(uint32, []byte) error { return nil })
+	if err != nil || h.Txn != 1 || h.Epoch != 1 || !slices.Equal(pgnosOf(entries), []uint32{1}) {
+		t.Fatalf("first commit: %+v, %v", h, err)
+	}
+	k, err := NewKeys("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, txn, err := k.ParseCommit(k.Commit(goldenDB, 1))
+	if err != nil || h.CheckKey(db, txn) != nil {
+		t.Fatalf("first commit under its key: %v", err)
+	}
+	mb, err := EncodeManifest(creationManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := DecodeManifest(mb, DatabaseID{})
+	if err != nil || !reflect.DeepEqual(m, creationManifest()) || len(mb) != 88 {
+		t.Fatalf("first manifest: %+v, %d bytes, %v", m, len(mb), err)
 	}
 }

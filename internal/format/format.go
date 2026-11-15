@@ -62,17 +62,18 @@ var (
 func checksum(b []byte) uint32 { return crc32.Checksum(b, castagnoli) }
 
 // recordIdentitySize is the size of the identity a page record's checksum
-// covers before the body: magic, database, transaction, epoch, page number.
+// covers before the body: magic, database, transaction, the commit's epoch
+// or the base object's tag, page number.
 const recordIdentitySize = 8 + 16 + 8 + 8 + 8
 
 // recordCRC is the checksum stored after a page body: the CRC-32C of the
 // record identity followed by the body.
-func recordCRC(magic string, db DatabaseID, txn, epoch, pgno uint64, body []byte) uint32 {
+func recordCRC(magic string, db DatabaseID, txn, epochOrTag, pgno uint64, body []byte) uint32 {
 	var id [recordIdentitySize]byte
 	copy(id[:], magic)
 	copy(id[8:], db[:])
 	le.PutUint64(id[24:], txn)
-	le.PutUint64(id[32:], epoch)
+	le.PutUint64(id[32:], epochOrTag)
 	le.PutUint64(id[40:], pgno)
 	return crc32.Update(checksum(id[:]), castagnoli, body)
 }

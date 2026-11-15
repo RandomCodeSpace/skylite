@@ -37,21 +37,22 @@ func putN(b []byte, off, n int, v uint64) {
 	}
 }
 
-// identity is the 48-byte record identity a page record's checksum covers.
-func identity(magic string, db DatabaseID, txn, epoch, pgno uint64) []byte {
+// identity is the 48-byte record identity a page record's checksum covers;
+// x is the commit's epoch or the base object's tag.
+func identity(magic string, db DatabaseID, txn, x, pgno uint64) []byte {
 	b := make([]byte, 48)
 	copy(b, magic)
 	copy(b[8:], db[:])
 	putN(b, 24, 8, txn)
-	putN(b, 32, 8, epoch)
+	putN(b, 32, 8, x)
 	putN(b, 40, 8, pgno)
 	return b
 }
 
 // record is a page body followed by its checksum.
-func record(magic string, db DatabaseID, txn, epoch, pgno uint64, body []byte) []byte {
+func record(magic string, db DatabaseID, txn, x, pgno uint64, body []byte) []byte {
 	b := append(slices.Clone(body), 0, 0, 0, 0)
-	putN(b, len(body), 4, uint64(crc32cBitwise(identity(magic, db, txn, epoch, pgno), body)))
+	putN(b, len(body), 4, uint64(crc32cBitwise(identity(magic, db, txn, x, pgno), body)))
 	return b
 }
 
@@ -133,8 +134,9 @@ func layoutBump() []byte {
 
 // layoutBase is the golden group: page size 512, group size 4, group
 // 524288 (pages 2097153-2097156, the first the lock page), transaction 9,
-// epoch 3, database size 2097155.
+// tag 0x9e3779b97f4a7c15, database size 2097155.
 func layoutBase() []byte {
+	const tag = 0x9e3779b97f4a7c15
 	b := make([]byte, 64)
 	copy(b[0:], "SKYLITEB")
 	putN(b, 8, 2, 1)
@@ -142,22 +144,23 @@ func layoutBase() []byte {
 	putN(b, 16, 4, 4)
 	putN(b, 20, 4, 524288)
 	putN(b, 24, 8, 9)
-	putN(b, 32, 8, 3)
+	putN(b, 32, 8, tag)
 	copy(b[40:], layoutDB[:])
 	putN(b, 56, 4, 2097155)
 	putN(b, 60, 4, uint64(crc32cBitwise(b[:60])))
 	zero := make([]byte, 512)
-	b = append(b, record("SKYLITEB", layoutDB, 9, 3, 2097153, zero)...)
-	b = append(b, record("SKYLITEB", layoutDB, 9, 3, 2097154, pattern(512, 2))...)
-	b = append(b, record("SKYLITEB", layoutDB, 9, 3, 2097155, pattern(512, 4))...)
-	return append(b, record("SKYLITEB", layoutDB, 9, 3, 2097156, zero)...)
+	b = append(b, record("SKYLITEB", layoutDB, 9, tag, 2097153, zero)...)
+	b = append(b, record("SKYLITEB", layoutDB, 9, tag, 2097154, pattern(512, 2))...)
+	b = append(b, record("SKYLITEB", layoutDB, 9, tag, 2097155, pattern(512, 4))...)
+	return append(b, record("SKYLITEB", layoutDB, 9, tag, 2097156, zero)...)
 }
 
 // layoutManifest is the golden manifest: page size 4096, group size 256,
-// database size 600 (3 groups), transaction 9, epoch 3, writer nonce
-// a7035ec19b24006fd8114ae2730cb596, groups {9,3} {0,0} {5,2}.
+// database size 600 (3 groups), transaction 9, retired through 6, epoch 3,
+// writer nonce a7035ec19b24006fd8114ae2730cb596, groups
+// {9, 0x9e3779b97f4a7c15} {0, 0} {5, 0}.
 func layoutManifest() []byte {
-	b := make([]byte, 76+3*16+4)
+	b := make([]byte, 84+3*16+4)
 	copy(b[0:], "SKYLITEM")
 	putN(b, 8, 2, 1)
 	putN(b, 12, 4, 4096)
@@ -167,12 +170,28 @@ func layoutManifest() []byte {
 	putN(b, 32, 8, 3)
 	copy(b[40:], layoutDB[:])
 	copy(b[56:], []byte{0xa7, 0x03, 0x5e, 0xc1, 0x9b, 0x24, 0x00, 0x6f, 0xd8, 0x11, 0x4a, 0xe2, 0x73, 0x0c, 0xb5, 0x96})
-	putN(b, 72, 4, 3)
-	putN(b, 76, 8, 9)
-	putN(b, 84, 8, 3)
-	putN(b, 108, 8, 5)
-	putN(b, 116, 8, 2)
-	putN(b, 124, 4, uint64(crc32cBitwise(b[:124])))
+	putN(b, 72, 8, 6)
+	putN(b, 80, 4, 3)
+	putN(b, 84, 8, 9)
+	putN(b, 92, 8, 0x9e3779b97f4a7c15)
+	putN(b, 116, 8, 5)
+	putN(b, 132, 4, uint64(crc32cBitwise(b[:132])))
+	return b
+}
+
+// layoutCreation is the first manifest of a database: page size 4096,
+// group size 256, database size 0, transaction 0, retired through 0, epoch
+// 1, the golden writer nonce, no groups.
+func layoutCreation() []byte {
+	b := make([]byte, 84+4)
+	copy(b[0:], "SKYLITEM")
+	putN(b, 8, 2, 1)
+	putN(b, 12, 4, 4096)
+	putN(b, 16, 4, 256)
+	putN(b, 32, 8, 1)
+	copy(b[40:], layoutDB[:])
+	copy(b[56:], []byte{0xa7, 0x03, 0x5e, 0xc1, 0x9b, 0x24, 0x00, 0x6f, 0xd8, 0x11, 0x4a, 0xe2, 0x73, 0x0c, 0xb5, 0x96})
+	putN(b, 84, 4, uint64(crc32cBitwise(b[:84])))
 	return b
 }
 
@@ -181,6 +200,10 @@ const layoutLease = `{"format":"skylite-lease","version":1,"holder":"node-a_10.0
 func TestLayout(t *testing.T) {
 	bh, bpages := goldenBase()
 	manifest, err := EncodeManifest(goldenManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	creation, err := EncodeManifest(creationManifest())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,10 +220,14 @@ func TestLayout(t *testing.T) {
 		{"commit-retired.bin", layoutRetired(), goldenRetired(t)},
 		{"base.bin", layoutBase(), encodeBase(t, bh, bpages)},
 		{"manifest.bin", layoutManifest(), manifest},
+		{"", layoutCreation(), creation},
 		{"lease.json", []byte(layoutLease), lease},
 	} {
 		if !bytes.Equal(c.encoded, c.want) {
 			t.Errorf("%s: encoder output differs from the specified layout at byte %d", c.name, firstDiff(c.encoded, c.want))
+		}
+		if c.name == "" {
+			continue // no golden file
 		}
 		if !bytes.Equal(readGolden(t, c.name), c.want) {
 			t.Errorf("%s: golden file differs from the specified layout", c.name)
@@ -250,12 +277,15 @@ func TestLayout(t *testing.T) {
 	if err != nil || gh != bh || !bytes.Equal(slices.Concat(gpages...), bpages) {
 		t.Errorf("base: decoded %+v, %v", gh, err)
 	}
-	fromManifest := BaseHeader{DB: layoutDB, PageSize: 512, GroupSize: 4, Group: 524288, Txn: 9, Epoch: 3}
+	fromManifest := BaseHeader{DB: layoutDB, PageSize: 512, GroupSize: 4, Group: 524288, Txn: 9, Tag: 0x9e3779b97f4a7c15}
 	if body, err := DecodeBasePage(fromManifest, 2097155, layoutBase()[64+2*516:64+3*516]); err != nil || !bytes.Equal(body, pattern(512, 4)) {
 		t.Errorf("base page 2097155: %v", err)
 	}
 	if m, err := DecodeManifest(layoutManifest(), layoutDB); err != nil || !reflect.DeepEqual(m, goldenManifest()) {
 		t.Errorf("manifest: decoded %+v, %v", m, err)
+	}
+	if m, err := DecodeManifest(layoutCreation(), layoutDB); err != nil || !reflect.DeepEqual(m, creationManifest()) {
+		t.Errorf("creation manifest: decoded %+v, %v", m, err)
 	}
 	if l, err := DecodeLease([]byte(layoutLease)); err != nil || l != goldenLease() {
 		t.Errorf("lease: decoded %+v, %v", l, err)
@@ -266,9 +296,10 @@ func TestLayout(t *testing.T) {
 	}
 	for got, want := range map[string]string{
 		k.Commit(layoutDB, 42):                                           "tenant-1/db/5b1e3c00912a4f7708d36ea510c42bf9/log/00000000000000000042",
-		k.Base(layoutDB, 3, 42, 7):                                       "tenant-1/db/5b1e3c00912a4f7708d36ea510c42bf9/base/0000000003-00000000000000000042-00000000000000000007",
+		k.Base(layoutDB, 3, 42, 0x9e3779b97f4a7c15):                      "tenant-1/db/5b1e3c00912a4f7708d36ea510c42bf9/base/0000000003-00000000000000000042-9e3779b97f4a7c15",
+		k.Base(layoutDB, 0, 1, 0):                                        "tenant-1/db/5b1e3c00912a4f7708d36ea510c42bf9/base/0000000000-00000000000000000001-0000000000000000",
 		k.Commit(DatabaseID{15: 1}, 18446744073709551615):                "tenant-1/db/00000000000000000000000000000001/log/18446744073709551615",
-		k.Base(DatabaseID{0: 0xff}, 4294967295, 1, 18446744073709551615): "tenant-1/db/ff000000000000000000000000000000/base/4294967295-00000000000000000001-18446744073709551615",
+		k.Base(DatabaseID{0: 0xff}, 4294967295, 1, 18446744073709551615): "tenant-1/db/ff000000000000000000000000000000/base/4294967295-00000000000000000001-ffffffffffffffff",
 		k.Manifest(): "tenant-1/db/manifest",
 		k.Lease():    "tenant-1/db/lease",
 	} {

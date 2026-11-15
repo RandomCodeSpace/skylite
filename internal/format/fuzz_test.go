@@ -63,6 +63,9 @@ func FuzzDecodeCommitHeader(f *testing.F) {
 		if !bytes.Equal(h.encode(h.tableCRC), b) {
 			t.Fatal("decoded header re-encodes differently")
 		}
+		if h.EpochBump && h.CommitID != nil {
+			t.Fatal("accepted an epoch bump with a commit identifier")
+		}
 		// The retired form differs from the header in bit 4 and the CRC
 		// alone, and the table and page decoders refuse it.
 		r, err := h.Retire()
@@ -187,16 +190,17 @@ func FuzzDecodeBaseHeader(f *testing.F) {
 // fix set, the record's checksum is recomputed for the page number given.
 func FuzzDecodeBasePage(f *testing.F) {
 	g := readGolden(f, "base.bin")
-	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097154), g[BaseHeaderSize+516:BaseHeaderSize+2*516], false)
-	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097153), g[BaseHeaderSize:BaseHeaderSize+516], false)
-	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097155), g[BaseHeaderSize+516:BaseHeaderSize+2*516], false)
-	f.Add(uint32(512), uint32(4), uint32(1073741823), uint32(4294967294), g[BaseHeaderSize+516:BaseHeaderSize+2*516], true)
-	f.Fuzz(func(t *testing.T, ps, gs, group, pgno uint32, rec []byte, fix bool) {
-		h := BaseHeader{DB: goldenDB, PageSize: ps, GroupSize: gs, Group: group, Txn: 9, Epoch: 3}
+	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097154), uint64(goldenTag), g[BaseHeaderSize+516:BaseHeaderSize+2*516], false)
+	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097153), uint64(goldenTag), g[BaseHeaderSize:BaseHeaderSize+516], false)
+	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097155), uint64(goldenTag), g[BaseHeaderSize+516:BaseHeaderSize+2*516], false)
+	f.Add(uint32(512), uint32(4), uint32(524288), uint32(2097154), uint64(0), g[BaseHeaderSize+516:BaseHeaderSize+2*516], false)
+	f.Add(uint32(512), uint32(4), uint32(1073741823), uint32(4294967294), uint64(0), g[BaseHeaderSize+516:BaseHeaderSize+2*516], true)
+	f.Fuzz(func(t *testing.T, ps, gs, group, pgno uint32, tag uint64, rec []byte, fix bool) {
+		h := BaseHeader{DB: goldenDB, PageSize: ps, GroupSize: gs, Group: group, Txn: 9, Tag: tag}
 		if fix && len(rec) >= recordTrailer {
 			rec = slices.Clone(rec)
 			n := len(rec) - recordTrailer
-			le.PutUint32(rec[n:], crc32cBitwise(identity("SKYLITEB", goldenDB, 9, 3, uint64(pgno)), rec[:n]))
+			le.PutUint32(rec[n:], crc32cBitwise(identity("SKYLITEB", goldenDB, 9, tag, uint64(pgno)), rec[:n]))
 		}
 		body, err := DecodeBasePage(h, pgno, rec)
 		if err != nil {
@@ -209,7 +213,7 @@ func FuzzDecodeBasePage(f *testing.F) {
 			t.Fatalf("accepted page %d outside group %d", pgno, group)
 		case len(rec) != int(ps)+4 || !bytes.Equal(body, rec[:ps]):
 			t.Fatal("accepted a record of the wrong length")
-		case le.Uint32(rec[ps:]) != crc32cBitwise(identity("SKYLITEB", goldenDB, 9, 3, p), body):
+		case le.Uint32(rec[ps:]) != crc32cBitwise(identity("SKYLITEB", goldenDB, 9, tag, p), body):
 			t.Fatalf("accepted a record that is not page %d of this group object", pgno)
 		case pgno == LockPage(ps) && !allZero(body):
 			t.Fatal("accepted a nonzero lock page")
@@ -219,6 +223,8 @@ func FuzzDecodeBasePage(f *testing.F) {
 
 func FuzzDecodeManifest(f *testing.F) {
 	f.Add(readGolden(f, "manifest.bin"), false)
+	creation, _ := EncodeManifest(creationManifest())
+	f.Add(creation, false)
 	f.Add([]byte(manifestMagic), true)
 	f.Fuzz(func(t *testing.T, b []byte, fix bool) {
 		if fix {
@@ -232,6 +238,14 @@ func FuzzDecodeManifest(f *testing.F) {
 		again, err := EncodeManifest(m)
 		if err != nil || !bytes.Equal(again, b) {
 			t.Fatalf("decoded manifest re-encodes differently: %v", err)
+		}
+		if m.RetiredThrough > m.Txn {
+			t.Fatalf("accepted retired through %d above transaction %d", m.RetiredThrough, m.Txn)
+		}
+		for g, r := range m.Groups {
+			if r.Txn == 0 && r.Tag != 0 || r.Txn > m.Txn {
+				t.Fatalf("accepted group %d reference %+v in a manifest at %d", g, r, m.Txn)
+			}
 		}
 	})
 }
@@ -256,6 +270,10 @@ func FuzzDecodeLease(f *testing.F) {
 func FuzzKeys(f *testing.F) {
 	const id = "5b1e3c00912a4f7708d36ea510c42bf9"
 	f.Add("db", "db/"+id+"/log/00000000000000000042")
+	f.Add("tenant/db", "tenant/db/"+id+"/base/0000000003-00000000000000000042-9e3779b97f4a7c15")
+	f.Add("tenant/db", "tenant/db/"+id+"/base/0000000003-00000000000000000042-0000000000000000")
+	f.Add("tenant/db", "tenant/db/"+id+"/base/0000000003-00000000000000000042-9E3779B97F4A7C15")
+	f.Add("tenant/db", "tenant/db/"+id+"/base/0000000003-00000000000000000042-9e3779b97f4a7c1")
 	f.Add("tenant/db", "tenant/db/"+id+"/base/0000000003-00000000000000000042-00000000000000000007")
 	f.Add("db", "db/5B1E3C00912A4F7708D36EA510C42BF9/log/00000000000000000042")
 	f.Add("db", "db/00000000000000000000000000000000/log/00000000000000000042")
@@ -277,8 +295,8 @@ func FuzzKeys(f *testing.F) {
 		} else {
 			checkClass(t, err)
 		}
-		if db, g, txn, epoch, err := k.ParseBase(key); err == nil {
-			if db == (DatabaseID{}) || k.Base(db, g, txn, epoch) != key {
+		if db, g, txn, tag, err := k.ParseBase(key); err == nil {
+			if db == (DatabaseID{}) || k.Base(db, g, txn, tag) != key {
 				t.Fatalf("ParseBase accepted %q, which Base does not build", key)
 			}
 		} else {

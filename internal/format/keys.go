@@ -17,10 +17,11 @@ const (
 const (
 	txnDigits   = 20 // math.MaxUint64 has 20 decimal digits
 	groupDigits = 10 // math.MaxUint32 has 10
+	tagHexLen   = 16 // a uint64 in hexadecimal
 	idHexLen    = 2 * len(DatabaseID{})
-	baseNameLen = groupDigits + 1 + txnDigits + 1 + txnDigits
+	baseNameLen = groupDigits + 1 + txnDigits + 1 + tagHexLen
 	// longestSuffix is the longest part a Keys method appends to the prefix:
-	// "/<identifier>/base/<group>-<txn>-<epoch>".
+	// "/<identifier>/base/<group>-<txn>-<tag>".
 	longestSuffix = 1 + idHexLen + len("/base/") + baseNameLen
 	// suffixSegments is the most segments a Keys method appends.
 	suffixSegments = 3
@@ -33,7 +34,7 @@ type Keys struct{ prefix string }
 // NewKeys returns the keys for the database stored under prefix, which is
 // one or more key segments separated by "/". The prefix must leave room for
 // every key built from it: at most MaxKeySegments-3 segments and
-// MaxKeyLen-91 bytes.
+// MaxKeyLen-87 bytes.
 func NewKeys(prefix string) (Keys, error) {
 	if len(prefix) > MaxKeyLen-longestSuffix {
 		return Keys{}, invalid("key prefix of %d bytes", len(prefix))
@@ -86,9 +87,9 @@ func (k Keys) Commit(db DatabaseID, txn uint64) string {
 func (k Keys) BasePrefix(db DatabaseID) string { return k.db(db) + "/base/" }
 
 // Base is the key of the base object of database db for group, current to
-// txn and written at epoch.
-func (k Keys) Base(db DatabaseID, group uint32, txn, epoch uint64) string {
-	return fmt.Sprintf("%s%010d-%020d-%020d", k.BasePrefix(db), group, txn, epoch)
+// txn and written by the compaction attempt with the given tag.
+func (k Keys) Base(db DatabaseID, group uint32, txn, tag uint64) string {
+	return fmt.Sprintf("%s%010d-%020d-%016x", k.BasePrefix(db), group, txn, tag)
 }
 
 // cutDB parses "<prefix>/<identifier><kind>" from the front of key and
@@ -123,19 +124,33 @@ func (k Keys) ParseCommit(key string) (DatabaseID, uint64, error) {
 }
 
 // ParseBase returns the database identifier, group, transaction number and
-// epoch in a key Base built.
-func (k Keys) ParseBase(key string) (db DatabaseID, group uint32, txn, epoch uint64, err error) {
+// tag in a key Base built.
+func (k Keys) ParseBase(key string) (db DatabaseID, group uint32, txn, tag uint64, err error) {
 	db, s, ok := k.cutDB(key, "/base/")
 	if !ok || len(s) != baseNameLen || s[groupDigits] != '-' || s[groupDigits+1+txnDigits] != '-' {
 		return DatabaseID{}, 0, 0, 0, invalid("key %q is not a base key", key)
 	}
 	g, ok1 := parseDigits(s[:groupDigits], groupDigits)
 	t, ok2 := parseDigits(s[groupDigits+1:groupDigits+1+txnDigits], txnDigits)
-	e, ok3 := parseDigits(s[groupDigits+2+txnDigits:], txnDigits)
+	e, ok3 := parseHex(s[groupDigits+2+txnDigits:])
 	if !ok1 || !ok2 || !ok3 || g > math.MaxUint32 {
 		return DatabaseID{}, 0, 0, 0, invalid("key %q is not a base key", key)
 	}
 	return db, uint32(g), t, e, nil
+}
+
+// parseHex parses exactly tagHexLen lowercase hexadecimal digits.
+func parseHex(s string) (uint64, bool) {
+	if len(s) != tagHexLen {
+		return 0, false
+	}
+	for i := range len(s) {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return 0, false
+		}
+	}
+	v, err := strconv.ParseUint(s, 16, 64)
+	return v, err == nil
 }
 
 // parseDigits parses exactly width decimal digits that fit in a uint64.

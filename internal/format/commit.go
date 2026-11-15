@@ -15,7 +15,7 @@ const (
 	CommitHeaderSize = 144
 	// PageEntrySize is the size of one page table entry.
 	PageEntrySize = 16
-	// MaxCommitIDLen is the longest client-supplied commit identifier.
+	// MaxCommitIDLen is the longest commit identifier.
 	MaxCommitIDLen = 64
 
 	// MaxCommitSize is the largest commit object, and so the largest
@@ -37,8 +37,10 @@ type CommitHeader struct {
 	EpochBump bool
 	// Retired reports a retired commit: this header and nothing after it.
 	// The other fields keep the values of the commit it retired.
-	Retired  bool
-	CommitID []byte // opaque, at most MaxCommitIDLen bytes; nil when absent
+	Retired bool
+	// CommitID is opaque, chosen by the server, at most MaxCommitIDLen
+	// bytes, and nil when absent. An epoch bump has none.
+	CommitID []byte
 
 	tableCRC uint32 // set by DecodeCommitHeader, checked by DecodeCommitTable
 }
@@ -89,6 +91,8 @@ func (h CommitHeader) validate() error {
 		return invalid("commit without pages")
 	case len(h.CommitID) > MaxCommitIDLen:
 		return invalid("commit identifier of %d bytes", len(h.CommitID))
+	case h.EpochBump && len(h.CommitID) != 0:
+		return invalid("epoch bump with a commit identifier")
 	}
 	return nil
 }
