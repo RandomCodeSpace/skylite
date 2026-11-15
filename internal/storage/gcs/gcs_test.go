@@ -181,8 +181,10 @@ func TestReplaceTokens(t *testing.T) {
 // credentials while the client would redirect them to STORAGE_EMULATOR_HOST.
 func TestEmulatorHostWithCredentials(t *testing.T) {
 	t.Setenv("STORAGE_EMULATOR_HOST", "127.0.0.1:1")
-	if _, err := Open(bg, Config{Bucket: "b"}); err == nil {
-		t.Fatal("Open with STORAGE_EMULATOR_HOST set and no endpoint succeeded")
+	// Without the check Open fails too where no credentials can be found, so
+	// the test requires the check's own error.
+	if _, err := Open(bg, Config{Bucket: "b"}); err == nil || !strings.Contains(err.Error(), "STORAGE_EMULATOR_HOST is set") {
+		t.Fatalf("Open with STORAGE_EMULATOR_HOST set and no endpoint = %v, want it refused", err)
 	}
 }
 
@@ -710,6 +712,41 @@ func TestReadFaults(t *testing.T) {
 	}
 }
 
+// TestBodyAfterCancel reads the start of a body, cancels its context and
+// reads again. The contract: once the context has ended, a Read that would
+// return more data fails with an error that wraps the context's error, even
+// when the connection still has data buffered.
+func TestBodyAfterCancel(t *testing.T) {
+	_, s, _ := fixture(t)
+	if _, err := s.Create(bg, "k", bytes.NewReader(data("k", 1<<20))); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Get", "GetRange"} {
+		ctx, cancel := context.WithCancel(bg)
+		var body io.ReadCloser
+		var err error
+		if name == "Get" {
+			body, _, err = s.Get(ctx, "k")
+		} else {
+			body, _, err = s.GetRange(ctx, "k", 1, 1<<19)
+		}
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(body, make([]byte, 10)); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		cancel()
+		n, err := body.Read(make([]byte, 1000))
+		_ = body.Close()
+		if n != 0 || !errors.Is(err, context.Canceled) {
+			t.Fatalf("%s: Read after cancel = %d bytes, %v; want 0 bytes and context.Canceled", name, n, err)
+		}
+	}
+}
+
 // brokenAfter returns left bytes of rc, waits for before, then fails.
 type brokenAfter struct {
 	rc     io.ReadCloser
@@ -844,7 +881,20 @@ func TestInterruptedStagedUpload(t *testing.T) {
 			if how == "cancelled" {
 				stop = readerFunc(func([]byte) (int, error) { cancel(); return 0, nil })
 			}
-			v, err := s.Create(ctx, key, io.MultiReader(bytes.NewReader(data(key, ChunkSize+1<<20)), stop))
+			// The cancelling reader keeps returning no data and no error, so only
+			// the store's own check of its context ends the write.
+			var v string
+			var err error
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				v, err = s.Create(ctx, key, io.MultiReader(bytes.NewReader(data(key, ChunkSize+1<<20)), stop))
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Minute):
+				t.Fatal("Create did not return within a minute of the body failing or its context ending")
+			}
 			expectDefinite(t, err, "create", key)
 			if v != "" {
 				t.Fatalf("a failed Create returned the token %q", v)
