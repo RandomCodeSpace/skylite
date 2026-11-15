@@ -465,7 +465,9 @@ func TestNoChangeCommitsNothing(t *testing.T) {
 	txn, err := c.Run(newID(), func(db *sqlite3.Conn) error {
 		return db.Exec("INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)")
 	})
-	if txn != head+1 || !errors.Is(err, ErrNotCommitted) {
+	// The first commits; the second is refused, and the error says so
+	// without reading as the Run's outcome.
+	if txn != head+1 || err == nil || errors.Is(err, ErrNotCommitted) || !strings.Contains(err.Error(), "a second commit") {
 		t.Fatalf("two commits with one identifier: %d, %v", txn, err)
 	}
 	if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,2" {

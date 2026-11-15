@@ -171,13 +171,13 @@ func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, o
 	}
 	l.cond = sync.NewCond(&l.cmu)
 	l.path = filepath.Join(l.dir, "db")
-	if err := os.RemoveAll(l.dir); err != nil {
+	if err := os.RemoveAll(l.dir); err != nil { //nolint:gosec // the caller's directory and a hex database identifier
 		return nil, err
 	}
-	if err := os.MkdirAll(l.dir, 0o700); err != nil {
+	if err := os.MkdirAll(l.dir, 0o700); err != nil { //nolint:gosec // as above
 		return nil, err
 	}
-	if l.scratch, err = os.OpenFile(filepath.Join(l.dir, "commit"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600); err != nil {
+	if l.scratch, err = os.OpenFile(filepath.Join(l.dir, "commit"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600); err != nil { //nolint:gosec // as above
 		return nil, err
 	}
 	var name [8]byte
@@ -237,7 +237,7 @@ func (l *Leader) Err() error {
 // and deletes the database's local files.
 func (l *Leader) Close() error {
 	l.cmu.Lock()
-	l.stopLocked(errors.New("engine: leader closed"))
+	_ = l.stopLocked(errors.New("engine: leader closed"))
 	conns := make([]*Conn, 0, len(l.conns))
 	for _, c := range l.conns {
 		conns = append(conns, c)
@@ -338,10 +338,10 @@ func (c *Conn) setup() error {
 		return err
 	}
 	if mode, err := c.pragma("journal_mode"); err != nil || mode != "wal" {
-		return fmt.Errorf("engine: database not in WAL mode (%q): %v", mode, err)
+		return errors.Join(fmt.Errorf("engine: database not in WAL mode (%q)", mode), err)
 	}
 	if s, err := c.pragma("synchronous"); err != nil || s != "2" {
-		return fmt.Errorf("engine: synchronous is %q, want FULL: %v", s, err)
+		return errors.Join(fmt.Errorf("engine: synchronous is %q, want FULL", s), err)
 	}
 	if err := c.db.BusyTimeout(busyTimeout); err != nil {
 		return err
@@ -468,7 +468,7 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 			cause = fmt.Errorf("transaction %d is committed in storage but SQLite did not complete it", uploaded)
 			done = uploaded
 		}
-		outcome = l.stopLocked(fmt.Errorf("%w (panic: %v, error: %v)", cause, p, ferr))
+		outcome = l.stopLocked(errors.Join(fmt.Errorf("%w (panic: %v)", cause, p), ferr))
 		c.inCommit, c.uploaded = false, 0
 		l.uploading = false
 		l.cond.Broadcast()
@@ -487,7 +487,7 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	if done != 0 && errors.Is(ferr, ErrNotCommitted) {
 		// The Run's commit stands: what failed after it must not read as its
 		// outcome.
-		ferr = fmt.Errorf("transaction %d committed, then: %s", done, ferr)
+		ferr = fmt.Errorf("transaction %d committed, then: %s", done, ferr) //nolint:errorlint // must not match ErrNotCommitted
 	}
 	return done, ferr
 }

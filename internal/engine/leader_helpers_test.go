@@ -383,7 +383,7 @@ func durableErr(t testing.TB, st storage.Store, keys format.Keys, txn uint64) (*
 		return nil, err
 	}
 	path := filepath.Join(t.TempDir(), "durable.db")
-	f, err := os.Create(path)
+	f, err := os.Create(path) //nolint:gosec // the test's own file
 	if err != nil {
 		return nil, err
 	}

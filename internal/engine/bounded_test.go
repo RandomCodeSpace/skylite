@@ -29,7 +29,7 @@ func importDatabase(t *testing.T, rows int) (*testStore, format.Keys, Office, in
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // the test's own file
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,10 +52,6 @@ func importDatabase(t *testing.T, rows int) (*testStore, format.Keys, Office, in
 // and bytes read from storage, and the local disk the main file uses, stay
 // under bounds that do not depend on the size.
 func TestLeaderBoundedWork(t *testing.T) {
-	type cost struct {
-		requests int
-		bytes    int64
-	}
 	// What one phase may cost: the workload's 20 lookups touch at most a
 	// root-to-leaf path each, four pages deep, and every miss fetches one
 	// page.

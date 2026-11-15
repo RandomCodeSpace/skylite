@@ -325,7 +325,7 @@ func TestExperimentSpillAndSavepoints(t *testing.T) {
 		// header write of its own frame.
 		var prev recEvent
 		for _, e := range evs {
-			if e.file == "wal" && e.op == "write" && e.n == 1024 && !(prev.n == 24 && prev.off+24 == e.off) {
+			if e.file == "wal" && e.op == "write" && e.n == 1024 && (prev.n != 24 || prev.off+24 != e.off) {
 				inPlace++
 			}
 			if e.file == "wal" {
@@ -425,11 +425,11 @@ func TestExperimentFailedSyncAndTruncate(t *testing.T) {
 		// the copy: recovery rebuilds the index from the WAL file.
 		crash := filepath.Join(t.TempDir(), "x.db")
 		for _, suffix := range []string{"", "-wal"} {
-			b, err := os.ReadFile(path + suffix)
+			b, err := os.ReadFile(path + suffix) //nolint:gosec // the test's own file
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(crash+suffix, b, 0o600); err != nil {
+			if err := os.WriteFile(crash+suffix, b, 0o600); err != nil { //nolint:gosec // the test's own file
 				t.Fatal(err)
 			}
 		}
