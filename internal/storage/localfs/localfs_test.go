@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"testing/iotest"
@@ -428,6 +429,91 @@ func TestOutcome(t *testing.T) {
 			}
 			if got != want || want == "old" && info.Version != old {
 				t.Fatalf("after the failure the key holds %q at %q, want %q", got, info.Version, want)
+			}
+		})
+	}
+}
+
+// TestForcedInterleavings stops a first mutation inside its critical section,
+// after it took the lock (for Replace: after its version check and before its
+// rename), starts a second mutation of the same key on another Store, waits
+// until that one is blocked on the lock, and only then lets the first go on.
+// The suite's race tests cannot force this window; the hook can.
+func TestForcedInterleavings(t *testing.T) {
+	cases := []struct {
+		first, second string
+		secondErr     error  // nil or the error the second mutation must return
+		want          string // "first" (the first Replace's content) or "missing"
+	}{
+		{"replace", "delete", nil, "missing"},
+		{"replace", "replace", storage.ErrPreconditionFailed, "first"},
+		{"delete", "replace", storage.ErrPreconditionFailed, "missing"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.first+" then "+tc.second, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			a, b := open(t, dir), open(t, dir)
+			v, err := a.Create(ctx, "k", strings.NewReader("old"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			paused, waiting := make(chan struct{}), make(chan struct{})
+			resume := make(chan struct{})
+			resumeOnce := sync.OnceFunc(func() { close(resume) })
+			var pauseOnce, waitOnce sync.Once
+			setHook(t, func(p string) error {
+				switch p {
+				case "locked":
+					pauseOnce.Do(func() { close(paused); <-resume })
+				case "lock busy":
+					waitOnce.Do(func() { close(waiting) })
+				}
+				return nil
+			})
+			mutate := func(s *Store, op, content string) error {
+				if op == "delete" {
+					return s.Delete(ctx, "k")
+				}
+				_, err := s.Replace(ctx, "k", v, strings.NewReader(content))
+				return err
+			}
+			var wg sync.WaitGroup
+			defer wg.Wait()
+			defer resumeOnce()
+			firstErr, secondErr := make(chan error, 1), make(chan error, 1)
+			wg.Go(func() { firstErr <- mutate(a, tc.first, "first") })
+			select {
+			case <-paused:
+			case err := <-firstErr:
+				t.Fatalf("first %s returned %v without reaching its critical section", tc.first, err)
+			}
+			wg.Go(func() { secondErr <- mutate(b, tc.second, "second") })
+			select {
+			case <-waiting:
+			case err := <-secondErr:
+				t.Fatalf("second %s returned %v while the first %s held the lock", tc.second, err, tc.first)
+			}
+			resumeOnce()
+			if err := <-firstErr; err != nil {
+				t.Fatalf("first %s: %v", tc.first, err)
+			}
+			if err := <-secondErr; !errors.Is(err, tc.secondErr) || (tc.secondErr == nil) != (err == nil) {
+				t.Fatalf("second %s error = %v, want %v", tc.second, err, tc.secondErr)
+			}
+			hook = nil
+			body, _, err := a.Get(ctx, "k")
+			switch {
+			case tc.want == "missing" && !errors.Is(err, storage.ErrNotFound):
+				t.Fatalf("Get error = %v, want ErrNotFound", err)
+			case tc.want == "first" && err != nil:
+				t.Fatalf("Get: %v", err)
+			case tc.want == "first":
+				got, _ := io.ReadAll(body)
+				_ = body.Close()
+				if string(got) != "first" {
+					t.Fatalf("k holds %q, want %q", got, "first")
+				}
 			}
 		})
 	}

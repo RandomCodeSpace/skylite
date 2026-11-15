@@ -452,6 +452,10 @@ func (s *Store) lock(ctx context.Context) (unlock func(), err error) {
 			_ = f.Close()
 			return nil, err
 		}
+		if err := at("lock busy"); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 		select {
 		case <-ctx.Done():
 			_ = f.Close()

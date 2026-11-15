@@ -79,10 +79,25 @@
 //
 //   - nil means the mutation took effect and is durable;
 //   - an error wrapping [ErrOutcomeUnknown] means it may or may not have taken
-//     effect, now or after a crash; the caller reads the key back to find out.
-//     A failed write returns no version token, so a caller that must recognise
-//     its own write puts something unique in the content;
+//     effect, now, later or after a crash (see below);
 //   - any other error means it had no effect, visible now or after a crash.
+//
+// An unknown outcome is not resolved by reading the key once. A request to a
+// cloud service can still be in flight after the call has returned, so a read
+// can see the old state and the original request can commit afterwards.
+// Reading tells the caller only this: seeing the write's own content confirms
+// that write took effect (a failed write returns no version token, so a caller
+// that must recognise its own write puts something unique in the content);
+// seeing older content, other content or no object does not establish that it
+// failed. The caller then does one of two things. Either it repeats the same
+// conditional write until it gets a definite answer: success, or
+// [ErrPreconditionFailed] followed by a read that shows whose content is
+// there. Or it arranges that the outstanding request can no longer matter, for
+// example by making sure its condition can never hold again. Delete has no
+// condition: repeating it until it succeeds leaves the key missing when it
+// returns, but the first request may still remove an object created at the
+// key afterwards, so a caller does not create a key again after a Delete of it
+// whose outcome was unknown, unless that removal would not matter.
 //
 // Publication begins when a write has read its body to its end, or when a
 // Delete sends the request or makes the system call that removes the object.
@@ -103,6 +118,16 @@
 // inside the caller's own body Read: a backend sees the context end only when
 // that Read returns, so a caller that needs a bounded write gives it a reader
 // that returns.
+//
+// A backend whose SDK retries a request decides the outcome of the whole call,
+// not of its last attempt. A precondition failure returned after a retry of an
+// attempt whose response was lost does not prove that the first attempt had no
+// effect: it may have committed, and the retry then failed its condition
+// against it, or against a later write. Such a backend classifies the failure
+// by reading the object back: its own content means the write took effect;
+// anything else is [ErrOutcomeUnknown], never [ErrPreconditionFailed]. The
+// portable suite cannot lose a response or make an SDK retry, so classifying
+// lost responses and retries is each cloud backend's own test obligation.
 //
 // # Staged uploads
 //
@@ -192,6 +217,14 @@
 // additionally [ErrOutcomeUnknown] when the rule above requires it. Test with
 // [errors.Is] and [errors.As].
 //
+// [errors.Is] and [errors.As] do not look inside a [*BodyError]: the caller's
+// reader may return any error, including one of this package's sentinels or a
+// context error, and that must not change how the write is classified. A
+// write whose reader returned [ErrOutcomeUnknown] or [ErrPreconditionFailed]
+// is a write that failed reading its body, with no effect. To inspect the
+// reader's error, get the [*BodyError] with [errors.As] and look at its Err
+// field.
+//
 // Error text never contains object contents or credentials (access keys,
 // tokens, signed URLs). A body reader's error is wrapped in a [*BodyError],
 // whose text is fixed, because the caller's reader may put anything in its
@@ -214,10 +247,14 @@
 // Passing storagetest.Run is necessary, not sufficient. The suite runs its
 // clients in one process and cannot crash the backend, cut its network or
 // inspect its service, so each backend also tests, itself: races between
-// processes or hosts; a process killed during and just after publication;
-// its staged upload path (see above) or its size limit; that durability
-// holds where it can be observed, such as the directory fsync of a local
-// backend; and that its SDK's errors are redacted.
+// processes or hosts; the critical interleavings of its own conditional
+// writes, forced with its own barriers or hooks (the suite's race tests only
+// stress the scheduler); a process killed during and just after publication;
+// lost responses and SDK retries, and that it classifies them as the outcome
+// rule requires; page filling, if its service can return pages shorter than
+// requested; its staged upload path (see above) or its size limit; that
+// durability holds where it can be observed, such as the directory fsync of a
+// local backend; and that its SDK's errors are redacted.
 package storage
 
 import (
@@ -270,14 +307,14 @@ func (e *Error) Error() string { return fmt.Sprintf("storage: %s %q: %v", e.Op, 
 
 func (e *Error) Unwrap() error { return e.Err }
 
-// BodyError holds an error returned by the caller's body reader. Its text is
-// fixed, because the reader's error may carry object contents; the reader's
-// error stays reachable through Unwrap.
+// BodyError holds an error returned by the caller's body reader in Err. Its
+// text is fixed, because the reader's error may carry object contents. It has
+// no Unwrap method on purpose: whatever the reader returned, [errors.Is] on
+// the write's error never matches it, so a reader cannot make a write look
+// like it failed for any other reason. Inspect Err directly.
 type BodyError struct{ Err error }
 
 func (e *BodyError) Error() string { return "reading the body failed" }
-
-func (e *BodyError) Unwrap() error { return e.Err }
 
 // Info describes one version of an object.
 type Info struct {
