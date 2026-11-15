@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -108,7 +109,7 @@ func TestModel(t *testing.T) {
 	or := newOracle(t)
 	const schema = "CREATE TABLE t(k INTEGER PRIMARY KEY, v)"
 	id := newID()
-	if _, err := conns[0].Run(id, func(db *sqlite3.Conn) error { return db.Exec(schema) }); err != nil {
+	if _, err := conns[0].Run(context.Background(), id, func(db *sqlite3.Conn) error { return db.Exec(schema) }); err != nil {
 		t.Fatal(err)
 	}
 	or.exec(t, schema)
@@ -144,7 +145,7 @@ func TestModel(t *testing.T) {
 			st.setRule(rule)
 			id = newID()
 			before := l.Head()
-			txn, err := c.Run(id, func(db *sqlite3.Conn) error {
+			txn, err := c.Run(context.Background(), id, func(db *sqlite3.Conn) error {
 				if rng.IntN(3) == 0 {
 					if err := db.Exec("PRAGMA cache_size=5"); err != nil {
 						return err
@@ -215,7 +216,7 @@ func TestModel(t *testing.T) {
 			}
 		case k < 15:
 			mode := []sqlite3.CheckpointMode{sqlite3.CHECKPOINT_PASSIVE, sqlite3.CHECKPOINT_RESTART, sqlite3.CHECKPOINT_TRUNCATE}[rng.IntN(3)]
-			if _, err := c.Run(nil, func(db *sqlite3.Conn) error {
+			if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 				_, _, err := db.WALCheckpoint("main", mode)
 				return err
 			}); err != nil && !errors.Is(err, sqlite3.BUSY) {

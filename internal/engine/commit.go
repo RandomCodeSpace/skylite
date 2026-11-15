@@ -202,17 +202,17 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 	l.cmu.Lock()
 	var refuse error
 	switch {
+	case l.head >= maxTxn:
+		refuse = fmt.Errorf("%w: %w", ErrNotCommitted, l.stopLocked(errMaxTxn))
+	case l.tailFullLocked():
+		l.startMaintenance()
+		refuse = l.tailErrLocked()
 	case l.noCreates:
 		refuse = fmt.Errorf("%w: %w: maintenance is running", ErrNotCommitted, ErrRetry)
 	case c.id == nil:
 		refuse = fmt.Errorf("%w: the transaction has no commit identifier", ErrNotCommitted)
 	case c.idUsed:
 		refuse = fmt.Errorf("%w: a second commit with one commit identifier", ErrNotCommitted)
-	case l.head == ^uint64(0):
-		refuse = fmt.Errorf("%w: %w", ErrNotCommitted, l.stopLocked(errMaxTxn))
-	case l.head-l.manifestTxn >= l.cfg.TailBound:
-		l.startMaintenance()
-		refuse = fmt.Errorf("%w: %w: the log tail holds %d commits, its bound", ErrNotCommitted, ErrRetry, l.head-l.manifestTxn)
 	}
 	h := format.CommitHeader{
 		DB: l.office.DB, PageSize: uint32(l.ps), Txn: l.head + 1, Epoch: l.office.Epoch, //nolint:gosec // a page size
@@ -244,6 +244,7 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 	case committed:
 		l.cmu.Lock()
 		l.head, l.headSize = h.Txn, h.DBSize
+		l.tailPages += int(h.PageCount)
 		pc := &commit{key: b.key, version: version, h: b.h, entries: b.entries}
 		if retired {
 			pc.entries = nil
@@ -251,7 +252,7 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 		l.pending = append(l.pending, pc)
 		c.uploaded, c.retired = h.Txn, retired
 		l.wal.start, l.wal.end = -1, cp.end
-		if l.head-l.manifestTxn >= l.cfg.TailBound {
+		if l.tailFullLocked() {
 			l.startMaintenance()
 		}
 		l.cmu.Unlock()
@@ -271,7 +272,9 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 	defer l.cmu.Unlock()
 	c.inCommit, l.uploading = false, false
 	c.outcome = fmt.Errorf("%w: commit %d: %w", ErrUnknown, h.Txn, err)
-	return l.stopLocked(c.outcome)
+	stopped := l.stopLocked(c.outcome)
+	c.outcome = fmt.Errorf("%w: %w", ErrStopped, c.outcome)
+	return stopped
 }
 
 // fail ends a commit known not to be in the durable history: it truncates

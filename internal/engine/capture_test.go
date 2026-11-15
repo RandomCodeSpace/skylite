@@ -3,6 +3,8 @@ package engine
 // Tests for "Commit capture and failure" and "Reads" in record 0004.
 
 import (
+	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +13,8 @@ import (
 	"testing"
 
 	"github.com/ncruces/go-sqlite3"
+
+	"github.com/RandomCodeSpace/skylite/internal/format"
 )
 
 // oracle is a plain SQLite database that receives the transactions the
@@ -63,7 +67,7 @@ func mustDump(t testing.TB, db *sqlite3.Conn) string {
 func dumpConn(t *testing.T, c *Conn) string {
 	t.Helper()
 	var d string
-	if _, err := c.Run(nil, func(db *sqlite3.Conn) (err error) {
+	if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) (err error) {
 		d, err = dump(db)
 		return err
 	}); err != nil {
@@ -107,12 +111,12 @@ func runScript(t *testing.T, c *Conn, sql string) (uint64, error) {
 		if sql == "checkpoint truncate" {
 			mode = sqlite3.CHECKPOINT_TRUNCATE
 		}
-		return c.Run(nil, func(db *sqlite3.Conn) error {
+		return c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 			_, _, err := db.WALCheckpoint("main", mode)
 			return err
 		})
 	}
-	return c.Run(newID(), func(db *sqlite3.Conn) error {
+	return c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
 		if err := db.Exec("PRAGMA cache_size=10"); err != nil {
 			return err
 		}
@@ -252,7 +256,7 @@ func TestUploadHeldReaders(t *testing.T) {
 				<-held.reached
 				see := func(c *Conn) string {
 					var out string
-					_, err := c.Run(nil, func(db *sqlite3.Conn) error {
+					_, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 						r, err := query(db, "SELECT x FROM t")
 						if err != nil && strings.Contains(err.Error(), "no such table") {
 							out = "none"
@@ -333,7 +337,7 @@ func TestReadsThroughCheckpoints(t *testing.T) {
 		or.exec(t, sql)
 	}
 	ckpt := func(mode sqlite3.CheckpointMode) error {
-		_, err := w.Run(nil, func(db *sqlite3.Conn) error {
+		_, err := w.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 			_, _, err := db.WALCheckpoint("main", mode)
 			return err
 		})
@@ -354,7 +358,7 @@ func TestReadsThroughCheckpoints(t *testing.T) {
 
 	// A reader holds a snapshot; checkpoints cannot pass it.
 	var held string
-	if _, err := snap.Run(nil, func(db *sqlite3.Conn) (err error) {
+	if _, err := snap.Run(context.Background(), nil, func(db *sqlite3.Conn) (err error) {
 		if err := db.Exec("BEGIN"); err != nil {
 			return err
 		}
@@ -371,7 +375,7 @@ func TestReadsThroughCheckpoints(t *testing.T) {
 	if got := dumpConn(t, snap); got != held {
 		t.Fatal("the held snapshot changed")
 	}
-	if _, err := snap.Run(nil, func(db *sqlite3.Conn) error { return db.Exec("COMMIT") }); err != nil {
+	if _, err := snap.Run(context.Background(), nil, func(db *sqlite3.Conn) error { return db.Exec("COMMIT") }); err != nil {
 		t.Fatal(err)
 	}
 	apply("DELETE FROM t WHERE k > 350")
@@ -412,7 +416,7 @@ func TestReadsThroughCheckpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	if lost, err := l.Open(); err == nil {
-		if _, err := lost.Run(nil, func(db *sqlite3.Conn) error {
+		if _, err := lost.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 			_, err := dump(db)
 			return err
 		}); err == nil {
@@ -453,12 +457,12 @@ func TestCaptureCannotBeBypassed(t *testing.T) {
 		"VACUUM INTO '" + filepath.Join(t.TempDir(), "copy.db") + "'",
 		"ATTACH 'file:" + l.path + "?vfs=" + l.vfs + "' AS again",
 	} {
-		if _, err := c.Run(nil, func(db *sqlite3.Conn) error { return db.Exec(sql) }); err == nil {
+		if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error { return db.Exec(sql) }); err == nil {
 			t.Errorf("%s: accepted", sql)
 		}
 	}
 	for _, sql := range []string{"PRAGMA journal_mode", "PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA synchronous"} {
-		if _, err := c.Run(nil, func(db *sqlite3.Conn) error { return db.Exec(sql) }); err != nil {
+		if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error { return db.Exec(sql) }); err != nil {
 			t.Errorf("%s: %v", sql, err)
 		}
 	}
@@ -519,7 +523,7 @@ func TestCaptureSpilledPagesBeyondTheNewSize(t *testing.T) {
 		"INSERT INTO t SELECT value, printf('%0500d', value) FROM generate_series(1, 50)",
 		"BEGIN; INSERT INTO t SELECT value, printf('%0900d', value) FROM generate_series(1000, 1400); DELETE FROM t WHERE k >= 1000; UPDATE t SET v = 'changed' WHERE k = 1; COMMIT",
 	} {
-		if _, err := c.Run(newID(), func(db *sqlite3.Conn) error {
+		if _, err := c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
 			if err := db.Exec("PRAGMA cache_size=5"); err != nil {
 				return err
 			}
@@ -656,5 +660,99 @@ func TestRollbackAfterSpillThenCheckpoint(t *testing.T) {
 	}
 	if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,1" {
 		t.Fatalf("durable rows %s", got)
+	}
+}
+
+// Covers: Commit capture and failure, "No error from the commit point is
+// turned into success", for a frame of SQLite's lock page, which SQLite
+// never writes: its checksums are rewritten so that only the page number is
+// wrong, and the commit fails as not committed with nothing sent.
+func TestCaptureRejectsLockPage(t *testing.T) {
+	st, keys, _, l, c := setup(t)
+	wal, err := os.OpenFile(l.path+"-wal", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = wal.Close() }()
+	l.fault = func(file, op string, off int64, n int) error {
+		if file != "wal" || op != "sync" {
+			return nil
+		}
+		l.cmu.Lock()
+		start, hwm := l.wal.start, l.wal.hwm
+		l.cmu.Unlock()
+		if start < 0 {
+			return nil
+		}
+		l.fault = nil
+		return relabel(wal, l.ps, start, hwm, format.LockPage(uint32(l.ps))) //nolint:gosec // a page size
+	}
+	st.resetCounts()
+	txn, err := exec(c, "INSERT INTO t VALUES (1)")
+	if txn != 0 || !errors.Is(err, ErrNotCommitted) || !strings.Contains(err.Error(), "holds page") {
+		t.Fatalf("commit with a lock-page frame: %d, %v", txn, err)
+	}
+	if _, creates, _ := st.counts(); creates != 0 {
+		t.Fatalf("%d creates", creates)
+	}
+	mustRun(t, c, "INSERT INTO t VALUES (2)")
+	if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,2" {
+		t.Fatalf("durable rows %s", got)
+	}
+}
+
+// relabel gives the first WAL frame at start page number pgno, and rewrites
+// the checksums of the frames from start to hwm so that SQLite's recovery
+// would accept them.
+func relabel(f *os.File, ps, start, hwm int64, pgno uint32) error {
+	be := binary.BigEndian
+	hdr := make([]byte, walHeaderSize)
+	if _, err := f.ReadAt(hdr, 0); err != nil {
+		return err
+	}
+	big := be.Uint32(hdr)&1 == 1
+	frame := ps + frameHeaderSize
+	seed := hdr[24:32]
+	if start != walHeaderSize {
+		seed = make([]byte, 8)
+		if _, err := f.ReadAt(seed, start-frame+16); err != nil {
+			return err
+		}
+	}
+	s1, s2 := be.Uint32(seed), be.Uint32(seed[4:])
+	buf := make([]byte, frame)
+	for off := start; off+frame <= hwm; off += frame {
+		if _, err := f.ReadAt(buf, off); err != nil {
+			return err
+		}
+		if off == start {
+			be.PutUint32(buf, pgno)
+		}
+		s1, s2 = walSum(buf[:8], s1, s2, big)
+		s1, s2 = walSum(buf[frameHeaderSize:], s1, s2, big)
+		be.PutUint32(buf[16:], s1)
+		be.PutUint32(buf[20:], s2)
+		if _, err := f.WriteAt(buf, off); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Covers: Commit capture and failure, "No transaction number is ever given
+// a second, different commit object": a truncation of the WAL within the
+// frames of commits already in storage, which SQLite never makes, stops the
+// database.
+func TestWALTruncatedWithinCommittedFramesStops(t *testing.T) {
+	_, _, _, l, c := setup(t)
+	mustRun(t, c, "INSERT INTO t VALUES (1)")
+	l.cmu.Lock()
+	w, end := l.wal.writer, l.wal.end
+	l.cmu.Unlock()
+	if err := w.Truncate(end - 1); err == nil {
+		t.Fatal("a truncation within committed frames was accepted")
+	}
+	if !errors.Is(l.Err(), ErrStopped) {
+		t.Fatalf("leader: %v, want stopped", l.Err())
 	}
 }

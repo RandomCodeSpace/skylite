@@ -134,7 +134,7 @@ func TestCrashChild(t *testing.T) {
 		if i == 1 {
 			sql = "CREATE TABLE t(k INTEGER PRIMARY KEY, v)"
 		}
-		txn, err := c.Run(fmt.Appendf(nil, "crash-%018d", i), func(db *sqlite3.Conn) error { return db.Exec(sql) })
+		txn, err := c.Run(context.Background(), fmt.Appendf(nil, "crash-%018d", i), func(db *sqlite3.Conn) error { return db.Exec(sql) })
 		if target && step == "after not committed" && errors.Is(err, ErrNotCommitted) {
 			pause(step)
 		}
@@ -232,7 +232,7 @@ func TestCrash(t *testing.T) {
 				}
 			}
 			check(durable(t, st.Store, keys, 0))
-			if _, err := c.Run(nil, func(db *sqlite3.Conn) error { check(db); return nil }); err != nil {
+			if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error { check(db); return nil }); err != nil {
 				t.Fatal(err)
 			}
 			mustRun(t, c, "INSERT INTO t VALUES (100, 'after the restart')")

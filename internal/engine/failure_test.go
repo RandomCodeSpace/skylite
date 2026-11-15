@@ -5,10 +5,11 @@ package engine
 // rule of decision 2.
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/ncruces/go-sqlite3"
 )
@@ -69,7 +70,7 @@ func TestFailureAfterUpload(t *testing.T) {
 			// the Run ends, another connection must not commit on top of
 			// the image that lacks it.
 			var otherErr error
-			txn, err := w.Run(newID(), func(db *sqlite3.Conn) error {
+			txn, err := w.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
 				err := db.Exec("INSERT INTO t VALUES (1)")
 				if tc == "SQLite error after upload" {
 					_, otherErr = exec(other, "INSERT INTO t VALUES (2)")
@@ -92,7 +93,7 @@ func TestFailureAfterUpload(t *testing.T) {
 			if tc != "panic in create" && (txn != o.Head+2 || durableRows != "0,1") {
 				t.Fatalf("committed in storage: reported %d, durable rows %s", txn, durableRows)
 			}
-			if _, err := other.Run(nil, func(db *sqlite3.Conn) error {
+			if _, err := other.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 				_, err := query(db, "SELECT x FROM t")
 				return err
 			}); !errors.Is(err, ErrStopped) {
@@ -155,17 +156,69 @@ func TestStopDuringAnotherUpload(t *testing.T) {
 // commit path, including one that holds the WAL write lock or is running a
 // checkpoint: within a time bound, another connection completes a later
 // write and a checkpoint, and a newly opened connection reads, with every
-// result checked against the oracle. ... If this fails, the fail-stop rule
-// extends to every panic." It fails
-// (TestExperimentPanickedConnectionKeepsLocks), so this test checks the
-// extended rule: any panic stops the database on the node, the other
-// connections stop serving, and a new leader, after a takeover, completes a
-// write and a checkpoint and a new connection reads, all checked against
-// the oracle. Also covers Limits and size, "Each connection's memory
-// ceiling is set": exceeding it panics in ncruces.
-func TestPanicStopsTheDatabase(t *testing.T) {
-	for _, tc := range []string{"holding the write lock", "running a checkpoint", "out of memory"} {
-		t.Run(tc, func(t *testing.T) {
+// result checked against the oracle"; decision 6, a panic outside the
+// commit path discards the connection if it closes cleanly and otherwise
+// stops the database. ncruces's out-of-memory panic, and a VFS panic inside
+// a prepared statement's step, leave the connection closable; a VFS panic
+// inside sqlite3_exec does not (TestExperimentPanickedConnectionKeepsLocks),
+// and there the database stops and a new leader, after a takeover, does the
+// same work. Also covers Limits and size, "Each connection's memory ceiling
+// is set": exceeding it panics in ncruces. Every wait for a lock is bounded
+// by the busy timeout, so leaked locks fail by assertion.
+func TestPanicOutsideTheCommitPath(t *testing.T) {
+	// Each value is under the length limit; together they pass the 16 MiB
+	// ceiling.
+	const oom = "SELECT randomblob(3000000), randomblob(3000000), randomblob(3000000), randomblob(3000000), randomblob(3000000), randomblob(3000000)"
+	walWritePanics := func(file, op string, off int64, n int) error {
+		if file == "wal" && op == "write" {
+			panic("injected")
+		}
+		return nil
+	}
+	for _, tc := range []struct {
+		name  string
+		fault func(file, op string, off int64, n int) error
+		f     func(db *sqlite3.Conn) error
+		stops bool
+	}{
+		{"out of memory in Exec, holding the write lock", nil, func(db *sqlite3.Conn) error {
+			if err := db.Exec("BEGIN IMMEDIATE; UPDATE t SET v = 'lost' WHERE k = 1"); err != nil {
+				return err
+			}
+			return db.Exec(oom)
+		}, false},
+		{"out of memory in a step, holding the write lock", nil, func(db *sqlite3.Conn) error {
+			if err := db.Exec("BEGIN IMMEDIATE; UPDATE t SET v = 'lost' WHERE k = 1"); err != nil {
+				return err
+			}
+			_, err := query(db, oom)
+			return err
+		}, false},
+		{"VFS panic in a step, holding the write lock", walWritePanics, func(db *sqlite3.Conn) error {
+			if err := db.Exec("PRAGMA cache_size=5; BEGIN"); err != nil {
+				return err
+			}
+			s, _, err := db.Prepare("UPDATE t SET v = 'spilled'")
+			if err != nil {
+				return err
+			}
+			s.Step()
+			return s.Close()
+		}, false},
+		{"VFS panic in a checkpoint", func(file, op string, off int64, n int) error {
+			if file == "main" && op == "write" {
+				panic("injected")
+			}
+			return nil
+		}, func(db *sqlite3.Conn) error {
+			_, _, err := db.WALCheckpoint("main", sqlite3.CHECKPOINT_PASSIVE)
+			return err
+		}, false},
+		{"VFS panic in Exec, holding the write lock", walWritePanics, func(db *sqlite3.Conn) error {
+			return db.Exec("PRAGMA cache_size=5; BEGIN; UPDATE t SET v = 'spilled'; COMMIT")
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			st, keys, o := newDatabase(t, 1024)
 			cfg := testConfig()
 			cfg.MaxMemory = 16 << 20
@@ -179,68 +232,79 @@ func TestPanicStopsTheDatabase(t *testing.T) {
 				mustRun(t, w, sql)
 				or.exec(t, sql)
 			}
-			var f func(db *sqlite3.Conn) error
-			switch tc {
-			case "holding the write lock":
-				l.fault = func(file, op string, off int64, n int) error {
-					if file == "wal" && op == "write" {
-						panic("injected")
-					}
-					return nil
-				}
-				f = func(db *sqlite3.Conn) error {
-					return db.Exec("PRAGMA cache_size=5; BEGIN; UPDATE t SET v = 'spilled'; COMMIT")
-				}
-			case "running a checkpoint":
-				l.fault = func(file, op string, off int64, n int) error {
-					if file == "main" && op == "write" {
-						panic("injected")
-					}
-					return nil
-				}
-				f = func(db *sqlite3.Conn) error {
-					_, _, err := db.WALCheckpoint("main", sqlite3.CHECKPOINT_PASSIVE)
-					return err
-				}
-			case "out of memory":
-				f = func(db *sqlite3.Conn) error {
-					// Each value is under the length limit; together they
-					// pass the 16 MiB ceiling.
-					_, err := query(db, "SELECT randomblob(3000000), randomblob(3000000), randomblob(3000000), randomblob(3000000), randomblob(3000000), randomblob(3000000)")
-					return err
-				}
-			}
-			_, err := victim.Run(newID(), f)
+			l.fault = tc.fault
+			txn, err := victim.Run(context.Background(), newID(), tc.f)
 			l.fault = nil
-			if !errors.Is(err, ErrStopped) || !errors.Is(err, ErrNotCommitted) || !strings.Contains(err.Error(), "panic") {
-				t.Fatalf("victim: %v, want the database stopped, nothing committed", err)
+			if txn != 0 || !errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrUnknown) || !strings.Contains(err.Error(), "panic") {
+				t.Fatalf("victim: %d, %v; want not committed, after a panic", txn, err)
 			}
-			if _, err := exec(w, "SELECT 1"); !errors.Is(err, ErrStopped) {
-				t.Fatalf("another connection served after the panic: %v", err)
+			if tc.stops {
+				if !errors.Is(err, ErrStopped) {
+					t.Fatalf("victim: %v, want the database stopped", err)
+				}
+				if _, err := exec(w, "SELECT 1"); !errors.Is(err, ErrStopped) {
+					t.Fatalf("another connection served after the panic: %v", err)
+				}
+				_ = l.Close()
+				l = lead(t, st, keys, takeOffice(t, st.Store, keys), cfg)
+				w = open(t, l)
+			} else {
+				if errors.Is(err, ErrStopped) || l.Err() != nil {
+					t.Fatalf("victim: %v; leader: %v; want only the connection discarded", err, l.Err())
+				}
+				if _, err := exec(victim, "SELECT 1"); !errors.Is(err, ErrNotCommitted) || !strings.Contains(err.Error(), "closed") {
+					t.Fatalf("the discarded connection: %v", err)
+				}
 			}
-			_ = l.Close()
-
-			deadline := time.AfterFunc(30*time.Second, func() { panic("no progress within 30s after the panic") })
-			defer deadline.Stop()
-			l2 := lead(t, st, keys, takeOffice(t, st.Store, keys), cfg)
-			w2 := open(t, l2)
 			sql := "UPDATE t SET v = 'after' WHERE k % 7 = 0"
-			mustRun(t, w2, sql)
+			mustRun(t, w, sql)
 			or.exec(t, sql)
-			if _, err := w2.Run(nil, func(db *sqlite3.Conn) error {
+			if _, err := w.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 				_, _, err := db.WALCheckpoint("main", sqlite3.CHECKPOINT_TRUNCATE)
 				return err
 			}); err != nil {
 				t.Fatalf("TRUNCATE checkpoint: %v", err)
 			}
 			exp := mustDump(t, or.db)
-			if got := dumpConn(t, open(t, l2)); got != exp {
+			if got := dumpConn(t, open(t, l)); got != exp {
 				t.Fatal("a new connection differs from the oracle")
 			}
 			if got := mustDump(t, durable(t, st.Store, keys, 0)); got != exp {
 				t.Fatal("durable state differs from the oracle")
 			}
 		})
+	}
+}
+
+// Covers: Limits and size, "Each connection's memory ceiling is set", for
+// the caps below it: a value or a statement longer than a quarter of the
+// ceiling fails with SQLITE_TOOBIG instead of reaching the ceiling, and the
+// connection serves on.
+func TestValueAndStatementLimits(t *testing.T) {
+	st, keys, o := newDatabase(t, 1024)
+	cfg := testConfig()
+	cfg.MaxMemory = 16 << 20
+	l := lead(t, st, keys, o, cfg)
+	c := open(t, l)
+	const limit = 4 << 20 // MaxMemory / 4
+	for _, tc := range []struct {
+		sql    string
+		tooBig bool
+	}{
+		{fmt.Sprintf("SELECT length(randomblob(%d))", limit), false},
+		{fmt.Sprintf("SELECT length(randomblob(%d))", limit+1), true},
+		{"SELECT '" + strings.Repeat("x", limit) + "'", true},
+	} {
+		_, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+			_, err := query(db, tc.sql)
+			return err
+		})
+		if tc.tooBig != errors.Is(err, sqlite3.TOOBIG) || !tc.tooBig && err != nil {
+			t.Fatalf("%.40s: %v", tc.sql, err)
+		}
+	}
+	if got := queryConn(t, c, "SELECT 1"); got[0] != "1" || l.Err() != nil {
+		t.Fatalf("after the limits: %v, %v", got, l.Err())
 	}
 }
 

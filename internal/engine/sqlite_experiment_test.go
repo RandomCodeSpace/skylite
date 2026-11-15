@@ -525,14 +525,14 @@ func TestExperimentTruncateCheckpoint(t *testing.T) {
 	}
 }
 
-// Experiment: decision 6, "Unproven: that discarding a connection after a
-// panic releases its locks and leaves the shared-memory index consistent
-// for the other connections." It does not, with ncruces v0.37.0 on Linux.
-// A panic in a VFS call unwinds through sqlite3_exec, whose statement
-// ncruces does not track, so the connection cannot be closed; and its
-// shared-memory locks are OFD locks that the mapping of the -shm file keeps
-// alive. Another connection then cannot write. So the engine stops the
-// database on every panic, as the record says it must if this fails.
+// Experiment: decision 6, whether discarding a connection after a panic
+// releases its locks, for the case where it does not, with ncruces v0.37.0
+// on Linux. A panic in a VFS call unwinds through sqlite3_exec, whose
+// statement ncruces does not track, so the connection cannot be closed; and
+// its shared-memory locks are OFD locks that the mapping of the -shm file
+// keeps alive. Another connection then cannot write. So the engine stops
+// the database when a panicked connection does not close cleanly; the cases
+// that do close are in TestPanicOutsideTheCommitPath.
 func TestExperimentPanickedConnectionKeepsLocks(t *testing.T) {
 	v := newRecVFS(t, 1024)
 	c, path := openRec(t, v, "FULL")

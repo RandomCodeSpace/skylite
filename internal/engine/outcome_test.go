@@ -240,7 +240,7 @@ func TestForeignObjectAtNextNameStops(t *testing.T) {
 					retire(t, st.Store, keys, o.DB, txn)
 				}
 			}
-			_, err := c.Run(id, func(db *sqlite3.Conn) error { return db.Exec("INSERT INTO t VALUES (1)") })
+			_, err := c.Run(context.Background(), id, func(db *sqlite3.Conn) error { return db.Exec("INSERT INTO t VALUES (1)") })
 			if !errors.Is(err, ErrUnknown) || errors.Is(err, ErrNotCommitted) {
 				t.Fatalf("commit: %v, want unknown", err)
 			}
@@ -436,7 +436,7 @@ func TestCommitPointErrors(t *testing.T) {
 			st.setRule(commitRules(tc.f))
 			for _, sql := range []string{"INSERT INTO t VALUES (1)", "BEGIN; INSERT INTO t VALUES (1); COMMIT"} {
 				var open bool
-				txn, err := c.Run(newID(), func(db *sqlite3.Conn) error {
+				txn, err := c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
 					err := db.Exec(sql)
 					open = !db.GetAutocommit()
 					if open {
@@ -473,7 +473,7 @@ func TestNoChangeCommitsNothing(t *testing.T) {
 		"UPDATE t SET x = x",
 	} {
 		// No identifier needed: nothing commits.
-		txn, err := c.Run(nil, func(db *sqlite3.Conn) error { return db.Exec(sql) })
+		txn, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error { return db.Exec(sql) })
 		if err != nil || txn != 0 {
 			t.Fatalf("%s: %d, %v", sql, txn, err)
 		}
@@ -482,10 +482,10 @@ func TestNoChangeCommitsNothing(t *testing.T) {
 		t.Fatalf("head moved from %d to %d", head, l.Head())
 	}
 	// A change needs an identifier, and one identifier commits once.
-	if _, err := c.Run(nil, func(db *sqlite3.Conn) error { return db.Exec("INSERT INTO t VALUES (1)") }); !errors.Is(err, ErrNotCommitted) {
+	if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error { return db.Exec("INSERT INTO t VALUES (1)") }); !errors.Is(err, ErrNotCommitted) {
 		t.Fatalf("commit without an identifier: %v", err)
 	}
-	txn, err := c.Run(newID(), func(db *sqlite3.Conn) error {
+	txn, err := c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
 		return db.Exec("INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)")
 	})
 	// The first commits; the second is refused, and the error says so

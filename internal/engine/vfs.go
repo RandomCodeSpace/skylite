@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 
@@ -12,8 +13,9 @@ import (
 )
 
 // leaderVFS is the VFS a leader registers with ncruces. The main database
-// file is virtual; the WAL, the shared-memory index and SQLite's temporary
-// files are ordinary local files, opened through ncruces's own VFS.
+// file is virtual; the WAL and the shared-memory index are ordinary local
+// files, opened through ncruces's own VFS, and SQLite's temporary files are
+// local files under the leader's directory, within its budget.
 type leaderVFS Leader
 
 var errNoJournal = errors.New("engine: the database has no rollback journal; its journal mode cannot change")
@@ -36,7 +38,80 @@ func (v *leaderVFS) OpenFilename(name *vfs.Filename, flags vfs.OpenFlag) (vfs.Fi
 	}
 	// Temporary databases, statement journals and the like: local, and
 	// not part of the database.
-	return osVFS().OpenFilename(name, flags)
+	f, err := os.CreateTemp(l.dir, "temp-")
+	if err != nil {
+		return nil, flags, err
+	}
+	return &tempFile{File: f, l: l}, flags, nil
+}
+
+// tempFile is one of SQLite's temporary files. It lives in the leader's
+// directory, so a start wipes what a crash left, and its size counts
+// against the leader's TempBudget: a write past the budget fails with
+// SQLITE_FULL. Only its own connection opens it, so it needs no locks.
+type tempFile struct {
+	*os.File
+	l    *Leader
+	held int64 // the bytes counted for it: its size
+}
+
+func (f *tempFile) WriteAt(p []byte, off int64) (int, error) {
+	if end := off + int64(len(p)); end > f.held {
+		if !f.l.chargeTemp(end - f.held) {
+			f.l.tempRefused.Add(1)
+			return 0, sqlite3.FULL
+		}
+		f.held = end
+	}
+	return f.File.WriteAt(p, off)
+}
+
+func (f *tempFile) Truncate(size int64) error {
+	if err := f.File.Truncate(size); err != nil {
+		return err
+	}
+	if size < f.held {
+		f.l.tempUsed.Add(size - f.held)
+		f.held = size
+	}
+	return nil
+}
+
+func (f *tempFile) Close() error {
+	f.l.tempUsed.Add(-f.held)
+	f.held = 0
+	return errors.Join(f.File.Close(), os.Remove(f.Name()))
+}
+
+// Sync does nothing: no temporary file is read after a crash.
+func (f *tempFile) Sync(vfs.SyncFlag) error { return nil }
+
+func (f *tempFile) Size() (int64, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+func (f *tempFile) Lock(vfs.LockLevel) error                        { return nil }
+func (f *tempFile) Unlock(vfs.LockLevel) error                      { return nil }
+func (f *tempFile) CheckReservedLock() (bool, error)                { return false, nil }
+func (f *tempFile) SectorSize() int                                 { return 4096 }
+func (f *tempFile) DeviceCharacteristics() vfs.DeviceCharacteristic { return 0 }
+
+// chargeTemp counts n more bytes of temporary files, unless that would pass
+// the budget.
+func (l *Leader) chargeTemp(n int64) bool {
+	for {
+		used := l.tempUsed.Load()
+		if used+n > l.cfg.TempBudget {
+			return false
+		}
+		if l.tempUsed.CompareAndSwap(used, used+n) {
+			return true
+		}
+	}
 }
 
 func (l *Leader) openMain(name *vfs.Filename, flags vfs.OpenFlag) (vfs.File, vfs.OpenFlag, error) {
@@ -106,60 +181,80 @@ func (v *leaderVFS) FullPathname(name string) (string, error) { return name, nil
 // mainFile is the virtual main database file of one connection. A page
 // reads as the last checkpoint wrote it since the base version, held in the
 // local file, or else as of the base version, from storage through the
-// connection's reader. The local file also carries SQLite's file locks and
-// the shared-memory index.
+// leader's index, which every connection shares. The local file also
+// carries SQLite's file locks and the shared-memory index.
 type mainFile struct {
 	vfs.File // the local file
 	l        *Leader
 	c        *Conn
 
-	r        *Reader // as of base
-	base     uint64
 	inCkpt   bool // between the checkpoint-start and -done file controls
 	ckptDone bool // a checkpoint finished; it may now truncate the file
 }
 
 func (f *mainFile) ReadAt(p []byte, off int64) (int, error) {
 	l := f.l
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	if err := l.err(); err != nil {
-		return 0, err
-	}
-	if f.r == nil || f.base != l.base {
-		f.r, f.base = l.tmpl.clone(), l.base
-	}
+	ctx := f.c.readContext()
 	n := 0
 	for n < len(p) {
 		pos := off + int64(n)
-		l.ovMu.Lock()
-		size, limit := l.size, l.baseLimit
-		pgno := uint32(pos/l.ps) + 1 //nolint:gosec // bounded by the file size
-		local := l.overlay[pgno]
-		l.ovMu.Unlock()
-		if pos >= size {
-			clear(p[n:])
-			return n, io.EOF
+		m, src, err := f.readLocal(p[n:], pos)
+		if err != nil {
+			return n, err
 		}
-		in := pos % l.ps
-		m := int(min(int64(len(p)-n), l.ps-in, size-pos))
-		switch {
-		case local:
-			if _, err := f.File.ReadAt(p[n:n+m], pos); err != nil {
-				return n, fmt.Errorf("engine: page %d checkpointed locally is missing: %w", pgno, err)
+		if src != nil {
+			pgno := uint32(pos/l.ps) + 1 //nolint:gosec // bounded by the file size
+			page, err := l.tmpl.fetch(ctx, *src, pgno)
+			var stale *staleError
+			if errors.As(err, &stale) {
+				// Only a later leader's compaction retires a commit or
+				// deletes a base object: this leader is deposed.
+				err = l.stop(fmt.Errorf("%w: %w", ErrFenced, stale))
 			}
-		case pgno > limit:
-			clear(p[n : n+m])
-		default:
-			page, err := f.r.ReadPage(l.ctx, pgno)
 			if err != nil {
 				return n, err
 			}
-			copy(p[n:n+m], page[in:])
+			copy(p[n:n+m], page[pos%l.ps:])
 		}
 		n += m
 	}
 	return n, nil
+}
+
+// readLocal reads the part of p at pos that lies in pos's page, under l.mu:
+// zeros past the base's limit, or the page as a checkpoint wrote it to the
+// local file. For a page that storage holds as of the base version, it
+// returns where to read it instead, which the caller does outside the lock.
+// Past the end of the file it clears p and returns io.EOF.
+func (f *mainFile) readLocal(p []byte, pos int64) (int, *source, error) {
+	l := f.l
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if err := l.err(); err != nil {
+		return 0, nil, err
+	}
+	l.ovMu.Lock()
+	size, limit := l.size, l.baseLimit
+	pgno := uint32(pos/l.ps) + 1 //nolint:gosec // bounded by the file size
+	local := l.overlay[pgno]
+	l.ovMu.Unlock()
+	if pos >= size {
+		clear(p)
+		return 0, nil, io.EOF
+	}
+	m := int(min(int64(len(p)), l.ps-pos%l.ps, size-pos))
+	switch {
+	case local:
+		if _, err := f.File.ReadAt(p[:m], pos); err != nil {
+			return 0, nil, fmt.Errorf("engine: page %d checkpointed locally is missing: %w", pgno, err)
+		}
+	case pgno > limit:
+		clear(p[:m])
+	default:
+		s := l.tmpl.locate(pgno)
+		return m, &s, nil
+	}
+	return m, nil, nil
 }
 
 // WriteAt accepts only a checkpoint's page writes: they go to the local
@@ -333,12 +428,16 @@ func (l *Leader) walWrite(w *walFile, p []byte, off int64) error {
 		t.start = off
 	}
 	t.writer = w
-	if end > l.cfg.WALBound {
+	switch {
+	case t.start >= 0 && walHeaderSize+end-t.start > l.cfg.WALBound:
+		// The transaction alone passes the bound. No maintenance would make
+		// room for it, so none starts and no other transaction is touched.
+		err := fmt.Errorf("%w: %w: the transaction alone passes the local WAL bound of %d bytes", ErrNotCommitted, ErrTooLarge, l.cfg.WALBound)
+		w.c.outcome = err
+		return err
+	case end > l.cfg.WALBound:
 		l.startMaintenance()
 		err := fmt.Errorf("%w: %w: the local WAL would pass its bound of %d bytes", ErrNotCommitted, ErrRetry, l.cfg.WALBound)
-		if t.start == walHeaderSize {
-			err = fmt.Errorf("%w: %w: the transaction alone passes the local WAL bound of %d bytes", ErrNotCommitted, ErrTooLarge, l.cfg.WALBound)
-		}
 		w.c.outcome = err
 		return err
 	}

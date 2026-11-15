@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -126,7 +127,7 @@ func TestLeaderBoundedWork(t *testing.T) {
 
 func checkpoint(t *testing.T, c *Conn, mode sqlite3.CheckpointMode) {
 	t.Helper()
-	if _, err := c.Run(nil, func(db *sqlite3.Conn) error {
+	if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 		_, _, err := db.WALCheckpoint("main", mode)
 		return err
 	}); err != nil {

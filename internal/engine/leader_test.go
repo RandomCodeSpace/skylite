@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -79,7 +80,7 @@ func TestLeaderConcurrency(t *testing.T) {
 		rg.Go(func() {
 			last := 0
 			for !done.Load() {
-				if _, err := rc.Run(nil, func(db *sqlite3.Conn) error {
+				if _, err := rc.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 					if err := db.Exec("BEGIN"); err != nil {
 						return err
 					}
@@ -112,7 +113,7 @@ func TestLeaderConcurrency(t *testing.T) {
 	rg.Go(func() {
 		modes := []sqlite3.CheckpointMode{sqlite3.CHECKPOINT_PASSIVE, sqlite3.CHECKPOINT_RESTART, sqlite3.CHECKPOINT_TRUNCATE}
 		for i := 0; !done.Load(); i++ {
-			if _, err := cc.Run(nil, func(db *sqlite3.Conn) error {
+			if _, err := cc.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 				_, _, err := db.WALCheckpoint("main", modes[i%len(modes)])
 				return err
 			}); err != nil && !errors.Is(err, sqlite3.BUSY) {
@@ -144,4 +145,34 @@ func TestLeaderConcurrency(t *testing.T) {
 	if got := mustQuery(t, db, "SELECT (SELECT sum(bal) FROM acct), (SELECT count(*) FROM xfer)"); got[0] != fmt.Sprintf("%d|%d", total, writers*transfers) {
 		t.Fatalf("durable sum and transfers: %s", got[0])
 	}
+}
+
+// Covers: decision 9's final check as Lead makes it: an office whose epoch
+// or nonce the manifest does not carry, or whose head is not its own epoch
+// bump, is fenced, and Lead refuses it.
+func TestLeadChecksOffice(t *testing.T) {
+	st, keys, o := newDatabase(t, 4096)
+	l := lead(t, st, keys, o, testConfig())
+	txn := mustRun(t, open(t, l), "CREATE TABLE t(x)")
+	_ = l.Close()
+	nonce := o.Nonce
+	nonce[0] ^= 1
+	o2 := o // filled in below, after a later takeover
+	for _, tc := range []struct {
+		name string
+		o    func() Office
+	}{
+		{"another epoch", func() Office { return Office{DB: o.DB, Epoch: o.Epoch + 1, Head: o.Head, Nonce: o.Nonce} }},
+		{"another nonce", func() Office { return Office{DB: o.DB, Epoch: o.Epoch, Head: o.Head, Nonce: nonce} }},
+		{"head not a bump", func() Office { return Office{DB: o.DB, Epoch: o.Epoch, Head: txn, Nonce: o.Nonce} }},
+		{"head an earlier epoch's bump", func() Office {
+			o2 = takeOffice(t, st.Store, keys)
+			return Office{DB: o.DB, Epoch: o2.Epoch, Head: o.Head, Nonce: o2.Nonce}
+		}},
+	} {
+		if _, err := Lead(context.Background(), st, keys, t.TempDir(), tc.o(), testConfig()); !errors.Is(err, ErrFenced) {
+			t.Fatalf("%s: %v, want fenced", tc.name, err)
+		}
+	}
+	lead(t, st, keys, o2, testConfig())
 }

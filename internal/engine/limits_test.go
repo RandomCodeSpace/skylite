@@ -4,9 +4,9 @@ package engine
 // decision 10 up to the point where compaction would begin.
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"strings"
 	"testing"
@@ -66,7 +66,7 @@ func TestWALBound(t *testing.T) {
 			c := open(t, l)
 			mustRun(t, c, "CREATE TABLE t(k INTEGER PRIMARY KEY, v)")
 			st.resetCounts()
-			txn, err := c.Run(newID(), func(db *sqlite3.Conn) error {
+			txn, err := c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
 				err := db.Exec(tc.sql)
 				if !db.GetAutocommit() {
 					return fmt.Errorf("transaction left open: %w", err)
@@ -86,23 +86,43 @@ func TestWALBound(t *testing.T) {
 			}
 		})
 	}
-	// A transaction that alone passes the bound is too large.
+	// A transaction that alone passes the bound is too large. Behind another
+	// commit in the WAL it reaches the bound before it passes it alone, and
+	// then it cannot be told from one that fits once maintenance resets the
+	// WAL, so it is refused as retryable. Alone in the WAL, it is too large
+	// at once and starts no maintenance, so another connection's open read
+	// transaction is untouched.
 	st, keys, o = newDatabase(t, 1024)
 	cfg := testConfig()
 	cfg.WALBound = 64 << 10
 	l = lead(t, st, keys, o, cfg)
-	c = open(t, l)
+	c, b := open(t, l), open(t, l)
 	mustRun(t, c, "CREATE TABLE t(v)")
-	// The first attempt follows another commit in the WAL, so the bound
-	// refuses it as retryable; after maintenance resets the WAL, it is the
-	// only transaction there, and too large.
 	if _, err := exec(c, "INSERT INTO t VALUES (zeroblob(200000))"); !errors.Is(err, ErrRetry) {
 		t.Fatalf("a transaction over the WAL bound: %v", err)
 	}
 	waitMaintenance(t, l)
-	if _, err := exec(c, "INSERT INTO t VALUES (zeroblob(200000))"); !errors.Is(err, ErrTooLarge) {
+	if _, err := b.Run(context.Background(), nil, func(db *sqlite3.Conn) error { return db.Exec("BEGIN; SELECT count(*) FROM t") }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec(c, "INSERT INTO t VALUES (zeroblob(200000))"); !errors.Is(err, ErrTooLarge) || !errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrRetry) {
 		t.Fatalf("a transaction larger than the WAL bound: %v", err)
 	}
+	l.cmu.Lock()
+	maintaining, closed := l.maintaining, l.admitClosed
+	l.cmu.Unlock()
+	if maintaining || closed {
+		t.Fatalf("a transaction too large for the WAL started maintenance: %v, %v", maintaining, closed)
+	}
+	if _, err := b.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+		if db.GetAutocommit() {
+			return errors.New("the read transaction was rolled back")
+		}
+		return db.Exec("SELECT count(*) FROM t; COMMIT")
+	}); err != nil {
+		t.Fatalf("the other connection's transaction: %v", err)
+	}
+	mustRun(t, c, "INSERT INTO t VALUES (1)")
 }
 
 // Covers: Limits and size, "The WAL grows under a long reader on the
@@ -130,7 +150,7 @@ func TestMaintenanceAfterLongReader(t *testing.T) {
 	if err := apply("CREATE TABLE t(k INTEGER PRIMARY KEY, v)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reader.Run(nil, func(db *sqlite3.Conn) error {
+	if _, err := reader.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 		if err := db.Exec("BEGIN"); err != nil {
 			return err
 		}
@@ -141,6 +161,7 @@ func TestMaintenanceAfterLongReader(t *testing.T) {
 	}
 	// The reader holds every checkpoint back; the WAL grows to its bound.
 	truncating := newGate()
+	t.Cleanup(truncating.open) // so that a failure below does not hang Close
 	l.fault = func(file, op string, off int64, n int) error {
 		if file == "wal" && op == "truncate" && off == 0 {
 			truncating.wait()
@@ -164,7 +185,7 @@ func TestMaintenanceAfterLongReader(t *testing.T) {
 	}
 	// So are reads, from admission closing to readmission (ADR 0005's
 	// amendment of decision 10, steps 1 and 5).
-	if _, err := open(t, l).Run(nil, func(db *sqlite3.Conn) error {
+	if _, err := open(t, l).Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 		_, err := query(db, "SELECT count(*) FROM t")
 		return err
 	}); !errors.Is(err, ErrRetry) || !errors.Is(err, ErrNotCommitted) {
@@ -176,7 +197,7 @@ func TestMaintenanceAfterLongReader(t *testing.T) {
 	if l.base != l.Head() {
 		t.Fatalf("base version %d after the TRUNCATE checkpoint, head %d", l.base, l.Head())
 	}
-	if _, err := reader.Run(nil, func(db *sqlite3.Conn) error { return nil }); !errors.Is(err, ErrRetry) {
+	if _, err := reader.Run(context.Background(), nil, func(db *sqlite3.Conn) error { return nil }); !errors.Is(err, ErrRetry) {
 		t.Fatalf("the long reader after maintenance: %v, want rolled back", err)
 	}
 	if err := apply("INSERT INTO t VALUES (100000, 'resumed')"); err != nil {
@@ -206,7 +227,7 @@ func TestMaintenanceRollsBackWriters(t *testing.T) {
 	t.Run("idle and queued writers", func(t *testing.T) {
 		st, keys, _, l, w := setup(t)
 		idle, queued := open(t, l), open(t, l)
-		if _, err := idle.Run(nil, func(db *sqlite3.Conn) error {
+		if _, err := idle.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 			return db.Exec("BEGIN IMMEDIATE; INSERT INTO t VALUES (10)")
 		}); err != nil {
 			t.Fatal(err)
@@ -214,7 +235,7 @@ func TestMaintenanceRollsBackWriters(t *testing.T) {
 		started := make(chan struct{})
 		queuedDone := make(chan error)
 		go func() {
-			_, err := queued.Run(newID(), func(db *sqlite3.Conn) error {
+			_, err := queued.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
 				close(started)
 				return db.Exec("BEGIN IMMEDIATE; INSERT INTO t VALUES (20); COMMIT")
 			})
@@ -226,7 +247,7 @@ func TestMaintenanceRollsBackWriters(t *testing.T) {
 			t.Fatalf("queued writer: %v", err)
 		}
 		waitMaintenance(t, l)
-		if _, err := idle.Run(nil, func(*sqlite3.Conn) error { return nil }); !errors.Is(err, ErrNotCommitted) || !errors.Is(err, ErrRetry) {
+		if _, err := idle.Run(context.Background(), nil, func(*sqlite3.Conn) error { return nil }); !errors.Is(err, ErrNotCommitted) || !errors.Is(err, ErrRetry) {
 			t.Fatalf("idle writer: %v", err)
 		}
 		if l.base != l.Head() {
@@ -281,7 +302,8 @@ func TestMaintenanceRollsBackWriters(t *testing.T) {
 
 // Covers: Limits and size, "The tail bound counts epoch bumps": a log tail
 // filled by takeovers refuses writes and starts maintenance. Clearing it
-// needs a compaction, which is later work, so writes stay refused here.
+// needs a compaction, which is later work, so reads and writes stay
+// refused, with an error that says a retry does not help.
 func TestTailBoundCountsBumps(t *testing.T) {
 	st, keys, _ := newDatabase(t, 4096)
 	takeOffice(t, st.Store, keys)
@@ -290,15 +312,92 @@ func TestTailBoundCountsBumps(t *testing.T) {
 	cfg.TailBound = o.Head
 	l := lead(t, st, keys, o, cfg)
 	c := open(t, l)
-	if _, err := exec(c, "CREATE TABLE t(x)"); !errors.Is(err, ErrRetry) {
-		t.Fatalf("commit at the tail bound: %v", err)
+	atBound := func(what string, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrTailBound) || !errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrRetry) || strings.Contains(err.Error(), "maintenance") {
+			t.Fatalf("%s at the tail bound: %v", what, err)
+		}
 	}
+	read := func() error {
+		_, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+			_, err := query(db, "SELECT count(*) FROM sqlite_schema")
+			return err
+		})
+		return err
+	}
+	// A leader that takes office at the bound refuses from the start.
+	_, err := exec(c, "CREATE TABLE t(x)")
+	atBound("a write", err)
+	atBound("a read", read())
 	waitMaintenance(t, l)
-	if _, err := exec(c, "CREATE TABLE t(x)"); !errors.Is(err, ErrRetry) || !errors.Is(err, ErrNotCommitted) {
-		t.Fatalf("commit after maintenance without compaction: %v", err)
-	}
+	_, err = exec(c, "CREATE TABLE t(x)")
+	atBound("a write after maintenance", err)
+	atBound("a read after maintenance", read())
 	if ids := commitIDs(t, st.Store, keys, o.DB, o.Head+1); len(ids) != 0 {
 		t.Fatalf("objects above the tail bound: %v", ids)
+	}
+
+	// A leader that reaches the bound: the commit that reaches it stands and
+	// starts maintenance, which does not readmit.
+	cfg.TailBound = o.Head + 2
+	l = lead(t, st, keys, takeOffice(t, st.Store, keys), cfg) // a tail of 5
+	c = open(t, l)
+	mustRun(t, c, "CREATE TABLE t(x)")
+	_, err = exec(c, "INSERT INTO t VALUES (1)")
+	atBound("a write", err)
+	waitMaintenance(t, l)
+	l.cmu.Lock()
+	closed := l.admitClosed
+	l.cmu.Unlock()
+	if !closed {
+		t.Fatal("maintenance readmitted at the tail bound")
+	}
+	atBound("a read after maintenance", read())
+}
+
+// Covers: Limits and size, "A reader's walk is bounded ... The leader's
+// tail bound is at most half of each": Lead refuses a larger TailBound, and
+// a leader inside its bounds, on commits or on page entries, never writes a
+// tail that a fresh Open refuses. The reader's limits are lowered so that
+// the leader reaches its own in a few commits.
+func TestLeaderTailWithinReaderLimits(t *testing.T) {
+	st, keys, o := newDatabase(t, 1024)
+	cfg := testConfig()
+	cfg.TailBound = 1<<15 + 1
+	if _, err := Lead(context.Background(), st, keys, t.TempDir(), o, cfg); err == nil {
+		t.Fatal("Lead accepted a tail bound above 32,768")
+	}
+	oldTail, oldPages := maxTail, maxTailPages
+	maxTail, maxTailPages = 16, 64
+	t.Cleanup(func() { maxTail, maxTailPages = oldTail, oldPages })
+	for _, tc := range []struct {
+		name string
+		sql  string // each commit's statement
+	}{
+		{"commits", "INSERT INTO t VALUES (1)"},
+		{"page entries", "INSERT INTO t SELECT randomblob(900) FROM generate_series(1, 16)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, keys, o := newDatabase(t, 1024)
+			cfg := testConfig()
+			cfg.TailBound = uint64(maxTail / 2) //nolint:gosec // lowered above
+			l := lead(t, st, keys, o, cfg)
+			c := open(t, l)
+			mustRun(t, c, "CREATE TABLE t(x)")
+			var err error
+			for i := 0; err == nil; i++ {
+				if i > maxTail {
+					t.Fatal("the leader never reached its tail bound")
+				}
+				_, err = exec(c, tc.sql)
+			}
+			if !errors.Is(err, ErrTailBound) {
+				t.Fatalf("at the bound: %v", err)
+			}
+			if _, err := Open(context.Background(), st.Store, keys, nil, 0); err != nil {
+				t.Fatalf("a fresh Open of the leader's tail: %v", err)
+			}
+		})
 	}
 }
 
@@ -358,7 +457,7 @@ func TestTransactionTooLarge(t *testing.T) {
 func TestMaxTransactionNumberStops(t *testing.T) {
 	_, _, _, l, c := setup(t)
 	l.cmu.Lock()
-	l.head = math.MaxUint64
+	l.head = 1<<63 - 1 // ADR 0005, requirement 13
 	l.cmu.Unlock()
 	if _, err := exec(c, "INSERT INTO t VALUES (1)"); !errors.Is(err, ErrNotCommitted) {
 		t.Fatalf("commit at the last transaction number: %v", err)
@@ -374,7 +473,10 @@ func TestMaxTransactionNumberStops(t *testing.T) {
 // the rest of it.
 func TestMaintenanceAfterCommitInSameRun(t *testing.T) {
 	st, keys, _, l, c := setup(t)
-	txn, err := c.Run(newID(), func(db *sqlite3.Conn) error {
+	// The deadline ends the statement if maintenance does not.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	txn, err := c.Run(ctx, newID(), func(db *sqlite3.Conn) error {
 		if err := db.Exec("INSERT INTO t VALUES (1)"); err != nil {
 			return err
 		}
@@ -383,6 +485,9 @@ func TestMaintenanceAfterCommitInSameRun(t *testing.T) {
 		_, err := query(db, "SELECT count(*) FROM generate_series(1, 1000000000000)")
 		return err
 	})
+	if ctx.Err() != nil {
+		t.Fatal("maintenance did not interrupt the running statement")
+	}
 	if txn == 0 || errors.Is(err, ErrNotCommitted) {
 		t.Fatalf("Run: %d, %v; want the commit reported, not \"not committed\"", txn, err)
 	}
@@ -392,5 +497,87 @@ func TestMaintenanceAfterCommitInSameRun(t *testing.T) {
 	waitMaintenance(t, l)
 	if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,1" {
 		t.Fatalf("durable rows %s", got)
+	}
+}
+
+// Covers: Limits and size, "Maximum transaction size", at the limit
+// itself: a commit object of exactly the maximum size commits and one byte
+// less refuses it; and the limit in use by default is the format's 1 GiB.
+func TestCommitSizeLimit(t *testing.T) {
+	if maxCommitSize != 1<<30 {
+		t.Fatalf("the commit size limit is %d, want 1 GiB", maxCommitSize)
+	}
+	old := maxCommitSize
+	t.Cleanup(func() { maxCommitSize = old })
+	try := func(limit int64) (int64, error) {
+		maxCommitSize = limit
+		st, keys, o := newDatabase(t, 4096)
+		l := lead(t, st, keys, o, testConfig())
+		c := open(t, l)
+		mustRun(t, c, "CREATE TABLE t(v)")
+		txn, err := exec(c, "INSERT INTO t VALUES (zeroblob(60000))")
+		if err != nil {
+			return 0, err
+		}
+		info, err := st.Store.Head(context.Background(), keys.Commit(o.DB, txn))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.Size, nil
+	}
+	size, err := try(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := try(size); err != nil {
+		t.Fatalf("a commit object of exactly the limit: %v", err)
+	}
+	if _, err := try(size - 1); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("a commit object one byte above the limit: %v", err)
+	}
+}
+
+// Covers: Limits and size, "The measurement counts ... SQLite's temporary
+// files": they live under the leader's directory and within its budget. A
+// read-only sort that would write about 300 MB of them fails with
+// SQLITE_FULL and says why, the connection and the leader serve on, and the
+// budget is returned when the files close.
+func TestTempFileBudget(t *testing.T) {
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.TempBudget = 8 << 20
+	l := lead(t, st, keys, o, cfg)
+	c := open(t, l)
+	sort := func(rows int) error {
+		_, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+			_, err := query(db, fmt.Sprintf("SELECT count(*) FROM (SELECT randomblob(1000) AS x FROM generate_series(1, %d) ORDER BY x)", rows))
+			return err
+		})
+		return err
+	}
+	err := sort(300000)
+	if !errors.Is(err, sqlite3.FULL) || !errors.Is(err, ErrNotCommitted) || !strings.Contains(err.Error(), "temporary files") {
+		t.Fatalf("a sort past the budget: %v", err)
+	}
+	if err := l.Err(); err != nil {
+		t.Fatalf("leader: %v", err)
+	}
+	if used := l.tempUsed.Load(); used != 0 {
+		t.Fatalf("%d bytes counted after the statement ended", used)
+	}
+	// A smaller sort spills too: it fails under a 1 MiB budget.
+	l.cfg.TempBudget = 1 << 20
+	if err := sort(5000); !errors.Is(err, sqlite3.FULL) {
+		t.Fatalf("a 5 MB sort under a 1 MiB budget: %v", err)
+	}
+	// Four of them fit one by one in 8 MiB, only if each returns its bytes.
+	l.cfg.TempBudget = 8 << 20
+	for i := range 4 {
+		if err := sort(5000); err != nil {
+			t.Fatalf("sort %d within the budget: %v", i, err)
+		}
+	}
+	if used := l.tempUsed.Load(); used != 0 {
+		t.Fatalf("%d bytes counted after the statements ended", used)
 	}
 }

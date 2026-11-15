@@ -12,7 +12,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ncruces/go-sqlite3"
@@ -40,6 +42,11 @@ var (
 	// ErrTooLarge, with ErrNotCommitted, means the transaction does not fit
 	// in one commit object or in the local WAL bound.
 	ErrTooLarge = errors.New("engine: transaction too large")
+	// ErrTailBound, with ErrNotCommitted, means the log above the manifest
+	// is at the leader's tail bound. Only a compaction clears it, and this
+	// version has none, so a retry does not help: reads and writes stay
+	// refused for the life of the leader.
+	ErrTailBound = errors.New("engine: the log tail is at its bound, and this version has no compaction to clear it")
 	// ErrFenced means another candidacy's epoch bump holds the leader's next
 	// transaction number. The leader has stopped.
 	ErrFenced = errors.New("engine: fenced by another leader's epoch bump")
@@ -61,19 +68,26 @@ type Config struct {
 	// write past it rolls its transaction back and starts maintenance.
 	WALBound int64
 	// TailBound is how many commits, epoch bumps included, the log may
-	// hold above the manifest's transaction number. Once it holds that
-	// many, commits are refused and maintenance starts.
+	// hold above the manifest's transaction number, at most 32,768. Once it
+	// holds that many, or 2,097,152 page entries, commits are refused and
+	// maintenance starts. Those are half of what a reader walks (record
+	// 0004 decision 10).
 	TailBound uint64
 	// MaxMemory is each connection's SQLite memory ceiling in bytes.
 	MaxMemory int64
+	// TempBudget is the most bytes SQLite's temporary files (sorts,
+	// temporary tables, statement journals) may hold at once over all the
+	// leader's connections. A write past it fails its statement with
+	// SQLITE_FULL.
+	TempBudget int64
 	// Cache holds pages read from storage; it may be shared.
 	Cache *Cache
 }
 
 // Leader serves one database on this node while it holds office: SQLite in
 // WAL mode with a main file served from object storage, and every commit
-// created in the commit log before SQLite reports it. The package
-// documentation describes the mechanism.
+// created in the commit log before SQLite reports it, as record 0004
+// decisions 5 to 7 and 10 describe.
 type Leader struct {
 	st     storage.Store
 	keys   format.Keys
@@ -97,10 +111,15 @@ type Leader struct {
 	// error it returns fails the call. Tests use it for disk failures.
 	fault func(file, op string, off int64, n int) error
 
-	// mu orders main-file reads against advances of the base version.
+	// tempUsed is the bytes SQLite's temporary files hold; tempRefused
+	// counts the writes refused for passing TempBudget.
+	tempUsed, tempRefused atomic.Int64
+
+	// mu orders main-file reads against advances of the base version. No
+	// storage read is made while it is held.
 	mu   sync.RWMutex
 	base uint64  // the base version (decision 7)
-	tmpl *Reader // the base version's index; main-file handles clone it
+	tmpl *Reader // the base version's index, shared by every connection
 
 	// ovMu guards what checkpoints wrote to the main file since base.
 	ovMu      sync.Mutex
@@ -115,6 +134,7 @@ type Leader struct {
 	head        uint64 // the leader's last commit
 	headSize    uint32 // database size in pages at head
 	manifestTxn uint64 // the manifest's transaction number, for the tail bound
+	tailPages   int    // page entries in the log above the manifest
 	pending     []*commit
 	wal         walState
 	uploading   bool // a commit is between its first create and its local completion
@@ -143,8 +163,8 @@ type walState struct {
 // subdirectory held, and deletes it again at Close. Lead reads the manifest
 // and the log tail up to office.Head, never the database's pages.
 func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, office Office, cfg Config) (*Leader, error) {
-	if cfg.WALBound <= 0 || cfg.TailBound == 0 || cfg.MaxMemory <= 0 || cfg.Cache == nil {
-		return nil, errors.New("engine: Config needs a WAL bound, a tail bound, a memory ceiling and a cache")
+	if cfg.WALBound <= 0 || cfg.TailBound == 0 || cfg.TailBound > uint64(maxTail/2) || cfg.MaxMemory <= 0 || cfg.TempBudget <= 0 || cfg.Cache == nil { //nolint:gosec // maxTail is a small positive constant
+		return nil, fmt.Errorf("engine: Config needs a WAL bound, a tail bound from 1 to %d, a memory ceiling, a temporary-file budget and a cache", maxTail/2)
 	}
 	tmpl, err := Open(ctx, st, keys, cfg.Cache, office.Head)
 	if err != nil {
@@ -165,10 +185,14 @@ func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, o
 		psow: true,
 		base: office.Head, tmpl: tmpl,
 		overlay: map[uint32]bool{}, size: int64(tmpl.Size()) * int64(tmpl.PageSize()), baseLimit: tmpl.Size(),
-		head: office.Head, headSize: tmpl.Size(), manifestTxn: m.Txn,
+		head: office.Head, headSize: tmpl.Size(), manifestTxn: m.Txn, tailPages: entryCount(tmpl.commits),
 		wal:   walState{start: -1},
 		conns: map[int64]*Conn{},
 	}
+	// A tail already at its bound refuses reads and writes from the start;
+	// only a compaction, later work, would clear it.
+	l.admitClosed = l.tailFullLocked()
+	l.noCreates = l.admitClosed
 	l.cond = sync.NewCond(&l.cmu)
 	l.path = filepath.Join(l.dir, "db")
 	if err := os.RemoveAll(l.dir); err != nil { //nolint:gosec // the caller's directory and a hex database identifier
@@ -263,9 +287,13 @@ func (l *Leader) stop(cause error) error {
 	return l.stopLocked(cause)
 }
 
+// stopLocked stops the leader, with l.cmu held, and returns why it
+// stopped. That error matches ErrStopped only: the cause is kept as text, so
+// that it never gives another Run's error the class of the Run that caused
+// the stop.
 func (l *Leader) stopLocked(cause error) error {
 	if l.stopped == nil {
-		l.stopped = fmt.Errorf("%w: %w", ErrStopped, cause)
+		l.stopped = fmt.Errorf("%w: %v", ErrStopped, cause) //nolint:errorlint // see above
 		l.cond.Broadcast()
 	}
 	return l.stopped
@@ -278,7 +306,7 @@ func (l *Leader) err() error {
 }
 
 // Open opens a new SQLite connection to the database.
-func (l *Leader) Open() (*Conn, error) {
+func (l *Leader) Open() (_ *Conn, err error) {
 	l.cmu.Lock()
 	if l.stopped != nil {
 		defer l.cmu.Unlock()
@@ -286,25 +314,47 @@ func (l *Leader) Open() (*Conn, error) {
 	}
 	l.nextConn++
 	c := &Conn{l: l, n: l.nextConn}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	l.conns[c.n] = c
 	l.cmu.Unlock()
-
-	u := url.URL{Scheme: "file", Path: l.path, RawQuery: url.Values{"vfs": {l.vfs}, "conn": {fmt.Sprint(c.n)}}.Encode()}
-	db, err := sqlite3.OpenContext(sqlite3.WithMaxMemory(context.Background(), l.cfg.MaxMemory), u.String())
-	if err == nil {
-		c.db = db
-		err = c.setup()
-	}
-	if err != nil {
-		if db != nil {
-			_ = db.Close()
+	defer func() {
+		p := recover()
+		if p != nil {
+			err = fmt.Errorf("engine: opening a connection panicked: %v", p)
+		}
+		if err == nil {
+			return
+		}
+		// A connection that panicked inside sqlite3.Open cannot be closed.
+		// One that is not closed may hold locks the others wait for.
+		if c.db == nil && p != nil || c.db != nil && !closeQuietly(c.db) {
+			_ = l.stop(fmt.Errorf("engine: a connection that failed to open could not be closed: %w", err))
 		}
 		l.cmu.Lock()
 		delete(l.conns, c.n)
 		l.cmu.Unlock()
+	}()
+
+	u := url.URL{Scheme: "file", Path: l.path, RawQuery: url.Values{"vfs": {l.vfs}, "conn": {fmt.Sprint(c.n)}}.Encode()}
+	if c.db, err = sqlite3.OpenContext(sqlite3.WithMaxMemory(context.Background(), l.cfg.MaxMemory), u.String()); err != nil {
+		return nil, err
+	}
+	if err := c.setup(); err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+// closeQuietly closes db and reports whether that worked without an error
+// or a panic.
+func closeQuietly(db *sqlite3.Conn) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	return db.Close() == nil
 }
 
 // Conn is one SQLite connection to the leader's database. It is safe for
@@ -312,10 +362,13 @@ func (l *Leader) Open() (*Conn, error) {
 type Conn struct {
 	l  *Leader
 	n  int64
-	mu sync.Mutex // held by Run, Close and maintenance
+	mu sync.Mutex // held by Open, Run, Close and maintenance
 	db *sqlite3.Conn
+	// tempSeen is l.tempRefused when the running Run began.
+	tempSeen int64
 
 	// Guarded by l.cmu.
+	ctx       context.Context // the running Run's; its storage reads use it
 	main      *mainFile
 	id        []byte // the commit identifier for this Run
 	idUsed    bool
@@ -342,16 +395,28 @@ func (c *Conn) setup() error {
 	if err := c.db.BusyTimeout(busyTimeout); err != nil {
 		return err
 	}
-	// Any panic stops the database (see finish), and exceeding the memory
-	// ceiling panics in ncruces. Capping values and statements well below
-	// the ceiling turns the commonest way there, one huge value, into an
-	// SQLITE_TOOBIG error.
+	// Exceeding the memory ceiling panics in ncruces, and a panic costs the
+	// connection, or the database when the connection cannot be closed (see
+	// finish). Capping values and statements well below the ceiling turns
+	// the commonest way there, one huge value, into an SQLITE_TOOBIG error.
 	limit := int(min(1e9, c.l.cfg.MaxMemory/4))
 	c.db.Limit(sqlite3.LIMIT_LENGTH, limit)
 	c.db.Limit(sqlite3.LIMIT_SQL_LENGTH, limit)
 	c.db.WALHook(c.walHook)
 	c.db.RollbackHook(c.rollbackHook)
 	return nil
+}
+
+// readContext is the context for the connection's storage reads: its
+// running Run's, or the leader's outside one.
+func (c *Conn) readContext() context.Context {
+	l := c.l
+	l.cmu.Lock()
+	defer l.cmu.Unlock()
+	if c.ctx != nil {
+		return c.ctx
+	}
+	return l.ctx
 }
 
 func (c *Conn) pragma(name string) (string, error) {
@@ -367,33 +432,49 @@ func (c *Conn) pragma(name string) (string, error) {
 }
 
 // Run runs f on the connection. f may run any SQL, but must not keep db or
-// statements beyond its return. id is the commit identifier, at most
-// format.MaxCommitIDLen bytes, of the one transaction f may commit; a
-// commit without one, or a second commit in one Run, is refused as not
-// committed. A transaction that changes no page commits nothing and needs
-// none. Run returns the transaction number of the commit f made, or 0, and
-// f's error together with the commit's outcome if it was not committed. A
-// nonzero transaction number is committed whatever the error says; the error
-// then reports what failed later in the Run, and never matches
-// ErrNotCommitted.
-func (c *Conn) Run(id []byte, f func(db *sqlite3.Conn) error) (txn uint64, err error) {
+// statements beyond its return, and must not replace db's interrupt
+// context. ctx ends f's statements when it is done, page reads from storage
+// included; Close, and maintenance, end them too. id is the commit
+// identifier, at most format.MaxCommitIDLen bytes, of the one transaction f
+// may commit; a commit without one, or a second commit in one Run, is
+// refused as not committed. A transaction that changes no page commits
+// nothing and needs none.
+//
+// Every Run ends in exactly one of these classes:
+//   - txn is nonzero: f's commit is in the durable history. A non-nil error
+//     then means committed-then-failed: it reports what failed later in the
+//     Run and matches neither ErrNotCommitted nor ErrUnknown, so a caller
+//     must look at txn before err.
+//   - txn is 0 and err is nil: f succeeded and committed nothing.
+//   - err matches ErrNotCommitted: the Run committed nothing, and nothing
+//     of it can enter the history. It also matches ErrStopped if the leader
+//     stopped, ErrRetry if a retry can succeed, ErrTooLarge or ErrTailBound
+//     if it cannot, and wraps f's own error, if any. A transaction f left
+//     open stays open for the next Run unless the error says it was rolled
+//     back.
+//   - err matches ErrUnknown: f's commit may be in the history, now or
+//     later. The leader has stopped.
+func (c *Conn) Run(ctx context.Context, id []byte, f func(db *sqlite3.Conn) error) (txn uint64, err error) {
 	if len(id) > format.MaxCommitIDLen {
-		return 0, fmt.Errorf("engine: commit identifier of %d bytes", len(id))
+		return 0, fmt.Errorf("%w: a commit identifier of %d bytes, above %d", ErrNotCommitted, len(id), format.MaxCommitIDLen)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	l := c.l
-	ictx, cancel := context.WithCancel(context.Background())
+	ictx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer context.AfterFunc(l.ctx, cancel)()
 
 	l.cmu.Lock()
 	switch {
 	case l.stopped != nil:
-		err = l.stopped
+		err = fmt.Errorf("%w: %w", ErrNotCommitted, l.stopped)
 	case c.db == nil:
-		err = fmt.Errorf("%w: connection closed", ErrStopped)
+		err = fmt.Errorf("%w: the connection is closed", ErrNotCommitted)
 	case c.aborted != nil:
 		err = c.aborted
+	case l.admitClosed && c != l.mconn && l.tailFullLocked():
+		err = l.tailErrLocked()
 	case l.admitClosed && c != l.mconn:
 		// From decision 10's step 1 to its step 8, reads are refused as
 		// well as writes (amended by ADR 0005), before any reaches SQLite.
@@ -404,8 +485,9 @@ func (c *Conn) Run(id []byte, f func(db *sqlite3.Conn) error) (txn uint64, err e
 		return 0, err
 	}
 	c.id, c.idUsed, c.done, c.outcome = bytes.Clone(id), false, 0, nil
-	c.interrupt = cancel
+	c.interrupt, c.ctx = cancel, ictx
 	l.cmu.Unlock()
+	c.tempSeen = l.tempRefused.Load()
 	c.db.SetInterrupt(ictx)
 
 	defer func() {
@@ -416,36 +498,54 @@ func (c *Conn) Run(id []byte, f func(db *sqlite3.Conn) error) (txn uint64, err e
 }
 
 // finish ends a Run: it applies the rules for a panic or an error in the
-// commit path and reports the commit's outcome.
+// commit path and reports the Run's class.
 //
-// Any panic stops the database on this node, not only one in the commit
-// path. Decision 6 left discarding just the panicked connection to a test,
-// and it fails: a panic that unwinds through SQLite leaves a statement
-// ncruces cannot finalize, so the connection cannot be closed, and its
-// shared-memory locks outlive its files because the mapping keeps the file
-// description open (TestExperimentPanickedConnectionKeepsLocks). The record
-// extends fail-stop to every panic in that case.
+// A panic in the commit path stops the database on this node (decision 6).
+// A panic outside it discards just the connection if the connection closes
+// cleanly, and otherwise stops the database too: a panic that unwinds
+// through sqlite3_exec leaves a statement ncruces does not track, so the
+// connection cannot be closed and keeps its shared-memory locks
+// (TestExperimentPanickedConnectionKeepsLocks), while ncruces's
+// out-of-memory panic, and a VFS panic inside a prepared statement's step or
+// a checkpoint, leave it closable (TestPanicOutsideTheCommitPath).
 func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	l := c.l
 	if p == nil {
 		c.db.SetInterrupt(context.Background())
 	}
 	l.cmu.Lock()
-	inCommit, uploaded, done, outcome, maint := c.inCommit, c.uploaded, c.done, c.outcome, c.maint
-	c.interrupt, c.id = nil, nil
+	inCommit := c.inCommit
+	c.interrupt, c.id, c.ctx = nil, nil, nil
+	l.cmu.Unlock()
+	// The leader's own connection is never discarded: maintenance needs it.
+	discarded := p != nil && !inCommit && c != l.mconn && c.discard()
+	l.cmu.Lock()
+	uploaded, done, outcome, maint := c.uploaded, c.done, c.outcome, c.maint
+	unsent := "nothing of this Run was sent to storage"
+	if done != 0 {
+		unsent = fmt.Sprintf("nothing of this Run after transaction %d was sent to storage", done)
+	}
 	switch {
+	case discarded:
+		outcome = fmt.Errorf("%w: %s; the connection was closed and discarded (panic: %v)", ErrNotCommitted, unsent, p)
 	case p != nil || inCommit:
-		// The Run ended in a panic, or the commit path ended without SQLite
-		// completing a commit whose create may have taken effect.
+		// The Run ended in a panic that left the connection unclosable, or
+		// the commit path ended without SQLite completing a commit whose
+		// create may have taken effect.
 		cause := fmt.Errorf("%w: a commit's create may have taken effect", ErrUnknown)
 		if !inCommit {
-			cause = fmt.Errorf("%w: nothing of this Run was sent to storage", ErrNotCommitted)
+			cause = fmt.Errorf("%w: %s, but the connection could not be closed", ErrNotCommitted, unsent)
 		}
 		if uploaded != 0 {
 			cause = fmt.Errorf("transaction %d is committed in storage but SQLite did not complete it", uploaded)
 			done = uploaded
 		}
-		outcome = l.stopLocked(errors.Join(fmt.Errorf("%w (panic: %v)", cause, p), ferr))
+		if p != nil {
+			cause = fmt.Errorf("%w (panic: %v)", cause, p)
+		}
+		cause = errors.Join(cause, ferr)
+		_ = l.stopLocked(cause)
+		outcome = fmt.Errorf("%w: %w", ErrStopped, cause)
 		c.inCommit, c.uploaded = false, 0
 		l.uploading = false
 		l.cond.Broadcast()
@@ -458,15 +558,65 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 		// Interrupted by maintenance.
 		ferr = fmt.Errorf("%w: %w: %w", ErrNotCommitted, ErrRetry, ferr)
 	}
-	if outcome != nil {
-		ferr = errors.Join(outcome, ferr)
+	if errors.Is(ferr, sqlite3.FULL) && l.tempRefused.Load() != c.tempSeen {
+		// shortcut: the count is leader-wide, so a full local disk during
+		// another connection's refusal reads as the budget; a per-connection
+		// count needs the connection in the temporary file's open call.
+		ferr = fmt.Errorf("engine: SQLite's temporary files would pass the leader's budget of %d bytes: %w", l.cfg.TempBudget, ferr)
 	}
-	if done != 0 && errors.Is(ferr, ErrNotCommitted) {
-		// The Run's commit stands: what failed after it must not read as its
-		// outcome.
-		ferr = fmt.Errorf("transaction %d committed, then: %s", done, ferr) //nolint:errorlint // must not match ErrNotCommitted
+	return classify(done, errors.Join(outcome, ferr), l.err())
+}
+
+// classify gives a Run's result exactly one of the classes Run documents.
+// err holds f's error and the Run's own commit outcome; stopped is why the
+// leader stopped, if it has.
+func classify(done uint64, err, stopped error) (uint64, error) {
+	switch {
+	case err == nil:
+	case done != 0:
+		if errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrUnknown) {
+			// The Run's commit stands: what failed after it must not read
+			// as its outcome.
+			err = fmt.Errorf("transaction %d committed, then: %s", done, err) //nolint:errorlint // must not match either class
+		}
+	case errors.Is(err, ErrUnknown):
+		if errors.Is(err, ErrNotCommitted) {
+			// A failure after the commit whose outcome is unknown.
+			err = fmt.Errorf("%w: %s", ErrUnknown, err) //nolint:errorlint // must not match ErrNotCommitted
+		}
+	case errors.Is(err, ErrNotCommitted):
+	case stopped != nil:
+		// The leader stopped under the Run: SQLite reports only an I/O
+		// error. No create of it was sent, or its outcome would be set.
+		err = fmt.Errorf("%w: %w: %w", ErrNotCommitted, stopped, err)
+	default:
+		err = fmt.Errorf("%w: nothing of this Run was sent to storage: %w", ErrNotCommitted, err)
 	}
-	return done, ferr
+	return done, err
+}
+
+// discard closes the connection after a panic outside the commit path, each
+// statement and then the connection under recover, and reports whether the
+// connection closed cleanly. Then SQLite has finalized every statement and
+// released the connection's locks, and the connection leaves the leader. A
+// statement whose Close panics counts as closed: ncruces finalizes it first
+// and then re-reports its out-of-memory error that way; a statement it does
+// not track makes the connection's close fail.
+func (c *Conn) discard() bool {
+	for _, s := range slices.Collect(c.db.Stmts()) {
+		func() {
+			defer func() { _ = recover() }()
+			_ = s.Close()
+		}()
+	}
+	if !closeQuietly(c.db) {
+		return false
+	}
+	c.db = nil
+	c.l.cmu.Lock()
+	delete(c.l.conns, c.n)
+	c.l.cmu.Unlock()
+	return true
 }
 
 // walHook runs after SQLite completes a commit on this connection.
@@ -511,7 +661,7 @@ func (c *Conn) rollbackHook() {
 }
 
 // Close closes the connection, rolling back an open transaction.
-func (c *Conn) Close() error {
+func (c *Conn) Close() (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	l := c.l
@@ -521,7 +671,13 @@ func (c *Conn) Close() error {
 	if c.db == nil {
 		return nil
 	}
-	err := c.db.Close()
+	defer func() {
+		if p := recover(); p != nil {
+			// The connection may still hold locks that the others wait for.
+			err = l.stop(fmt.Errorf("engine: closing a connection panicked: %v", p))
+		}
+	}()
+	err = c.db.Close()
 	c.db = nil
 	return err
 }
@@ -601,7 +757,7 @@ func (l *Leader) maintain() {
 		if l.err() != nil {
 			return
 		}
-		_, err := l.mconn.Run(nil, func(db *sqlite3.Conn) error {
+		_, err := l.mconn.Run(l.ctx, nil, func(db *sqlite3.Conn) error {
 			_, _, err := db.WALCheckpoint("main", sqlite3.CHECKPOINT_TRUNCATE)
 			return err
 		})
@@ -620,9 +776,22 @@ func (l *Leader) maintain() {
 	defer l.cmu.Unlock()
 	l.maintaining = false
 	l.cond.Broadcast()
-	if l.head-l.manifestTxn < l.cfg.TailBound {
+	if !l.tailFullLocked() {
 		l.admitClosed, l.noCreates = false, false
 	}
+}
+
+// tailFullLocked reports, with l.cmu held, whether the log above the
+// manifest is at the tail bound: TailBound commits, or half the page
+// entries a reader indexes.
+func (l *Leader) tailFullLocked() bool {
+	return l.head-l.manifestTxn >= l.cfg.TailBound || l.tailPages >= maxTailPages/2
+}
+
+// tailErrLocked is the refusal at the tail bound, with l.cmu held.
+func (l *Leader) tailErrLocked() error {
+	return fmt.Errorf("%w: %w: %d commits and %d page entries above the manifest at %d, bounds %d and %d",
+		ErrNotCommitted, ErrTailBound, l.head-l.manifestTxn, l.tailPages, l.manifestTxn, l.cfg.TailBound, maxTailPages/2)
 }
 
 // advanceBase moves the base version to the head when SQLite restarts the
@@ -653,13 +822,6 @@ func (l *Leader) advanceBase() error {
 	return nil
 }
 
-// clone returns a reader at the same state as r, built without I/O.
-func (r *Reader) clone() *Reader {
-	n := &Reader{st: r.st, keys: r.keys, cache: r.cache}
-	n.reset(r.a, r.commits)
-	return n
-}
-
 func (l *Leader) injected(file, op string, off int64, n int) error {
 	if l.fault == nil {
 		return nil
@@ -667,5 +829,9 @@ func (l *Leader) injected(file, op string, off int64, n int) error {
 	return l.fault(file, op, off, n)
 }
 
-// The transaction number never wraps (invariant 1).
-var errMaxTxn = fmt.Errorf("engine: transaction number %d reached", uint64(math.MaxUint64))
+// maxTxn is the largest transaction number: it never wraps (invariant 1),
+// and it fits the client protocol's signed 64-bit integers (ADR 0005,
+// requirement 13).
+const maxTxn = math.MaxInt64
+
+var errMaxTxn = fmt.Errorf("engine: transaction number %d reached", maxTxn)

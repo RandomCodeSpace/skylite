@@ -26,6 +26,7 @@ type gate struct {
 	reached chan struct{}
 	release chan struct{}
 	once    sync.Once
+	opened  sync.Once
 }
 
 func newGate() *gate { return &gate{reached: make(chan struct{}), release: make(chan struct{})} }
@@ -35,7 +36,7 @@ func (g *gate) wait() {
 	<-g.release
 }
 
-func (g *gate) open() { close(g.release) }
+func (g *gate) open() { g.opened.Do(func() { close(g.release) }) }
 
 // fault says what one store call does. The zero fault passes it through.
 type fault struct {
@@ -272,7 +273,7 @@ func createBump(t testing.TB, st storage.Store, keys format.Keys, db format.Data
 }
 
 func testConfig() Config {
-	return Config{WALBound: 64 << 20, TailBound: 1 << 20, MaxMemory: 64 << 20, Cache: NewCache(8 << 20)}
+	return Config{WALBound: 64 << 20, TailBound: 1 << 15, MaxMemory: 64 << 20, TempBudget: 64 << 20, Cache: NewCache(8 << 20)}
 }
 
 // newDatabase creates a database in a new store and takes office for it.
@@ -320,7 +321,7 @@ func newID() []byte {
 
 // exec runs sql on c as one Run with a new commit identifier.
 func exec(c *Conn, sql string) (uint64, error) {
-	return c.Run(newID(), func(db *sqlite3.Conn) error { return db.Exec(sql) })
+	return c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error { return db.Exec(sql) })
 }
 
 func mustRun(t *testing.T, c *Conn, sql string) uint64 {
@@ -354,7 +355,7 @@ func query(db *sqlite3.Conn, sql string) ([]string, error) {
 func queryConn(t *testing.T, c *Conn, sql string) []string {
 	t.Helper()
 	var rows []string
-	if _, err := c.Run(nil, func(db *sqlite3.Conn) (err error) {
+	if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) (err error) {
 		rows, err = query(db, sql)
 		return err
 	}); err != nil {
