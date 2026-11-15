@@ -6,7 +6,7 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Lob;
 
-/** A binary column mapped with @Lob, which Hibernate reads through ResultSet.getBlob. */
+/** A binary column mapped with @Lob; with the community SQLite dialect, Hibernate reads it through ResultSet.getBlob. */
 @Entity
 public class Document {
     @Id

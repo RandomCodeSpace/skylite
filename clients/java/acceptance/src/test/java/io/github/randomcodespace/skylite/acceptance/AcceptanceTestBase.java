@@ -4,12 +4,14 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.jdbc.autoconfigure.DataSourceProperties;
 import org.springframework.boot.test.context.SpringBootTest;
 
 /** Shares one application context across test classes and empties the tables before each test. */
 @SpringBootTest
+@ExtendWith(Baseline.class)
 abstract class AcceptanceTestBase {
     @Autowired AuthorRepository authors;
     @Autowired BookRepository books;

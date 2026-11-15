@@ -4,7 +4,7 @@ description: skylite will ship its own JDBC driver over its HTTPS API, because a
 weight: 3
 ---
 
-**Status:** Proposed
+**Status:** Accepted
 
 **Date:** 2026-11-15
 
@@ -21,7 +21,7 @@ The project fixed the rule before testing: candidate A is chosen only if a reali
 
 The pull request that adds this record also adds three things, all of which run without skylite, because no skylite server exists yet:
 
-- **An acceptance suite** in `clients/java/acceptance/`: a Spring Boot application with Spring Data JPA, Hibernate and HikariCP, and 16 tests covering schema creation and validation, CRUD with database-generated ids, lazy one-to-many and many-to-one associations, `@Transactional` commit and rollback checked from a second connection, derived, JPQL and native queries, pagination and sorting, optimistic locking, batch inserts, column types and nulls, a `@Lob`, a unique-constraint violation, and isolation between pooled connections. Its README says what each test stands for. The JDBC URL, driver class and dialect come from configuration.
+- **An acceptance suite** in `clients/java/acceptance/`: a Spring Boot application with Spring Data JPA, Hibernate and HikariCP, and 20 tests covering schema creation and validation, CRUD with database-generated ids, lazy one-to-many and many-to-one associations, a JPQL `join fetch`, `@Transactional` commit and rollback checked from a second connection, derived, JPQL and native queries, pagination and sorting, optimistic locking on a detached copy and on a managed entity whose update matches no row, batch inserts, column types and nulls, a `@Lob`, unique, foreign-key and not-null constraint violations, and isolation between pooled connections. Its README says what each test stands for. The JDBC URL, driver class and dialect come from configuration.
 - **A baseline run** of that suite through the reference SQLite JDBC driver on a temporary file database, to show that the suite and the dialect work, so that a failure on candidate A belongs to A. CI runs it on every pull request as the `java-acceptance` job.
 - **A Flight SQL server** in `internal/spike/flightsql/`, a nested Go module that serves the SQLite example server from the Apache Arrow Go module on a SQLite file in WAL mode. The suite ran against it through the Arrow Flight SQL JDBC driver.
 
@@ -37,7 +37,7 @@ Versions:
 | Arrow Go, SQLite example server | v18.8.0 | `internal/spike/flightsql/go.mod` |
 | JDK | Temurin 25 | local run and the CI job |
 
-The candidate A run used `-Djunit.jupiter.conditions.deactivate='org.junit.*DisabledCondition'`, so it also ran the three tests that are disabled because they fail on the baseline. The suite's README gives the commands.
+The five tests that fail on the baseline are skipped only when the driver is sqlite-jdbc and the dialect is the community SQLite dialect, so the candidate A run included them with no extra flag. The suite's README gives the commands.
 
 To keep the Arrow driver's allocator from failing at start-up on Java 25, the run passed `--sun-misc-unsafe-memory-access=allow` as well as the `--add-opens` flag the driver documents ([flight_sql_jdbc_driver.rst#L30-L35](https://github.com/apache/arrow-java/blob/v19.0.0/docs/source/flight_sql_jdbc_driver.rst#L30-L35)). Without it, the copy of Netty inside the driver disables `sun.misc.Unsafe` on Java 25 and later ([PlatformDependent0.java#L554-L563](https://github.com/netty/netty/blob/netty-4.2.9.Final/common/src/main/java/io/netty/util/internal/PlatformDependent0.java#L554-L563); version 4.2.9.Final per the `META-INF/DEPENDENCIES` file in the driver jar), and every test fails with `ExceptionInInitializerError` in `RootAllocator`. These are JVM options, not application code.
 
@@ -53,9 +53,10 @@ Only driver and dialect-and-driver failures count against candidate A.
 
 | Test | Baseline | Candidate A | Cause on A (first failure) | Kind |
 |---|---|---|---|---|
-| `SchemaLifecycleTest.createThenValidate` | Fail (known, disabled) | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
+| `SchemaLifecycleTest.createThenValidate` | Fail (known, skipped) | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `CrudTest.createReadUpdateDelete` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `RelationsTest.lazyAssociationsLoadInsideTransaction` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
+| `RelationsTest.joinFetchLoadsParentAndChildren` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
 | `TransactionTest.commitIsVisibleFromSecondConnection` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `TransactionTest.exceptionRollsBackEveryWrite` | Pass | Fail | [F1](#f1-generated-identifiers); [F3](#f3-transactions) would follow | Dialect and driver; driver |
 | `QueryTest.derivedQuery` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
@@ -63,30 +64,44 @@ Only driver and dialect-and-driver failures count against candidate A.
 | `QueryTest.nativeQuery` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
 | `QueryTest.paginationAndSorting` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
 | `OptimisticLockingTest.versionIncrementsAndStaleUpdateFails` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
+| `OptimisticLockingTest.updateMatchingNoRowFailsOnFlush` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `BatchInsertTest.insertsAreBatched` | Pass | Fail | [F2](#f2-parameter-and-result-schemas) | Server |
 | `ColumnTypesTest.valuesRoundTrip` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `ColumnTypesTest.nullsRoundTrip` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
-| `LobTest.lobRoundTrips` | Fail (known, disabled) | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
-| `ConstraintTest.duplicateUniqueValueIsDataIntegrityViolation` | Fail (known, disabled) | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
+| `LobTest.lobRoundTrips` | Fail (known, skipped) | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
+| `ConstraintTest.duplicateUniqueValueIsDataIntegrityViolation` | Fail (known, skipped) | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
+| `ConstraintTest.referenceToMissingRowIsDataIntegrityViolation` | Fail (known, skipped) | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
+| `ConstraintTest.nullInRequiredColumnIsDataIntegrityViolation` | Fail (known, skipped) | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
 | `ConnectionPoolTest.uncommittedWriteIsInvisibleToAnotherPooledConnection` | Pass | Fail | [F2](#f2-parameter-and-result-schemas); [F3](#f3-transactions) would follow | Server; driver |
 
-Baseline: 13 passed and 3 failed for reasons in the dialect or sqlite-jdbc; the CI job runs those 3 as skipped. Candidate A: 0 of 16 passed. Each test stops at its first failure, so the table names the first cause, and the steps after it did not run. Where a later step depends on transactions, the table adds [F3](#f3-transactions), which was shown separately.
+Baseline: 15 passed and 5 failed when every test was run; by default, as in the CI job, those 5 are skipped, so 15 pass and 5 are skipped. Candidate A: 0 of 20 passed (18 errors and 2 assertion failures; the 2 assertion failures, in `TransactionTest.exceptionRollsBackEveryWrite` and `ConstraintTest.referenceToMissingRowIsDataIntegrityViolation`, are the F1 exception arriving where the test expected another). Each test stops at its first failure, so the table names the first cause, and the steps after it did not run. Where a later step depends on transactions, the table adds [F3](#f3-transactions), which was shown separately.
 
 Hibernate's `ddl-auto=create` did run on candidate A: the tables were created, and the tests then failed on their first insert or parameter bind.
 
 ### Baseline failures
 
-The three baseline failures come from the Hibernate community SQLite dialect and sqlite-jdbc. The suite's README traces each one:
+Five tests fail on the baseline. They are requirements on skylite's driver and dialect together, not defects that a skylite dialect would simply inherit from the community one: for some of them the driver alone could satisfy the requirement. The suite's README traces each failure and links the source. In summary, read from the pinned source and not tested:
 
-- Schema validation: the dialect creates `IDENTITY` columns as `integer` ([SQLiteIdentityColumnSupport.java#L30-L32](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-community-dialects/src/main/java/org/hibernate/community/dialect/identity/SQLiteIdentityColumnSupport.java#L30-L32)), then `validate` expects `bigint` for a `Long` id ([ColumnDefinitions.java#L28-L30](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/tool/schema/internal/ColumnDefinitions.java#L28-L30)).
-- `@Lob byte[]`: Hibernate reads it with `ResultSet.getBlob` ([BlobJdbcType.java#L58-L62](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/type/descriptor/jdbc/BlobJdbcType.java#L58-L62)), which sqlite-jdbc does not implement ([JDBC4ResultSet.java#L451-L453](https://github.com/xerial/sqlite-jdbc/blob/3.53.4.0/src/main/java/org/sqlite/jdbc4/JDBC4ResultSet.java#L451-L453)).
-- Unique violation: the dialect's exception conversion does not map `SQLITE_CONSTRAINT` ([SQLiteDialect.java#L451-L470](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-community-dialects/src/main/java/org/hibernate/community/dialect/SQLiteDialect.java#L451-L470)), so Spring raises `JpaSystemException` instead of `DataIntegrityViolationException`.
+- Schema validation: the dialect creates `IDENTITY` columns as `integer`, and validation compares the entity's `bigint` with the type the driver reports from `DatabaseMetaData.getColumns` through the dialect's `equivalentTypes` ([ColumnDefinitions.java#L28-L30](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/tool/schema/internal/ColumnDefinitions.java#L28-L30)). Either side could satisfy it: the dialect by treating the two as equivalent, or the driver by reporting the column as `BIGINT`.
+- `@Lob byte[]`: with the community dialect, Hibernate reads this mapping with `ResultSet.getBlob` ([SQLiteDialect.java#L367](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-community-dialects/src/main/java/org/hibernate/community/dialect/SQLiteDialect.java#L367), [BlobJdbcType.java#L58-L62](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/type/descriptor/jdbc/BlobJdbcType.java#L58-L62)), which sqlite-jdbc does not implement. A driver that implements `getBlob` would satisfy it with the community dialect unchanged; so would a dialect that registers the materialized BLOB descriptor, which reads with `getBytes` ([BlobJdbcType.java#L256-L262](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/type/descriptor/jdbc/BlobJdbcType.java#L256-L262)).
+- Unique and not-null violations: SQLite rejects the write, but sqlite-jdbc raises a plain `SQLException` with no SQL state, the dialect does not map its error code ([SQLiteDialect.java#L451-L470](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-community-dialects/src/main/java/org/hibernate/community/dialect/SQLiteDialect.java#L451-L470)), and Spring raises `JpaSystemException` instead of `DataIntegrityViolationException`. A driver that raises `SQLIntegrityConstraintViolationException` ([SQLExceptionTypeDelegate.java#L55-L60](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/exception/internal/SQLExceptionTypeDelegate.java#L55-L60)) or a class 23 SQL state ([SQLStateConversionDelegate.java#L64-L77](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/exception/internal/SQLStateConversionDelegate.java#L64-L77)) would get Hibernate's standard conversion with no dialect change; so would a dialect that maps the code.
+- Foreign keys: the generated `book` table has no foreign key, because the community dialect reports no `ALTER TABLE` support and Hibernate then emits none ([StandardForeignKeyExporter.java#L37-L42](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/tool/schema/internal/StandardForeignKeyExporter.java#L37-L42)), and `PRAGMA foreign_keys` was 0 on the suite's connections, so SQLite would not enforce one either; both were checked on the baseline database. This one needs both sides: the dialect has to declare the constraint and the connection has to enforce it.
 
 One limit was also found: `Instant` values kept milliseconds only, so the suite tests at millisecond precision.
 
 ### F1: generated identifiers
 
 Every insert of an entity with an `IDENTITY` id failed with `SQLFeatureNotSupportedException` from `AvaticaConnection.prepareStatement`. The driver reports `supportsGetGeneratedKeys() == false`, and Hibernate accordingly uses its selecting delegate, which prepares the insert with `prepareStatement(sql, Statement.NO_GENERATED_KEYS)` ([AbstractSelectingDelegate.java#L60-L64](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/id/insert/AbstractSelectingDelegate.java#L60-L64)). Avatica, which the Arrow driver is built on, throws for that overload whatever the flag value ([AvaticaConnection.java#L373-L376](https://github.com/apache/calcite-avatica/blob/rel/avatica-1.26.0/core/src/main/java/org/apache/calcite/avatica/AvaticaConnection.java#L373-L376)). Hibernate and the driver disagree on a standard JDBC call, so this is a dialect-and-driver failure, and the server cannot change it.
+
+What was and was not tried against F1:
+
+- `hibernate.jdbc.use_get_generated_keys=false` was not run on its own. Hibernate defaults that setting to the driver's `supportsGetGeneratedKeys()` ([SessionFactoryOptionsBuilder.java#L505-L506](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/boot/internal/SessionFactoryOptionsBuilder.java#L505-L506)), which is `false` here, so setting it to `false` keeps the selecting delegate that failed ([IdentityGenerator.java#L66-L92](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/id/IdentityGenerator.java#L66-L92)).
+- `hibernate.jdbc.use_get_generated_keys=true` was run with `CrudTest`. Hibernate then chose its generated-keys delegate, which prepares the insert with `prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)` or `prepareStatement(sql, String[])` ([GetGeneratedKeysDelegate.java#L77-L83](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/id/insert/GetGeneratedKeysDelegate.java#L77-L83)); the test failed with `SQLFeatureNotSupportedException` from that call, and Avatica rejects the `String[]` and `int[]` overloads as well ([AvaticaConnection.java#L373-L386](https://github.com/apache/calcite-avatica/blob/rel/avatica-1.26.0/core/src/main/java/org/apache/calcite/avatica/AvaticaConnection.java#L373-L386)).
+- Hibernate's insert-returning delegate, which a dialect can select by declaring `insert ... returning` support (the community SQLite dialect does not), prepares its statement with `prepareStatement(sql, NO_GENERATED_KEYS)` as well ([InsertReturningDelegate.java#L93-L96](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/id/insert/InsertReturningDelegate.java#L93-L96)), so, read from source and not tested, it would meet the same rejection.
+- Changing the entities' identifier strategy, for example to application-generated UUIDs, would avoid F1 but is a change to application code, which the rule excludes.
+- A custom dialect or a custom generated-values delegate that inserts through an overload Avatica accepts was not evaluated. Whether one could avoid F1 is open.
+
+None of this changes the outcome: F3 alone fails candidate A under the rule.
 
 Inferred, not tested: if that call were accepted, the selecting delegate would next run `select last_insert_rowid()` ([SQLiteIdentityColumnSupport.java#L35-L37](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-community-dialects/src/main/java/org/hibernate/community/dialect/identity/SQLiteIdentityColumnSupport.java#L35-L37)) as a separate statement, and the example server runs statements on a Go `database/sql` pool ([sqlite_server.go#L415-L426](https://github.com/apache/arrow-go/blob/v18.8.0/arrow/flight/flightsql/example/sqlite_server.go#L415-L426)), which may give it a different SQLite connection from the insert.
 
@@ -110,20 +125,20 @@ Not run. The rule called for an Envoy run only if the suite passed on candidate 
 
 ## Decision
 
-The rule produces candidate B: skylite will ship its own JDBC driver over its HTTPS API. Candidate A failed 16 of 16 tests, including failures of the driver kind (transactions, F3) and of the dialect-and-driver kind (generated identifiers, F1), which count against it under the rule.
+The rule produces candidate B: skylite will ship its own JDBC driver over its HTTPS API. Candidate A failed 20 of 20 tests, including failures of the driver kind (transactions, F3) and of the dialect-and-driver kind (generated identifiers, F1), which count against it under the rule. F3 is decisive on its own: `commit` and `rollback` are empty in the driver itself, so, as read from the source, a server, a Hibernate setting or a dialect has no call to act on.
 
 ## Alternatives considered
 
-- **Candidate A, Arrow Flight SQL with the Arrow JDBC driver.** Rejected by the rule above. Transactions failing in the driver was the deciding result; a skylite Flight SQL server could not fix F1 or F3.
+- **Candidate A, Arrow Flight SQL with the Arrow JDBC driver.** Rejected by the rule above. Transactions failing in the driver was the deciding result; a skylite Flight SQL server could not fix F1 or F3. For F1, `use_get_generated_keys` was checked both ways (`true` by a run, `false` from source), and a custom dialect or generated-values delegate was not evaluated ([F1](#f1-generated-identifiers)); none of these reaches F3.
 - **Candidate A with a patched or forked Arrow driver.** Not tested. It would mean maintaining Java driver code anyway, which is what candidate A was meant to avoid, and the rule tested the driver as published.
 
 ## Consequences
 
 - skylite has to write and maintain a JDBC driver that talks to its HTTPS API, and a Hibernate dialect. The suite in `clients/java/acceptance/` is the yardstick for both, and will run against skylite's endpoint once one exists.
-- The three baseline failures are gaps in the community SQLite dialect and sqlite-jdbc. A skylite dialect that extends the community one would inherit them unless it addresses them; schema validation, `@Lob` and constraint violations are therefore requirements for skylite's dialect.
+- The five baseline failures are requirements on skylite's driver and dialect together: schema validation, `@Lob` and unique and not-null violations can be satisfied by either side, and foreign keys need both (see [Baseline failures](#baseline-failures)). Which side takes each one is for the driver's design.
 - The `java-acceptance` CI job runs the baseline on every pull request, merge-queue group and push to `main`. It is not a required check until the ruleset on `main` is changed to include it.
 - `internal/spike/flightsql/` is a nested module kept to reproduce candidate A's result. `go build ./...` at the repository root does not include it.
-- If this record is accepted, the [open question](/docs/architecture/#wire-protocol-for-jdbc) on the architecture page is to be updated in the same pull request.
+- The [question](/docs/architecture/#wire-protocol-for-jdbc) on the architecture page is updated in the same pull request to state this decision.
 
 ## Limits
 
@@ -132,7 +147,7 @@ The rule produces candidate B: skylite will ship its own JDBC driver over its HT
 - Each test stopped at its first failure, so most later steps on candidate A were not reached. Results beyond the first failure come from the source and the separate probes, not from the suite.
 - No server that returns parameter and result schemas was built, so how candidate A would fare against a more complete Flight SQL server is untested; F1 and F3 do not depend on the server.
 - No HTTP/2 proxy, TLS, authentication or performance was tested.
-- The baseline covers the suite's 16 tests only. It does not show that sqlite-jdbc or the community dialect work for features the suite does not test.
+- The baseline covers the suite's 20 tests only. It does not show that sqlite-jdbc or the community dialect work for features the suite does not test.
 
 ## Appendix: the rollback probe
 

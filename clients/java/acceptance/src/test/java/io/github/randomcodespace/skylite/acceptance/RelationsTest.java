@@ -36,4 +36,22 @@ class RelationsTest extends AcceptanceTestBase {
 
         assertThat(library.bookTitles(authorId)).isEqualTo(List.of("A Wizard of Earthsea", "The Dispossessed"));
     }
+
+    @Test
+    void joinFetchLoadsParentAndChildren() {
+        Author author = new Author("Iris", "iris@example.com");
+        author.addBook("Under the Net");
+        author.addBook("The Sea, the Sea");
+        Long authorId = authors.save(author).getId();
+
+        // Outside a transaction, so a fresh persistence context; each result row holds author and book columns.
+        Author loaded = authors.findWithBooksByEmail("iris@example.com").orElseThrow();
+        assertThat(loaded.getId()).isEqualTo(authorId);
+        assertThat(loaded.getName()).isEqualTo("Iris");
+        assertThat(Hibernate.isInitialized(loaded.getBooks())).isTrue();
+        assertThat(loaded.getBooks()).extracting(Book::getTitle)
+                .containsExactlyInAnyOrder("Under the Net", "The Sea, the Sea");
+        assertThat(loaded.getBooks()).extracting(Book::getId).doesNotContainNull().doesNotHaveDuplicates();
+        assertThat(loaded.getBooks()).allSatisfy(b -> assertThat(b.getAuthor()).isSameAs(loaded));
+    }
 }
