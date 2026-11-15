@@ -146,7 +146,7 @@ The rule produces candidate B: skylite will ship its own JDBC driver over its HT
 
 - skylite has to write and maintain a JDBC driver that talks to its HTTPS API, and a Hibernate dialect. The suite in `clients/java/acceptance/` is the yardstick for both, and will run against skylite's endpoint once one exists.
 - The five baseline failures are requirements on skylite's driver and dialect together: schema validation and `@Lob` can be satisfied by either side, and foreign keys need both (see [Baseline failures](#baseline-failures)). For unique and not-null violations, Spring translates the error correctly with either a dialect mapping or a driver that raises the right exception class or SQL state, but the suite requires the driver to raise `SQLIntegrityConstraintViolationException` with an SQL state of class 23, as it does for foreign-key violations. Which side takes each one is for the driver's design.
-- The `java-acceptance` CI job runs the baseline on every pull request, merge-queue group and push to `main`. It is not a required check until the ruleset on `main` is changed to include it.
+- The `java-acceptance` CI job runs the baseline on every pull request, merge-queue group and push to `main`. The ruleset on `main` has required it since this record was merged.
 - `internal/spike/flightsql/` is a nested module kept to reproduce candidate A's result. `go build ./...` at the repository root does not include it.
 - The [question](/docs/architecture/#wire-protocol-for-jdbc) on the architecture page is updated in the same pull request to state this decision.
 
