@@ -72,11 +72,11 @@ type Candidate struct {
 // back by the same holder's next candidacy.
 func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candidate) (Office, *Lease, error) {
 	r := &Reader{st: st, keys: keys} // for its manifest and log reads
-	a, err := r.readManifest(ctx, anchor{})
+	a, err := r.readManifest(ctx, anchor{}, nil)
 	if err != nil {
 		return Office{}, nil, err
 	}
-	m := a.m
+	m := a.manifest()
 	if m.Epoch == math.MaxUint64 {
 		return Office{}, nil, fmt.Errorf("%w: epoch %d", ErrExhausted, m.Epoch)
 	}
@@ -126,7 +126,7 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 	}
 
 	held := func() error {
-		cur, err := r.readManifest(ctx, anchor{m: m})
+		cur, err := r.readManifest(ctx, anchor{m: m}, nil)
 		switch {
 		case err != nil:
 			return err

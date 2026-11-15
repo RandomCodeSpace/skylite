@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -47,7 +48,7 @@ func TestTakeoverAlone(t *testing.T) {
 	case l == nil:
 		t.Fatal("no lease")
 	}
-	if b, err := get(bg, e.g, e.keys.Lease()); err != nil {
+	if b, err := get(bg, e.g, e.keys.Lease(), 1<<40); err != nil {
 		t.Fatal(err)
 	} else if ls, err := format.DecodeLease(b); err != nil || ls.Holder != "b" || ls.Epoch != o.Epoch {
 		t.Fatalf("lease %+v, %v; want holder b at epoch %d", ls, err, o.Epoch)
@@ -65,6 +66,46 @@ func TestTakeoverAlone(t *testing.T) {
 		t.Fatalf("new leader's commit: %v", out)
 	}
 	e.check([]Office{e.l.o, o}, []*leader{e.l, nl}, true)
+}
+
+// TestTakeoverCompacted takes over a database whose base has several groups:
+// the epoch swap writes every group reference back unchanged, a reader reads
+// the base through the swapped manifest, and the new leader commits.
+func TestTakeoverCompacted(t *testing.T) {
+	st, keys := newMemStore(t)
+	h := newHistory(t, st, keys, 11, 512, 4)
+	pages := map[uint32][]byte{}
+	for p := range uint32(16) {
+		pages[p+1] = h.bytes(512)
+	}
+	h.commit(16, pages)
+	h.commit(16, map[uint32][]byte{6: h.bytes(512)})
+	h.compact(h.head())
+	h.commit(16, map[uint32][]byte{11: h.bytes(512)})
+	before, _ := h.manifest()
+	if len(before.Groups) != 4 {
+		t.Fatalf("fixture has %d groups, want 4", len(before.Groups))
+	}
+	g := &gated{Store: st, manifest: keys.Manifest()}
+	e := &env{t: t, g: g, keys: keys, h: h, inv: newInvariants(st, keys, h.db), clk: newClock(0)}
+	e.inv.g = g
+	o, _ := mustTakeover(t, e, "c")
+	m := manifestOf(t, e)
+	if !o.Holds(m) || m.Txn != before.Txn || !slices.Equal(m.Groups, before.Groups) {
+		t.Fatalf("manifest after swap %+v, before %+v", m, before)
+	}
+	r, err := Open(bg, st, keys, nil, o.Head-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.checkReader(bg, r, false); err != nil {
+		t.Fatal(err)
+	}
+	nl := newLeader(h, g, o)
+	if out := nl.commit(bg); out != committed {
+		t.Fatalf("new leader's commit: %v", out)
+	}
+	e.check([]Office{o}, []*leader{nl}, true)
 }
 
 func TestHolds(t *testing.T) {
@@ -224,7 +265,7 @@ func TestDeposedLeaderRecognition(t *testing.T) {
 	e.h.retireAll()
 	// The deposed leader's commit 7 is now retired; reading it again still
 	// says committed, and its next name holds the bump that fenced it.
-	got, err := get(bg, e.g, e.keys.Commit(e.h.db, 7))
+	got, err := get(bg, e.g, e.keys.Commit(e.h.db, 7), 1<<40)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +488,7 @@ func TestLostResponseLease(t *testing.T) {
 			a.finish()
 			e.g.landAll()
 		}
-		b, _ := get(bg, e.g, key)
+		b, _ := get(bg, e.g, key, 1<<40)
 		if l, err := format.DecodeLease(b); err != nil || l.Holder != "b" || l.Renewed != 0 {
 			t.Fatalf("lease after release: %+v %v", l, err)
 		}
@@ -562,7 +603,7 @@ func TestStickySwap(t *testing.T) {
 	if ok, err := e.g.land(); !ok || !errors.Is(err, storage.ErrPreconditionFailed) {
 		t.Fatalf("late swap: %v", err)
 	}
-	if b, _ := get(bg, e.g, e.keys.Lease()); !bytes.Equal(b, leaseBytes(t, dl)) {
+	if b, _ := get(bg, e.g, e.keys.Lease(), 1<<40); !bytes.Equal(b, leaseBytes(t, dl)) {
 		t.Fatal("the losing candidate's release changed the winner's lease")
 	}
 	e.check([]Office{e.l.o, d}, nil, true)
@@ -699,7 +740,7 @@ func TestLeaseUnreadable(t *testing.T) {
 			e.g.takeTrace()
 			o, l, err := Takeover(bg, e.g, e.keys, e.cand("b"))
 			if c.replaced {
-				if err != nil || !bytes.Equal(must(get(bg, e.g, e.keys.Lease())), leaseBytes(t, l)) {
+				if err != nil || !bytes.Equal(must(get(bg, e.g, e.keys.Lease(), 1<<40)), leaseBytes(t, l)) {
 					t.Fatalf("takeover over an undecodable lease: %+v %v", o, err)
 				}
 				return
@@ -808,7 +849,7 @@ func TestLeaseOwnUnresolvedWrite(t *testing.T) {
 		if err := op(bg); err != nil {
 			t.Fatalf("release %v after an unresolved renewal: %v", release, err)
 		}
-		if ls, err := format.DecodeLease(must(get(bg, e.g, key))); err != nil || ls != l.l || (ls.Renewed == 0) != release {
+		if ls, err := format.DecodeLease(must(get(bg, e.g, key, 1<<40))); err != nil || ls != l.l || (ls.Renewed == 0) != release {
 			t.Fatalf("lease %+v, %v; the handle has %+v", ls, err, l.l)
 		}
 	}
@@ -898,7 +939,7 @@ func TestTakeoverReleasesLease(t *testing.T) {
 		if k.err == nil || errors.Is(k.err, storage.ErrOutcomeUnknown) == c.released {
 			t.Fatalf("swap %v: %v", c.acts, k.err)
 		}
-		ls, err := format.DecodeLease(must(get(bg, e.g, e.keys.Lease())))
+		ls, err := format.DecodeLease(must(get(bg, e.g, e.keys.Lease(), 1<<40)))
 		if err != nil || ls.Holder != "b" || (ls.Renewed == 0) != c.released {
 			t.Fatalf("swap %v: lease %+v %v", c.acts, ls, err)
 		}
@@ -1066,7 +1107,7 @@ func TestLostSwapReadsLittle(t *testing.T) {
 	gc := &getCounter{Store: st, key: keys.Manifest()}
 	e := newEnvOn(t, gc, keys, 24)
 	e.g.manifest = "" // its record of replacements would read the manifest too
-	before := len(must(get(bg, st, keys.Manifest())))
+	before := len(must(get(bg, st, keys.Manifest(), 1<<40)))
 	c := e.g.candidate(t, e.keys, e.cand("c"))
 	if c.until("replace", e.keys.Manifest()) == nil {
 		t.Fatal("no swap")
@@ -1082,9 +1123,9 @@ func TestLostSwapReadsLittle(t *testing.T) {
 		t.Fatalf("swap after a compaction: %v", c.err)
 	}
 	if gc.n > int64(before)+1 {
-		t.Fatalf("the candidate read %d bytes of a %d-byte manifest after its %d-byte swap lost", gc.n, len(must(get(bg, st, keys.Manifest()))), before)
+		t.Fatalf("the candidate read %d bytes of a %d-byte manifest after its %d-byte swap lost", gc.n, len(must(get(bg, st, keys.Manifest(), 1<<40))), before)
 	}
-	if ls, err := format.DecodeLease(must(get(bg, st, keys.Lease()))); err != nil || ls.Holder != "c" || ls.Renewed != 0 {
+	if ls, err := format.DecodeLease(must(get(bg, st, keys.Lease(), 1<<40))); err != nil || ls.Holder != "c" || ls.Renewed != 0 {
 		t.Fatalf("lease after a lost swap: %+v %v", ls, err)
 	}
 }
@@ -1116,7 +1157,7 @@ func TestLeaseOwnUnresolvedCreate(t *testing.T) {
 		t.Fatalf("the first create did not land: %v", err)
 	}
 	second.finish()
-	if second.err != nil || !bytes.Equal(must(get(bg, st, keys.Lease())), leaseBytes(t, second.l)) {
+	if second.err != nil || !bytes.Equal(must(get(bg, st, keys.Lease(), 1<<40)), leaseBytes(t, second.l)) {
 		t.Fatalf("second candidacy: %v", second.err)
 	}
 }

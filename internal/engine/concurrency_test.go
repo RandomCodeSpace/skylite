@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,9 +18,10 @@ import (
 )
 
 func TestCacheEvicts(t *testing.T) {
-	c := NewCache(30)
 	page := func(b byte) []byte { return bytes.Repeat([]byte{b}, 9) }
-	c.put("a", page(1)) // 10 bytes each with its key
+	entry := entrySize("a", page(1)) // each entry, with its key and overhead
+	c := NewCache(3 * entry)
+	c.put("a", page(1))
 	c.put("b", page(2))
 	c.put("c", page(3))
 	if _, ok := c.get("a"); !ok { // a is now the most recent
@@ -37,9 +39,14 @@ func TestCacheEvicts(t *testing.T) {
 	if c.used > c.budget {
 		t.Fatalf("%d bytes used of %d", c.used, c.budget)
 	}
-	c.put("big", make([]byte, 40))
-	if _, ok := c.get("big"); ok || c.used != 30 {
+	c.put("big", make([]byte, 3*entry))
+	if _, ok := c.get("big"); ok || c.used != 3*entry {
 		t.Fatal("an entry larger than the budget was cached")
+	}
+	exact := NewCache(entry)
+	exact.put("a", page(1))
+	if _, ok := exact.get("a"); !ok {
+		t.Fatal("an entry the size of the budget was not cached")
 	}
 	z := NewCache(0)
 	z.put("a", page(1))
@@ -313,4 +320,45 @@ func openCopy(t *testing.T, snap string) storage.Store {
 	}
 	t.Cleanup(func() { _ = fs.Close() })
 	return fs
+}
+
+// TestCacheHeap fills a cache through a reader and measures the heap it
+// holds: within 5% of its budget at every page size, with entries much
+// smaller than the budget so that rounding to whole entries does not count.
+func TestCacheHeap(t *testing.T) {
+	ctx := context.Background()
+	for _, ps := range []uint32{512, 4096, 8192, 65536} {
+		st, keys := newStore(t)
+		h := newHistory(t, st.Store, keys, 11, ps, 4)
+		const n = 400
+		pages := map[uint32][]byte{}
+		for p := uint32(1); p <= n; p++ {
+			pages[p] = h.bytes(int(ps))
+		}
+		h.commit(n, pages)
+		h.compact(2)
+		h.commit(n, map[uint32][]byte{2: h.bytes(int(ps))})
+		budget := int64(200) * int64(ps)
+		c := NewCache(budget)
+		r, err := Open(ctx, st, keys, c, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m0, m1 runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&m0)
+		for p := uint32(1); p <= n; p++ {
+			if _, err := r.ReadPage(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+		}
+		runtime.GC()
+		runtime.ReadMemStats(&m1)
+		held := int64(m1.HeapAlloc) - int64(m0.HeapAlloc) //nolint:gosec // heap sizes fit
+		t.Logf("page size %d: budget %d, accounted %d, heap held %d (%.1f%%), %d entries", ps, budget, c.used, held, 100*float64(held)/float64(budget), len(c.m))
+		if held > budget+budget/20 {
+			t.Errorf("page size %d: the cache holds %d bytes of heap for a budget of %d", ps, held, budget)
+		}
+		runtime.KeepAlive(r)
+	}
 }

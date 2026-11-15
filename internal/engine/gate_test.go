@@ -370,7 +370,7 @@ type leader struct {
 // store, so it may run in an actor.
 func newLeader(h *history, st storage.Store, o Office) *leader {
 	l := &leader{h: h, st: st, o: o, head: o.Head, told: map[string]outcome{}}
-	b, err := get(context.Background(), h.st, h.keys.Commit(o.DB, o.Head))
+	b, err := get(context.Background(), h.st, h.keys.Commit(o.DB, o.Head), 1<<40)
 	var bh format.CommitHeader
 	if err == nil {
 		bh, err = format.DecodeCommitHeader(b[:format.CommitHeaderSize], o.DB)
@@ -419,7 +419,7 @@ func (l *leader) create(ctx context.Context, txn uint64, b []byte) outcome {
 		case err == nil:
 			return committed
 		case errors.Is(err, storage.ErrPreconditionFailed):
-			found, rerr := get(ctx, l.st, key)
+			found, rerr := get(ctx, l.st, key, 1<<40)
 			if rerr != nil && !errors.Is(rerr, storage.ErrNotFound) {
 				unknown = true
 				continue
@@ -475,7 +475,7 @@ func (l *leader) compact(ctx context.Context) bool {
 			return err
 		},
 		func() (bool, error) {
-			b, err := get(ctx, l.st, key)
+			b, err := get(ctx, l.st, key, 1<<40)
 			return bytes.Equal(b, next), err
 		})
 	if err != nil || !own {
@@ -517,7 +517,7 @@ func (h *history) sync() {
 	}
 	h.mv = info.Version
 	for txn := uint64(len(h.states)); ; txn++ {
-		b, err := get(ctx, h.st, h.keys.Commit(h.db, txn))
+		b, err := get(ctx, h.st, h.keys.Commit(h.db, txn), 1<<40)
 		if errors.Is(err, storage.ErrNotFound) {
 			return
 		}
@@ -572,7 +572,7 @@ func newInvariants(st storage.Store, keys format.Keys, db format.DatabaseID) *in
 // request is left that could still land.
 func (v *invariants) check(offices []Office, leaders []*leader, final bool) error {
 	ctx := context.Background()
-	b, err := get(ctx, v.st, v.keys.Manifest())
+	b, err := get(ctx, v.st, v.keys.Manifest(), 1<<40)
 	if err != nil {
 		return err
 	}
@@ -621,7 +621,7 @@ func (v *invariants) check(offices []Office, leaders []*leader, final bool) erro
 		if key != v.keys.Commit(v.db, txn) {
 			return fmt.Errorf("log is not contiguous: %s at position %d", key, txn)
 		}
-		b, err := get(ctx, v.st, key)
+		b, err := get(ctx, v.st, key, 1<<40)
 		if err != nil {
 			return err
 		}
@@ -729,7 +729,7 @@ func unfenced(t testing.TB, st storage.Store, keys format.Keys, offices []Office
 	t.Helper()
 	var out []Office
 	for _, o := range offices {
-		b, err := get(context.Background(), st, keys.Commit(o.DB, o.Head+1))
+		b, err := get(context.Background(), st, keys.Commit(o.DB, o.Head+1), 1<<40)
 		if err == nil {
 			h, err := format.DecodeCommitHeader(b[:format.CommitHeaderSize], o.DB)
 			if err != nil {

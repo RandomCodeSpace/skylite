@@ -25,7 +25,7 @@ func leaderActor(t *testing.T, e *env, l *leader) (*actor, string) {
 
 func isRetired(t *testing.T, e *env, txn uint64) (retired, bump bool) {
 	t.Helper()
-	b, err := get(bg, e.g, e.keys.Commit(e.h.db, txn))
+	b, err := get(bg, e.g, e.keys.Commit(e.h.db, txn), 1<<40)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestInterleavingLostResponseCommit(t *testing.T) {
 // lastID is the commit identifier of the commit at txn.
 func (e *env) lastID(txn uint64) string {
 	e.t.Helper()
-	b, err := get(bg, e.g, e.keys.Commit(e.h.db, txn))
+	b, err := get(bg, e.g, e.keys.Commit(e.h.db, txn), 1<<40)
 	if err != nil {
 		e.t.Fatal(err)
 	}
