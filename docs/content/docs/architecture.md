@@ -55,6 +55,8 @@ Two client libraries are planned:
 - A Go `database/sql` driver. The target is that it works with GORM.
 - A JDBC driver and a Hibernate dialect. The target is that they work with Spring Data JPA.
 
+Both drivers are planned to speak one protocol, specified in [0005: Client protocol](/docs/decisions/0005-client-protocol/): ordinary HTTP requests with JSON bodies under `/v1`, results as newline-delimited JSON with a required final frame, and channels with sequence numbers for every request that can write, so that, for a driver that alone holds its channel's token, no request takes effect twice and the driver reports an outcome only when it can prove it.
+
 ## Storage backends
 
 All storage access goes through one storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete; there is no unconditional put. Azure Blob Storage comes first, then AWS S3, Google Cloud Storage and the local filesystem. The backends are meant to share one test suite that runs against storage emulators.
@@ -87,4 +89,4 @@ Settled by [0003: JDBC transport](/docs/decisions/0003-jdbc-transport/). skylite
 
 ### Client authentication
 
-How do clients authenticate to the query endpoint?
+Settled by [0006: Authentication](/docs/decisions/0006-authentication/). Clients authenticate to the query endpoint with OIDC JWT bearer tokens only, from issuers in the server's configuration, such as a Kubernetes cluster's service-account issuer or Microsoft Entra ID. Access is denied by default and granted by rules that give a `read`, `write` or `admin` role on a database. Every pod that handles a request is planned to verify its token, including after another pod forwards it ([0005: Client protocol](/docs/decisions/0005-client-protocol/)). No server uses this yet.
