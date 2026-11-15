@@ -209,7 +209,7 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 	case c.idUsed:
 		refuse = fmt.Errorf("%w: a second commit with one commit identifier", ErrNotCommitted)
 	case l.head == ^uint64(0):
-		refuse = l.stopLocked(errMaxTxn)
+		refuse = fmt.Errorf("%w: %w", ErrNotCommitted, l.stopLocked(errMaxTxn))
 	case l.head-l.manifestTxn >= l.cfg.TailBound:
 		l.startMaintenance()
 		refuse = fmt.Errorf("%w: %w: the log tail holds %d commits, its bound", ErrNotCommitted, ErrRetry, l.head-l.manifestTxn)

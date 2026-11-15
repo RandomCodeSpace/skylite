@@ -346,6 +346,13 @@ func (c *Conn) setup() error {
 	if err := c.db.BusyTimeout(busyTimeout); err != nil {
 		return err
 	}
+	// Any panic stops the database (see finish), and exceeding the memory
+	// ceiling panics in ncruces. Capping values and statements well below
+	// the ceiling turns the commonest way there, one huge value, into an
+	// SQLITE_TOOBIG error.
+	limit := int(min(1e9, c.l.cfg.MaxMemory/4))
+	c.db.Limit(sqlite3.LIMIT_LENGTH, limit)
+	c.db.Limit(sqlite3.LIMIT_SQL_LENGTH, limit)
 	c.db.WALHook(c.walHook)
 	c.db.RollbackHook(c.rollbackHook)
 	return nil
@@ -466,6 +473,10 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	l.cmu.Unlock()
 	if p == nil && maint {
 		ferr = errors.Join(ferr, c.rollbackForMaintenance())
+	}
+	if ferr != nil && outcome == nil && !errors.Is(ferr, ErrNotCommitted) && (maint || c.queryOnly && errors.Is(ferr, sqlite3.READONLY)) {
+		// Interrupted by maintenance, or refused by closed admission.
+		ferr = fmt.Errorf("%w: %w: %w", ErrNotCommitted, ErrRetry, ferr)
 	}
 	if outcome != nil {
 		return done, errors.Join(outcome, ferr)

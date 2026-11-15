@@ -191,7 +191,9 @@ func TestPanicStopsTheDatabase(t *testing.T) {
 				}
 			case "out of memory":
 				f = func(db *sqlite3.Conn) error {
-					_, err := query(db, "SELECT length(randomblob(100000000))")
+					// Each value is under the length limit; together they
+					// pass the 16 MiB ceiling.
+					_, err := query(db, "SELECT randomblob(3000000), randomblob(3000000), randomblob(3000000), randomblob(3000000), randomblob(3000000), randomblob(3000000)")
 					return err
 				}
 			}
