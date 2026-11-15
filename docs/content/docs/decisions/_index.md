@@ -1,12 +1,12 @@
 ---
 title: Decisions
-description: Architecture decision records for skylite. None have been recorded yet.
+description: Architecture decision records for skylite.
 weight: 40
 ---
 
 This section holds the project's architecture decision records (ADRs). Each record captures one decision: the context that forced it, what was chosen, what was rejected and what follows from it. Records are kept after they are superseded, so the history of the design stays readable.
 
-**No decisions are recorded yet.** The first ones are expected after the durability spike, starting with the [open questions](/docs/architecture/#open-questions) on the architecture page.
+The first record covers the evaluation of Litebase as a base. More are expected after the durability spike, starting with the [open questions](/docs/architecture/#open-questions) on the architecture page.
 
 ## Adding a record
 
