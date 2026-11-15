@@ -824,8 +824,8 @@ func within(t reporter, bg *background, what string, fn func() error) error {
 		return err
 	case <-timer.C:
 		bg.openAll()
-		<-done
-		t.Fatalf("%s did not return within %v while a write was reading its body; a write must not block other mutations while it reads its body", what, overlapTimeout)
+		err := <-done
+		t.Fatalf("%s did not return within %v while a write was reading its body (it returned %v once the write was released); a write must not block other mutations while it reads its body", what, overlapTimeout, err)
 		return nil
 	}
 }
