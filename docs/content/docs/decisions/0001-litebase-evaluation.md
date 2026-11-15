@@ -66,11 +66,11 @@ This is the deciding gap. The commit path traced in the code is:
 
 A client is therefore acknowledged before its write reaches object storage. On a real shared file system, durability comes from that file system. On a pod whose network path is local or `emptyDir` disk, the code suggests that writes since the last compaction and upload exist only on that pod's disk. These intervals suggest roughly an hour between ordinary compactions, plus upload delay; they do not bound the amount of data absent from object storage. This was inferred from the code, not measured.
 
-**Storage-layer probe.** A test written for this evaluation, kept outside the Litebase tree, ran in the project's single-node test harness and used the tiered file system driver with two local directories as its high and low tiers. It wrote `AAAA` to a file, flushed it, wrote `BBBB` through the same descriptor and closed it. After the close the low tier held `AAAA`, the high-tier copy had been removed, and a read through the driver returned `AAAA`: the second write was lost. In the code, a modified file counts as releasable if it was flushed less than 10 s ago ([tiered_file.go#L379](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/tiered_file.go#L379)), and release flushes only after 10 s have passed ([tiered_file_system_driver.go#L770](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/tiered_file_system_driver.go#L770)) before removing the high-tier copy ([tiered_file_system_driver.go#L783](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/tiered_file_system_driver.go#L783)). This shows lost data at the storage driver level only. It was not shown to lose a committed SQL row; that would need a compaction, a second write to the same range file and a release within 10 s, and no such end-to-end test was run.
+**Storage-layer probe.** A test written for this evaluation, kept outside the Litebase tree and reproduced in full in the [appendix](#appendix-the-storage-layer-probe), ran in the project's single-node test harness and used the tiered file system driver with two local directories as its high and low tiers. It wrote `AAAA` to a file, flushed it, wrote `BBBB` through the same descriptor and closed it. After the close the low tier held `AAAA`, the high-tier copy had been removed, and a read through the driver returned `AAAA`: the second write was lost. In the code, a modified file counts as releasable if it was flushed less than 10 s ago ([tiered_file.go#L379](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/tiered_file.go#L379)), and release flushes only after 10 s have passed ([tiered_file_system_driver.go#L770](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/tiered_file_system_driver.go#L770)) before removing the high-tier copy ([tiered_file_system_driver.go#L783](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/tiered_file_system_driver.go#L783)). This shows lost data at the storage driver level only. It was not shown to lose a committed SQL row; that would need a compaction, a second write to the same range file and a release within 10 s, and no such end-to-end test was run.
 
 ### 3. Backends
 
-Storage sits behind a POSIX-like `FileSystemDriver` interface of 17 methods ([file_system.go#L12](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/file_system.go#L12)). The object tier is either a local directory or S3 through aws-sdk-go-v2 ([node_file_system.go#L48][r3]). No Azure or GCS driver was found, and `go.mod` lists no Azure or Google Cloud SDK. The S3 driver uses unconditional `PutObject` of whole objects ([object_file.go#L160](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/object_file.go#L160)), emulates rename as copy then delete ([object_file_system_driver.go#L377](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/object_file_system_driver.go#L377)), and downloads a whole object when it is opened ([object_file.go#L86](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/object_file.go#L86)).
+Storage sits behind a POSIX-like `FileSystemDriver` interface of 17 methods ([file_system.go#L12](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/file_system.go#L12)). The object tier is either a local directory or S3 through aws-sdk-go-v2 ([node_file_system.go#L48][r3]). No Azure or GCS driver was found, and `go.mod` lists no Azure or Google Cloud SDK. The S3 driver uses unconditional `PutObject` of whole objects ([object_file.go#L160](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/object_file.go#L160)), emulates rename as copy then delete ([object_file_system_driver.go#L377](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/object_file_system_driver.go#L377)), and reads with whole-object GETs rather than ranged reads ([object_file.go#L86](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/object_file.go#L86)).
 
 ### 4. Cloud authentication
 
@@ -88,7 +88,7 @@ Replicas read the primary's WAL and page logs from the shared file system and pa
 
 ### 7. Pod storage
 
-Managed caches and buffers share a memory-manager budget of 1 GiB by default ([cluster.go#L113](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/cluster/cluster.go#L113-L123)), and SQLite's page cache is set to zero ([database_connection.go#L58](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/database/database_connection.go#L58)). Total process memory was not measured; SQLite's shared-memory regions, for example, are allocated directly with `C.malloc` ([vfs.go#L391](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/vfs/vfs.go#L391-L403)). Disk is not bounded in bytes. The WAL and all page logs since the last compaction stay on the network file system, which is local disk under the fallback. Range files, up to 16 MiB at the default 4 KiB page size ([config.go#L91](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/config/config.go#L91)), are fetched whole ([tiered_file_system_driver.go#L738](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/tiered_file_system_driver.go#L738)) into the shared POSIX high tier ([node_file_system.go#L183](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/cluster/node_file_system.go#L183-L189)), or local disk when using the fallback. Its eviction policy uses file count and age rather than a byte budget: 10,000 files and one hour ([tiered_file_system_driver.go#L35][r7]).
+Managed caches and buffers share a memory-manager budget of 1 GiB by default ([cluster.go#L113](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/cluster/cluster.go#L113-L123)), and SQLite's page cache is set to zero ([database_connection.go#L58](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/database/database_connection.go#L58)). Total process memory was not measured; SQLite's shared-memory regions, for example, are allocated directly with `C.malloc` ([vfs.go#L391](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/vfs/vfs.go#L391-L403)). Disk is not bounded in bytes. The WAL and all page logs since the last compaction stay on the network file system, which is local disk under the fallback. Range files, which hold up to 16 MiB of page payload at the default 4 KiB page size ([config.go#L91](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/config/config.go#L91)) plus an encryption header when encryption is enabled ([stream_encrypter.go#L20](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/stream_encrypter.go#L20)), are fetched whole ([tiered_file_system_driver.go#L738](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/tiered_file_system_driver.go#L738)) into the shared POSIX high tier ([node_file_system.go#L183](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/cluster/node_file_system.go#L183-L189)), or local disk when using the fallback. Its eviction policy uses file count and age rather than a byte budget: 10,000 files and one hour ([tiered_file_system_driver.go#L35][r7]).
 
 ### 8. Clients
 
@@ -96,7 +96,7 @@ Managed caches and buffers share a memory-manager budget of 1 GiB by default ([c
 
 ### 9. Security
 
-The query endpoint accepts basic authentication, Litebase-issued tokens and signed access keys ([authentication_middleware.go#L38][r11]); no OIDC JWT validation was found on that path. Authorisation is fine-grained: a SQLite authoriser callback maps every action code to the credential's privileges and denies anything unlisted ([database_connection.go#L743][r9]). A connection with no credential attached is allowed every action ([database_connection.go#L665](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/database/database_connection.go#L665)). `ATTACH` is always denied ([statements.go#L221](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/auth/statements.go#L221)) and extension loading is compiled out. No `sqlite3_limit` calls were found. Internal requests carry a header encrypted with the cluster key over plain HTTP, and the `POST /v1/cluster/members` route is registered without the internal middleware ([private_routes.go#L24](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/http/private_routes.go#L24)); its controller checks the encrypted header but not the timestamp ([cluster_members.controller.go#L70](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/http/cluster_members.controller.go#L70)) that the internal middleware checks on other routes ([internal_middleware.go#L51](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/http/internal_middleware.go#L51)).
+The query endpoint accepts basic authentication, Litebase-issued tokens and signed access keys ([authentication_middleware.go#L38][r11]); no OIDC JWT validation was found on that path. Authorisation is fine-grained: a SQLite authoriser callback checks the action codes it lists against the credential's privileges and denies any action it does not list ([database_connection.go#L743][r9]). A connection with no credential attached is allowed every action ([database_connection.go#L665](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/database/database_connection.go#L665)). For connections with a credential, `ATTACH` is denied ([statements.go#L221](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/auth/statements.go#L221)) and extension loading is compiled out. No application-level calls overriding SQLite's runtime limits were found in the inspected bindings. Internal requests carry a header encrypted with the cluster key over plain HTTP, and the `POST /v1/cluster/members` route is registered without the internal middleware ([private_routes.go#L24](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/http/private_routes.go#L24)); its controller checks the encrypted header but not the timestamp ([cluster_members.controller.go#L70](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/http/cluster_members.controller.go#L70)) that the internal middleware checks on other routes ([internal_middleware.go#L51](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/http/internal_middleware.go#L51)).
 
 ### Project health
 
@@ -109,9 +109,9 @@ Observed on 2026-11-14 from the git history and the GitHub API.
 | Other branch | `vector`, last commit 2026-03-27 |
 | Commits since 2026-05-14 | 0, on any branch |
 | Human contributors | 1 (1,395 of 1,414 commits; the rest are bots) |
-| Releases | 11 on GitHub, v0.5.0 to v0.5.11, all prereleases, last 2026-01-13 |
+| Latest release | v0.5.11, a prerelease published 2026-01-13; every release listed by the [releases API](https://api.github.com/repos/litebase/litebase/releases?per_page=100) was a prerelease |
 | Open issues and PRs | 2 issues, 0 PRs |
-| Outside contributions | 2 of 80 issue and PR numbers, both issues |
+| Outside contributions | Two outside-authored issues and no outside-authored pull requests were found among the records visible through the [issues API](https://api.github.com/repos/litebase/litebase/issues?state=all&per_page=100) |
 | Stars and forks | 450 and 11 |
 | Tests | 267 test files, including storage recovery ([page_log_recovery_test.go#L19](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/page_log_recovery_test.go#L19)) and primary-crash recovery ([node_file_system_test.go#L129](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/cluster/node_file_system_test.go#L129)) tests; their coverage and runtime behaviour were not evaluated |
 | CI | Last 5 runs on `main` passed |
@@ -125,10 +125,10 @@ skylite will not reuse or fork Litebase and will not depend on it. skylite will 
 Litestream v0.5.18 ([`057d3956`](https://github.com/benbjohnson/litestream/tree/057d39564c75ebd67ba042410a7ffa05ad4c242d)) was read for this decision. What it provides and what skylite has to add:
 
 - **Pure Go.** Litestream's library packages use `modernc.org/sqlite` ([litestream.go#L16](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/litestream.go#L16)), and the library with its Azure, S3, GCS and file clients builds with `CGO_ENABLED=0`.
-- **Acknowledgement after upload.** A caller can turn off Litestream's background sync ([replica.go#L61](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/replica.go#L61)) and call `DB.SyncAndWait`, which returns after the pending change files have been uploaded, as far as the storage client reports success ([db.go#L798](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/db.go#L798)). skylite plans to acknowledge a write only after that call succeeds. From the code, one Litestream transaction ID covers one sync, not one SQLite transaction, so writes are acknowledged per sync batch.
+- **Acknowledgement after upload.** A caller can turn off Litestream's background sync ([replica.go#L61](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/replica.go#L61)) and call `DB.SyncAndWait`, which returns after the pending change files have been uploaded, as far as the storage client reports success ([db.go#L798](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/db.go#L798)). skylite plans to acknowledge a write only after that call succeeds. From the code, a Litestream transaction ID identifies a change-file capture batch, which may contain several SQLite transactions, and one `SyncAndWait` call can create and upload more than one such batch ([db.go#L1315](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/db.go#L1315)). Writes would therefore be acknowledged per sync, not per transaction ID.
 - **Fencing is skylite's.** Litestream's `WriteLTXFile` takes no precondition ([replica_client.go#L41](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/replica_client.go#L41)), and the Azure client uploads without access conditions ([abs/replica_client.go#L241](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/abs/replica_client.go#L241)). skylite plans to wrap the replica client, which change-file writes and deletes, including the compactor's, pass through ([db.go#L884](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/db.go#L884)). The proposed fence, pending the durability spike, is that each change file is created only if absent. A conflict on a name that holds different content would mean another leader has taken over: the wrapper would stop the database and fail unacknowledged writes, rather than return an error Litestream would retry. Litestream resets its position after a failed upload ([replica.go#L174](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/replica.go#L174)) and would otherwise continue at the next free name.
 - **Leader election is skylite's.** Litestream's [lease implementation](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/leaser.go#L24) is S3-only and is not wired into replication. skylite plans a lease object per database in object storage, used for liveness and placement; the create-if-absent write is the proposed fence.
-- **Reads are skylite's.** Litestream's on-demand reader needs cgo ([vfs.go#L28](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/vfs.go#L28)). A [pure-Go fork](https://github.com/ncruces/litestream) of it is read-only and 280 commits behind v0.5.18.
+- **Reads are skylite's.** Litestream's on-demand reader needs cgo ([vfs.go#L28](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/vfs.go#L28)). A [pure-Go fork](https://github.com/ncruces/litestream) of it is read-only and 280 commits behind v0.5.18. The normal Litestream database and restore APIs work on local database and WAL files ([db.go#L1135](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/db.go#L1135), [replica.go#L901](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/replica.go#L901)), so a bounded reader does not by itself bound the writer's local footprint.
 - **Azure authentication.** Litestream's Azure client supports SAS tokens, shared keys and the default Azure credential chain ([abs/replica_client.go#L193](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/abs/replica_client.go#L193)), but not connection strings, and does not accept an injected client. The fencing wrapper would build its own Azure client, so skylite would own credential handling.
 
 ## Alternatives considered
@@ -145,8 +145,8 @@ Litestream v0.5.18 ([`057d3956`](https://github.com/benbjohnson/litestream/tree/
 
 Litebase is MIT-licensed, so skylite may copy parts of it with attribution and the licence notice kept. Parts worth studying:
 
-- The deny-by-default authoriser that maps every SQLite action code to a privilege ([database_connection.go#L663](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/database/database_connection.go#L663)) and the privilege checks in [statements.go](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/auth/statements.go#L221). skylite would not copy the rule that a connection without a credential may do anything.
-- Its SQL lockdown choices: extension loading compiled out, `ATTACH` always denied.
+- The deny-by-default authoriser, which checks listed SQLite action codes against privileges and denies unlisted ones ([database_connection.go#L663](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/database/database_connection.go#L663)) and the privilege checks in [statements.go](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/auth/statements.go#L221). skylite would not copy the rule that a connection without a credential may do anything.
+- Its SQL lockdown choices: extension loading compiled out, `ATTACH` denied for connections with a credential.
 - Redirecting WAL I/O through the VFS ([vfs.go#L580](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/vfs/vfs.go#L580)) and updating SQLite with a script that copies the upstream amalgamation's `sqlite3.c` and `sqlite3.h` over the vendored files ([update_sqlite.sh#L21-L24](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/scripts/update_sqlite.sh#L21-L24)). Whether the vendored files match the upstream amalgamation was not checked.
 - Compression and encryption layered over storage ([durable_database_file_system.go#L31](https://github.com/litebase/litebase/blob/2eb763bced6d3766caebac72a915463f1da5f3a9/pkg/storage/durable_database_file_system.go#L31)), and the page-log and range-file layout as a design reference.
 - Transactions that span HTTP requests with a hard timeout, as a model for the query API.
@@ -185,6 +185,77 @@ From the Litestream reading behind the decision:
 
 - No test was run against Azure or Azurite. The responses to conditional writes that fail, and how the Azure SDK's retries interact with them, were not observed.
 - Per-commit latency under load was not measured.
-- Create-if-absent is the proposed fence, pending the durability spike.
+- Create-if-absent is the proposed fence, pending the durability spike. It stops a writer overwriting an occupied change-file name; it does not by itself make a vacant name conditional on holding the lease. The spike must therefore also pause the old leader, transfer leadership, and resume the old leader before the new leader's first change-file write. Fencing in that interval has not been established.
+- Meeting the minimal-pod-storage requirement for a writable 10 to 100 GB database is unverified. It may need integration beyond a read-only on-demand reader, because the writer path above uses local files.
 - After fencing, compaction, snapshots and deletes must also be gated, not only ordinary L0 uploads, since the compactor deletes through the same client ([compactor.go#L272](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/compactor.go#L272), [compactor.go#L408](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/compactor.go#L408)). Whether the wrapper can gate all of them was not verified.
 - A new leader must restore and establish its position before its first write; Litestream seeds the position from the latest remote L0 file ([db.go#L1698-L1725](https://github.com/benbjohnson/litestream/blob/057d39564c75ebd67ba042410a7ffa05ad4c242d/db.go#L1698-L1725)). Recovery when L0 retention has removed the latest L0 file was not verified.
+
+## Appendix: the storage-layer probe
+
+The probe below was placed in Litebase's `pkg/storage` directory at the evaluated commit, run once, and then removed. It forces the driver's sync eligibility to true and uses two local directories as tiers, so it exercises the tiered driver only: no object storage, no SQL, and one node.
+
+```go
+package storage_test
+
+import (
+	"context"
+	"os"
+	"testing"
+
+	"github.com/litebase/litebase/internal/test"
+	"github.com/litebase/litebase/pkg/server"
+	"github.com/litebase/litebase/pkg/storage"
+)
+
+// Evaluation probe: does a second update made within WriteInterval of the last
+// durable flush survive closing the last descriptor?
+func TestEvalReleaseDropsRecentUpdate(t *testing.T) {
+	test.RunWithApp(t, func(app *server.App) {
+		high := storage.NewFileSystem(storage.NewLocalFileSystemDriver(app.Config.StorageLocalPath + "/eval_high"))
+		low := storage.NewFileSystem(storage.NewLocalFileSystemDriver(app.Config.StorageLocalPath + "/eval_low"))
+		fsd := storage.NewTieredFileSystemDriver(context.Background(), high, low, app.Cluster.MemoryManager,
+			func(ctx context.Context, d *storage.TieredFileSystemDriver) { d.CanSyncDirtyFiles = func() bool { return true } })
+		defer fsd.Shutdown()
+
+		if err := fsd.MkdirAll("eval", 0750); err != nil {
+			t.Fatal(err)
+		}
+		f, err := fsd.OpenFile("eval/file", os.O_RDWR|os.O_CREATE, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteAt([]byte("AAAA"), 0); err != nil {
+			t.Fatal(err)
+		}
+		// Durable flush of "AAAA" while the descriptor stays open.
+		if err := fsd.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		afterFlush, _ := low.ReadFile("eval/file")
+		t.Logf("low tier after flush=%q", afterFlush)
+		if _, err := f.WriteAt([]byte("BBBB"), 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		lowData, _ := low.ReadFile("eval/file")
+		_, highErr := high.Stat("eval/file")
+		viaTiered, _ := fsd.ReadFile("eval/file")
+		t.Logf("low tier=%q highTierStatErr=%v tieredRead=%q", lowData, highErr, viaTiered)
+		if string(viaTiered) != "BBBB" {
+			t.Errorf("acknowledged update lost: got %q want %q", viaTiered, "BBBB")
+		}
+	})
+}
+```
+
+Command and recorded result, on 2026-11-14:
+
+```text
+go test ./pkg/storage -run TestEvalReleaseDropsRecentUpdate
+FAIL: low tier="AAAA", high-tier file removed, tiered read="AAAA"
+```
+
+The result line is a summary of the logged values and the failed assertion, not the verbatim test output. The run was not repeated.
