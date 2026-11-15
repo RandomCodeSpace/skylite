@@ -719,8 +719,9 @@ func TestP2NegativeControl(t *testing.T) {
 // Even iterations model a leader that renews its lease every renewEvery and
 // stops writing once the renewal fails; B must then win within a few
 // attempts. Odd iterations model a leader that ignores the lease and writes
-// back to back: B may starve, which is recorded rather than asserted,
-// because the lease is what provides liveness. Safety is asserted in both.
+// back to back for ignoreFor: B loses slots for as long as A writes, which
+// is recorded rather than asserted, because the lease is what provides
+// liveness. Safety is asserted in both.
 func TestTakeoverRace(t *testing.T) {
 	azuriteEndpoint(t)
 	ctx := context.Background()
@@ -729,6 +730,10 @@ func TestTakeoverRace(t *testing.T) {
 	iterations := int(envInt(t, "SKYLITE_SPIKE_RACE_ROUNDS", 3))
 	// Long enough that A keeps writing through B's first attempts.
 	const renewEvery = 250 * time.Millisecond
+	// Bounded because an unbounded writer also grows an uncompacted L0 tail
+	// that makes each of B's restores slower; in CI that ran to 14,000
+	// files and Azurite stopped accepting connections.
+	const ignoreFor = 3 * time.Second
 	for i := range iterations {
 		honourLease := i%2 == 0
 		container := newContainer(t, az)
@@ -748,10 +753,15 @@ func TestTakeoverRace(t *testing.T) {
 		var aErr error
 		aDone := make(chan struct{})
 		var stop atomic.Bool
+		var aStopped time.Time
 		go func() {
 			defer close(aDone)
+			defer func() { aStopped = time.Now() }()
 			renewed := time.Now()
 			for id := int64(1); !stop.Load(); id++ {
+				if !honourLease && time.Since(renewed) > ignoreFor {
+					return
+				}
 				if honourLease && time.Since(renewed) > renewEvery {
 					if aErr = leaseA.Renew(ctx, az, container); aErr != nil {
 						return
@@ -777,6 +787,7 @@ func TestTakeoverRace(t *testing.T) {
 			}
 		}
 		b, attempts, errB := TakeOffice(ctx, az, container, t.TempDir())
+		bOffice := time.Now()
 		want := map[int64]bool{}
 		epoch := int64(2)
 		switch {
@@ -787,7 +798,7 @@ func TestTakeoverRace(t *testing.T) {
 		case errB != nil:
 			stop.Store(true)
 			<-aDone
-			t.Logf("iteration %d: A ignores the lease and acknowledged %d writes; B starved after %d attempts: %v", i, len(ackedA), attempts, errB)
+			t.Logf("iteration %d: A ignored the lease and acknowledged %d writes; B gave up after %d attempts: %v", i, len(ackedA), attempts, errB)
 			epoch = 1
 		default:
 			for id := int64(1_000_001); id <= 1_000_020; id++ {
@@ -808,8 +819,11 @@ func TestTakeoverRace(t *testing.T) {
 			}
 			_ = b.Close(ctx)
 			how := "by losing the lease"
-			if errors.Is(aErr, ErrFenced) {
+			switch {
+			case errors.Is(aErr, ErrFenced):
 				how = "fenced by B's history"
+			case !honourLease:
+				how = fmt.Sprintf("after ignoring the lease for %s; B was in office %s after A stopped", ignoreFor, bOffice.Sub(aStopped).Round(time.Millisecond))
 			}
 			t.Logf("iteration %d: A acknowledged %d writes and stopped %s; B took office in %d attempt(s)", i, len(ackedA), how, attempts)
 		}

@@ -35,7 +35,9 @@ integration:
 	endpoint="http://127.0.0.1:$$port/devstoreaccount1"; \
 	for i in $$(seq 60); do curl -s -o /dev/null "$$endpoint" && break; sleep 1; done; \
 	curl -s -o /dev/null "$$endpoint" || { echo "integration: Azurite did not start" >&2; exit 1; }; \
-	SKYLITE_TEST_AZURITE_BLOB_ENDPOINT="$$endpoint" go test -race -count=1 -timeout $(INTEGRATION_TIMEOUT) -tags integration ./...
+	rc=0; SKYLITE_TEST_AZURITE_BLOB_ENDPOINT="$$endpoint" go test -race -count=1 -timeout $(INTEGRATION_TIMEOUT) -tags integration ./... || rc=$$?; \
+	if [ $$rc -ne 0 ]; then echo "integration: last Azurite log lines:" >&2; docker logs --tail 50 "$$name" >&2 || true; fi; \
+	exit $$rc
 
 # Documentation site (Hugo). Run from the repository root.
 #
