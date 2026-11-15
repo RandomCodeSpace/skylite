@@ -3,9 +3,11 @@ package auth
 import "path"
 
 // Authorize reports whether p holds at least role need on database. It is
-// deny by default: without a matching rule the answer is false.
+// deny by default: without a matching rule the answer is false, and a name
+// that is not a valid database name is denied before any rule is read.
+// Subjects, claim values and names are compared exactly, byte for byte.
 func (g *Guard) Authorize(p *Principal, database string, need Role) bool {
-	if p == nil || database == "" || need.rank() == 0 {
+	if p == nil || !validDatabaseName(database) || need.rank() == 0 {
 		return false
 	}
 	for _, r := range g.rules {
@@ -35,5 +37,5 @@ func (r Rule) matches(p *Principal) bool {
 
 func matchDatabase(pattern, name string) bool {
 	ok, err := path.Match(pattern, name)
-	return err == nil && ok // Config.Validate rejects bad patterns
+	return err == nil && ok // Config.Validate rejects bad patterns; one that slips through grants nothing
 }

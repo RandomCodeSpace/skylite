@@ -1,6 +1,9 @@
 package auth
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const (
 	issA = "https://a.example"
@@ -19,6 +22,17 @@ func TestConfigValidate(t *testing.T) {
 		{Issuers: iss, Rules: []Rule{rule}},
 		{Issuers: []Issuer{{Issuer: "kubernetes", Audience: "aud", JWKSFile: "/jwks.json"}}},
 		withRule(func(r *Rule) { r.Subject, r.Claim, r.Value = "", "groups", "analysts" }),
+		withRule(func(r *Rule) { r.Database = "a" }),
+		withRule(func(r *Rule) { r.Database = "z" }),
+		withRule(func(r *Rule) { r.Database = "9" }),
+		withRule(func(r *Rule) { r.Database = "0-db_1" }),
+		withRule(func(r *Rule) { r.Database = strings.Repeat("a", 63) }),
+		withRule(func(r *Rule) { r.Database = "*" }),
+		withRule(func(r *Rule) { r.Database = "?x" }),
+		withRule(func(r *Rule) { r.Database = "*_reports" }),
+		withRule(func(r *Rule) { r.Database = "report_*" }),
+		{Issuers: []Issuer{{Issuer: issA + "/tenant/v2.0", Audience: "aud"}}},
+		{Issuers: []Issuer{{Issuer: "any value, with ? and #", Audience: "aud", JWKSFile: "/jwks.json"}}},
 	}
 	for i, cfg := range good {
 		if err := cfg.Validate(); err != nil {
@@ -26,22 +40,40 @@ func TestConfigValidate(t *testing.T) {
 		}
 	}
 	bad := map[string]Config{
-		"no issuers":                {},
-		"empty issuer":              {Issuers: []Issuer{{Audience: "aud"}}},
-		"empty audience":            {Issuers: []Issuer{{Issuer: issA}}},
-		"http issuer":               {Issuers: []Issuer{{Issuer: "http://a.example", Audience: "aud"}}},
-		"issuer without host":       {Issuers: []Issuer{{Issuer: "https:///path", Audience: "aud"}}},
-		"issuer with query":         {Issuers: []Issuer{{Issuer: issA + "?x=1", Audience: "aud"}}},
-		"issuer with user info":     {Issuers: []Issuer{{Issuer: "https://user@a.example", Audience: "aud"}}},
-		"issuer twice":              {Issuers: append(iss, iss...)},
-		"rule for unknown issuer":   withRule(func(r *Rule) { r.Issuer = issB }),
-		"subject and claim":         withRule(func(r *Rule) { r.Claim, r.Value = "groups", "x" }),
-		"neither subject nor claim": withRule(func(r *Rule) { r.Subject = "" }),
-		"claim without value":       withRule(func(r *Rule) { r.Subject, r.Claim = "", "groups" }),
-		"empty database":            withRule(func(r *Rule) { r.Database = "" }),
-		"bad pattern":               withRule(func(r *Rule) { r.Database = "[" }),
-		"unknown role":              withRule(func(r *Rule) { r.Role = "owner" }),
-		"empty role":                withRule(func(r *Rule) { r.Role = "" }),
+		"no issuers":                   {},
+		"empty issuer":                 {Issuers: []Issuer{{Audience: "aud"}}},
+		"empty audience":               {Issuers: []Issuer{{Issuer: issA}}},
+		"http issuer":                  {Issuers: []Issuer{{Issuer: "http://a.example", Audience: "aud"}}},
+		"issuer without host":          {Issuers: []Issuer{{Issuer: "https:///path", Audience: "aud"}}},
+		"issuer with query":            {Issuers: []Issuer{{Issuer: issA + "?x=1", Audience: "aud"}}},
+		"issuer with empty query":      {Issuers: []Issuer{{Issuer: issA + "?", Audience: "aud"}}},
+		"issuer with fragment":         {Issuers: []Issuer{{Issuer: issA + "#x", Audience: "aud"}}},
+		"issuer with empty fragment":   {Issuers: []Issuer{{Issuer: issA + "#", Audience: "aud"}}},
+		"issuer with a space":          {Issuers: []Issuer{{Issuer: issA + "/a b", Audience: "aud"}}},
+		"issuer with a no-break space": {Issuers: []Issuer{{Issuer: issA + "/a\u00a0b", Audience: "aud"}}},
+		"issuer with user info":        {Issuers: []Issuer{{Issuer: "https://user@a.example", Audience: "aud"}}},
+		"issuer twice":                 {Issuers: append(iss, iss...)},
+		"rule for unknown issuer":      withRule(func(r *Rule) { r.Issuer = issB }),
+		"subject and claim":            withRule(func(r *Rule) { r.Claim, r.Value = "groups", "x" }),
+		"neither subject nor claim":    withRule(func(r *Rule) { r.Subject = "" }),
+		"claim without value":          withRule(func(r *Rule) { r.Subject, r.Claim = "", "groups" }),
+		"empty database":               withRule(func(r *Rule) { r.Database = "" }),
+		"bad pattern":                  withRule(func(r *Rule) { r.Database = "[" }),
+		"character class":              withRule(func(r *Rule) { r.Database = "orders[1]" }),
+		"escape":                       withRule(func(r *Rule) { r.Database = `a\*` }),
+		"upper case":                   withRule(func(r *Rule) { r.Database = "Orders" }),
+		"upper case inside":            withRule(func(r *Rule) { r.Database = "orDers" }),
+		"dot inside":                   withRule(func(r *Rule) { r.Database = "a.b" }),
+		"slash":                        withRule(func(r *Rule) { r.Database = "a/b" }),
+		"dot":                          withRule(func(r *Rule) { r.Database = "." }),
+		"dot dot":                      withRule(func(r *Rule) { r.Database = ".." }),
+		"leading hyphen":               withRule(func(r *Rule) { r.Database = "-x" }),
+		"leading underscore":           withRule(func(r *Rule) { r.Database = "_*" }),
+		"64 bytes":                     withRule(func(r *Rule) { r.Database = strings.Repeat("a", 64) }),
+		"non-ASCII":                    withRule(func(r *Rule) { r.Database = "caf\u00e9" }),
+		"space":                        withRule(func(r *Rule) { r.Database = "a b" }),
+		"unknown role":                 withRule(func(r *Rule) { r.Role = "owner" }),
+		"empty role":                   withRule(func(r *Rule) { r.Role = "" }),
 	}
 	for name, cfg := range bad {
 		if err := cfg.Validate(); err == nil {
@@ -63,6 +95,7 @@ func TestAuthorize(t *testing.T) {
 			{Issuer: issA, Claim: "groups", Value: "analysts", Database: "report_*", Role: RoleRead},
 			{Issuer: issA, Claim: "roles", Value: "skylite.writer", Database: "inventory", Role: RoleWrite},
 			{Issuer: issB, Subject: "alice", Database: "b_only", Role: RoleRead},
+			{Issuer: issA, Subject: "frank", Database: "a?c", Role: RoleRead},
 		},
 	}
 	g, err := New(cfg, nil, nil, nil)
@@ -77,6 +110,7 @@ func TestAuthorize(t *testing.T) {
 		return &Principal{Issuer: iss, Subject: sub, Claims: claims}
 	}
 	alice, bob, carol := p(issA, "alice", nil), p(issA, "bob", nil), p(issA, "carol", nil)
+	group := func(v any) *Principal { return p(issA, "erin", map[string]any{"groups": v}) }
 	analyst := p(issA, "dave", map[string]any{"groups": []any{"staff", "analysts"}})
 	cases := []struct {
 		name string
@@ -98,6 +132,34 @@ func TestAuthorize(t *testing.T) {
 		{"admin includes write", g, carol, "anything", RoleWrite, true},
 		{"admin grants admin", g, carol, "anything", RoleAdmin, true},
 		{"empty database name", g, carol, "", RoleRead, false},
+		{"one-character name", g, carol, "a", RoleRead, true},
+		{"name starting with z", g, carol, "z", RoleRead, true},
+		{"name starting with 9", g, carol, "9", RoleRead, true},
+		{"upper case inside a name", g, carol, "orDers", RoleRead, false},
+		{"dot inside a name", g, carol, "a.b", RoleRead, false},
+		{"63-byte name", g, carol, strings.Repeat("a", 63), RoleRead, true},
+		{"name of every allowed character", g, carol, "0az9-_", RoleRead, true},
+		{"64-byte name", g, carol, strings.Repeat("a", 64), RoleRead, false},
+		{"upper-case name", g, carol, "Orders", RoleRead, false},
+		{"name with a slash", g, carol, "a/b", RoleRead, false},
+		{"name dot", g, carol, ".", RoleRead, false},
+		{"name dot dot", g, carol, "..", RoleRead, false},
+		{"name with a leading hyphen", g, carol, "-x", RoleRead, false},
+		{"name with a leading underscore", g, carol, "_x", RoleRead, false},
+		{"name with NUL", g, carol, "a\x00b", RoleRead, false},
+		{"non-ASCII name", g, carol, "caf\u00e9", RoleRead, false},
+		{"subject with a suffix", g, p(issA, "alice2", nil), "orders", RoleRead, false},
+		{"subject prefix", g, p(issA, "alic", nil), "orders", RoleRead, false},
+		{"subject inside another", g, p(issA, "xalicex", nil), "orders", RoleRead, false},
+		{"subject in another case", g, p(issA, "Alice", nil), "orders", RoleRead, false},
+		{"claim string with a suffix", g, group("analysts2"), "report_q1", RoleRead, false},
+		{"claim string containing the value", g, group("xanalystsx"), "report_q1", RoleRead, false},
+		{"claim string prefix", g, group("analyst"), "report_q1", RoleRead, false},
+		{"claim string in another case", g, group("Analysts"), "report_q1", RoleRead, false},
+		{"claim entries near the value", g, group([]any{"analysts2", "Analysts", "analyst"}), "report_q1", RoleRead, false},
+		{"pattern ? matches one character", g, p(issA, "frank", nil), "abc", RoleRead, true},
+		{"pattern ? needs a character", g, p(issA, "frank", nil), "ac", RoleRead, false},
+		{"pattern ? matches only one", g, p(issA, "frank", nil), "abbc", RoleRead, false},
 		{"unknown role required", g, carol, "orders", "owner", false},
 		{"pattern matches", g, analyst, "report_q1", RoleRead, true},
 		{"pattern does not match", g, analyst, "reports", RoleRead, false},
@@ -115,6 +177,18 @@ func TestAuthorize(t *testing.T) {
 	for _, tc := range cases {
 		if got := tc.g.Authorize(tc.p, tc.db, tc.need); got != tc.want {
 			t.Errorf("%s: Authorize = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestBadPatternNeverGrants(t *testing.T) {
+	// Config.Validate rejects these; a Guard built around it must still deny.
+	for _, pattern := range []string{"[", `\`, "a["} {
+		g := &Guard{rules: []Rule{{Issuer: issA, Subject: "alice", Database: pattern, Role: RoleAdmin}}}
+		for _, db := range []string{"a", "x"} {
+			if g.Authorize(&Principal{Issuer: issA, Subject: "alice"}, db, RoleRead) {
+				t.Errorf("pattern %q granted %q", pattern, db)
+			}
 		}
 	}
 }

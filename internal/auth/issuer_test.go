@@ -93,7 +93,9 @@ type testIssuer struct {
 	url           string
 	mu            sync.Mutex
 	jwks          []byte
-	discoveryIss  string // issuer named by the discovery document; defaults to url
+	discovery     map[string]any // members that replace those of the discovery document
+	redirect      string         // if set, discovery answers with a redirect to it
+	status        atomic.Int64   // if set, the status of every response; the body is unchanged
 	jwksHits      atomic.Int64
 	discoveryHits atomic.Int64
 }
@@ -104,19 +106,27 @@ func newIssuer(t *testing.T, keys ...signingKey) *testIssuer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		ti.discoveryHits.Add(1)
+		doc := map[string]any{"issuer": ti.url, "jwks_uri": ti.url + "/jwks"}
 		ti.mu.Lock()
-		iss := ti.discoveryIss
-		ti.mu.Unlock()
-		if iss == "" {
-			iss = ti.url
+		for k, v := range ti.discovery {
+			doc[k] = v
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"issuer": iss, "jwks_uri": ti.url + "/jwks"})
+		redirect := ti.redirect
+		ti.mu.Unlock()
+		if redirect != "" {
+			w.Header().Set("Location", redirect)
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		ti.writeStatus(w)
+		_ = json.NewEncoder(w).Encode(doc)
 	})
 	mux.HandleFunc("GET /jwks", func(w http.ResponseWriter, _ *http.Request) {
 		ti.jwksHits.Add(1)
 		ti.mu.Lock()
 		b := ti.jwks
 		ti.mu.Unlock()
+		ti.writeStatus(w)
 		_, _ = w.Write(b)
 	})
 	ti.srv = httptest.NewTLSServer(mux)
@@ -140,11 +150,34 @@ func (ti *testIssuer) setJWKS(b []byte) {
 	ti.mu.Unlock()
 }
 
-func (ti *testIssuer) setDiscoveryIssuer(iss string) {
+func (ti *testIssuer) writeStatus(w http.ResponseWriter) {
+	if s := ti.status.Load(); s != 0 {
+		w.WriteHeader(int(s))
+	}
+}
+
+// setDiscovery sets member k of the discovery document to v.
+func (ti *testIssuer) setDiscovery(k string, v any) {
 	ti.mu.Lock()
-	ti.discoveryIss = iss
+	if ti.discovery == nil {
+		ti.discovery = map[string]any{}
+	}
+	ti.discovery[k] = v
 	ti.mu.Unlock()
 }
+
+func (ti *testIssuer) setDiscoveryIssuer(iss string) { ti.setDiscovery("issuer", iss) }
+
+func (ti *testIssuer) setRedirect(u string) {
+	ti.mu.Lock()
+	ti.redirect = u
+	ti.mu.Unlock()
+}
+
+// roundTripFunc is an http.RoundTripper for tests that observe or replace requests.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // claims are valid claims for ti at the clock's time; tests then change them.
 func (ti *testIssuer) claims(c *fakeClock) map[string]any {

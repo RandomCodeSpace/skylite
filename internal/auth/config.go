@@ -13,7 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"path"
+	"strings"
+	"unicode"
 )
 
 // Config is the authentication and authorisation configuration of a server.
@@ -27,7 +28,8 @@ type Config struct {
 // Issuer is one trusted token issuer.
 type Issuer struct {
 	// Issuer is the exact value tokens carry in their iss claim. Unless
-	// JWKSFile is set, it must be an https URL, and the issuer's discovery
+	// JWKSFile is set, it must be an https URL without query, fragment, user
+	// info or white space, and the issuer's discovery
 	// document is fetched from Issuer + "/.well-known/openid-configuration".
 	Issuer string
 	// Audience is the value a token's aud claim must contain.
@@ -73,7 +75,11 @@ type Rule struct {
 	Claim string
 	// Value is the string the claim must equal or contain.
 	Value string
-	// Database is a database name or a pattern in the syntax of [path.Match].
+	// Database is a database name, which is 1 to 63 bytes of lower-case ASCII
+	// letters, digits, '-' and '_', starting with a letter or a digit, or a pattern.
+	// A pattern may also hold '*', which matches any run of characters, and
+	// '?', which matches one character. It is 1 to 63 bytes long and starts
+	// with a letter, a digit, '*' or '?'.
 	Database string
 	Role     Role
 }
@@ -112,8 +118,9 @@ func (iss Issuer) validate() error {
 		return nil
 	}
 	u, err := url.Parse(iss.Issuer)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-		return fmt.Errorf("issuer %q is not an https URL without query, fragment or user info", iss.Issuer)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil ||
+		strings.ContainsAny(iss.Issuer, "?#") || strings.IndexFunc(iss.Issuer, unicode.IsSpace) >= 0 {
+		return fmt.Errorf("issuer %q is not an https URL without query, fragment, user info or white space", iss.Issuer)
 	}
 	return nil
 }
@@ -128,14 +135,28 @@ func (r Rule) validate(issuers map[string]bool) error {
 	if r.Claim != "" && r.Value == "" {
 		return errors.New("claim rule has an empty value")
 	}
-	if r.Database == "" {
-		return errors.New("database is empty")
-	}
-	if _, err := path.Match(r.Database, ""); err != nil {
-		return fmt.Errorf("database pattern %q: %w", r.Database, err)
+	if !validDatabasePattern(r.Database) {
+		return fmt.Errorf("database %q is not a valid database name or pattern", r.Database)
 	}
 	if r.Role.rank() == 0 {
 		return fmt.Errorf("unknown role %q", r.Role)
 	}
 	return nil
 }
+
+// validDatabaseName reports whether name is a valid database name: 1 to 63
+// bytes of lower-case ASCII letters, digits, '-' and '_', starting with a
+// letter or a digit.
+func validDatabaseName(name string) bool {
+	return len(name) <= 63 && name != "" && nameStart(name[0]) && strings.Trim(name, nameChars) == ""
+}
+
+// validDatabasePattern reports whether p is a valid database name in which
+// '*' and '?' may also appear. Every such pattern matches some valid name.
+func validDatabasePattern(p string) bool {
+	return len(p) <= 63 && p != "" && (nameStart(p[0]) || p[0] == '*' || p[0] == '?') && strings.Trim(p, nameChars+"*?") == ""
+}
+
+const nameChars = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+
+func nameStart(c byte) bool { return 'a' <= c && c <= 'z' || '0' <= c && c <= '9' }

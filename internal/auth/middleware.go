@@ -52,7 +52,7 @@ func (g *Guard) Require(need Role, database func(*http.Request) string, next htt
 		db := database(r)
 		if !g.Authorize(p, db, need) {
 			attrs := refusalAttrs(&Error{Code: CodeForbidden, Issuer: p.Issuer, Subject: p.Subject}, token)
-			attrs = append(attrs, slog.String("database", db), slog.String("role", string(need)))
+			attrs = append(attrs, slog.String("database", clip(db)), slog.String("role", string(need)))
 			g.log.LogAttrs(r.Context(), slog.LevelInfo, "auth: request refused", attrs...)
 			w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope"`)
 			http.Error(w, string(CodeForbidden), http.StatusForbidden)
@@ -72,20 +72,22 @@ func bearerToken(h http.Header) (string, error) {
 	if len(values) == 0 {
 		return "", &Error{Code: CodeMissingToken}
 	}
+	// RFC 7235 allows one or more spaces after the scheme.
 	scheme, token, _ := strings.Cut(values[0], " ")
+	token = strings.TrimLeft(token, " ")
 	if !strings.EqualFold(scheme, "Bearer") || token == "" {
 		return "", &Error{Code: CodeMissingToken}
 	}
 	return token, nil
 }
 
-// refusalAttrs are the log attributes of a refusal. The token itself is
-// represented only by a prefix of its SHA-256 hash.
+// refusalAttrs are the log attributes of a refusal, each value cut to 200
+// bytes. The token itself is represented only by a prefix of its SHA-256 hash.
 func refusalAttrs(e *Error, token string) []slog.Attr {
 	attrs := []slog.Attr{slog.String("code", string(e.Code))}
 	for _, a := range []struct{ k, v string }{{"issuer", e.Issuer}, {"subject", e.Subject}, {"kid", e.KeyID}} {
 		if a.v != "" {
-			attrs = append(attrs, slog.String(a.k, a.v))
+			attrs = append(attrs, slog.String(a.k, clip(a.v)))
 		}
 	}
 	if token != "" {

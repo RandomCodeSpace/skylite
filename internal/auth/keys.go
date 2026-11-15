@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +36,27 @@ const (
 	minRefreshInterval = time.Minute
 	// minRSABits is the smallest RSA key accepted.
 	minRSABits = 2048
+	// maxLoggedValue bounds a value from a remote document or a token copied into an error or a log line.
+	maxLoggedValue = 200
 )
+
+// errRedirect refuses every redirect: no key or discovery request goes to a URL chosen by a redirect.
+var errRedirect = errors.New("redirects are not followed")
+
+// noRedirects returns a shallow copy of client that follows no redirect.
+func noRedirects(client *http.Client) *http.Client {
+	c := *client
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return errRedirect }
+	return &c
+}
+
+// clip bounds s to maxLoggedValue bytes.
+func clip(s string) string {
+	if len(s) <= maxLoggedValue {
+		return s
+	}
+	return s[:maxLoggedValue] + "..."
+}
 
 // keySource holds one issuer's signing keys and refreshes them on demand.
 // It starts no goroutines: refreshes run in the calling request.
@@ -62,14 +83,9 @@ func (s *keySource) key(ctx context.Context, kid string) (jose.JSONWebKey, Code)
 		return k, ""
 	case found && usable:
 		// The cached key is still good enough: refresh only if no other request is already doing so.
-		if s.fetchMu.TryLock() {
-			s.refresh(ctx)
-			s.fetchMu.Unlock()
-		}
+		s.refreshExclusive(ctx, true)
 	default:
-		s.fetchMu.Lock()
-		s.refresh(ctx)
-		s.fetchMu.Unlock()
+		s.refreshExclusive(ctx, false)
 	}
 	k, found, _, usable = s.lookup(kid)
 	switch {
@@ -79,6 +95,19 @@ func (s *keySource) key(ctx context.Context, kid string) (jose.JSONWebKey, Code)
 		return jose.JSONWebKey{}, CodeUnknownKey
 	}
 	return k, ""
+}
+
+// refreshExclusive runs refresh while holding fetchMu, and releases it on
+// every path, a panic included. With try set, it does nothing if another
+// request holds fetchMu.
+func (s *keySource) refreshExclusive(ctx context.Context, try bool) {
+	if !try {
+		s.fetchMu.Lock()
+	} else if !s.fetchMu.TryLock() {
+		return
+	}
+	defer s.fetchMu.Unlock()
+	s.refresh(ctx)
 }
 
 func (s *keySource) lookup(kid string) (k jose.JSONWebKey, found, fresh, usable bool) {
@@ -133,13 +162,13 @@ func (s *keySource) fetch(ctx context.Context) (map[string]jose.JSONWebKey, erro
 		JWKSURI string `json:"jwks_uri"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, fmt.Errorf("discovery document is not valid JSON: %w", err)
+		return nil, fmt.Errorf("discovery document is not valid JSON: %s", clip(err.Error()))
 	}
 	if doc.Issuer != s.issuer.Issuer {
-		return nil, fmt.Errorf("discovery document names issuer %q", doc.Issuer)
+		return nil, fmt.Errorf("discovery document names issuer %q", clip(doc.Issuer))
 	}
 	if u, err := url.Parse(doc.JWKSURI); err != nil || u.Scheme != "https" || u.Host == "" {
-		return nil, fmt.Errorf("discovery document jwks_uri %q is not an https URL", doc.JWKSURI)
+		return nil, fmt.Errorf("discovery document jwks_uri %q is not an https URL", clip(doc.JWKSURI))
 	}
 	raw, err = s.get(ctx, doc.JWKSURI)
 	if err != nil {
@@ -151,19 +180,20 @@ func (s *keySource) fetch(ctx context.Context) (map[string]jose.JSONWebKey, erro
 func (s *keySource) get(ctx context.Context, u string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("GET %s: %s", clip(u), clip(err.Error()))
 	}
 	req.Header.Set("Accept", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, err
+		// A *url.Error repeats the URL, or a redirect's Location; report only its cause.
+		if ue, ok := errors.AsType[*url.Error](err); ok {
+			err = ue.Err
+		}
+		return nil, fmt.Errorf("GET %s: %s", clip(u), clip(err.Error()))
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.Request.URL.Scheme != "https" {
-		return nil, fmt.Errorf("GET %s: redirected to a URL that is not https", u)
-	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: status %d", u, resp.StatusCode)
+		return nil, fmt.Errorf("GET %s: status %d", clip(u), resp.StatusCode)
 	}
 	return readLimited(resp.Body, u)
 }
@@ -180,28 +210,34 @@ func readFile(name string) ([]byte, error) {
 func readLimited(r io.Reader, name string) ([]byte, error) {
 	b, err := io.ReadAll(io.LimitReader(r, maxDocumentSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", name, err)
+		return nil, fmt.Errorf("reading %s: %s", clip(name), clip(err.Error()))
 	}
 	if len(b) > maxDocumentSize {
-		return nil, fmt.Errorf("%s is larger than %d bytes", name, maxDocumentSize)
+		return nil, fmt.Errorf("%s is larger than %d bytes", clip(name), maxDocumentSize)
 	}
 	return b, nil
 }
 
 // parseKeySet returns the usable signing keys of a JWKS by key id. Keys
-// without an id, not for signing, of an unsupported type, or that do not
-// parse are skipped; a set with no usable key is an error.
+// without an id, not for signing (a use other than sig, or a key_ops without
+// verify), of an unsupported type, or that do not parse are skipped; of two
+// keys with one id, the first usable one is kept. A set with no usable key
+// is an error.
 func parseKeySet(raw []byte) (map[string]jose.JSONWebKey, error) {
 	var set struct {
 		Keys []json.RawMessage `json:"keys"`
 	}
 	if err := json.Unmarshal(raw, &set); err != nil {
-		return nil, fmt.Errorf("JWKS is not valid JSON: %w", err)
+		return nil, fmt.Errorf("JWKS is not valid JSON: %s", clip(err.Error()))
 	}
 	keys := make(map[string]jose.JSONWebKey, len(set.Keys))
 	for _, r := range set.Keys {
 		var k jose.JSONWebKey
-		if k.UnmarshalJSON(r) != nil || k.KeyID == "" || (k.Use != "" && k.Use != "sig") {
+		var ops struct {
+			KeyOps []string `json:"key_ops"` // go-jose does not decode key_ops
+		}
+		if k.UnmarshalJSON(r) != nil || k.KeyID == "" || (k.Use != "" && k.Use != "sig") ||
+			json.Unmarshal(r, &ops) != nil || (ops.KeyOps != nil && !slices.Contains(ops.KeyOps, "verify")) {
 			continue
 		}
 		k = k.Public() // drops private material, if a careless issuer published any

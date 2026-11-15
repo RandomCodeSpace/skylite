@@ -21,9 +21,11 @@ const (
 	maxLoggedKeyID = 64
 )
 
-// acceptedAlgorithms are the only signature algorithms accepted: asymmetric,
-// never HMAC, never "none".
-var acceptedAlgorithms = []jose.SignatureAlgorithm{jose.RS256, jose.ES256, jose.EdDSA}
+// acceptedAlgorithms returns the only signature algorithms accepted:
+// asymmetric, never HMAC, never "none".
+func acceptedAlgorithms() []jose.SignatureAlgorithm {
+	return []jose.SignatureAlgorithm{jose.RS256, jose.ES256, jose.EdDSA}
+}
 
 // Code is a stable identifier for why a request was refused.
 type Code string
@@ -49,7 +51,8 @@ const (
 
 // Error is a refused token or request. Its fields are safe to log: Issuer is
 // set only when it equals a configured issuer, Subject only when the token's
-// signature verified, and KeyID only when it is short.
+// signature verified and then cut to 200 bytes, and KeyID only when it is at
+// most 64 bytes long.
 type Error struct {
 	Code    Code
 	Issuer  string
@@ -65,6 +68,9 @@ type Principal struct {
 	Issuer  string
 	Subject string
 	Claims  map[string]any
+	// Expires is the token's exp. The principal must not be used after it,
+	// for example on a long-lived connection.
+	Expires time.Time
 }
 
 // Guard verifies bearer tokens and authorises principals.
@@ -77,7 +83,7 @@ type Guard struct {
 
 // New validates cfg and returns a Guard. client fetches discovery documents
 // and key sets; each fetch is bounded by its own timeout, so client needs
-// none. now is the clock and log receives refusals and key refresh failures.
+// none, and a copy of it that follows no redirect is used. now is the clock and log receives refusals and key refresh failures.
 // A nil client, now or log means http.DefaultClient, time.Now or no logging.
 // New makes no network request.
 func New(cfg Config, client *http.Client, now func() time.Time, log *slog.Logger) (*Guard, error) {
@@ -93,6 +99,7 @@ func New(cfg Config, client *http.Client, now func() time.Time, log *slog.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	client = noRedirects(client)
 	g := &Guard{sources: make(map[string]*keySource, len(cfg.Issuers)), rules: cfg.Rules, now: now, log: log}
 	for _, iss := range cfg.Issuers {
 		g.sources[iss.Issuer] = &keySource{issuer: iss, client: client, now: now, log: log}
@@ -108,7 +115,7 @@ func (g *Guard) Verify(ctx context.Context, token string) (*Principal, error) {
 	if len(token) > MaxTokenSize {
 		return nil, &Error{Code: CodeTokenTooLarge}
 	}
-	tok, err := jwt.ParseSigned(token, acceptedAlgorithms)
+	tok, err := jwt.ParseSigned(token, acceptedAlgorithms())
 	if err != nil {
 		if _, ok := errors.AsType[*jose.ErrUnexpectedSignatureAlgorithm](err); ok {
 			return nil, &Error{Code: CodeUnsupportedAlgorithm}
@@ -149,7 +156,7 @@ func (g *Guard) Verify(ctx context.Context, token string) (*Principal, error) {
 		// The signature verified, so the payload is signed but its claims have the wrong types.
 		return nil, e.with(CodeMalformed)
 	}
-	e.Subject = std.Subject
+	e.Subject = clip(std.Subject)
 	switch {
 	case std.Subject == "", std.Expiry == nil, len(std.Audience) == 0:
 		return nil, e.with(CodeMissingClaim)
@@ -157,7 +164,7 @@ func (g *Guard) Verify(ctx context.Context, token string) (*Principal, error) {
 	err = std.ValidateWithLeeway(jwt.Expected{Issuer: src.issuer.Issuer, AnyAudience: jwt.Audience{src.issuer.Audience}, Time: g.now()}, ClockSkew)
 	switch {
 	case err == nil:
-		return &Principal{Issuer: std.Issuer, Subject: std.Subject, Claims: all}, nil
+		return &Principal{Issuer: std.Issuer, Subject: std.Subject, Claims: all, Expires: std.Expiry.Time()}, nil
 	case errors.Is(err, jwt.ErrInvalidAudience):
 		return nil, e.with(CodeInvalidAudience)
 	case errors.Is(err, jwt.ErrExpired):

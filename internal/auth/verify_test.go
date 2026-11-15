@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,16 +27,23 @@ import (
 
 func newGuard(t *testing.T, c *fakeClock, issuers ...*testIssuer) *Guard {
 	t.Helper()
+	g, _ := newGuardWith(t, c, issuers[0].srv.Client(), issuers...)
+	return g
+}
+
+// newGuardWith is newGuard with the given client, returning the log as well.
+func newGuardWith(t *testing.T, c *fakeClock, client *http.Client, issuers ...*testIssuer) (*Guard, *lockedBuffer) {
+	t.Helper()
 	cfg := Config{}
 	for _, ti := range issuers {
 		cfg.Issuers = append(cfg.Issuers, Issuer{Issuer: ti.url, Audience: testAudience})
 	}
-	log, _ := newLogger()
-	g, err := New(cfg, issuers[0].srv.Client(), c.Now, log)
+	log, logs := newLogger()
+	g, err := New(cfg, client, c.Now, log)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return g
+	return g, logs
 }
 
 // wantCode fails unless err is an *Error with code want, and checks that the
@@ -53,7 +61,7 @@ func wantCode(t *testing.T, token string, err error, want Code) {
 }
 
 func TestVerifyAcceptsEachAlgorithm(t *testing.T) {
-	for _, alg := range acceptedAlgorithms {
+	for _, alg := range []jose.SignatureAlgorithm{jose.RS256, jose.ES256, jose.EdDSA} {
 		t.Run(string(alg), func(t *testing.T) {
 			c := newClock()
 			k := newKey(t, "k-"+string(alg), alg)
@@ -64,6 +72,9 @@ func TestVerifyAcceptsEachAlgorithm(t *testing.T) {
 			p, err := g.Verify(context.Background(), sign(t, k, claims))
 			if err != nil {
 				t.Fatalf("Verify: %v", err)
+			}
+			if want := time.Unix(claims["exp"].(int64), 0); !p.Expires.Equal(want) {
+				t.Errorf("Expires %v, want %v", p.Expires, want)
 			}
 			if p.Issuer != ti.url || p.Subject != "system:serviceaccount:apps:orders" {
 				t.Errorf("principal (%s, %s)", p.Issuer, p.Subject)
@@ -136,9 +147,10 @@ func TestVerifyRejects(t *testing.T) {
 		{"issuer differs by trailing slash", sign(t, rsaKey, with(func(m map[string]any) { m["iss"] = ti.url + "/" })), CodeUntrustedIssuer},
 		{"key of another trusted issuer", sign(t, otherKey, ti.claims(c)), CodeUnknownKey},
 		{"wrong audience", sign(t, rsaKey, with(func(m map[string]any) { m["aud"] = "someone-else" })), CodeInvalidAudience},
-		{"expired beyond skew", sign(t, rsaKey, with(func(m map[string]any) { m["exp"] = now - int64(ClockSkew/time.Second) - 1 })), CodeExpired},
+		{"expired 61 s ago", sign(t, rsaKey, with(func(m map[string]any) { m["exp"] = now - 61 })), CodeExpired},
 		{"expired two minutes ago", sign(t, rsaKey, with(func(m map[string]any) { m["exp"] = now - 120 })), CodeExpired},
-		{"not yet valid beyond skew", sign(t, rsaKey, with(func(m map[string]any) { m["nbf"] = now + int64(ClockSkew/time.Second) + 1 })), CodeNotYetValid},
+		{"valid in 61 s", sign(t, rsaKey, with(func(m map[string]any) { m["nbf"] = now + 61 })), CodeNotYetValid},
+		{"issued in 61 s", sign(t, rsaKey, with(func(m map[string]any) { m["iat"] = now + 61 })), CodeIssuedInFuture},
 		{"valid in two minutes", sign(t, rsaKey, with(func(m map[string]any) { m["nbf"] = now + 120 })), CodeNotYetValid},
 		{"issued in the future", sign(t, rsaKey, with(func(m map[string]any) { m["iat"] = now + 3600 })), CodeIssuedInFuture},
 		{"missing sub", sign(t, rsaKey, with(func(m map[string]any) { delete(m, "sub") })), CodeMissingClaim},
@@ -159,6 +171,8 @@ func TestVerifyRejects(t *testing.T) {
 		{"no kid", sign(t, signingKey{alg: rsaKey.alg, priv: rsaKey.priv}, ti.claims(c)), CodeUnknownKey},
 		{"oversized", sign(t, rsaKey, with(func(m map[string]any) { m["pad"] = strings.Repeat("a", MaxTokenSize) })), CodeTokenTooLarge},
 		{"empty", "", CodeMissingToken},
+		{"16,384 bytes is not too large", strings.Repeat("a", 16384), CodeMalformed},
+		{"16,385 bytes is too large", strings.Repeat("a", 16385), CodeTokenTooLarge},
 		{"one segment", "abcdefghijkl", CodeMalformed},
 		{"two segments", parts[0] + "." + parts[1], CodeMalformed},
 		{"four segments", valid + ".abcd", CodeMalformed},
@@ -183,7 +197,7 @@ func TestVerifyClockSkew(t *testing.T) {
 	ti := newIssuer(t, k)
 	g := newGuard(t, c, ti)
 	now := c.Now().Unix()
-	skew := int64(ClockSkew / time.Second)
+	const skew = 60
 	for name, change := range map[string]func(map[string]any){
 		"expired within skew":       func(m map[string]any) { m["exp"] = now - skew },
 		"not yet valid within skew": func(m map[string]any) { m["nbf"] = now + skew },
@@ -242,7 +256,14 @@ func TestUnknownKeyIDsDoNotCauseUnboundedFetches(t *testing.T) {
 	if n := ti.jwksHits.Load(); n != 1 {
 		t.Errorf("%d JWKS fetches after tokens from an untrusted issuer, want 1", n)
 	}
-	c.Add(minRefreshInterval)
+	c.Add(59 * time.Second)
+	attacker.kid = "still-within-the-minute"
+	_, err := g.Verify(context.Background(), sign(t, attacker, ti.claims(c)))
+	wantCode(t, "", err, CodeUnknownKey)
+	if n := ti.jwksHits.Load(); n != 1 {
+		t.Errorf("%d JWKS fetches 59 s after the last, want 1", n)
+	}
+	c.Add(time.Second)
 	for i := range 10 {
 		attacker.kid = fmt.Sprintf("later-%d", i)
 		_, err := g.Verify(context.Background(), sign(t, attacker, ti.claims(c)))
@@ -431,4 +452,31 @@ func TestVerifyRejectsKeyPublishedForAnotherAlgorithm(t *testing.T) {
 	tok := sign(t, k, ti.claims(c))
 	_, err = g.Verify(context.Background(), tok)
 	wantCode(t, tok, err, CodeInvalidSignature)
+}
+
+func TestTokenWithoutKeyIDCausesNoFetch(t *testing.T) {
+	c := newClock()
+	k := newKey(t, "k", jose.ES256)
+	ti := newIssuer(t, k)
+	g := newGuard(t, c, ti)
+	verifyOK(t, g, ti, c, k, "first token")
+	c.Add(time.Minute)
+	verifyCode(t, g, ti, c, signingKey{alg: k.alg, priv: k.priv}, CodeUnknownKey)
+	if n := ti.jwksHits.Load(); n != 1 {
+		t.Errorf("%d JWKS fetches after a token without a kid, want 1", n)
+	}
+}
+
+func TestErrorSubjectIsBounded(t *testing.T) {
+	c := newClock()
+	k := newKey(t, "k", jose.ES256)
+	ti := newIssuer(t, k)
+	g := newGuard(t, c, ti)
+	cl := ti.claims(c)
+	cl["sub"], cl["exp"] = strings.Repeat("s", 300), c.Now().Unix()-3600
+	_, err := g.Verify(context.Background(), sign(t, k, cl))
+	e, ok := errors.AsType[*Error](err)
+	if !ok || e.Subject != strings.Repeat("s", 200)+"..." {
+		t.Errorf("error subject is not cut to 200 bytes (%v)", err)
+	}
 }
