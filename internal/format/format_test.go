@@ -41,10 +41,14 @@ func randBytes(r *rand.Rand, n int) []byte {
 
 var classes = []error{ErrNotFormat, ErrVersion, ErrChecksum, ErrInvalid, ErrMisplaced}
 
-// checkClass fails unless err wraps exactly one error class.
+// checkClass fails unless err wraps exactly one error class, or is
+// ErrRetired and wraps none.
 func checkClass(t *testing.T, err error) {
 	t.Helper()
 	n := 0
+	if errors.Is(err, ErrRetired) {
+		n = 1
+	}
 	for _, c := range classes {
 		if errors.Is(err, c) {
 			n++
@@ -121,6 +125,24 @@ func goldenCommit() commitCase {
 	}
 }
 
+// goldenNonce is the writer nonce of the golden manifest.
+var goldenNonce = [16]byte{0xa7, 0x03, 0x5e, 0xc1, 0x9b, 0x24, 0x00, 0x6f, 0xd8, 0x11, 0x4a, 0xe2, 0x73, 0x0c, 0xb5, 0x96}
+
+// goldenRetired is the retired form of the golden commit.
+func goldenRetired(t testing.TB) []byte {
+	t.Helper()
+	b := goldenCommit().encode(t)
+	h, err := DecodeCommitHeader(b[:CommitHeaderSize], goldenDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := h.Retire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
 func goldenBump() commitCase {
 	return commitCase{h: CommitHeader{DB: goldenDB, PageSize: 4096, Txn: 8, Epoch: 3, DBSize: 3, EpochBump: true}}
 }
@@ -154,8 +176,8 @@ func encodeBase(t testing.TB, h BaseHeader, pages []byte) []byte {
 func goldenManifest() Manifest {
 	return Manifest{
 		DB: goldenDB, PageSize: 4096, GroupSize: 256, DBSize: 600, Txn: 9, Epoch: 3,
+		Nonce:  goldenNonce,
 		Groups: []GroupRef{{Txn: 9, Epoch: 3}, {}, {Txn: 5, Epoch: 2}},
-		Bumps:  []uint64{2, 8},
 	}
 }
 
@@ -239,11 +261,12 @@ func TestGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	files := map[string][]byte{
-		"commit.bin":      goldenCommit().encode(t),
-		"commit-bump.bin": goldenBump().encode(t),
-		"base.bin":        encodeBase(t, bh, bpages),
-		"manifest.bin":    manifest,
-		"lease.json":      lease,
+		"commit.bin":         goldenCommit().encode(t),
+		"commit-bump.bin":    goldenBump().encode(t),
+		"commit-retired.bin": goldenRetired(t),
+		"base.bin":           encodeBase(t, bh, bpages),
+		"manifest.bin":       manifest,
+		"lease.json":         lease,
 	}
 	for name, got := range files {
 		path := filepath.Join("testdata", name)
@@ -275,6 +298,13 @@ func TestGolden(t *testing.T) {
 		if !reflect.DeepEqual(h, c.want.h) || !slices.Equal(pgnosOf(entries), c.want.pgnos) || !bytes.Equal(pages, c.want.pages) {
 			t.Errorf("%s: decoded %+v %v", c.name, h, pgnosOf(entries))
 		}
+	}
+	want := goldenCommit().h
+	want.Retired = true
+	h, entries, err := DecodeCommit(bytes.NewReader(readGolden(t, "commit-retired.bin")), goldenDB, nil)
+	h.tableCRC = 0
+	if !errors.Is(err, ErrRetired) || entries != nil || !reflect.DeepEqual(h, want) {
+		t.Errorf("commit-retired.bin: decoded %+v %v, %v", h, entries, err)
 	}
 	gh, gpages, err := DecodeBase(readGolden(t, "base.bin"), goldenDB)
 	if err != nil || gh != bh || !bytes.Equal(slices.Concat(gpages...), bpages) {
@@ -387,6 +417,29 @@ func TestCommitRoundTrip(t *testing.T) {
 		if again := (commitCase{h, pgnos, pages}).encode(t); !bytes.Equal(again, b) {
 			t.Fatalf("%+v: re-encoding differs", c.h)
 		}
+
+		// The retired form is the header with bit 4 set and its CRC
+		// recomputed, and decodes to the same fields.
+		retired, err := rh.Retire()
+		if c.h.EpochBump {
+			wantClass(t, err, ErrInvalid)
+			continue
+		}
+		want := slices.Clone(b[:CommitHeaderSize])
+		want[10] |= 1 << 4
+		le.PutUint32(want[140:], crc32cBitwise(want[:140]))
+		if err != nil || !bytes.Equal(retired, want) {
+			t.Fatalf("%+v: retired form differs: %v", c.h, err)
+		}
+		dh, de, err := DecodeCommit(bytes.NewReader(retired), c.h.DB, nil)
+		wantRetired := h
+		wantRetired.Retired = true
+		if !errors.Is(err, ErrRetired) || de != nil || !reflect.DeepEqual(dh, wantRetired) {
+			t.Fatalf("retired: decoded %+v %v, %v", dh, de, err)
+		}
+		if again, err := dh.Retire(); err != nil || !bytes.Equal(again, retired) {
+			t.Fatalf("retiring a retired header changed it: %v", err)
+		}
 	}
 }
 
@@ -470,6 +523,8 @@ func randManifest(r *rand.Rand) Manifest {
 	ps := randPageSize(r)
 	gs := uint32(1) << r.IntN(bitsLen(MaxGroupBytes/ps))
 	m := Manifest{DB: randDB(r), PageSize: ps, GroupSize: gs, Epoch: 1 + r.Uint64N(math.MaxUint64)}
+	copy(m.Nonce[:], randBytes(r, 16))
+	m.Nonce[r.IntN(16)] |= 1
 	if r.IntN(4) != 0 {
 		m.Txn = 1 + r.Uint64N(math.MaxUint64)
 	}
@@ -486,16 +541,6 @@ func randManifest(r *rand.Rand) Manifest {
 			g = GroupRef{Txn: 1 + r.Uint64N(m.Txn), Epoch: 1 + r.Uint64N(m.Epoch)}
 		}
 		m.Groups = append(m.Groups, g)
-	}
-	if m.Txn > 0 {
-		for range r.IntN(300) {
-			m.Bumps = append(m.Bumps, 1+r.Uint64N(m.Txn))
-		}
-		if r.IntN(2) == 0 {
-			m.Bumps = append(m.Bumps, m.Txn) // the newest possible bump
-		}
-		slices.Sort(m.Bumps)
-		m.Bumps = slices.Compact(m.Bumps)
 	}
 	return m
 }
@@ -571,7 +616,7 @@ func TestKeysRoundTrip(t *testing.T) {
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
 	for range 300 {
 		var segs []string
-		for range 1 + r.IntN(MaxKeySegments-2) {
+		for range 1 + r.IntN(MaxKeySegments-3) {
 			s := []byte{chars[r.IntN(len(chars)-3)]}
 			for range r.IntN(30) {
 				s = append(s, chars[r.IntN(len(chars))])
@@ -592,21 +637,21 @@ func TestKeysRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: %v", prefix, err)
 		}
-		txn, epoch, group := r.Uint64(), r.Uint64(), r.Uint32()
-		for _, key := range []string{k.Commit(txn), k.Base(group, txn, epoch), k.Manifest(), k.Lease()} {
+		db, txn, epoch, group := randDB(r), r.Uint64(), r.Uint64(), r.Uint32()
+		for _, key := range []string{k.Commit(db, txn), k.Base(db, group, txn, epoch), k.Manifest(), k.Lease()} {
 			if !validKey(key) {
 				t.Fatalf("built invalid key %q", key)
 			}
 		}
-		if got, err := k.ParseCommit(k.Commit(txn)); err != nil || got != txn {
-			t.Fatalf("ParseCommit = %d, %v; want %d", got, err, txn)
+		if gd, got, err := k.ParseCommit(k.Commit(db, txn)); err != nil || gd != db || got != txn {
+			t.Fatalf("ParseCommit = %x %d, %v; want %x %d", gd, got, err, db, txn)
 		}
-		g, tx, e, err := k.ParseBase(k.Base(group, txn, epoch))
-		if err != nil || g != group || tx != txn || e != epoch {
-			t.Fatalf("ParseBase = %d %d %d, %v", g, tx, e, err)
+		gd, g, tx, e, err := k.ParseBase(k.Base(db, group, txn, epoch))
+		if err != nil || gd != db || g != group || tx != txn || e != epoch {
+			t.Fatalf("ParseBase = %x %d %d %d, %v", gd, g, tx, e, err)
 		}
 		a, b := r.Uint64(), r.Uint64()
-		if (a < b) != (k.Commit(a) < k.Commit(b)) {
+		if (a < b) != (k.Commit(db, a) < k.Commit(db, b)) {
 			t.Fatalf("commit keys for %d and %d sort out of order", a, b)
 		}
 	}
@@ -623,8 +668,7 @@ func TestHugeLengthsAllocateLittle(t *testing.T) {
 	m := make([]byte, manifestHeaderSize+4+100)
 	copy(m, manifestMagic)
 	le.PutUint16(m[8:], Version)
-	le.PutUint32(m[56:], math.MaxUint32)
-	le.PutUint32(m[60:], math.MaxUint32)
+	le.PutUint32(m[72:], math.MaxUint32)
 
 	bh := BaseHeader{DB: goldenDB, PageSize: 65536, GroupSize: 1024, Group: 0, Txn: 1, Epoch: 1, DBSize: 1}.encode()
 
@@ -635,7 +679,7 @@ func TestHugeLengthsAllocateLittle(t *testing.T) {
 	}{
 		{"DecodeCommit", huge.Size(), func() error { _, _, err := DecodeCommit(bytes.NewReader(stream), goldenDB, nil); return err }},
 		{"DecodeCommitTable", huge.TableSize(), func() error { _, err := DecodeCommitTable(huge, small); return err }},
-		{"DecodeManifest", (groupRefSize + bumpSize) * math.MaxUint32, func() error { _, err := DecodeManifest(m, goldenDB); return err }},
+		{"DecodeManifest", groupRefSize * math.MaxUint32, func() error { _, err := DecodeManifest(m, goldenDB); return err }},
 		{"DecodeBase", MaxGroupBytes, func() error { _, _, err := DecodeBase(bh, goldenDB); return err }},
 	}
 	for _, c := range cases {

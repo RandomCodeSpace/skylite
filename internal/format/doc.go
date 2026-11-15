@@ -24,9 +24,10 @@
 //
 // Every database has a database identifier: 16 bytes, generated once when
 // the database is created, never all zeros. The manifest and the header
-// of every commit and base group object carry it, and every page record's
-// checksum covers it, so an object or record copied from one database to
-// another is rejected.
+// of every commit and base group object carry it, the key of every commit
+// and base group object contains it, and every page record's checksum
+// covers it, so an object or record copied from one database to another is
+// rejected.
 //
 // # Page records
 //
@@ -57,25 +58,36 @@
 // ErrChecksum, ErrInvalid (anything else that breaks a rule here:
 // truncation, trailing bytes, an out-of-range field, nonzero padding) and
 // ErrMisplaced (a well-formed object that belongs somewhere else: to
-// another database, or under another key). A manifest larger than
-// MaxManifestSize is ErrManifestTooLarge, which is in the ErrInvalid class
-// and can be told apart from other invalid manifests.
+// another database, or under another key). Two ErrInvalid errors can be
+// told apart from the rest of their class with errors.Is, because callers
+// report them: ErrManifestTooLarge, for a manifest larger than
+// MaxManifestSize, and ErrCommitTooLarge, for a commit object larger than
+// MaxCommitSize. The one other outcome is ErrRetired, which is not a format
+// error and wraps no class: the bytes are a valid retired commit, and the
+// caller asked for its page table or pages; see Retired commit.
 //
 // A binary object is checked part by part from the front: the header (the
 // whole manifest is one part), then the page table, then each record. A
 // header is checked in this order: magic, version (as soon as its two
-// bytes are present), length, checksum, flags, fields, database
-// identifier. A reader must reject everything this specification does not
-// allow; there are no optional or ignorable parts. Every accepted object
-// re-encodes to exactly its input bytes.
+// bytes are present, before any later byte is read), length, checksum,
+// flags, fields, database identifier. A reader must reject everything this
+// specification does not allow; there are no optional or ignorable parts.
+// Every accepted object re-encodes to exactly its input bytes.
 //
 // Decoders also take the identifier of the database the caller expects,
-// and reject an object of another with ErrMisplaced. A header does not say
-// which key it was fetched under, so the caller must check that too:
-// CommitHeader.CheckKey compares a commit's transaction number with its
-// key's, BaseHeader.CheckKey a group object's group, transaction number
-// and epoch with its key's, and both return ErrMisplaced on a mismatch.
-// Callers must call them for every object they fetch by key.
+// and reject an object of another with ErrMisplaced. The one exception is
+// discovery: DecodeManifest given the all-zero identifier accepts any, and
+// the caller learns the identifier from it. The manifest is the only
+// object a reader can find without knowing the identifier, so trust in a
+// discovered identifier rests on the key the manifest was read from, and
+// every read after discovery passes the identifier it learned.
+//
+// A header does not say which key it was fetched under, so the caller must
+// check that too: CommitHeader.CheckKey compares a commit's database
+// identifier and transaction number with its key's, BaseHeader.CheckKey a
+// group object's database identifier, group, transaction number and epoch
+// with its key's, and both return ErrMisplaced on a mismatch. Callers must
+// call them for every object they fetch by key.
 //
 // Errors that do not come from the bytes are not format errors and wrap
 // none of the classes. DecodeCommit returns errors from its reader and its
@@ -90,7 +102,8 @@
 //
 // No decoder allocates in proportion to a length field before checking it
 // against the bytes present. DecodeCommit reads from a stream, so it reads
-// the page table with a buffer that grows with the bytes that arrive.
+// the page table with a buffer that grows with the bytes that arrive, and
+// the commit size limit, checked from the header, bounds it.
 //
 // # Versioning
 //
@@ -103,41 +116,60 @@
 // ErrVersion. Base group objects have no per-page lengths, so compressing
 // them will need a new version with an offset table.
 //
-// # Assumptions
+// # What the decoders check and what the engine must
 //
-// The format rests on these and does not check them:
+// The decoders check what the bytes of one object, its expected database
+// identifier and, through CheckKey, its key can show: everything this
+// specification states as a layout or a field rule. The rules below
+// relate objects to each other or to the history of storage, so no codec
+// can check them. They are the engine's obligations, and the format's
+// correctness rests on them:
 //
 //   - An epoch belongs to exactly one leader candidacy: no two writers ever
 //     write with the same epoch.
-//   - Commit transaction numbers are contiguous from 1, and each number is
-//     created at most once, by create-if-absent.
-//
-// So there is no predecessor digest and no writer-instance field. A key
-// in the log names at most one object ever, so there is no second history
-// for a digest to detect, and a writer is identified by its epoch, which
-// no other writer shares. If storage broke create-if-absent, or two
-// writers shared an epoch, the format would not notice.
-//
-// Epochs need not be non-decreasing along the commit log, and readers must
-// not require it: a paused candidate can leave an epoch bump with a lower
-// epoch after commits of a higher one.
-//
-// # Rules for the life of a database
-//
+//   - Commit transaction numbers are contiguous from 1. A log key is
+//     created once, by create-if-absent, and may be replaced once, by the
+//     retired form of the commit it holds, with a replace conditional on
+//     the version read; it is never deleted. So a log key names one commit
+//     for the life of the database, first whole and then perhaps retired.
+//   - An epoch bump carries the database size of the commit before it.
+//   - An epoch bump is never retired, and a commit is retired only once
+//     its transaction number is at or below that of a manifest read from
+//     storage, or of a manifest replacement of the collector's own that
+//     succeeded.
 //   - The page size and the group size never change for the life of a
 //     database identifier.
-//   - The manifest's transaction number and epoch never decrease when it
-//     is replaced, and a writer replaces only a manifest whose epoch is at
-//     most its own.
+//   - A manifest replacement obeys these against the manifest it
+//     replaces: the database identifier, page size and group size are
+//     unchanged; the transaction number and epoch never decrease; a writer
+//     replaces only a manifest whose epoch is at most its own; and the
+//     bytes change. An epoch swap, by a candidate taking over, raises the
+//     epoch by one and sets a new random writer nonce; a compaction, by
+//     the leader, keeps the epoch and nonce of that leader's swap and
+//     raises the transaction number.
 //   - A compaction's output objects carry a transaction number strictly
-//     greater than that of the manifest they were built from, so a
-//     compaction never writes under the key of an object a manifest it
-//     read names, and an unreferenced object can be judged from its key
-//     and a manifest; see Garbage collection.
+//     greater than that of the manifest they were built from and the
+//     compacting leader's epoch, so a compaction never writes under the
+//     key of an object a manifest it read names.
 //   - A group's content at a transaction number is fixed by the log, and
 //     the encoding has no free choices, so every group object written
 //     under one key has the same bytes; a retried compaction rewrites a
 //     key with what is already there.
+//   - Base objects are deleted only as Garbage collection describes, and
+//     a base key is never created again after its writer has issued a
+//     delete for it.
+//   - Every object fetched by key is checked with CheckKey, and every read
+//     after the manifest's discovery passes the identifier it learned.
+//
+// So there is no predecessor digest and no writer-instance field. A log
+// key names one commit ever, so there is no second history for a digest
+// to detect, and a writer is identified by its epoch, which no other
+// writer shares. If storage broke create-if-absent, or two writers shared
+// an epoch, the format would not notice.
+//
+// Epochs need not be non-decreasing along the commit log, and readers must
+// not require it: a paused candidate can leave an epoch bump with a lower
+// epoch after commits of a higher one.
 //
 // # Commit object
 //
@@ -152,7 +184,7 @@
 //	off  size  field
 //	0    8     magic "SKYLITEC"
 //	8    2     version, 1
-//	10   2     flags: bit 0 epoch bump; bits 1-3 codec, 0; other bits 0
+//	10   2     flags: bit 0 epoch bump; bits 1-3 codec, 0; bit 4 retired; other bits 0
 //	12   4     page size
 //	16   8     transaction number, at least 1
 //	24   8     epoch of the writer, at least 1
@@ -167,11 +199,9 @@
 //	140  4     CRC-32C of bytes 0-139
 //
 // The commit identifier is opaque bytes supplied by the client, used to
-// find out later whether a commit whose response was lost happened. It can
-// be found only while its commit object is still in the log: once garbage
-// collection deletes the object, a search for the identifier finds
-// nothing, and not finding it means the outcome is unknown, not that the
-// commit did not happen.
+// find out later whether a commit whose response was lost happened. The
+// retired form keeps it, so it stays in the log for the life of the
+// database.
 //
 // Page table entry i, at offset 144 + 16i:
 //
@@ -188,8 +218,12 @@
 // "SKYLITEC" and the commit's database identifier, transaction number and
 // epoch.
 //
-// An epoch bump has flag bit 0 set, no pages, and carries the database
-// size of the commit before it. Any other commit has at least one page.
+// An epoch bump has flag bit 0 set and no pages. Any other commit has at
+// least one page. A commit object is at most MaxCommitSize (1 GiB) bytes,
+// computed from the header with 64-bit arithmetic as above; a larger one is
+// ErrCommitTooLarge, from the encoder and from every decoder of its header,
+// before any of its page table is read. Bit 4 is clear in every commit
+// object written by EncodeCommit.
 //
 // Reading a page takes three range reads at most: the header, then the
 // page table, then the record. Each is verified on its own: the header by
@@ -198,6 +232,30 @@
 // before using it: a valid page number and an offset that is a record
 // position. Such an entry must come from the page table of the same
 // object.
+//
+// # Retired commit
+//
+// Garbage collection replaces a commit whose pages the base covers with
+// its retired form: the commit's 144-byte header with flag bit 4 set and
+// the CRC at offset 140 recomputed, and nothing after it. Every other
+// header byte keeps its value: page size, transaction number, epoch,
+// database size, page count, page table size and checksum, database
+// identifier and commit identifier. So the retired form is a pure function
+// of the commit's header bytes, and a header with bit 4 set describes, in
+// every other field, the commit it retired. An epoch bump is never retired:
+// a header with bits 0 and 4 both set is ErrInvalid.
+//
+// A retired object is exactly 144 bytes; DecodeCommit rejects bytes after
+// the header with ErrInvalid. DecodeCommitHeader decodes a retired header
+// and reports it with Retired set. DecodeCommitTable and DecodeCommitPage,
+// given a retired header, and DecodeCommit, given a retired object, return
+// ErrRetired, DecodeCommit together with the header. An empty table and no
+// pages would be mistaken for an epoch bump or an empty commit, and both
+// would let a caller that ignores Retired apply nothing and carry on, so
+// they are not returned. A reader that needs the pages of a retired commit
+// must go to the base; how the engine handles that is not part of the
+// format. CommitHeader.Retire produces the retired form from a decoded
+// header.
 //
 // # Base group object
 //
@@ -226,10 +284,12 @@
 //	60   4     CRC-32C of bytes 0-59
 //
 // The group's first page, g*G+1, is at most the database size, so a group
-// object holds at least one page of the database. Every slot is present.
-// Pages never written are stored as zeros. The lock page, and every slot
-// whose page number is beyond the database size (and so every slot beyond
-// page 4294967294), must be zeros. Record i's identity carries
+// object holds at least one page of the database. Every slot is present
+// and is a full record: a body of page size bytes followed by its record
+// checksum. The body of a page never written is zeros, still followed by
+// the checksum of its identity and that zero body. The lock page, and every
+// slot whose page number is beyond the database size (and so every slot
+// beyond page 4294967294), must have a zero body. Record i's identity carries
 // "SKYLITEB", the group object's database identifier, transaction number
 // and epoch, and page number g*G+1+i.
 //
@@ -256,28 +316,25 @@
 //	24   8     transaction number the base is current to; 0 for none
 //	32   8     epoch of the writer, at least 1
 //	40   16    database identifier
-//	56   4     group count, exactly ceil(database size / G)
-//	60   4     epoch-bump count b
-//	64   16    per group, in group order: transaction number, epoch
-//	...  8     per epoch bump, ascending: its transaction number
+//	56   16    writer nonce, not all zeros
+//	72   4     group count, exactly ceil(database size / G)
+//	76   16    per group, in group order: transaction number, epoch
 //	...  4     CRC-32C of every byte before it
 //
 // Entry g names the object for group g by the transaction number it is
-// current to and its writer's epoch: both zero means the group has no
-// object and reads as zeros; otherwise the transaction number is at most
-// the manifest's and the epoch at most the manifest's. Because entries are
-// indexed by group, duplicate and out-of-range groups cannot be expressed.
+// current to and its writer's epoch. Both zero means the group has no
+// object and reads as zeros. Otherwise both are non-zero (an entry with
+// exactly one of them zero is ErrInvalid), the transaction number is at
+// most the manifest's and the epoch at most the manifest's. Because
+// entries are indexed by group, duplicate and out-of-range groups cannot
+// be expressed.
 //
-// The epoch-bump list holds the transaction number of every epoch-bump
-// commit at or below the manifest's transaction number: strictly
-// ascending, each at least 1 and at most the manifest's transaction
-// number. Garbage collection deletes a commit object only if its number is
-// at or below the manifest's and not in this list; compaction maintains the
-// list from the commits it folds. The list is kept for the life of the
-// database, 8 bytes per takeover attempt that created a bump.
+// The writer nonce is 16 random bytes, set by a candidate when it swaps the
+// manifest to a new epoch and kept by that leader's later manifests, so a
+// candidate can tell its own swap from another's at the same epoch.
 //
 // The encoding has no free choices, so equal manifests are equal bytes.
-// Its size is 68 + 16*ceil(database size / G) + 8b bytes, and at most
+// Its size is 80 + 16*ceil(database size / G) bytes, and at most
 // MaxManifestSize (16 MiB). Encoders refuse to write and decoders refuse
 // to read a larger one, with ErrManifestTooLarge. The limit is 16 times
 // below the smallest single-request upload limit of the backends (Azure
@@ -286,26 +343,45 @@
 // is always one upload.
 //
 // With G = 256 at 4096-byte pages (1 MiB groups, the suggested default) a
-// 100 GiB database has 102400 groups and a 1638468-byte manifest, 16 bytes
-// per MiB of data, leaving room for 1892343 epoch bumps. Larger groups
-// shrink the manifest and the object count and make read-ahead coarser;
-// smaller groups make compaction rewrite less when writes are scattered,
-// since a single changed page rewrites its whole group.
+// 100 GiB database has 102400 groups and a 1638480-byte manifest, 16 bytes
+// per MiB of data. Larger groups shrink the manifest and the object count
+// and make read-ahead coarser; smaller groups make compaction rewrite less
+// when writes are scattered, since a single changed page rewrites its
+// whole group.
 //
 // # Supported sizes
 //
 // The format can represent databases of 4294967294 pages (16 TiB at
-// 4096-byte pages). What is supported is less, set by two limits:
+// 4096-byte pages). What is supported is less, set by two limits.
 //
-//   - The manifest: at most 1048571 groups with no epoch bumps, each bump
-//     taking the space of half a group. At the default 1 MiB groups that
-//     is a database just under 1 TiB (1048571 MiB). A 16 TiB database
-//     needs groups of 32 MiB or more (524288 groups, an 8 MiB manifest).
-//   - The page table: decoders accept a commit of up to 4294967294 pages,
-//     a 68719476704-byte table, and the format sets no lower limit.
-//     DecodeCommit holds the table and its decoded entries, 32 bytes per
-//     page, so the reader's memory bounds a transaction: one that writes
-//     1 GiB at 4096-byte pages has 262144 pages and a 4 MiB table.
+// The manifest holds at most 1048571 groups, a manifest of exactly
+// MaxManifestSize. At the default 1 MiB groups that is a database of
+// 1048571 MiB, just under 1 TiB. A 16 TiB database needs groups of 32 MiB
+// or more (524288 groups, an 8 MiB manifest).
+//
+// A commit object is at most MaxCommitSize, 1 GiB, and this is the
+// largest transaction this version supports. A commit of n pages is
+// 144 + n*(page size + 20) bytes, so a commit holds at most:
+//
+//	page size  pages    page data
+//	512        2018311  985.5 MiB
+//	1024       1028488  1004.4 MiB
+//	2048       519217   1014.1 MiB
+//	4096       260870   1019.0 MiB
+//	8192       130752   1021.5 MiB
+//	16384      65456    1022.8 MiB
+//	32768      32748    1023.4 MiB
+//	65536      16378    1023.6 MiB
+//
+// No commit object is exactly 1 GiB, since 2^30 - 144 is not a multiple of
+// any page size plus 20, so at each page size the limit is the page count
+// tabled. The limit bounds a decoder's memory: DecodeCommit holds the page
+// table and its decoded entries, 32 bytes per page, at most about 62 MiB
+// at 512-byte pages. It also keeps a commit within one upload on every
+// backend at its current single-request limit, the smallest of which is
+// the Azurite emulator's 2 GiB. Azure Blob Storage service versions before
+// 2019-12-12 accept only 256 MiB in one request, so the engine must not
+// use them for commits.
 //
 // # Lease
 //
@@ -340,40 +416,46 @@
 // Keys follow the storage interface's rules: ASCII, at most 1024 bytes, at
 // most 32 segments separated by "/", each segment one or more of A-Z a-z
 // 0-9 . _ -, not "." or "..", not ending in ".". A database lives under a
-// prefix of one or more segments, at most 966 bytes and 30 segments, so
-// that every key below fits:
+// prefix of one or more segments, at most 933 bytes and 29 segments, so
+// that every key below fits (the longest, a base key, adds 91 bytes and 3
+// segments):
 //
-//	<prefix>/log/<txn>                  commit object
-//	<prefix>/base/<group>-<txn>-<epoch> base group object
-//	<prefix>/manifest                   manifest
-//	<prefix>/lease                      lease
+//	<prefix>/<id>/log/<txn>                  commit object
+//	<prefix>/<id>/base/<group>-<txn>-<epoch> base group object
+//	<prefix>/manifest                        manifest
+//	<prefix>/lease                           lease
 //
-// txn and epoch are 20 decimal digits and group is 10, zero-padded, so
-// byte order is numeric order: listing <prefix>/log/ starting after the
-// key of transaction n yields the commits after n in order. Parsers accept
-// only what the builders produce. A commit object's header must carry its
-// key's transaction number, and a base object's header its key's group,
-// transaction number and epoch.
+// id is the database identifier as 32 lowercase hexadecimal characters,
+// byte 0 first; uppercase, another length and the all-zero identifier are
+// invalid. txn and epoch are 20 decimal digits and group is 10,
+// zero-padded, so byte order is numeric order. Parsers accept only what the
+// builders produce. A commit object's header must carry its key's database
+// identifier and transaction number, and a base object's header its key's
+// database identifier, group, transaction number and epoch. Because every
+// log and base key carries the identifier, a request an actor issues for
+// one database, however late it lands, cannot touch the objects of a
+// database later created under the same prefix with a new identifier.
 //
 // # Garbage collection
 //
-// A commit object is garbage when its transaction number is at or below
-// the manifest's and is not in the manifest's epoch-bump list.
+// Garbage collection deletes no commit object. It retires a commit once its
+// transaction number is at or below a manifest's, by replacing the object,
+// conditional on the version it read, with the commit's retired form. An
+// epoch bump is never retired. The manifest's transaction number never
+// decreases, so once a commit may be retired it may be retired forever, and
+// a retire whose outcome is unknown needs no resolution.
 //
-// A base object the manifest names is live. One it does not name is
-// garbage, judged against that manifest, exactly when:
-//
-//   - its epoch is lower than the manifest's: its writer can no longer
-//     replace the manifest, so nothing will ever name it; or
-//   - it carries the manifest's epoch and the compaction that wrote it has
-//     ended. Only the writer of that epoch knows when that is, so this is
-//     the engine's rule; the key alone does not decide it.
-//
-// One with a higher epoch than the manifest's is never garbage on that
-// manifest's evidence: it may belong to a candidate that has not yet
-// replaced the manifest. For example, with the manifest at transaction 9
-// and epoch 3, a group object at transaction 9 and epoch 4 is kept. It
-// cannot come from a compaction built from that manifest, whose outputs
-// carry transaction numbers above 9, but whatever wrote it, its epoch
-// alone keeps it.
+// Base objects are the only objects deleted. A base object the current
+// manifest names is live. One a manifest named and a later one dropped is
+// garbage under every later manifest. One no manifest has named is
+// garbage only once the manifest version its publication was, or could
+// have been, conditioned on no longer exists. That is the engine's rule,
+// not the format's: the key and a manifest do not decide it. For example,
+// an object whose epoch is lower than the manifest's is garbage, because
+// its writer could only have conditioned on a manifest of its own epoch,
+// and the swap that raised the epoch replaced it; one whose epoch is
+// higher is never garbage on that manifest's evidence, since it may belong
+// to a candidate that has not yet replaced the manifest. A base key is
+// never created again after its writer has issued a delete for it, so a
+// delete that lands late removes only garbage.
 package format

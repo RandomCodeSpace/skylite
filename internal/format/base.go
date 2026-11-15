@@ -71,12 +71,13 @@ func (h BaseHeader) validateObject() error {
 }
 
 // CheckKey returns an ErrMisplaced error unless h belongs under the base
-// key of group, txn and epoch. Callers must check every base header they
-// decode against the key they fetched it under.
-func (h BaseHeader) CheckKey(group uint32, txn, epoch uint64) error {
-	if h.Group != group || h.Txn != txn || h.Epoch != epoch {
-		return misplaced("group %d at transaction %d epoch %d under the key of group %d at transaction %d epoch %d",
-			h.Group, h.Txn, h.Epoch, group, txn, epoch)
+// key of database db, group, txn and epoch, as Keys.ParseBase returns them.
+// Callers must check every base header they decode against the key they
+// fetched it under.
+func (h BaseHeader) CheckKey(db DatabaseID, group uint32, txn, epoch uint64) error {
+	if h.DB != db || h.Group != group || h.Txn != txn || h.Epoch != epoch {
+		return misplaced("database %x group %d at transaction %d epoch %d under the key of database %x group %d at transaction %d epoch %d",
+			h.DB, h.Group, h.Txn, h.Epoch, db, group, txn, epoch)
 	}
 	return nil
 }

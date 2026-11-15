@@ -93,6 +93,27 @@ func layoutCommit() []byte {
 	return append(b, record("SKYLITEC", layoutDB, 7, 2, 3, p3)...)
 }
 
+// layoutRetired is the golden commit's retired form: its header with flag
+// bit 4 set and the header CRC recomputed, every other byte the same.
+func layoutRetired() []byte {
+	b := make([]byte, 144)
+	copy(b[0:], "SKYLITEC")
+	putN(b, 8, 2, 1)
+	putN(b, 10, 2, 0x10)
+	putN(b, 12, 4, 512)
+	putN(b, 16, 8, 7)
+	putN(b, 24, 8, 2)
+	putN(b, 32, 4, 3)
+	putN(b, 36, 4, 2)
+	putN(b, 40, 8, 32)
+	copy(b[52:], layoutDB[:])
+	b[68] = 9
+	copy(b[69:], "client-42")
+	putN(b, 48, 4, uint64(crc32cBitwise(layoutCommit()[144:176])))
+	putN(b, 140, 4, uint64(crc32cBitwise(b[:140])))
+	return b
+}
+
 // layoutBump is the golden epoch bump: page size 4096, transaction 8, epoch
 // 3, database size 3.
 func layoutBump() []byte {
@@ -133,10 +154,10 @@ func layoutBase() []byte {
 }
 
 // layoutManifest is the golden manifest: page size 4096, group size 256,
-// database size 600 (3 groups), transaction 9, epoch 3, groups
-// {9,3} {0,0} {5,2}, epoch bumps 2 and 8.
+// database size 600 (3 groups), transaction 9, epoch 3, writer nonce
+// a7035ec19b24006fd8114ae2730cb596, groups {9,3} {0,0} {5,2}.
 func layoutManifest() []byte {
-	b := make([]byte, 64+3*16+2*8+4)
+	b := make([]byte, 76+3*16+4)
 	copy(b[0:], "SKYLITEM")
 	putN(b, 8, 2, 1)
 	putN(b, 12, 4, 4096)
@@ -145,15 +166,13 @@ func layoutManifest() []byte {
 	putN(b, 24, 8, 9)
 	putN(b, 32, 8, 3)
 	copy(b[40:], layoutDB[:])
-	putN(b, 56, 4, 3)
-	putN(b, 60, 4, 2)
-	putN(b, 64, 8, 9)
-	putN(b, 72, 8, 3)
-	putN(b, 96, 8, 5)
-	putN(b, 104, 8, 2)
-	putN(b, 112, 8, 2)
-	putN(b, 120, 8, 8)
-	putN(b, 128, 4, uint64(crc32cBitwise(b[:128])))
+	copy(b[56:], []byte{0xa7, 0x03, 0x5e, 0xc1, 0x9b, 0x24, 0x00, 0x6f, 0xd8, 0x11, 0x4a, 0xe2, 0x73, 0x0c, 0xb5, 0x96})
+	putN(b, 72, 4, 3)
+	putN(b, 76, 8, 9)
+	putN(b, 84, 8, 3)
+	putN(b, 108, 8, 5)
+	putN(b, 116, 8, 2)
+	putN(b, 124, 4, uint64(crc32cBitwise(b[:124])))
 	return b
 }
 
@@ -175,6 +194,7 @@ func TestLayout(t *testing.T) {
 	}{
 		{"commit.bin", layoutCommit(), goldenCommit().encode(t)},
 		{"commit-bump.bin", layoutBump(), goldenBump().encode(t)},
+		{"commit-retired.bin", layoutRetired(), goldenRetired(t)},
 		{"base.bin", layoutBase(), encodeBase(t, bh, bpages)},
 		{"manifest.bin", layoutManifest(), manifest},
 		{"lease.json", []byte(layoutLease), lease},
@@ -218,6 +238,14 @@ func TestLayout(t *testing.T) {
 		t.Fatalf("page 3: %v", err)
 	}
 
+	rh, err := DecodeCommitHeader(layoutRetired(), layoutDB)
+	want := goldenCommit().h
+	want.Retired = true
+	rh.tableCRC = 0
+	if err != nil || !reflect.DeepEqual(rh, want) {
+		t.Errorf("retired header: decoded %+v, %v", rh, err)
+	}
+
 	gh, gpages, err := DecodeBase(layoutBase(), layoutDB)
 	if err != nil || gh != bh || !bytes.Equal(slices.Concat(gpages...), bpages) {
 		t.Errorf("base: decoded %+v, %v", gh, err)
@@ -231,6 +259,22 @@ func TestLayout(t *testing.T) {
 	}
 	if l, err := DecodeLease([]byte(layoutLease)); err != nil || l != goldenLease() {
 		t.Errorf("lease: decoded %+v, %v", l, err)
+	}
+	k, err := NewKeys("tenant-1/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for got, want := range map[string]string{
+		k.Commit(layoutDB, 42):                                           "tenant-1/db/5b1e3c00912a4f7708d36ea510c42bf9/log/00000000000000000042",
+		k.Base(layoutDB, 3, 42, 7):                                       "tenant-1/db/5b1e3c00912a4f7708d36ea510c42bf9/base/0000000003-00000000000000000042-00000000000000000007",
+		k.Commit(DatabaseID{15: 1}, 18446744073709551615):                "tenant-1/db/00000000000000000000000000000001/log/18446744073709551615",
+		k.Base(DatabaseID{0: 0xff}, 4294967295, 1, 18446744073709551615): "tenant-1/db/ff000000000000000000000000000000/base/4294967295-00000000000000000001-18446744073709551615",
+		k.Manifest(): "tenant-1/db/manifest",
+		k.Lease():    "tenant-1/db/lease",
+	} {
+		if got != want {
+			t.Errorf("key %q, want %q", got, want)
+		}
 	}
 	const extreme = `{"format":"skylite-lease","version":1,"holder":"x","epoch":18446744073709551615,"renewed":0}`
 	if l, err := DecodeLease([]byte(extreme)); err != nil || l != (Lease{Holder: "x", Epoch: 1<<64 - 1}) {

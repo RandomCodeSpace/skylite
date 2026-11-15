@@ -18,7 +18,12 @@ const (
 	// MaxCommitIDLen is the longest client-supplied commit identifier.
 	MaxCommitIDLen = 64
 
+	// MaxCommitSize is the largest commit object, and so the largest
+	// transaction this version supports; see the package documentation.
+	MaxCommitSize = 1 << 30
+
 	flagEpochBump = 1 << 0
+	flagRetired   = 1 << 4
 )
 
 // CommitHeader is the fixed-size front of a commit object.
@@ -30,7 +35,10 @@ type CommitHeader struct {
 	DBSize    uint32 // database size in pages after this commit
 	PageCount uint32
 	EpochBump bool
-	CommitID  []byte // opaque, at most MaxCommitIDLen bytes; nil when absent
+	// Retired reports a retired commit: this header and nothing after it.
+	// The other fields keep the values of the commit it retired.
+	Retired  bool
+	CommitID []byte // opaque, at most MaxCommitIDLen bytes; nil when absent
 
 	tableCRC uint32 // set by DecodeCommitHeader, checked by DecodeCommitTable
 }
@@ -43,9 +51,13 @@ type PageEntry struct {
 }
 
 // TableSize is the size of the page table, which starts at CommitHeaderSize.
+// For a retired header it is the size of the retired commit's table, which
+// the retired object no longer holds.
 func (h CommitHeader) TableSize() int64 { return int64(h.PageCount) * PageEntrySize }
 
-// Size is the size of the whole commit object.
+// Size is the size of the whole commit object. For a retired header it is
+// the size of the commit it retired; the retired object is
+// CommitHeaderSize bytes.
 func (h CommitHeader) Size() int64 {
 	return CommitHeaderSize + h.TableSize() + int64(h.PageCount)*h.recordLen()
 }
@@ -67,6 +79,10 @@ func (h CommitHeader) validate() error {
 		return invalid("database size %d pages exceeds %d", h.DBSize, uint32(MaxPages))
 	case h.PageCount > h.DBSize:
 		return invalid("%d pages in a database of %d pages", h.PageCount, h.DBSize)
+	case h.Size() > MaxCommitSize:
+		return fmt.Errorf("%w: %d bytes", ErrCommitTooLarge, h.Size())
+	case h.EpochBump && h.Retired:
+		return invalid("retired epoch bump")
 	case h.EpochBump && h.PageCount != 0:
 		return invalid("epoch bump with %d pages", h.PageCount)
 	case !h.EpochBump && h.PageCount == 0:
@@ -78,11 +94,12 @@ func (h CommitHeader) validate() error {
 }
 
 // CheckKey returns an ErrMisplaced error unless h belongs under the commit
-// key of transaction txn. Callers must check every commit header they
-// decode against the key they fetched it under.
-func (h CommitHeader) CheckKey(txn uint64) error {
-	if h.Txn != txn {
-		return misplaced("commit of transaction %d under the key of transaction %d", h.Txn, txn)
+// key of database db and transaction txn, as Keys.ParseCommit returns them.
+// Callers must check every commit header they decode against the key they
+// fetched it under.
+func (h CommitHeader) CheckKey(db DatabaseID, txn uint64) error {
+	if h.DB != db || h.Txn != txn {
+		return misplaced("commit of database %x transaction %d under the key of database %x transaction %d", h.DB, h.Txn, db, txn)
 	}
 	return nil
 }
@@ -124,9 +141,14 @@ func (h CommitHeader) encode(tableCRC uint32) []byte {
 	b := make([]byte, CommitHeaderSize)
 	copy(b, commitMagic)
 	le.PutUint16(b[8:], Version)
+	var flags uint16
 	if h.EpochBump {
-		le.PutUint16(b[10:], flagEpochBump)
+		flags |= flagEpochBump
 	}
+	if h.Retired {
+		flags |= flagRetired
+	}
+	le.PutUint16(b[10:], flags)
 	le.PutUint32(b[12:], h.PageSize)
 	le.PutUint64(b[16:], h.Txn)
 	le.PutUint64(b[24:], h.Epoch)
@@ -144,13 +166,17 @@ func (h CommitHeader) encode(tableCRC uint32) []byte {
 // EncodeCommit writes a commit object to w. pgnos lists the pages in
 // ascending order and pages supplies their bodies, h.PageSize bytes each, in
 // the same order. Only one page body is held in memory at a time, and the
-// object is exactly h.Size() bytes. h.PageCount must equal len(pgnos).
+// object is exactly h.Size() bytes. h.PageCount must equal len(pgnos), and
+// h.Retired must be false; Retire writes the retired form.
 // EncodeCommit reads exactly len(pgnos)*h.PageSize bytes from pages and
 // nothing after them. Errors from w are returned unchanged; errors reading
 // pages are wrapped with the page number. Neither is a format class.
 func EncodeCommit(w io.Writer, h CommitHeader, pgnos []uint32, pages io.Reader) error {
 	if err := h.validate(); err != nil {
 		return err
+	}
+	if h.Retired {
+		return invalid("retired commit given to EncodeCommit")
 	}
 	if int64(len(pgnos)) != int64(h.PageCount) {
 		return invalid("%d page numbers for a page count of %d", len(pgnos), h.PageCount)
@@ -196,13 +222,27 @@ func EncodeCommit(w io.Writer, h CommitHeader, pgnos []uint32, pages io.Reader) 
 	return bw.Flush()
 }
 
+// Retire returns the retired form of the commit h describes: its header
+// with the retired flag set and the header checksum recomputed, every other
+// field unchanged. h must come from DecodeCommitHeader or DecodeCommit,
+// because the retired form keeps the page table checksum, which only they
+// carry. An epoch bump is never retired. A retired h gives the same bytes.
+func (h CommitHeader) Retire() ([]byte, error) {
+	h.Retired = true
+	if err := h.validate(); err != nil {
+		return nil, err
+	}
+	return h.encode(h.tableCRC), nil
+}
+
 // DecodeCommitHeader decodes the first CommitHeaderSize bytes of a commit
-// object of database db.
+// object of database db. A retired commit's header decodes with Retired set.
 func DecodeCommitHeader(b []byte, db DatabaseID) (CommitHeader, error) {
 	if err := checkHeader(b, commitMagic, CommitHeaderSize); err != nil {
 		return CommitHeader{}, err
 	}
-	if f := le.Uint16(b[10:]); f&^flagEpochBump != 0 {
+	f := le.Uint16(b[10:])
+	if f&^(flagEpochBump|flagRetired) != 0 {
 		return CommitHeader{}, fmt.Errorf("%w: flags %#x", ErrVersion, f)
 	}
 	idLen := int(b[68])
@@ -218,7 +258,8 @@ func DecodeCommitHeader(b []byte, db DatabaseID) (CommitHeader, error) {
 		Epoch:     le.Uint64(b[24:]),
 		DBSize:    le.Uint32(b[32:]),
 		PageCount: le.Uint32(b[36:]),
-		EpochBump: le.Uint16(b[10:])&flagEpochBump != 0,
+		EpochBump: f&flagEpochBump != 0,
+		Retired:   f&flagRetired != 0,
 		tableCRC:  le.Uint32(b[48:]),
 	}
 	copy(h.DB[:], b[52:68])
@@ -238,10 +279,14 @@ func DecodeCommitHeader(b []byte, db DatabaseID) (CommitHeader, error) {
 }
 
 // DecodeCommitTable decodes the page table, the h.TableSize() bytes that
-// follow the header. h must come from DecodeCommitHeader.
+// follow the header. h must come from DecodeCommitHeader. A retired h gives
+// ErrRetired.
 func DecodeCommitTable(h CommitHeader, b []byte) ([]PageEntry, error) {
 	if err := h.validate(); err != nil {
 		return nil, err
+	}
+	if h.Retired {
+		return nil, ErrRetired
 	}
 	if int64(len(b)) != h.TableSize() {
 		return nil, invalid("page table is %d bytes, want %d", len(b), h.TableSize())
@@ -269,10 +314,14 @@ func DecodeCommitTable(h CommitHeader, b []byte) ([]PageEntry, error) {
 // DecodeCommitPage verifies one page record, the e.Length bytes at e.Offset,
 // and returns the page body, which aliases b. h must come from
 // DecodeCommitHeader and e from DecodeCommitTable for the same object. A
-// record of another page, object or database fails its checksum.
+// record of another page, object or database fails its checksum. A retired
+// h gives ErrRetired.
 func DecodeCommitPage(h CommitHeader, e PageEntry, b []byte) ([]byte, error) {
 	if err := h.validate(); err != nil {
 		return nil, err
+	}
+	if h.Retired {
+		return nil, ErrRetired
 	}
 	if err := h.checkPgno(0, e.Pgno); err != nil {
 		return nil, err
@@ -295,18 +344,35 @@ func DecodeCommitPage(h CommitHeader, e PageEntry, b []byte) ([]byte, error) {
 // r: header, page table, every page, and that nothing follows the last page.
 // It calls fn, if not nil, with each page in order; the page slice is reused
 // after fn returns. Errors from r and from fn are returned unchanged, not
-// wrapped in a format class.
+// wrapped in a format class. It judges the magic and version from the first
+// ten bytes before reading more. A retired commit, which must end at its
+// header, gives its header, no entries and ErrRetired.
 func DecodeCommit(r io.Reader, db DatabaseID, fn func(pgno uint32, page []byte) error) (CommitHeader, []PageEntry, error) {
 	hb := make([]byte, CommitHeaderSize)
-	if n, err := io.ReadFull(r, hb); err != nil {
+	if n, err := io.ReadFull(r, hb[:versionEnd]); err != nil {
 		if short(err) {
-			_, err = DecodeCommitHeader(hb[:n], db)
+			err = checkMagicVersion(hb[:n], commitMagic)
+		}
+		return CommitHeader{}, nil, err
+	}
+	if err := checkMagicVersion(hb[:versionEnd], commitMagic); err != nil {
+		return CommitHeader{}, nil, err
+	}
+	if n, err := io.ReadFull(r, hb[versionEnd:]); err != nil {
+		if short(err) {
+			err = invalid("header truncated at %d bytes", versionEnd+n)
 		}
 		return CommitHeader{}, nil, err
 	}
 	h, err := DecodeCommitHeader(hb, db)
 	if err != nil {
 		return CommitHeader{}, nil, err
+	}
+	if h.Retired {
+		if err := atEOF(r); err != nil {
+			return CommitHeader{}, nil, err
+		}
+		return h, nil, ErrRetired
 	}
 	// ReadAll grows with the bytes actually present, not with TableSize.
 	tb, err := io.ReadAll(io.LimitReader(r, h.TableSize()))

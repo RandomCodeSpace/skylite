@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"math"
+	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -83,6 +85,14 @@ func TestCommitRejects(t *testing.T) {
 		{"header checksum corrupt", plain, flip(141), ErrChecksum},
 		{"codec set", plain, fixed(set16(10, 1<<1)), ErrVersion},
 		{"unknown flag", plain, fixed(set16(10, 1<<15)), ErrVersion},
+		{"flag bit 5", plain, fixed(set16(10, 1<<5)), ErrVersion},
+		{"retired epoch bump", bump, fixed(set16(10, flagEpochBump|flagRetired)), ErrInvalid},
+		{"retired with its page table", plain, fixed(set16(10, flagRetired)), ErrInvalid},
+		{"retired with a trailing byte", func() []byte { return goldenRetired(t) }, func(b []byte) []byte { return append(b, 0) }, ErrInvalid},
+		{"retired with a trailing table", func() []byte { return append(goldenRetired(t), plain()[CommitHeaderSize:]...) }, nil, ErrInvalid},
+		{"retired, other database", func() []byte { return goldenRetired(t) }, fixed(setDB(52, otherDB)), ErrMisplaced},
+		{"retired, header corrupt", func() []byte { return goldenRetired(t) }, flip(20), ErrChecksum},
+		{"retired, too large", func() []byte { return goldenRetired(t) }, fixed(then(set32(12, 65536), then(set32(32, 100000), then(set32(36, 65536), set64(40, 65536*16))))), ErrInvalid},
 		{"page size not a power of two", plain, fixed(set32(12, 1000)), ErrInvalid},
 		{"page size too small", plain, fixed(set32(12, 256)), ErrInvalid},
 		{"page size too large", plain, fixed(set32(12, 131072)), ErrInvalid},
@@ -541,18 +551,35 @@ func TestBasePageRejects(t *testing.T) {
 
 func TestCheckKey(t *testing.T) {
 	c := goldenCommit().h
-	if err := c.CheckKey(7); err != nil {
+	if err := c.CheckKey(goldenDB, 7); err != nil {
 		t.Fatal(err)
 	}
-	wantClass(t, c.CheckKey(8), ErrMisplaced)
-	wantClass(t, c.CheckKey(6), ErrMisplaced)
+	wantClass(t, c.CheckKey(goldenDB, 8), ErrMisplaced)
+	wantClass(t, c.CheckKey(goldenDB, 6), ErrMisplaced)
+	wantClass(t, c.CheckKey(otherDB, 7), ErrMisplaced)
 	b, _ := goldenBase()
-	if err := b.CheckKey(524288, 9, 3); err != nil {
+	if err := b.CheckKey(goldenDB, 524288, 9, 3); err != nil {
 		t.Fatal(err)
 	}
-	wantClass(t, b.CheckKey(524289, 9, 3), ErrMisplaced)
-	wantClass(t, b.CheckKey(524288, 8, 3), ErrMisplaced)
-	wantClass(t, b.CheckKey(524288, 9, 4), ErrMisplaced)
+	wantClass(t, b.CheckKey(goldenDB, 524289, 9, 3), ErrMisplaced)
+	wantClass(t, b.CheckKey(goldenDB, 524288, 8, 3), ErrMisplaced)
+	wantClass(t, b.CheckKey(goldenDB, 524288, 9, 4), ErrMisplaced)
+	wantClass(t, b.CheckKey(otherDB, 524288, 9, 3), ErrMisplaced)
+
+	// A header checked against the key it was parsed from.
+	k, err := NewKeys("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{k.Commit(goldenDB, 7), k.Commit(otherDB, 7)} {
+		db, txn, err := k.ParseCommit(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.CheckKey(db, txn); (key == k.Commit(goldenDB, 7)) != (err == nil) {
+			t.Fatalf("%s: %v", key, err)
+		}
+	}
 }
 
 func TestZeroDivisorsPanic(t *testing.T) {
@@ -578,7 +605,6 @@ func TestManifestRejects(t *testing.T) {
 	golden := func() []byte { b, _ := EncodeManifest(goldenManifest()); return b }
 	fixed := func(m func([]byte) []byte) func([]byte) []byte { return then(m, refixManifest) }
 	const ref0 = manifestHeaderSize
-	const bump0 = manifestHeaderSize + 3*groupRefSize
 	cases := []mutation{
 		{"empty", golden, cut(0), ErrNotFormat},
 		{"other magic", golden, flip(7), ErrNotFormat},
@@ -591,11 +617,13 @@ func TestManifestRejects(t *testing.T) {
 		{"version 2", golden, set16(8, 2), ErrVersion},
 		{"one byte short", golden, func(b []byte) []byte { return b[:len(b)-1] }, ErrInvalid},
 		{"trailing byte", golden, func(b []byte) []byte { return append(b, 0) }, ErrInvalid},
-		{"group count", golden, fixed(set32(56, 2)), ErrInvalid},
-		{"bump count", golden, fixed(set32(60, 1)), ErrInvalid},
-		{"counts traded", golden, fixed(then(set32(56, 2), set32(60, 4))), ErrInvalid},
+		{"group count", golden, fixed(set32(72, 2)), ErrInvalid},
+		{"group count with the bytes to match", golden, fixed(func(b []byte) []byte { le.PutUint32(b[72:], 4); return append(b, make([]byte, 16)...) }), ErrInvalid},
 		{"corrupt", golden, flip(30), ErrChecksum},
-		{"bump corrupt", golden, flip(bump0 + 9), ErrChecksum},
+		{"nonce corrupt", golden, flip(60), ErrChecksum},
+		{"reference corrupt", golden, flip(ref0 + 9), ErrChecksum},
+		{"nonce zero", golden, fixed(func(b []byte) []byte { clear(b[56:72]); return b }), ErrInvalid},
+		{"nonce one bit", golden, fixed(func(b []byte) []byte { clear(b[56:72]); b[71] = 0x80; return b }), nil},
 		{"checksum corrupt", golden, func(b []byte) []byte { b[len(b)-1] ^= 1; return b }, ErrChecksum},
 		{"flags", golden, fixed(set16(10, 1)), ErrVersion},
 		{"page size", golden, fixed(set32(12, 100)), ErrInvalid},
@@ -613,12 +641,8 @@ func TestManifestRejects(t *testing.T) {
 		{"reference after manifest transaction", golden, fixed(set64(ref0, 10)), ErrInvalid},
 		{"reference after manifest epoch", golden, fixed(set64(ref0+8, 4)), ErrInvalid},
 		{"last reference after manifest epoch", golden, fixed(set64(ref0+2*16+8, 4)), ErrInvalid},
-		{"bump 0", golden, fixed(set64(bump0, 0)), ErrInvalid},
-		{"bump after manifest transaction", golden, fixed(set64(bump0+8, 10)), ErrInvalid},
-		{"bump at manifest transaction", golden, fixed(set64(bump0+8, 9)), nil},
-		{"duplicate bump", golden, fixed(set64(bump0+8, 2)), ErrInvalid},
-		{"bumps descending", golden, fixed(set64(bump0, 9)), ErrInvalid},
-		{"bumps before any base", golden, fixed(then(set64(24, 0), then(set32(20, 0), set32(56, 0)))), ErrInvalid},
+		{"empty reference with a transaction", golden, fixed(set64(ref0+16, 1)), ErrInvalid},
+		{"empty reference with an epoch", golden, fixed(set64(ref0+16+8, 1)), ErrInvalid},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -636,27 +660,32 @@ func TestManifestRejects(t *testing.T) {
 			wantClass(t, err, c.want)
 		})
 	}
-	// A reader that does not know the identifier yet accepts any.
+	// Discovery: a reader that does not know the identifier yet accepts any.
 	if m, err := DecodeManifest(golden(), DatabaseID{}); err != nil || m.DB != goldenDB {
 		t.Fatalf("decoded %x, %v", m.DB, err)
+	}
+	foreign := goldenManifest()
+	foreign.DB = otherDB
+	if fb, err := EncodeManifest(foreign); err != nil {
+		t.Fatal(err)
+	} else if m, err := DecodeManifest(fb, DatabaseID{}); err != nil || m.DB != otherDB {
+		t.Fatalf("discovery of another database: %x, %v", m.DB, err)
 	}
 
 	with := func(f func(*Manifest)) Manifest { m := goldenManifest(); f(&m); return m }
 	for name, m := range map[string]Manifest{
-		"database identifier": with(func(m *Manifest) { m.DB = DatabaseID{} }),
-		"page size":           with(func(m *Manifest) { m.PageSize = 0 }),
-		"group size":          with(func(m *Manifest) { m.GroupSize = 6 }),
-		"database too large":  with(func(m *Manifest) { m.DBSize = MaxPages + 1 }),
-		"epoch 0":             with(func(m *Manifest) { m.Epoch = 0 }),
-		"too few groups":      with(func(m *Manifest) { m.Groups = m.Groups[:2] }),
-		"too many groups":     with(func(m *Manifest) { m.Groups = append(m.Groups, GroupRef{}) }),
-		"half a reference":    with(func(m *Manifest) { m.Groups[1].Txn = 1 }),
-		"reference too new":   with(func(m *Manifest) { m.Groups[0].Txn = 10 }),
-		"reference epoch new": with(func(m *Manifest) { m.Groups[0].Epoch = 4 }),
-		"bump 0":              with(func(m *Manifest) { m.Bumps = []uint64{0, 2} }),
-		"bump too new":        with(func(m *Manifest) { m.Bumps = []uint64{2, 10} }),
-		"duplicate bump":      with(func(m *Manifest) { m.Bumps = []uint64{2, 2} }),
-		"bumps descending":    with(func(m *Manifest) { m.Bumps = []uint64{8, 2} }),
+		"database identifier":     with(func(m *Manifest) { m.DB = DatabaseID{} }),
+		"page size":               with(func(m *Manifest) { m.PageSize = 0 }),
+		"group size":              with(func(m *Manifest) { m.GroupSize = 6 }),
+		"database too large":      with(func(m *Manifest) { m.DBSize = MaxPages + 1 }),
+		"epoch 0":                 with(func(m *Manifest) { m.Epoch = 0 }),
+		"nonce zero":              with(func(m *Manifest) { m.Nonce = [16]byte{} }),
+		"too few groups":          with(func(m *Manifest) { m.Groups = m.Groups[:2] }),
+		"too many groups":         with(func(m *Manifest) { m.Groups = append(m.Groups, GroupRef{}) }),
+		"half a reference":        with(func(m *Manifest) { m.Groups[1].Txn = 1 }),
+		"reference too new":       with(func(m *Manifest) { m.Groups[0].Txn = 10 }),
+		"reference epoch new":     with(func(m *Manifest) { m.Groups[0].Epoch = 4 }),
+		"half a reference, epoch": with(func(m *Manifest) { m.Groups[1].Epoch = 1 }),
 	} {
 		t.Run("encode "+name, func(t *testing.T) {
 			_, err := EncodeManifest(m)
@@ -668,11 +697,9 @@ func TestManifestRejects(t *testing.T) {
 	}
 }
 
-// TestManifestSizeLimit fills a manifest with epoch bumps to the largest
-// size the format allows, 68 + 8b bytes with no groups, and one bump more.
 // rawManifest encodes m without validating it.
 func rawManifest(m Manifest) []byte {
-	b := make([]byte, manifestSize(int64(len(m.Groups)), int64(len(m.Bumps))))
+	b := make([]byte, 80+16*len(m.Groups))
 	copy(b, "SKYLITEM")
 	putN(b, 8, 2, 1)
 	putN(b, 12, 4, uint64(m.PageSize))
@@ -681,14 +708,11 @@ func rawManifest(m Manifest) []byte {
 	putN(b, 24, 8, m.Txn)
 	putN(b, 32, 8, m.Epoch)
 	copy(b[40:], m.DB[:])
-	putN(b, 56, 4, uint64(len(m.Groups)))
-	putN(b, 60, 4, uint64(len(m.Bumps)))
+	copy(b[56:], m.Nonce[:])
+	putN(b, 72, 4, uint64(len(m.Groups)))
 	for i, r := range m.Groups {
-		putN(b, 64+16*i, 8, r.Txn)
-		putN(b, 72+16*i, 8, r.Epoch)
-	}
-	for i, t := range m.Bumps {
-		putN(b, 64+16*len(m.Groups)+8*i, 8, t)
+		putN(b, 76+16*i, 8, r.Txn)
+		putN(b, 84+16*i, 8, r.Epoch)
 	}
 	putN(b, len(b)-4, 4, uint64(crc32cBitwise(b[:len(b)-4])))
 	return b
@@ -737,7 +761,7 @@ func TestHeaderRules(t *testing.T) {
 	}
 
 	manifest := func(f func(*Manifest)) Manifest {
-		m := Manifest{DB: goldenDB, PageSize: 4096, GroupSize: 256, Epoch: 1}
+		m := Manifest{DB: goldenDB, PageSize: 4096, GroupSize: 256, Epoch: 1, Nonce: goldenNonce}
 		f(&m)
 		m.Groups = make([]GroupRef, GroupCount(m.DBSize, m.GroupSize))
 		return m
@@ -750,7 +774,7 @@ func TestHeaderRules(t *testing.T) {
 		"group size 3":       manifest(func(m *Manifest) { m.GroupSize = 3 }),
 		"epoch 0":            manifest(func(m *Manifest) { m.Epoch = 0 }),
 		"database too large": manifest(func(m *Manifest) { m.PageSize, m.GroupSize, m.DBSize = 512, 131072, MaxPages+1 }),
-		"first bump 0":       manifest(func(m *Manifest) { m.Txn, m.Bumps = 5, []uint64{0} }),
+		"nonce zero":         manifest(func(m *Manifest) { m.Nonce = [16]byte{} }),
 	} {
 		t.Run("manifest "+name, func(t *testing.T) {
 			_, err := DecodeManifest(rawManifest(m), goldenDB)
@@ -766,39 +790,34 @@ func TestHeaderRules(t *testing.T) {
 	}
 }
 
+// TestManifestSizeLimit builds the largest manifest the format allows,
+// 1048571 groups in exactly MaxManifestSize bytes, and one group more.
 func TestManifestSizeLimit(t *testing.T) {
-	const most = (MaxManifestSize - 68) / 8
-	m := Manifest{DB: goldenDB, PageSize: 4096, GroupSize: 256, Txn: most + 1, Epoch: 1, Bumps: make([]uint64, most)}
-	for i := range m.Bumps {
-		m.Bumps[i] = uint64(i) + 1
-	}
+	const most = (MaxManifestSize - 80) / 16
+	m := Manifest{DB: goldenDB, PageSize: 512, GroupSize: 1, DBSize: most, Txn: 1, Epoch: 1, Nonce: goldenNonce, Groups: make([]GroupRef, most)}
 	b, err := EncodeManifest(m)
-	if err != nil || len(b) != 68+8*most || len(b) > MaxManifestSize || len(b)+8 <= MaxManifestSize {
+	if err != nil || len(b) != MaxManifestSize {
 		t.Fatalf("largest manifest: %d bytes, %v", len(b), err)
 	}
-	if got, err := DecodeManifest(b, goldenDB); err != nil || len(got.Bumps) != most {
+	if got, err := DecodeManifest(b, goldenDB); err != nil || len(got.Groups) != most {
 		t.Fatalf("largest manifest does not decode: %v", err)
 	}
-	m.Bumps = append(m.Bumps, most+1)
+	m.DBSize++
+	m.Groups = append(m.Groups, GroupRef{})
 	_, err = EncodeManifest(m)
 	wantClass(t, err, ErrInvalid)
 	if !errors.Is(err, ErrManifestTooLarge) {
 		t.Fatalf("encode: %v, want ErrManifestTooLarge", err)
 	}
 	// Decoding checks the size before the counts, the checksum or any field.
-	big := append(slices.Clone(b), make([]byte, 8)...)
+	big := append(slices.Clone(b), make([]byte, 16)...)
 	_, err = DecodeManifest(big, goldenDB)
 	wantClass(t, err, ErrInvalid)
 	if !errors.Is(err, ErrManifestTooLarge) {
 		t.Fatalf("decode: %v, want ErrManifestTooLarge", err)
 	}
-	limit := make([]byte, MaxManifestSize+1)
-	copy(limit, b[:10])
-	if _, err := DecodeManifest(limit, goldenDB); !errors.Is(err, ErrManifestTooLarge) {
+	if _, err := DecodeManifest(big[:MaxManifestSize+1], goldenDB); !errors.Is(err, ErrManifestTooLarge) {
 		t.Fatalf("decode one byte over the limit: %v, want ErrManifestTooLarge", err)
-	}
-	if _, err := DecodeManifest(limit[:MaxManifestSize], goldenDB); err == nil || errors.Is(err, ErrManifestTooLarge) {
-		t.Fatalf("decode at the limit: %v, want an ordinary invalid manifest", err)
 	}
 	le.PutUint16(big[8:], 2)
 	wantClass(t, func() error { _, err := DecodeManifest(big, goldenDB); return err }(), ErrVersion)
@@ -906,7 +925,7 @@ func TestKeysReject(t *testing.T) {
 	for _, p := range []string{
 		"", "/", "a/", "/a", "a//b", ".", "..", "a.", "a/./b", "a/../b", "a b", "a\x00", "ä", "a:b", "a\\b",
 		strings.Repeat("a", MaxKeyLen-longestSuffix+1),
-		strings.Repeat("a/", MaxKeySegments-2) + "a",
+		strings.Repeat("a/", MaxKeySegments-3) + "a",
 	} {
 		if _, err := NewKeys(p); err == nil {
 			t.Errorf("NewKeys(%q) accepted", p)
@@ -914,59 +933,281 @@ func TestKeysReject(t *testing.T) {
 			wantClass(t, err, ErrInvalid)
 		}
 	}
-	for _, p := range []string{"a", "tenant-1/db.main_2", "..a", "a..b", strings.Repeat("a/", MaxKeySegments-3) + "a", strings.Repeat("a", MaxKeyLen-longestSuffix)} {
+	for _, p := range []string{"a", "tenant-1/db.main_2", "..a", "a..b", strings.Repeat("a/", MaxKeySegments-4) + "a", strings.Repeat("a", MaxKeyLen-longestSuffix)} {
 		k, err := NewKeys(p)
 		if err != nil {
 			t.Errorf("NewKeys(%q): %v", p, err)
 			continue
 		}
-		if key := k.Base(math.MaxUint32, math.MaxUint64, math.MaxUint64); !validKey(key) {
+		if key := k.Base(goldenDB, math.MaxUint32, math.MaxUint64, math.MaxUint64); !validKey(key) {
 			t.Errorf("longest key %q is invalid", key)
 		}
+	}
+	if MaxKeyLen-longestSuffix != 933 {
+		t.Errorf("longest prefix is %d bytes, the specification says 933", MaxKeyLen-longestSuffix)
 	}
 
 	k, err := NewKeys("db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := k.Commit(42); got != "db/log/00000000000000000042" {
+	const id = "5b1e3c00912a4f7708d36ea510c42bf9" // goldenDB
+	if got := k.Commit(goldenDB, 42); got != "db/"+id+"/log/00000000000000000042" {
 		t.Errorf("Commit(42) = %q", got)
 	}
-	if got := k.Base(3, 42, 7); got != "db/base/0000000003-00000000000000000042-00000000000000000007" {
+	if got := k.Base(goldenDB, 3, 42, 7); got != "db/"+id+"/base/0000000003-00000000000000000042-00000000000000000007" {
 		t.Errorf("Base(3, 42, 7) = %q", got)
 	}
 	if k.Manifest() != "db/manifest" || k.Lease() != "db/lease" {
 		t.Errorf("Manifest, Lease = %q, %q", k.Manifest(), k.Lease())
 	}
+	if k.CommitPrefix(goldenDB) != "db/"+id+"/log/" || k.BasePrefix(goldenDB) != "db/"+id+"/base/" {
+		t.Errorf("prefixes %q, %q", k.CommitPrefix(goldenDB), k.BasePrefix(goldenDB))
+	}
 
-	commit := k.Commit(42)
+	const upper = "5B1E3C00912A4F7708D36EA510C42BF9"
+	const zero = "00000000000000000000000000000000"
+	const log42 = "/log/00000000000000000042"
+	commit := k.Commit(goldenDB, 42)
 	for _, key := range []string{
-		"", "db/log/", "db/log/42", commit[:len(commit)-1], commit + "0", commit + "/x",
-		"db/log/0000000000000000004a", "db/log/+0000000000000000042", "db/log/ 0000000000000000042",
-		"db/log/99999999999999999999", "other/log/00000000000000000042", "db/base/00000000000000000042",
-		"dbx/log/00000000000000000042", "db//log/00000000000000000042",
+		"", "db/" + id + "/log/", "db/" + id + "/log/42", commit[:len(commit)-1], commit + "0", commit + "/x",
+		"db/" + id + "/log/0000000000000000004a", "db/" + id + "/log/+0000000000000000042", "db/" + id + "/log/ 0000000000000000042",
+		"db/" + id + "/log/99999999999999999999", "other/" + id + log42, "db/" + id + "/base/00000000000000000042",
+		"dbx/" + id + log42, "db//" + id + log42,
+		"db" + log42, // no identifier
+		"db/" + upper + log42,
+		"db/5b1e3c00912a4f7708d36ea510c42bF9" + log42,
+		"db/" + zero + log42,
+		"db/" + id[:31] + log42,
+		"db/" + id + "0" + log42,
+		"db/" + id[:30] + "zz" + log42,
+		"db/" + id + "log/00000000000000000042",
 	} {
-		if _, err := k.ParseCommit(key); err == nil {
+		if _, _, err := k.ParseCommit(key); err == nil {
 			t.Errorf("ParseCommit(%q) accepted", key)
 		} else {
 			wantClass(t, err, ErrInvalid)
 		}
 	}
-	base := k.Base(3, 42, 7)
+	const name = "0000000003-00000000000000000042-00000000000000000007"
+	base := k.Base(goldenDB, 3, 42, 7)
 	for _, key := range []string{
-		"", "db/base/", base[:len(base)-1], base + "0", commit,
+		"", "db/" + id + "/base/", base[:len(base)-1], base + "0", commit,
 		strings.Replace(base, "-", "_", 1),
-		"db/base/4294967296-00000000000000000042-00000000000000000007",
-		"db/base/0000000003-99999999999999999999-00000000000000000007",
-		"db/base/0000000003-00000000000000000042-99999999999999999999",
-		"db/base/000000000a-00000000000000000042-00000000000000000007",
-		"db/base/0000000003-00000000000000000042-0000000000000000000x",
-		"db/base/00000000003-0000000000000000042-00000000000000000007",
+		"db/" + id + "/base/4294967296-00000000000000000042-00000000000000000007",
+		"db/" + id + "/base/0000000003-99999999999999999999-00000000000000000007",
+		"db/" + id + "/base/0000000003-00000000000000000042-99999999999999999999",
+		"db/" + id + "/base/000000000a-00000000000000000042-00000000000000000007",
+		"db/" + id + "/base/0000000003-00000000000000000042-0000000000000000000x",
+		"db/" + id + "/base/00000000003-0000000000000000042-00000000000000000007",
+		"db/base/" + name,
+		"db/" + upper + "/base/" + name,
+		"db/" + zero + "/base/" + name,
+		"db/" + id[:31] + "/base/" + name,
 	} {
-		if _, _, _, err := k.ParseBase(key); err == nil {
+		if _, _, _, _, err := k.ParseBase(key); err == nil {
 			t.Errorf("ParseBase(%q) accepted", key)
 		} else {
 			wantClass(t, err, ErrInvalid)
 		}
 	}
+	// A key of another database parses to that database's identifier.
+	if db, _, err := k.ParseCommit(k.Commit(otherDB, 42)); err != nil || db != otherDB {
+		t.Errorf("ParseCommit of another database: %x, %v", db, err)
+	}
+	if db, _, _, _, err := k.ParseBase(k.Base(otherDB, 3, 42, 7)); err != nil || db != otherDB {
+		t.Errorf("ParseBase of another database: %x, %v", db, err)
+	}
+}
+
+// onceReader returns its data in one Read and fails the test on any later one.
+type onceReader struct {
+	t    *testing.T
+	data []byte
+	done bool
+}
+
+func (r *onceReader) Read(p []byte) (int, error) {
+	if r.done {
+		r.t.Fatal("read again after the version was supplied")
+	}
+	r.done = true
+	return copy(p, r.data), nil
+}
+
+// TestEarlyStreamVersion is the review's case: DecodeCommit judges the
+// magic and version from the first ten bytes, before reading more.
+func TestEarlyStreamVersion(t *testing.T) {
+	for _, v := range []uint16{0, 2, 0xffff} {
+		b := []byte("SKYLITEC\x00\x00")
+		le.PutUint16(b[8:], v)
+		_, _, err := DecodeCommit(&onceReader{t: t, data: b}, goldenDB, nil)
+		wantClass(t, err, ErrVersion)
+	}
+	_, _, err := DecodeCommit(&onceReader{t: t, data: []byte("SKYLITEX\x01\x00")}, goldenDB, nil)
+	wantClass(t, err, ErrNotFormat)
+}
+
+// TestCommitSizeLimit checks the largest commit at every page size and one
+// page more, from the header alone, in the encoder and in each decoder.
+func TestCommitSizeLimit(t *testing.T) {
+	for ps := uint32(MinPageSize); ps <= MaxPageSize; ps *= 2 {
+		// No commit is exactly MaxCommitSize, so a limit off by one byte in
+		// either direction accepts and refuses the same commits.
+		if (MaxCommitSize-CommitHeaderSize)%(int64(ps)+PageEntrySize+recordTrailer) == 0 {
+			t.Fatalf("page size %d: a commit can be exactly MaxCommitSize", ps)
+		}
+		most := uint32((MaxCommitSize - CommitHeaderSize) / (int64(ps) + PageEntrySize + recordTrailer)) //nolint:gosec // at most 2018311
+		h := CommitHeader{DB: goldenDB, PageSize: ps, Txn: 1, Epoch: 1, DBSize: MaxPages, PageCount: most}
+		if h.Size() > MaxCommitSize || h.Size()+int64(ps)+PageEntrySize+recordTrailer <= MaxCommitSize {
+			t.Fatalf("page size %d: %d pages make %d bytes", ps, most, h.Size())
+		}
+		if _, err := DecodeCommitHeader(h.encode(0), goldenDB); err != nil {
+			t.Fatalf("page size %d, %d pages: %v", ps, most, err)
+		}
+		h.PageCount++
+		_, err := DecodeCommitHeader(h.encode(0), goldenDB)
+		wantTooLarge(t, err)
+		_, _, err = DecodeCommit(bytes.NewReader(h.encode(0)), goldenDB, nil)
+		wantTooLarge(t, err)
+		_, err = DecodeCommitTable(h, nil)
+		wantTooLarge(t, err)
+		_, err = DecodeCommitPage(h, PageEntry{}, nil)
+		wantTooLarge(t, err)
+		_, err = h.Retire()
+		wantTooLarge(t, err)
+		// The encoder refuses before it reads a page or writes a byte.
+		pgnos := make([]uint32, h.PageCount)
+		for i := range pgnos {
+			pgnos[i] = uint32(i) + 1 //nolint:gosec // below MaxPages
+		}
+		w := &failWriter{}
+		wantTooLarge(t, EncodeCommit(w, h, pgnos, &onceReader{t: t, done: true}))
+	}
+}
+
+func wantTooLarge(t *testing.T, err error) {
+	t.Helper()
+	wantClass(t, err, ErrInvalid)
+	if !errors.Is(err, ErrCommitTooLarge) {
+		t.Fatalf("error %v, want ErrCommitTooLarge", err)
+	}
+}
+
+// TestLargestCommit encodes and decodes the largest commit at 65536-byte
+// pages, 16378 pages of 1 GiB in all, through a pipe so neither side holds
+// the object.
+func TestLargestCommit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes 1 GiB")
+	}
+	const n = 16378
+	h := CommitHeader{DB: goldenDB, PageSize: 65536, Txn: 1, Epoch: 1, DBSize: n + 1, PageCount: n}
+	var pgnos []uint32
+	for p := uint32(1); len(pgnos) < n; p++ {
+		if p != LockPage(65536) {
+			pgnos = append(pgnos, p)
+		}
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		pw.CloseWithError(EncodeCommit(pw, h, pgnos, zeroReader{}))
+	}()
+	var pages int
+	got, entries, err := DecodeCommit(pr, goldenDB, func(uint32, []byte) error { pages++; return nil })
+	if err != nil || pages != n || len(entries) != n || got.Size() != 1073676312 {
+		t.Fatalf("largest commit: %d pages, %d bytes, %v", pages, got.Size(), err)
+	}
+	if last := entries[n-1]; last.Offset+uint64(last.Length) != 1073676312 {
+		t.Fatalf("last record ends at %d", last.Offset+uint64(last.Length))
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) { clear(p); return len(p), nil }
+
+// TestTooLargeFromHeader is the review's two wide-arithmetic cases, which
+// the commit size limit turned into rejections. A 1 MiB page table at
+// 65536-byte pages describes a 4296278160-byte commit, whose size wraps to
+// 1310864 bytes in 32 bits; a header advertising a 4 GiB table has a table
+// size that wraps to 0 in 32 bits. Both are refused from the header, with
+// little allocation and without reading the table that follows.
+func TestTooLargeFromHeader(t *testing.T) {
+	for _, h := range []CommitHeader{
+		{DB: goldenDB, PageSize: 65536, Txn: 1, Epoch: 1, DBSize: 100000, PageCount: 65536},
+		{DB: goldenDB, PageSize: 512, Txn: 1, Epoch: 1, DBSize: MaxPages, PageCount: 1 << 28},
+	} {
+		hdr := h.encode(0)
+		if got := le.Uint64(hdr[40:]); got != uint64(h.PageCount)*16 || got < 1<<20 {
+			t.Fatalf("table size field %d", got)
+		}
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		_, _, err := DecodeCommit(io.MultiReader(bytes.NewReader(hdr), &onceReader{t: t, done: true}), goldenDB, nil)
+		runtime.ReadMemStats(&after)
+		wantTooLarge(t, err)
+		if got := after.TotalAlloc - before.TotalAlloc; got > 64<<10 {
+			t.Fatalf("allocated %d bytes", got)
+		}
+		_, err = DecodeCommitTable(h, make([]byte, 1<<20))
+		wantTooLarge(t, err)
+	}
+}
+
+// TestRetired checks the retired form and what each decoder does with it.
+func TestRetired(t *testing.T) {
+	b := goldenCommit().encode(t)
+	h, entries, err := DecodeCommit(bytes.NewReader(b), goldenDB, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := h.Retire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(r[:10], b[:10]) || le.Uint16(r[10:]) != 1<<4 || !bytes.Equal(r[12:140], b[12:140]) {
+		t.Fatal("retiring changed a field other than the flags")
+	}
+	rh, err := DecodeCommitHeader(r, goldenDB)
+	if err != nil || !rh.Retired || rh.EpochBump {
+		t.Fatalf("retired header %+v, %v", rh, err)
+	}
+	if err := rh.CheckKey(goldenDB, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeCommitTable(rh, b[CommitHeaderSize:CommitHeaderSize+32]); err != ErrRetired { //nolint:errorlint // must be exactly ErrRetired
+		t.Fatalf("table of a retired commit: %v", err)
+	}
+	if _, err := DecodeCommitPage(rh, entries[0], b[entries[0].Offset:entries[0].Offset+516]); err != ErrRetired { //nolint:errorlint // must be exactly ErrRetired
+		t.Fatalf("page of a retired commit: %v", err)
+	}
+	called := false
+	dh, de, err := DecodeCommit(bytes.NewReader(r), goldenDB, func(uint32, []byte) error { called = true; return nil })
+	if err != ErrRetired || de != nil || called || !reflect.DeepEqual(dh, rh) { //nolint:errorlint // must be exactly ErrRetired
+		t.Fatalf("DecodeCommit of a retired commit: %+v %v, %v", dh, de, err)
+	}
+	for _, c := range classes {
+		if errors.Is(ErrRetired, c) {
+			t.Fatalf("ErrRetired wraps %v", c)
+		}
+	}
+	// A read error after the retired header is the reader's, unchanged.
+	_, _, err = DecodeCommit(&errReader{data: r}, goldenDB, nil)
+	wantForeign(t, err, errBoom)
+
+	// An epoch bump is never retired, and EncodeCommit writes no retired form.
+	bh, _, err := DecodeCommit(bytes.NewReader(goldenBump().encode(t)), goldenDB, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = bh.Retire()
+	wantClass(t, err, ErrInvalid)
+	g := goldenCommit()
+	g.h.Retired = true
+	wantClass(t, EncodeCommit(io.Discard, g.h, g.pgnos, bytes.NewReader(g.pages)), ErrInvalid)
+	bump := goldenBump().h
+	bump.Retired = true
+	_, err = DecodeCommitHeader(bump.encode(0), goldenDB)
+	wantClass(t, err, ErrInvalid)
 }

@@ -2,6 +2,7 @@ package format
 
 import (
 	"bytes"
+	"errors"
 	"slices"
 	"testing"
 )
@@ -13,7 +14,7 @@ import (
 // also reaches the checks behind them.
 
 func FuzzDecodeCommit(f *testing.F) {
-	for _, name := range []string{"commit.bin", "commit-bump.bin"} {
+	for _, name := range []string{"commit.bin", "commit-bump.bin", "commit-retired.bin"} {
 		f.Add(readGolden(f, name), false)
 	}
 	f.Add([]byte(commitMagic), true)
@@ -26,9 +27,18 @@ func FuzzDecodeCommit(f *testing.F) {
 			pages = append(pages, p...)
 			return nil
 		})
+		if errors.Is(err, ErrRetired) {
+			if !h.Retired || h.EpochBump || entries != nil || pages != nil || !bytes.Equal(h.encode(h.tableCRC), b) {
+				t.Fatalf("retired commit decoded as %+v %v", h, entries)
+			}
+			return
+		}
 		if err != nil {
 			checkClass(t, err)
 			return
+		}
+		if h.Retired {
+			t.Fatal("retired commit decoded without ErrRetired")
 		}
 		if again := (commitCase{h, pgnosOf(entries), pages}).encode(t); !bytes.Equal(again, b) {
 			t.Fatal("decoded commit re-encodes differently")
@@ -37,7 +47,7 @@ func FuzzDecodeCommit(f *testing.F) {
 }
 
 func FuzzDecodeCommitHeader(f *testing.F) {
-	for _, name := range []string{"commit.bin", "commit-bump.bin"} {
+	for _, name := range []string{"commit.bin", "commit-bump.bin", "commit-retired.bin"} {
 		f.Add(readGolden(f, name)[:CommitHeaderSize], false)
 	}
 	f.Fuzz(func(t *testing.T, b []byte, fix bool) {
@@ -52,6 +62,29 @@ func FuzzDecodeCommitHeader(f *testing.F) {
 		}
 		if !bytes.Equal(h.encode(h.tableCRC), b) {
 			t.Fatal("decoded header re-encodes differently")
+		}
+		// The retired form differs from the header in bit 4 and the CRC
+		// alone, and the table and page decoders refuse it.
+		r, err := h.Retire()
+		if h.EpochBump {
+			if err == nil {
+				t.Fatal("an epoch bump was retired")
+			}
+			checkClass(t, err)
+			return
+		}
+		want := slices.Clone(b)
+		want[10] |= 1 << 4
+		le.PutUint32(want[140:], crc32cBitwise(want[:140]))
+		if err != nil || !bytes.Equal(r, want) {
+			t.Fatalf("retired form differs: %v", err)
+		}
+		rh, err := DecodeCommitHeader(r, goldenDB)
+		if err != nil || !rh.Retired {
+			t.Fatalf("retired header decodes as %+v, %v", rh, err)
+		}
+		if _, err := DecodeCommitTable(rh, nil); !errors.Is(err, ErrRetired) {
+			t.Fatalf("table of a retired commit: %v", err)
 		}
 	})
 }
@@ -221,8 +254,12 @@ func FuzzDecodeLease(f *testing.F) {
 }
 
 func FuzzKeys(f *testing.F) {
+	const id = "5b1e3c00912a4f7708d36ea510c42bf9"
+	f.Add("db", "db/"+id+"/log/00000000000000000042")
+	f.Add("tenant/db", "tenant/db/"+id+"/base/0000000003-00000000000000000042-00000000000000000007")
+	f.Add("db", "db/5B1E3C00912A4F7708D36EA510C42BF9/log/00000000000000000042")
+	f.Add("db", "db/00000000000000000000000000000000/log/00000000000000000042")
 	f.Add("db", "db/log/00000000000000000042")
-	f.Add("tenant/db", "tenant/db/base/0000000003-00000000000000000042-00000000000000000007")
 	f.Add("a.", "a./manifest")
 	f.Fuzz(func(t *testing.T, prefix, key string) {
 		k, err := NewKeys(prefix)
@@ -230,18 +267,18 @@ func FuzzKeys(f *testing.F) {
 			checkClass(t, err)
 			return
 		}
-		if longest := k.Base(1<<32-1, 1<<64-1, 1<<64-1); !validKey(longest) {
+		if longest := k.Base(goldenDB, 1<<32-1, 1<<64-1, 1<<64-1); !validKey(longest) {
 			t.Fatalf("prefix %q accepted but builds invalid key %q", prefix, longest)
 		}
-		if txn, err := k.ParseCommit(key); err == nil {
-			if k.Commit(txn) != key {
+		if db, txn, err := k.ParseCommit(key); err == nil {
+			if db == (DatabaseID{}) || k.Commit(db, txn) != key {
 				t.Fatalf("ParseCommit accepted %q, which Commit does not build", key)
 			}
 		} else {
 			checkClass(t, err)
 		}
-		if g, txn, epoch, err := k.ParseBase(key); err == nil {
-			if k.Base(g, txn, epoch) != key {
+		if db, g, txn, epoch, err := k.ParseBase(key); err == nil {
+			if db == (DatabaseID{}) || k.Base(db, g, txn, epoch) != key {
 				t.Fatalf("ParseBase accepted %q, which Base does not build", key)
 			}
 		} else {

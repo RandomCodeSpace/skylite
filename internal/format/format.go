@@ -36,6 +36,17 @@ var (
 // errors.Is tells it apart from other invalid manifests.
 var ErrManifestTooLarge = fmt.Errorf("%w: manifest larger than %d bytes", ErrInvalid, MaxManifestSize)
 
+// ErrCommitTooLarge is the ErrInvalid error for a commit object larger than
+// MaxCommitSize, the largest transaction this version supports. It wraps
+// ErrInvalid, so it is in that class, and errors.Is tells it apart.
+var ErrCommitTooLarge = fmt.Errorf("%w: commit object larger than %d bytes", ErrInvalid, MaxCommitSize)
+
+// ErrRetired is returned by the decoders of a commit's page table and pages,
+// and by DecodeCommit together with the header, when the commit is retired.
+// It is not a format error and wraps none of the classes: the object is
+// well formed and its pages are gone.
+var ErrRetired = errors.New("format: commit retired")
+
 // DatabaseID identifies one database. It is generated once, when the
 // database is created, and is never all zeros.
 type DatabaseID [16]byte
@@ -110,6 +121,9 @@ func checkHeader(b []byte, magic string, size int) error {
 	}
 	return nil
 }
+
+// versionEnd is the length of the magic and the version that follows it.
+const versionEnd = 10
 
 // checkMagicVersion checks the 8-byte magic and, as soon as its two bytes
 // are present, the version that follows it.
