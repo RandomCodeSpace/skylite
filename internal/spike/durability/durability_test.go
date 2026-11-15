@@ -1311,6 +1311,12 @@ func TestTakeoverRace(t *testing.T) {
 			}
 		}()
 
+		// A failure below must not leave A writing into a container that
+		// cleanup is deleting.
+		t.Cleanup(func() {
+			stop.Store(true)
+			<-aDone
+		})
 		// B starts only once A has acknowledged a write and is still writing.
 		select {
 		case <-aAcked:

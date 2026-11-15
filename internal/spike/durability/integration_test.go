@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -289,10 +291,26 @@ func TestEmulatorSemantics(t *testing.T) {
 			t.Fatalf("upload of %d bytes took %d requests; want Put Block x5 + Put Block List", size, n)
 		}
 
-		before = requests.Load()
-		_, err := az.UploadStream(ctx, container, "large", bytes.NewReader(randomBytes(size)), opts)
+		// Stage the blocks one request at a time, so the test shows which
+		// request is rejected: every Put Block is accepted, the Put Block
+		// List is not.
+		bb := az.ServiceClient().NewContainerClient(container).NewBlockBlobClient("large")
+		other := randomBytes(size)
+		var ids []string
+		for off := 0; off < len(other); off += 1 << 20 {
+			id := base64.StdEncoding.EncodeToString(fmt.Appendf(nil, "%08d", len(ids)))
+			block := other[off:min(off+1<<20, len(other))]
+			if _, err := bb.StageBlock(ctx, id, streaming.NopCloser(bytes.NewReader(block)), nil); err != nil {
+				t.Fatalf("Put Block %d on an existing blob: %v", len(ids), err)
+			}
+			ids = append(ids, id)
+		}
+		if len(ids) != 5 {
+			t.Fatalf("staged %d blocks, want 5", len(ids))
+		}
+		_, err := bb.CommitBlockList(ctx, ids, &blockblob.CommitBlockListOptions{AccessConditions: ifNoneMatchAny()})
 		status, code := respErr(err)
-		t.Logf("Put Block List If-None-Match:* on an existing blob: HTTP %d %s after %d requests", status, code, requests.Load()-before)
+		t.Logf("Put Block List If-None-Match:* on an existing blob: HTTP %d %s", status, code)
 		if status != http.StatusConflict || code != string(bloberror.BlobAlreadyExists) {
 			t.Fatalf("got %d %q (%v), want 409 BlobAlreadyExists", status, code, err)
 		}
@@ -398,6 +416,11 @@ func TestEmulatorSemantics(t *testing.T) {
 		}
 		if err := rival.DeleteLTXFiles(ctx, []*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}); !errors.Is(err, ErrFenced) {
 			t.Fatalf("delete after fencing = %v, want ErrFenced", err)
+		}
+		// The identical bytes at the existing slot pass every other check, as
+		// retry showed above; only the latch refuses them now.
+		if _, err := rival.WriteLTXFile(ctx, 0, head, head, bytes.NewReader(mine)); !errors.Is(err, ErrFenced) {
+			t.Fatalf("identical rewrite by a fenced client = %v, want ErrFenced", err)
 		}
 		if got := downloadLTX(t, az, container, 0, head); !bytes.Equal(got, mine) {
 			t.Fatal("the taken slot changed")
