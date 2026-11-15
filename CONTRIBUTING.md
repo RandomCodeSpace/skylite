@@ -37,16 +37,21 @@ The queue runs the required checks again and then lands the squashed commit.
 You need Go (the version in `go.mod` or newer) and
 [golangci-lint](https://golangci-lint.run/) v2.
 
-| Command      | What it runs                                         |
-|--------------|------------------------------------------------------|
-| `make build` | `CGO_ENABLED=0` build of `bin/skylite`               |
-| `make test`  | `go test -race -count=1 ./...`                       |
-| `make vet`   | `go vet ./...`                                       |
-| `make lint`  | `golangci-lint run`                                  |
-| `make vuln`  | `govulncheck ./...` at the pinned version            |
-| `make check` | all of the above                                     |
+| Command            | What it runs                                                    |
+|--------------------|-----------------------------------------------------------------|
+| `make build`       | `CGO_ENABLED=0` build of `bin/skylite`                          |
+| `make test`        | `go test -race -count=1 ./...`                                  |
+| `make vet`         | `go vet ./...`                                                  |
+| `make lint`        | `golangci-lint run`                                             |
+| `make vuln`        | `govulncheck ./...` at the pinned version                       |
+| `make check`       | all of the above                                                |
+| `make integration` | Azurite in Docker, then `go test -race -tags integration ./...` |
 
-Run `make check` before opening a pull request. CI runs the same checks plus
+Run `make check` before opening a pull request. `make integration` needs
+Docker; it picks a free local port and removes its Azurite container when it
+finishes. The durability kill test runs 20 rounds by default; set
+`SKYLITE_SPIKE_KILL_ROUNDS` for a longer soak, for example
+`SKYLITE_SPIKE_KILL_ROUNDS=300 make integration`. CI runs the same checks plus
 `go mod tidy -diff` and workflow linting. CodeQL code scanning runs through
 GitHub's default setup, which is managed at the organisation level, so there is
 no CodeQL workflow in this repository.
