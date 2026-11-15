@@ -478,13 +478,15 @@
 // a retire whose outcome is unknown needs no resolution.
 //
 // Base objects are the only objects deleted, under one rule: a base object
-// is garbage when a manifest read from authoritative storage does not
-// reference it and has a transaction number at or above the transaction
-// number in the object's key. An unreferenced object whose key's
-// transaction number is above the manifest's is kept. The rule holds
-// because a manifest carries forward references its predecessor had and
-// adds references to objects its own attempt created, and nothing else,
-// and an attempt publishes by replacing a manifest whose transaction
+// is garbage when a manifest read from authoritative storage, in a read
+// begun after the object was listed, does not reference it and has a
+// transaction number at or above the transaction number in the object's
+// key. An unreferenced object whose key's transaction number is above the
+// manifest's is kept. The rule holds because a manifest carries forward
+// references its predecessor had and adds references to its own attempt's
+// objects (ones the attempt created, or found holding exactly the bytes it
+// would have written), and nothing else, and an attempt publishes by
+// replacing a manifest whose transaction
 // number is below that of its output: once a manifest at or above it has
 // been current, no later manifest can first reference the object. A
 // delete whose outcome is unknown therefore needs no resolution.

@@ -1251,3 +1251,71 @@ func TestRetired(t *testing.T) {
 	_, err = DecodeCommitHeader(bump.encode(0), goldenDB)
 	wantClass(t, err, ErrInvalid)
 }
+
+// An epoch bump has an empty page table, and its header still carries that
+// table's checksum.
+func TestBumpTableChecksum(t *testing.T) {
+	b := goldenBump().encode(t)
+	le.PutUint32(b[48:], 1)
+	le.PutUint32(b[140:], checksum(b[:140]))
+	_, _, err := DecodeCommit(bytes.NewReader(b), goldenDB, nil)
+	wantClass(t, err, ErrChecksum)
+	h, err := DecodeCommitHeader(b, goldenDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = DecodeCommitTable(h, nil)
+	wantClass(t, err, ErrChecksum)
+}
+
+// The identifier lengths this version writes (24 bytes) and the longest the
+// format allows survive encoding, decoding and retirement.
+func TestCommitIDLengths(t *testing.T) {
+	for _, n := range []int{24, MaxCommitIDLen} {
+		c := goldenCommit()
+		c.h.CommitID = bytes.Repeat([]byte{0xa5}, n)
+		h, _, err := DecodeCommit(bytes.NewReader(c.encode(t)), goldenDB, nil)
+		if err != nil || !bytes.Equal(h.CommitID, c.h.CommitID) {
+			t.Fatalf("%d bytes: decoded identifier %x, %v", n, h.CommitID, err)
+		}
+		r, err := h.Retire()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rh, err := DecodeCommitHeader(r, goldenDB)
+		if err != nil || !rh.Retired || !bytes.Equal(rh.CommitID, c.h.CommitID) {
+			t.Fatalf("%d bytes: retired header %+v, %v", n, rh, err)
+		}
+	}
+}
+
+// A lease or key far beyond the format's limits is rejected without work or
+// memory in proportion to its size.
+func TestOversizedInputAllocations(t *testing.T) {
+	const size = 8 << 20
+	big := strings.Repeat("7", size)
+	keys, err := NewKeys("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, epoch := []byte(leaseHead+big+`"`), []byte(leaseHead+"a"+leaseEpoch+big)
+	commitKey, baseKey := keys.Commit(goldenDB, 1)+big, keys.Base(goldenDB, 1, 1, 1)+big
+	cases := map[string]func() error{
+		"lease holder": func() error { _, err := DecodeLease(holder); return err },
+		"lease epoch":  func() error { _, err := DecodeLease(epoch); return err },
+		"commit key":   func() error { _, _, err := keys.ParseCommit(commitKey); return err },
+		"base key":     func() error { _, _, _, _, err := keys.ParseBase(baseKey); return err },
+	}
+	for name, decode := range cases {
+		t.Run(name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			err := decode()
+			runtime.ReadMemStats(&after)
+			wantClass(t, err, ErrInvalid)
+			if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+				t.Fatalf("allocated %d bytes for a %d-byte input", got, size)
+			}
+		})
+	}
+}

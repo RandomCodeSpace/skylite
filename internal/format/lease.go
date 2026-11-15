@@ -86,6 +86,11 @@ func DecodeLease(b []byte) (Lease, error) {
 	if string(rest[:n]) != "1" {
 		return Lease{}, fmt.Errorf("%w: lease version %.20s", ErrVersion, rest[:n])
 	}
+	// Checked before any field is copied or parsed, so an oversized object
+	// costs no allocation in proportion to its size.
+	if len(b) > MaxLeaseSize {
+		return Lease{}, invalid("lease is %d bytes; the longest is %d", len(b), MaxLeaseSize)
+	}
 	rest, ok = bytes.CutPrefix(b, []byte(leaseHead))
 	if !ok {
 		return Lease{}, invalid("lease is not in canonical form")

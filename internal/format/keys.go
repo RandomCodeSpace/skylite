@@ -114,11 +114,11 @@ func (k Keys) cutDB(key, kind string) (DatabaseID, string, bool) {
 func (k Keys) ParseCommit(key string) (DatabaseID, uint64, error) {
 	db, s, ok := k.cutDB(key, "/log/")
 	if !ok {
-		return DatabaseID{}, 0, invalid("key %q is not a commit key", key)
+		return DatabaseID{}, 0, invalid("key %.80q is not a commit key", key)
 	}
 	txn, ok := parseDigits(s, txnDigits)
 	if !ok {
-		return DatabaseID{}, 0, invalid("key %q is not a commit key", key)
+		return DatabaseID{}, 0, invalid("key %.80q is not a commit key", key)
 	}
 	return db, txn, nil
 }
@@ -128,13 +128,13 @@ func (k Keys) ParseCommit(key string) (DatabaseID, uint64, error) {
 func (k Keys) ParseBase(key string) (db DatabaseID, group uint32, txn, tag uint64, err error) {
 	db, s, ok := k.cutDB(key, "/base/")
 	if !ok || len(s) != baseNameLen || s[groupDigits] != '-' || s[groupDigits+1+txnDigits] != '-' {
-		return DatabaseID{}, 0, 0, 0, invalid("key %q is not a base key", key)
+		return DatabaseID{}, 0, 0, 0, invalid("key %.80q is not a base key", key)
 	}
 	g, ok1 := parseDigits(s[:groupDigits], groupDigits)
 	t, ok2 := parseDigits(s[groupDigits+1:groupDigits+1+txnDigits], txnDigits)
 	e, ok3 := parseHex(s[groupDigits+2+txnDigits:])
 	if !ok1 || !ok2 || !ok3 || g > math.MaxUint32 {
-		return DatabaseID{}, 0, 0, 0, invalid("key %q is not a base key", key)
+		return DatabaseID{}, 0, 0, 0, invalid("key %.80q is not a base key", key)
 	}
 	return db, uint32(g), t, e, nil
 }
