@@ -761,6 +761,19 @@ func staleLeaderScenario(t *testing.T, sc staleCase) staleResult {
 	}
 
 	// A resumes.
+	// fencedBy records a violation unless A's client is already latched by
+	// the check this ordering names. It runs right after the operation that
+	// is meant to fence A, so a later operation cannot supply the fence.
+	maintenanceFirst := sc.first != "" && sc.first != "writes"
+	fencedBy := func(op string) {
+		switch fenced := a.Fenced(); {
+		case sc.unsafe:
+		case fenced == nil:
+			res.violations = append(res.violations, fmt.Sprintf("A is not fenced after its %s", op))
+		case !strings.Contains(fenced.Error(), sc.wantFence):
+			res.violations = append(res.violations, fmt.Sprintf("A was fenced in its %s by %q, want the check %q", op, fenced, sc.wantFence))
+		}
+	}
 	writes := func() {
 		for id := int64(201); id <= 204; id++ {
 			err := a.Exec(ctx, insertRow(ctx, id, "a", false))
@@ -768,6 +781,9 @@ func staleLeaderScenario(t *testing.T, sc staleCase) staleResult {
 				res.ackedAfter = append(res.ackedAfter, id)
 			} else if !sc.unsafe && !errors.Is(err, ErrFenced) {
 				res.violations = append(res.violations, fmt.Sprintf("A write %d failed with %v, want ErrFenced", id, err))
+			}
+			if id == 201 && !maintenanceFirst {
+				fencedBy("first write")
 			}
 		}
 		// Litestream's own retry path, bypassing the leader's latch check.
@@ -783,6 +799,9 @@ func staleLeaderScenario(t *testing.T, sc staleCase) staleResult {
 		},
 		"retention": func() error {
 			minTXID, err := a.db.EnforceSnapshotRetention(ctx, time.Now())
+			if sc.first == "retention" {
+				fencedBy("snapshot retention")
+			}
 			for _, level := range []int{0, 1} {
 				err = errors.Join(err, a.db.EnforceRetentionByTXID(ctx, level, minTXID))
 			}
@@ -799,8 +818,11 @@ func staleLeaderScenario(t *testing.T, sc staleCase) staleResult {
 		order = append([]string{sc.first}, slices.Delete(order, i, i+1)...)
 	}
 	maintenance := func() {
-		for _, step := range order {
+		for i, step := range order {
 			t.Logf("A %s: %v", step, steps[step]())
+			if i == 0 && maintenanceFirst && step != "retention" {
+				fencedBy(step)
+			}
 		}
 	}
 	if sc.resetPosition {
@@ -813,7 +835,7 @@ func staleLeaderScenario(t *testing.T, sc staleCase) staleResult {
 		}
 	}
 	phases := []func(){writes, maintenance}
-	if sc.first != "" && sc.first != "writes" {
+	if maintenanceFirst {
 		phases = []func(){maintenance, writes}
 	}
 	// A listing after each phase, so a blob A overwrites and later deletes
@@ -1072,7 +1094,8 @@ func staleWindowCase(t *testing.T, kind string) {
 	}
 	pausedCh := make(chan struct{})
 	release := make(chan struct{})
-	var once sync.Once
+	var once, releaseOnce sync.Once
+	releaseA := func() { releaseOnce.Do(func() { close(release) }) }
 	a.client.beforeMutation = func(op string, level int) {
 		if op == wantOp && level == wantLevel {
 			once.Do(func() {
@@ -1093,6 +1116,12 @@ func staleWindowCase(t *testing.T, kind string) {
 		case "RetentionDelete":
 			errA = a.db.EnforceL0RetentionByTime(ctx)
 		}
+	}()
+	// Runs before A is closed, so a failure below never leaves the worker
+	// blocked holding the client's lock.
+	defer func() {
+		releaseA()
+		<-doneA
 	}()
 	select {
 	case <-pausedCh:
@@ -1144,7 +1173,7 @@ func staleWindowCase(t *testing.T, kind string) {
 
 	// A's operation completes.
 	beforeRelease := listing(t, az, container)
-	close(release)
+	releaseA()
 	select {
 	case <-doneA:
 	case <-time.After(time.Minute):
@@ -1257,6 +1286,7 @@ func TestTakeoverRace(t *testing.T) {
 		aDone := make(chan struct{})
 		var stop atomic.Bool
 		var aStopped time.Time
+		aAcked := make(chan struct{})
 		go func() {
 			defer close(aDone)
 			defer func() { aStopped = time.Now() }()
@@ -1275,10 +1305,24 @@ func TestTakeoverRace(t *testing.T) {
 					return
 				}
 				ackedA = append(ackedA, id)
+				if id == 1 {
+					close(aAcked)
+				}
 			}
 		}()
 
+		// B starts only once A has acknowledged a write and is still writing.
+		select {
+		case <-aAcked:
+		case <-aDone:
+			t.Fatalf("iteration %d: A stopped before acknowledging a write: %v", i, aErr)
+		}
 		time.Sleep(50*time.Millisecond + time.Duration(rng.Int64N(int64(200*time.Millisecond))))
+		select {
+		case <-aDone:
+			t.Fatalf("iteration %d: A stopped before B started: %v", i, aErr)
+		default:
+		}
 		// A renewal can win the CAS between B's read and write; B retries.
 		for {
 			_, err := AcquireLease(ctx, az, container, "b")
