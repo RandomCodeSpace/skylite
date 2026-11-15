@@ -74,7 +74,7 @@ The names below are illustrative. The format package decides the exact keys and 
 
 - **Commit log.** One object per committed transaction, named by a fixed-width transaction number and written with create-if-absent. It holds the changed pages, the database size after the commit, the leader's epoch and a checksum. That single create is the commit point, the acknowledgement point and the fence for commits.
 - **Base.** The database's pages, in fixed-size groups of consecutive page numbers. Each group is an immutable object under a name that is never reused. A page's group follows from arithmetic on its page number, so the index needs memory in proportion to the number of groups, not the number of pages.
-- **Manifest.** One small object, updated only by compare-and-swap. It names the base objects, the transaction number the base is current to, and the epoch. It is the atomic fence for everything that is not a commit.
+- **Manifest.** One small object, updated only by compare-and-swap. It names the base objects, the transaction number the base is current to, the epoch, and the transaction number of every epoch-bump commit ([decision 6](#6-compaction-and-garbage-collection)). It is the atomic fence for everything that is not a commit.
 - **Lease.** An object updated by compare-and-swap, used only so that a takeover makes progress.
 
 Every object must fit in one upload request on every backend, because 0002 finding 6 rules out multi-part uploads for objects that fence. The format package sets the group size and the maximum commit size with that in mind.
@@ -92,8 +92,8 @@ On the leader, SQLite runs in WAL mode with a file-backed shared-memory index. T
 
 Two behaviours seen in the probes qualify the description above. The engine must handle both:
 
-- **`BUSY` does not roll back an explicit `COMMIT`.** If the commit point returns `BUSY` inside an explicit transaction, `COMMIT` fails with "database is locked" and the transaction stays open with the write lock held. A retried `COMMIT` writes the frames again ([vdbeaux.c#L3438-L3446][sq-busy1], [vdbe.c#L4197-L4202][sq-busy2]). The storage layer must therefore never return `BUSY` from the commit point, or must handle the open transaction explicitly.
-- **Entering WAL mode writes page 1 outside the WAL.** `PRAGMA journal_mode=wal` changes page 1 through a rollback-journal transaction, whatever the journal mode ([vdbe.c#L8302-L8307][sq-jm], [btree.c#L11572-L11600][sq-ver]). That write never passes through WAL capture. On a new database the probes saw the first WAL commit send page 1 again, so storage ended up correct. The engine must not rely on that by accident.
+- **`BUSY` does not roll back an explicit `COMMIT`.** If the commit point returns `BUSY` inside an explicit transaction, `COMMIT` fails with "database is locked" and the transaction stays open with the write lock held. A retried `COMMIT` writes the frames again ([vdbeaux.c#L3438-L3446][sq-busy1], [vdbe.c#L4197-L4202][sq-busy2]). The decision: the storage layer never returns `BUSY` from the commit point. Every failure there is reported with an error code that the probes saw roll the transaction back.
+- **Entering WAL mode writes page 1 outside the WAL.** `PRAGMA journal_mode=wal` changes page 1 through a rollback-journal transaction, whatever the journal mode ([vdbe.c#L8302-L8307][sq-jm], [btree.c#L11572-L11600][sq-ver]). That write never passes through WAL capture. On a new database the probes saw the first WAL commit send page 1 again, so storage ended up correct, by accident. The decision: the engine does not create a database through WAL capture. It builds the first commit object itself, holding an empty database whose header already says WAL mode, so that opening it never needs that write.
 
 WAL mode with exclusive locking, which allows one connection and needs no shared-memory index ([vfs/README.md#L69-L74][nc-walreadme]), is the recorded fallback if the shared-memory route fails the engine's tests.
 
@@ -112,9 +112,12 @@ WAL mode with exclusive locking, which allows one connection and needs no shared
 
 This closes, by construction, the window that [0002](/docs/decisions/0002-durability-spike/) measured in finding 7. That is a design argument. No test has shown it yet.
 
-**A gap the design must close.** The commit fence relies on the name of the next transaction number being taken. Garbage collection removes commit log objects once the base covers them, which frees their names again. A stale leader paused for longer than the grace period could then win a create-if-absent at a transaction number that is already folded into the base, and acknowledge a write that no reader will ever see. The engine must make this impossible without relying on time. One candidate is to re-read the manifest after the create and before acknowledging, and to stop if the manifest has moved past that transaction number or to a higher epoch. This is sound only because manifests move forward. The candidate is not decided or tested.
+**Garbage collection must not reopen the commit fence.** The commit fence relies on the name of the next transaction number being taken. Deleting commit log objects once the base covers them frees their names again. Without a further rule, a stale leader paused for longer than the grace period could win a create-if-absent at a transaction number that is already folded into the base, and acknowledge a write that no reader will ever see. Two rules close this without relying on time. Both are design arguments. No test has shown them yet.
 
-Objects from a stale leader's lost compaction are never referenced by any manifest, so the rule above never deletes them. Reclaiming them needs a separate rule, not yet decided.
+- **Epoch-bump commits are never deleted.** The manifest keeps the transaction number of every epoch bump, one per takeover, and garbage collection skips those objects. The argument: a leader is the only writer of ordinary commits in its epoch, so the only name it will ever try next is the one after its own last confirmed commit. The takeover that deposed it put its epoch bump at exactly that name. If the old leader's last create had an unknown outcome, it reads that name back, as the storage contract requires, and finds either its own commit, which is part of the history, or the bump. Either way its next create meets a name that is never freed. The cost is one small object and one number in the manifest per takeover, kept for the life of the database.
+- **A candidate confirms its epoch before it serves.** A candidate that pauses between reading the log tail and creating its epoch bump could otherwise place the bump at a freed name. After its bump is created, the candidate reads the manifest again and takes office only if the manifest still carries the epoch it swapped in. The argument: from the moment of its swap, no older leader can change the manifest, so the base cannot have moved past the candidate's view and no name after it can have been freed, unless a newer candidate has swapped the manifest since, which the re-read detects. A candidate that fails the check stops and never acknowledges a write.
+
+**Orphaned base objects.** Output from a compaction whose swap lost is never referenced by any manifest, so the delete rule above never reaches it. A base object's name carries the epoch of its writer. The leader may delete a base object that the current manifest does not reference when that epoch is lower than the manifest's epoch, because the writer of a lower epoch can no longer swap the manifest; and it may delete its own unreferenced output once the compaction that wrote it has ended. It never deletes an unreferenced object carrying an epoch higher than the manifest it read.
 
 ### 7. Takeover
 
@@ -122,6 +125,7 @@ Objects from a stale leader's lost compaction are never referenced by any manife
 2. It swaps the manifest to a higher epoch.
 3. It reads the tail of the commit log.
 4. It wins a create-if-absent for an epoch-bump commit at the next transaction number.
+5. It reads the manifest again and takes office only if the manifest still carries its epoch ([decision 6](#6-compaction-and-garbage-collection)).
 
 The old leader's next commit loses that name, and it stops for good. If the old leader commits first, the candidate loses the create, reads the tail again and retries. The takeover does not download the database, so the intent is that takeover time depends on the length of the log tail, not on database size. No safety argument rests on clocks or on the lease. An old leader that ignores the lease can delay a takeover, as 0002 finding 8 observed, but cannot break the history.
 
@@ -167,8 +171,8 @@ The WAL route showed none of these four in the probes.
 - skylite owns the storage engine: the WAL parser, the commit format, the paged reader, compaction, garbage collection and takeover. These are the parts where a mistake loses data. The engine's own tests carry the weight that the spike's tests carried for Litestream.
 - Every acknowledged write costs at least one object-storage round trip. This was already accepted in 0001. It has still not been measured against a real cloud.
 - The engine depends on a project with one maintainer. The pinned version, the panic recovery and the storage layer boundary are what make replacing it possible.
-- The gap in [decision 6](#6-compaction-and-garbage-collection), a commit name freed by garbage collection, has to be closed before garbage collection of the commit log is enabled.
-- Orphaned objects from a lost compaction need a reclamation rule. None is decided.
+- Every takeover leaves one small commit object and one number in the manifest that are kept for the life of the database ([decision 6](#6-compaction-and-garbage-collection)).
+- Garbage collection of the commit log must not be enabled before the tests for the two rules in decision 6 exist and pass.
 - 0001's choice to embed Litestream is superseded. Its rejection of Litebase stands.
 - In this pull request: the [architecture page](/docs/architecture/) and the [roadmap](/docs/roadmap/) now follow this decision.
 
@@ -181,8 +185,8 @@ The probes behind this record are exploratory code that is not in this repositor
 - A failed commit never reappears, after a crash or after every connection closes and the database reopens. This must cover every error the commit point can return, a failed create-if-absent, and a crash at each step of the truncation.
 - No error from the commit point is turned into success. Every error code the storage layer can return must surface to the caller as an error.
 - No connection sees a transaction before its upload has succeeded.
-- `BUSY` inside an explicit `COMMIT` is either never returned or handled. A retried `COMMIT` must not upload the transaction twice, or under a second transaction number.
-- The page-1 write made when a database first enters WAL mode reaches object storage, for a new database and for an existing one.
+- The commit point never returns `BUSY`, whatever fails inside it. No failed `COMMIT` leaves a transaction open, and no transaction is uploaded twice or under a second transaction number.
+- A database created by the engine opens in WAL mode with no write to page 1 outside the WAL, and a database already in object storage opens the same way. A main-file write that is not part of a checkpoint is an error, not a silent local change.
 - The WAL header sync after each WAL restart is not taken for a commit.
 - The commit-frame layout is checked on the storage layer the engine actually uses. The probes saw no sector padding because the WAL reported powersafe overwrite. That was not probed without it.
 - The parser handles frames spilled before `COMMIT`, frame numbers reused after a rollback, dead frames past the commit frame, pages overwritten in place, and checksum-only rewrites after the commit frame.
@@ -206,7 +210,9 @@ The probes behind this record are exploratory code that is not in this repositor
 
 - Takeover time does not depend on database size. It is measured at more than one database size with the same log tail.
 - After a takeover, a stale leader cannot get a commit acknowledged, cannot make its compaction reachable, and cannot delete an object that any later manifest references. This is tested with the stale leader paused before and after each of its storage requests.
-- A stale leader paused for longer than the grace period cannot win a commit name that garbage collection has freed, or cannot acknowledge it if it does.
+- A stale leader paused until garbage collection has removed every commit log object it could delete still cannot get a commit acknowledged: its next create meets a retained epoch-bump commit. This is tested for a leader deposed one takeover ago and several takeovers ago, and for a leader whose last create had an unknown outcome.
+- A candidate paused at each step of a takeover, for long enough that the history has moved on and been garbage-collected, never acknowledges a write.
+- An unreferenced base object is deleted only under the orphan rule in decision 6, and never while a compaction that could still reference it is running.
 - An old leader that ignores the lease never breaks the history. Only the takeover's progress may suffer.
 
 **Shared-memory index**
