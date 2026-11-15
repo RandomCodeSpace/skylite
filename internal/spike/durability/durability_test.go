@@ -4,7 +4,9 @@ package durability
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -22,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/benbjohnson/litestream"
@@ -64,42 +67,110 @@ func seededRand(t testing.TB) *rand.Rand {
 	return rand.New(rand.NewPCG(uint64(seed), 0x5eed)) //nolint:gosec // seeded so a failing run can be replayed
 }
 
+// roundIDs spaces the record IDs of kill rounds: round i writes
+// (i+1)*roundIDs + seq, so an ID never depends on restored state and is never
+// reused by a later round.
+const roundIDs = 1_000_000
+
+// tagBytes is the size of the content every record carries.
+const tagBytes = 16
+
+// record is what a restored row must hold for its ID.
+type record struct {
+	writer string
+	big    bool
+}
+
+// payload derives n bytes from a record's identity, so restored content can
+// be checked against the ID and writer alone.
+func payload(writer string, id int64, n int) []byte {
+	b := make([]byte, n)
+	_, _ = rand.NewChaCha8(sha256.Sum256(fmt.Appendf(nil, "%s/%d", writer, id))).Read(b)
+	return b
+}
+
 func createSchema(ctx context.Context, l *Leader) error {
 	return l.Exec(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS rows (id INTEGER PRIMARY KEY, writer TEXT NOT NULL);
-			CREATE TABLE IF NOT EXISTS big (slot INTEGER PRIMARY KEY, data BLOB NOT NULL)`)
+		_, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS rows (id INTEGER PRIMARY KEY, writer TEXT NOT NULL, tag BLOB NOT NULL, big INTEGER NOT NULL);
+			CREATE TABLE IF NOT EXISTS big (slot INTEGER PRIMARY KEY, id INTEGER NOT NULL, writer TEXT NOT NULL, data BLOB NOT NULL)`)
 		return err
 	})
 }
 
-func insertRow(ctx context.Context, id int64, writer string, big []byte) func(*sql.Tx) error {
+// insertRow writes record id. A big record also replaces big slot id%4 with
+// bigRowBytes derived from its identity, so the database stays small.
+func insertRow(ctx context.Context, id int64, writer string, big bool) func(*sql.Tx) error {
 	return func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO rows (id, writer) VALUES (?, ?)`, id, writer); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO rows (id, writer, tag, big) VALUES (?, ?, ?, ?)`, id, writer, payload(writer, id, tagBytes), big); err != nil {
 			return err
 		}
-		if big != nil {
-			_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO big (slot, data) VALUES (?, ?)`, id%4, big)
+		if big {
+			_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO big (slot, id, writer, data) VALUES (?, ?, ?, ?)`, id%4, id, writer, payload(writer, id, bigRowBytes))
 			return err
 		}
 		return nil
 	}
 }
 
-func rowIDs(db *sql.DB) (map[int64]bool, error) {
-	rows, err := db.Query(`SELECT id FROM rows`)
+// readRecords returns every restored record and every way restored content
+// disagrees with the identities: a tag that does not match its row, or a big
+// slot that does not hold the bytes of the highest-numbered big record
+// mapping to it.
+func readRecords(db *sql.DB) (map[int64]record, []string, error) {
+	got := map[int64]record{}
+	var bad []string
+	rows, err := db.Query(`SELECT id, writer, tag, big FROM rows`)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	ids := map[int64]bool{}
+	latest := map[int64]int64{}
 	for rows.Next() {
 		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
+		var r record
+		var tag []byte
+		if err := rows.Scan(&id, &r.writer, &tag, &r.big); err != nil {
+			return nil, nil, err
 		}
-		ids[id] = true
+		if !bytes.Equal(tag, payload(r.writer, id, tagBytes)) {
+			bad = append(bad, fmt.Sprintf("record %d by %s: content does not match its identity", id, r.writer))
+		}
+		got[id] = r
+		if r.big {
+			latest[id%4] = max(latest[id%4], id)
+		}
 	}
-	return ids, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	slots, err := db.Query(`SELECT slot, id, writer, data FROM big WHERE slot < 4`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = slots.Close() }()
+	seen := map[int64]bool{}
+	for slots.Next() {
+		var slot, id int64
+		var writer string
+		var data []byte
+		if err := slots.Scan(&slot, &id, &writer, &data); err != nil {
+			return nil, nil, err
+		}
+		seen[slot] = true
+		if !bytes.Equal(data, payload(writer, id, bigRowBytes)) {
+			bad = append(bad, fmt.Sprintf("big slot %d: data does not match record %d by %s", slot, id, writer))
+		}
+		if id != latest[slot] || got[id].writer != writer {
+			bad = append(bad, fmt.Sprintf("big slot %d holds record %d by %s, want latest big record %d", slot, id, writer, latest[slot]))
+		}
+	}
+	for slot, id := range latest {
+		if !seen[slot] {
+			bad = append(bad, fmt.Sprintf("big slot %d is empty, want record %d", slot, id))
+		}
+	}
+	return got, bad, slots.Err()
 }
 
 func epochOf(db *sql.DB) (int64, error) {
@@ -140,9 +211,24 @@ func l0Gaps(ctx context.Context, az *azblob.Client, container string) ([]string,
 	return gaps, nil
 }
 
+// holdPrefix is how many records a hold-mode child acknowledges before it
+// starts the upload it holds; the first carries a large row, so the held
+// compaction and snapshot files are large as well.
+const holdPrefix = 3
+
+// holdLevels maps the hold modes to the LTX level whose upload is held.
+var holdLevels = map[string]int{"hold-l0": 0, "hold-l1": 1, "hold-snapshot": litestream.SnapshotLevel}
+
 // TestHelperWriter is the child process of the kill tests. It takes office
-// on an empty directory and writes increasing IDs until it is killed,
-// printing "ack <id>" only after Exec has returned nil.
+// on an empty directory and writes records until it is killed, printing
+// "ack <id>" only after Exec has returned nil. Round i writes IDs
+// (i+1)*roundIDs + 1, + 2, and so on.
+//
+// Modes: "writer" writes until killed; "ack-early" acknowledges its first
+// record after the local commit and then waits, before any upload, to be
+// killed; the hold modes acknowledge holdPrefix records, start one upload at
+// their level, print "uploading" once half of its body has been read by the
+// HTTP transport, and wait there to be killed.
 func TestHelperWriter(t *testing.T) {
 	mode := os.Getenv(helperEnv)
 	if mode == "" {
@@ -155,6 +241,10 @@ func TestHelperWriter(t *testing.T) {
 	}
 	seed, _ := strconv.ParseUint(os.Getenv(helperSeedEnv), 10, 64)
 	rng := rand.New(rand.NewPCG(seed, 1)) //nolint:gosec // seeded by the parent so a failing run can be replayed
+	index, err := strconv.Atoi(os.Getenv(helperRoundEnv))
+	if err != nil {
+		fail("round: %v", err)
+	}
 	az := newAzure(t, nil)
 
 	l, attempts, err := TakeOffice(ctx, az, os.Getenv(helperContainerEnv), os.Getenv(helperDirEnv))
@@ -164,9 +254,11 @@ func TestHelperWriter(t *testing.T) {
 	if err := createSchema(ctx, l); err != nil {
 		fail("schema: %v", err)
 	}
-	var next int64
-	if err := l.SQL().QueryRow(`SELECT COALESCE(MAX(id), 0) + 1 FROM rows`).Scan(&next); err != nil {
-		fail("next id: %v", err)
+	// Records already in the history. This only schedules maintenance;
+	// record IDs never depend on restored state.
+	var written int64
+	if err := l.SQL().QueryRow(`SELECT COUNT(*) FROM rows`).Scan(&written); err != nil {
+		fail("count: %v", err)
 	}
 	// Catch up on maintenance before writing, as a Store would on its
 	// schedule. Without this, kills that land faster than a growing
@@ -175,50 +267,64 @@ func TestHelperWriter(t *testing.T) {
 	if _, err := l.db.Compact(ctx, 1); err != nil && !errors.Is(err, litestream.ErrNoCompaction) {
 		fail("compact: %v", err)
 	}
-	if round, _ := strconv.Atoi(os.Getenv(helperRoundEnv)); round%10 == 0 {
+	if index%10 == 0 {
 		if _, err := l.db.Snapshot(ctx); err != nil {
 			fail("snapshot: %v", err)
 		}
 	}
-	fmt.Printf("office epoch=%d next=%d attempts=%d\n", l.Epoch(), next, attempts)
+	fmt.Printf("office epoch=%d written=%d attempts=%d\n", l.Epoch(), written, attempts)
 
-	for id := next; ; id++ {
-		var big []byte
-		if rng.IntN(4) == 0 {
-			big = randomBytes(bigRowBytes)
-		}
-		fmt.Printf("begin %d big=%t\n", id, big != nil)
+	write := func(seq int64, big bool) {
+		id := int64(index+1)*roundIDs + seq
+		fmt.Printf("begin %d big=%t\n", id, big)
 		if mode == "ack-early" {
 			// Negative control: acknowledge after the local commit and before
 			// the upload, which is the bug the kill test must catch.
-			tx, err := l.SQL().BeginTx(ctx, nil)
-			if err == nil {
-				err = insertRow(ctx, id, "w", big)(tx)
-			}
-			if err == nil {
-				err = tx.Commit()
-			}
-			if err != nil {
+			if err := commitLocal(ctx, l, insertRow(ctx, id, "w", big)); err != nil {
 				fail("local commit %d: %v", id, err)
 			}
 			fmt.Printf("ack %d\n", id)
-			if err := l.Exec(ctx, func(*sql.Tx) error { return nil }); err != nil {
-				fail("sync %d: %v", id, err)
-			}
-		} else {
-			if err := l.Exec(ctx, insertRow(ctx, id, "w", big)); err != nil {
-				fail("exec %d: %v", id, err)
-			}
-			fmt.Printf("ack %d\n", id)
+			time.Sleep(time.Hour)
+			fail("ack-early helper was not killed")
 		}
-		if id%10 == 0 {
+		if err := l.Exec(ctx, insertRow(ctx, id, "w", big)); err != nil {
+			fail("exec %d: %v", id, err)
+		}
+		fmt.Printf("ack %d\n", id)
+	}
+
+	if level, ok := holdLevels[mode]; ok {
+		for seq := int64(1); seq <= holdPrefix; seq++ {
+			write(seq, seq == 1)
+		}
+		l.client.uploadBody = func(lv int, minTXID, maxTXID ltx.TXID) {
+			if lv == level {
+				fmt.Printf("uploading level=%d %s-%s\n", lv, minTXID, maxTXID)
+				time.Sleep(time.Hour)
+			}
+		}
+		switch level {
+		case 0:
+			write(holdPrefix+1, true)
+		case 1:
+			_, err = l.db.Compact(ctx, 1)
+		default:
+			_, err = l.db.Snapshot(ctx)
+		}
+		fail("level %d upload was not held (err %v)", level, err)
+	}
+
+	for seq := int64(1); ; seq++ {
+		write(seq, rng.IntN(4) == 0)
+		n := written + seq
+		if n%10 == 0 {
 			// Compaction keeps restores short and puts level-1 writes under
 			// the kill as well.
 			if _, err := l.db.Compact(ctx, 1); err != nil {
 				fail("compact: %v", err)
 			}
 		}
-		if id%50 == 0 {
+		if n%50 == 0 {
 			// Puts snapshot writes under the kill as well.
 			if _, err := l.db.Snapshot(ctx); err != nil {
 				fail("snapshot: %v", err)
@@ -229,14 +335,16 @@ func TestHelperWriter(t *testing.T) {
 
 type round struct {
 	epoch    int64
-	acked    []int64
-	inflight int64 // the begun but unacknowledged ID when killed, or 0
-	big      bool  // inflight write carried a large row
+	acked    map[int64]bool // acknowledged IDs, true if the record was big
+	inflight int64          // the begun but unacknowledged ID when killed, or 0
+	big      bool           // inflight write carried a large row
 	office   bool
+	held     string // the "uploading" line of a hold-mode child
 }
 
 // killPolicy says what the parent waits for before the random delay and
-// the kill: "" for process start, or a line prefix such as "office" or "ack".
+// the kill: "" for process start, or a line prefix such as "office", "ack"
+// or "uploading".
 type killPolicy struct {
 	after    string
 	maxDelay time.Duration
@@ -314,7 +422,7 @@ func runRound(t *testing.T, container, mode string, index int, rng *rand.Rand, p
 		t.Fatalf("helper ended with %v, not SIGKILL: %s", err, stderr.String())
 	}
 
-	var r round
+	r := round{acked: map[int64]bool{}}
 	for _, line := range lines {
 		var id int64
 		var big bool
@@ -333,72 +441,95 @@ func runRound(t *testing.T, container, mode string, index int, rng *rand.Rand, p
 			if _, err := fmt.Sscanf(line, "ack %d", &id); err != nil {
 				t.Fatalf("parse %q: %v", line, err)
 			}
-			r.acked = append(r.acked, id)
+			if id != r.inflight {
+				t.Fatalf("ack %d without its begin line", id)
+			}
+			r.acked[id] = r.big
 			r.inflight, r.big = 0, false
+		case strings.HasPrefix(line, "uploading "):
+			r.held = line
 		}
 	}
 	return r
 }
 
-// checkP1 restores the history on an empty directory and returns every way
-// it disagrees with what the rounds acknowledged.
+// p1Result is what a restore on an empty directory held against what the
+// rounds acknowledged.
+type p1Result struct {
+	present    map[int64]record
+	missing    map[int64]bool // acknowledged IDs absent from the restore
+	violations []string       // every other disagreement
+}
+
+// checkP1 restores the history on an empty directory and compares it with
+// what the rounds acknowledged. It fails the test if the restore itself
+// fails.
 //
-// Rule for unacknowledged IDs: an ID that is present but was never
+// Rule for unacknowledged records: a record that is present but was never
 // acknowledged is allowed only if it is the write a round had begun and not
-// acknowledged when it was killed. Its upload may have completed before the
-// kill landed; nothing else may appear.
-func checkP1(ctx context.Context, t *testing.T, az *azblob.Client, container string, rounds []round) []string {
+// acknowledged when it was killed, with the content that write carried. Its
+// upload may have completed before the kill landed; nothing else may appear.
+func checkP1(ctx context.Context, t *testing.T, az *azblob.Client, container string, rounds []round) p1Result {
 	t.Helper()
-	var v []string
 	start := time.Now()
 	db, err := restoreFresh(ctx, t, az, container)
 	if err != nil {
-		return []string{fmt.Sprintf("restore: %v", err)}
+		t.Fatalf("restore: %v", err)
 	}
 	var pages, pageSize int64
 	_ = db.QueryRow(`PRAGMA page_count`).Scan(&pages)
 	_ = db.QueryRow(`PRAGMA page_size`).Scan(&pageSize)
 	t.Logf("final restore: %.1f MiB in %s", float64(pages*pageSize)/(1<<20), time.Since(start).Round(time.Millisecond))
 
+	res := p1Result{missing: map[int64]bool{}}
 	if err := integrityCheck(db); err != nil {
-		v = append(v, err.Error())
+		res.violations = append(res.violations, err.Error())
 	}
-	present, err := rowIDs(db)
+	present, bad, err := readRecords(db)
 	if err != nil {
-		return append(v, err.Error())
+		t.Fatalf("read restored records: %v", err)
 	}
-	acked := map[int64]bool{}
-	inflight := map[int64]bool{}
+	res.present = present
+	res.violations = append(res.violations, bad...)
+
+	acked := map[int64]record{}
+	inflight := map[int64]record{}
 	for _, r := range rounds {
-		for _, id := range r.acked {
-			acked[id] = true
+		for id, big := range r.acked {
+			acked[id] = record{writer: "w", big: big}
 		}
 		if r.inflight != 0 {
-			inflight[r.inflight] = true
+			inflight[r.inflight] = record{writer: "w", big: r.big}
 		}
 	}
 	for _, id := range slices.Sorted(maps.Keys(acked)) {
-		if !present[id] {
-			v = append(v, fmt.Sprintf("acknowledged id %d is missing", id))
+		got, ok := present[id]
+		switch {
+		case !ok:
+			res.missing[id] = true
+			res.violations = append(res.violations, fmt.Sprintf("acknowledged record %d is missing", id))
+		case got != acked[id]:
+			res.violations = append(res.violations, fmt.Sprintf("acknowledged record %d restored as %+v, want %+v", id, got, acked[id]))
 		}
 	}
 	trailing := 0
 	for _, id := range slices.Sorted(maps.Keys(present)) {
-		switch {
-		case acked[id]:
-		case inflight[id]:
-			trailing++
-		default:
-			v = append(v, fmt.Sprintf("id %d is present but was never acknowledged nor in flight", id))
+		if _, ok := acked[id]; ok {
+			continue
 		}
+		if want, ok := inflight[id]; ok && present[id] == want {
+			trailing++
+			continue
+		}
+		res.violations = append(res.violations, fmt.Sprintf("record %d %+v is present but was never acknowledged nor in flight", id, present[id]))
 	}
-	t.Logf("%d acknowledged ids, %d present, %d unacknowledged in-flight writes survived", len(acked), len(present), trailing)
+	t.Logf("%d acknowledged records, %d present, %d unacknowledged in-flight writes survived", len(acked), len(present), trailing)
 
 	// Epochs: one bump per round that took office. A round killed after its
 	// bump landed but before it printed leaves a jump the next round shows.
 	final, err := epochOf(db)
 	if err != nil {
-		return append(v, fmt.Sprintf("epoch: %v", err))
+		t.Fatalf("epoch: %v", err)
 	}
 	var last int64
 	lastRound := -1
@@ -407,31 +538,33 @@ func checkP1(ctx context.Context, t *testing.T, az *azblob.Client, container str
 			continue
 		}
 		if r.epoch <= last || r.epoch-last > int64(i-lastRound) {
-			v = append(v, fmt.Sprintf("round %d epoch %d after epoch %d in round %d", i, r.epoch, last, lastRound))
+			res.violations = append(res.violations, fmt.Sprintf("round %d epoch %d after epoch %d in round %d", i, r.epoch, last, lastRound))
 		}
 		last, lastRound = r.epoch, i
 	}
 	if final < last || final > int64(len(rounds)) {
-		v = append(v, fmt.Sprintf("final epoch %d, last printed %d, %d rounds", final, last, len(rounds)))
+		res.violations = append(res.violations, fmt.Sprintf("final epoch %d, last printed %d, %d rounds", final, last, len(rounds)))
 	}
 
 	gaps, err := l0Gaps(ctx, az, container)
 	if err != nil {
-		return append(v, err.Error())
+		t.Fatalf("l0 gaps: %v", err)
 	}
-	return append(v, gaps...)
+	res.violations = append(res.violations, gaps...)
+	return res
 }
 
-func runKillTest(t *testing.T, mode string, rounds int, policy func(*rand.Rand) killPolicy) []string {
+func runKillTest(t *testing.T, mode string, rounds int, policy func(*rand.Rand) killPolicy) ([]round, p1Result) {
 	ctx := context.Background()
 	rng := seededRand(t)
 	az := newAzure(t, nil)
 	container := newContainer(t, az)
 
 	var results []round
-	var bigKills, officeKills int
+	var acked, bigKills, officeKills int
 	for i := range rounds {
 		r := runRound(t, container, mode, i, rng, policy(rng))
+		acked += len(r.acked)
 		if r.big {
 			bigKills++
 		}
@@ -440,8 +573,8 @@ func runKillTest(t *testing.T, mode string, rounds int, policy func(*rand.Rand) 
 		}
 		results = append(results, r)
 	}
-	t.Logf("%d rounds: %d killed before taking office was reported, %d killed during a large write", rounds, officeKills, bigKills)
-	return checkP1(ctx, t, az, container, results)
+	t.Logf("%d rounds: %d acknowledged records, %d rounds killed before taking office was reported, %d killed after beginning a large write and before its ack", rounds, acked, officeKills, bigKills)
+	return results, checkP1(ctx, t, az, container, results)
 }
 
 // TestP1KillRestore kills a writer with SIGKILL at random moments, each
@@ -450,7 +583,7 @@ func runKillTest(t *testing.T, mode string, rounds int, policy func(*rand.Rand) 
 func TestP1KillRestore(t *testing.T) {
 	azuriteEndpoint(t)
 	rounds := int(envInt(t, killRoundsEnv, defaultKillRounds))
-	violations := runKillTest(t, "writer", rounds, func(rng *rand.Rand) killPolicy {
+	results, res := runKillTest(t, "writer", rounds, func(rng *rand.Rand) killPolicy {
 		// A quarter of the kills count from process start, so they can land
 		// in the restore or the epoch bump; the rest land among the writes.
 		if rng.IntN(4) == 0 {
@@ -458,50 +591,112 @@ func TestP1KillRestore(t *testing.T) {
 		}
 		return killPolicy{after: "office", maxDelay: time.Second}
 	})
-	for _, v := range violations {
+	acked := 0
+	for _, r := range results {
+		acked += len(r.acked)
+	}
+	if acked == 0 {
+		t.Error("no round acknowledged a record; the soak tested nothing")
+	}
+	for _, v := range res.violations {
 		t.Error(v)
 	}
 }
 
-// TestP1NegativeControl acknowledges before the upload and kills right
-// after an acknowledgement. The P1 checks must report lost writes.
+// TestP1KillDuringUpload holds an upload of each kind part way through its
+// request body, kills the writer there and checks that a restore holds
+// exactly the acknowledged prefix. A new leader then takes office on the
+// same history and writes once, which shows the killed upload left nothing
+// that blocks the next writer.
+func TestP1KillDuringUpload(t *testing.T) {
+	azuriteEndpoint(t)
+	for _, mode := range []string{"hold-l0", "hold-l1", "hold-snapshot"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			az := newAzure(t, nil)
+			container := newContainer(t, az)
+			r := runRound(t, container, mode, 0, rand.New(rand.NewPCG(1, 1)), killPolicy{after: "uploading"}) //nolint:gosec // fixed seed, nothing random is used
+			if len(r.acked) != holdPrefix || r.held == "" {
+				t.Fatalf("helper acknowledged %d records and held %q before the kill, want %d and an upload", len(r.acked), r.held, holdPrefix)
+			}
+			t.Logf("killed holding %q after %d acknowledged records", r.held, len(r.acked))
+
+			next, _, err := TakeOffice(ctx, az, container, t.TempDir())
+			if err != nil {
+				t.Fatalf("take office after the kill: %v", err)
+			}
+			id := int64(2*roundIDs + 1)
+			if err := next.Exec(ctx, insertRow(ctx, id, "w", false)); err != nil {
+				t.Fatalf("write after the kill: %v", err)
+			}
+			_ = next.Close(ctx)
+
+			res := checkP1(ctx, t, az, container, []round{r, {office: true, epoch: next.Epoch(), acked: map[int64]bool{id: false}}})
+			for _, v := range res.violations {
+				t.Error(v)
+			}
+			if _, ok := res.present[r.inflight]; r.inflight != 0 && ok {
+				t.Errorf("record %d, whose L0 upload was killed mid-body, is in the restore", r.inflight)
+			}
+		})
+	}
+}
+
+// TestP1NegativeControl acknowledges each round's first record after the
+// local commit and kills the writer before it uploads. The P1 checks must
+// report that record missing in every round.
 func TestP1NegativeControl(t *testing.T) {
 	azuriteEndpoint(t)
-	violations := runKillTest(t, "ack-early", 5, func(*rand.Rand) killPolicy {
+	const rounds = 5
+	results, res := runKillTest(t, "ack-early", rounds, func(*rand.Rand) killPolicy {
 		return killPolicy{after: "ack"}
 	})
-	lost := 0
-	for _, v := range violations {
-		if strings.Contains(v, "is missing") {
-			lost++
+	for i, r := range results {
+		if len(r.acked) != 1 {
+			t.Errorf("round %d acknowledged %d records, want 1", i, len(r.acked))
+		}
+		for id := range r.acked {
+			if !res.missing[id] {
+				t.Errorf("round %d: record %d was acknowledged before upload and the writer killed, yet the P1 checks did not report it missing", i, id)
+			}
 		}
 	}
-	if lost == 0 {
-		t.Fatalf("acknowledging before upload lost nothing; the P1 checks cannot see a lost write: %v", violations)
-	}
-	t.Logf("negative control: %d acknowledged writes lost, as expected", lost)
+	t.Logf("negative control: %d of %d acknowledged records reported missing", len(res.missing), rounds)
 }
 
 type staleCase struct {
-	pendingUpload    bool // A committed and built its L0 file but had not uploaded it when paused
-	resetPosition    bool // A's replica position was reset by an earlier failed sync
-	maintenanceFirst bool // on resume A runs compaction, snapshot and retention before writing
-	unsafe           bool // negative control: A's client has no fencing at all
+	pendingUpload bool   // A committed and built its L0 file but had not uploaded it when paused
+	resetPosition bool   // A's replica position was reset by an earlier failed sync
+	first         string // what A runs first on resume: "writes" (default), or the maintenance step "snapshot", "retention" or "compaction"
+	unsafe        bool   // negative control: A's client has no fencing at all
+	bSkipsCompact bool   // B does not compact, so A's compaction finds L0 files to compact
+	wantFence     string // part of the reason A's client must latch with
+}
+
+// staleResult is what leader A did to storage after B took office.
+type staleResult struct {
+	ackedAfter  []int64         // A's post-takeover writes that were acknowledged
+	bL0         map[string]bool // B's L0 blobs when A resumed
+	overwritten []string        // blobs whose ETag changed while A ran
+	deleted     []string        // blobs that disappeared while A ran
+	added       []string        // blobs that appeared while A ran
+	violations  []string        // every other P2 check that failed
 }
 
 // staleLeaderScenario pauses leader A, lets B take office, resumes A and
-// returns every P2 violation it finds.
+// reports what A did. Operational errors that are not A's doing, such as a
+// failed restore or an unexpected lease error, fail the test.
 //
 // A is held in-process rather than with SIGSTOP: with the monitors off,
 // Litestream runs no goroutine of its own, so a leader the test does not
 // call is exactly a paused process as far as storage can tell, and the test
 // can then drive the compaction, snapshot and retention calls a store would
 // make on A's behalf.
-func staleLeaderScenario(t *testing.T, sc staleCase) []string {
+func staleLeaderScenario(t *testing.T, sc staleCase) staleResult {
 	ctx := context.Background()
 	az := newAzure(t, nil)
 	container := newContainer(t, az)
-	var v []string
+	var res staleResult
 
 	leaseA, err := AcquireLease(ctx, az, container, "a")
 	if err != nil {
@@ -515,15 +710,15 @@ func staleLeaderScenario(t *testing.T, sc staleCase) []string {
 	if err := createSchema(ctx, a); err != nil {
 		t.Fatal(err)
 	}
-	want := map[int64]bool{}
+	want := map[int64]record{}
 	for id := int64(1); id <= 5; id++ {
-		if err := a.Exec(ctx, insertRow(ctx, id, "a", nil)); err != nil {
+		if err := a.Exec(ctx, insertRow(ctx, id, "a", false)); err != nil {
 			t.Fatal(err)
 		}
-		want[id] = true
+		want[id] = record{writer: "a"}
 	}
 	if sc.pendingUpload {
-		if err := commitLocal(ctx, a, insertRow(ctx, 6, "a", nil)); err != nil {
+		if err := commitLocal(ctx, a, insertRow(ctx, 6, "a", false)); err != nil {
 			t.Fatal(err)
 		}
 		if err := a.db.Sync(ctx); err != nil {
@@ -534,6 +729,7 @@ func staleLeaderScenario(t *testing.T, sc staleCase) []string {
 		a.db.Replica.SetPos(ltx.Pos{})
 	}
 	a.client.unsafe = sc.unsafe
+	paused := listing(t, az, container)
 
 	// A is paused. B takes the lease and office and acknowledges writes.
 	if _, err := AcquireLease(ctx, az, container, "b"); err != nil {
@@ -545,25 +741,33 @@ func staleLeaderScenario(t *testing.T, sc staleCase) []string {
 	}
 	defer func() { _ = b.Close(ctx) }()
 	for id := int64(101); id <= 105; id++ {
-		if err := b.Exec(ctx, insertRow(ctx, id, "b", nil)); err != nil {
+		if err := b.Exec(ctx, insertRow(ctx, id, "b", false)); err != nil {
 			t.Fatal(err)
 		}
-		want[id] = true
+		want[id] = record{writer: "b"}
 	}
 	// An L1 file gives A's L0 retention something it could delete.
-	if _, err := b.db.Compact(ctx, 1); err != nil {
-		t.Fatal(err)
+	if !sc.bSkipsCompact {
+		if _, err := b.db.Compact(ctx, 1); err != nil {
+			t.Fatal(err)
+		}
 	}
 	before := listing(t, az, container)
+	res.bL0 = map[string]bool{}
+	for key := range before {
+		if _, ok := paused[key]; !ok && strings.HasPrefix(key, litestream.LTXLevelDir(DBPrefix, 0)+"/") {
+			res.bL0[key] = true
+		}
+	}
 
 	// A resumes.
 	writes := func() {
 		for id := int64(201); id <= 204; id++ {
-			err := a.Exec(ctx, insertRow(ctx, id, "a", nil))
+			err := a.Exec(ctx, insertRow(ctx, id, "a", false))
 			if err == nil {
-				v = append(v, fmt.Sprintf("A acknowledged post-takeover write %d", id))
+				res.ackedAfter = append(res.ackedAfter, id)
 			} else if !sc.unsafe && !errors.Is(err, ErrFenced) {
-				v = append(v, fmt.Sprintf("A write %d failed with %v, want ErrFenced", id, err))
+				res.violations = append(res.violations, fmt.Sprintf("A write %d failed with %v, want ErrFenced", id, err))
 			}
 		}
 		// Litestream's own retry path, bypassing the leader's latch check.
@@ -571,91 +775,130 @@ func staleLeaderScenario(t *testing.T, sc staleCase) []string {
 			t.Logf("A: Litestream SyncAndWait returned nil at local position %s with uploaded head %s", mustPos(a), a.client.Head())
 		}
 	}
-	// The calls a litestream.Store makes on its schedule, snapshot first so
-	// that a snapshot ending at A's own head is tried before anything else
-	// has fenced A.
+	// The calls a litestream.Store makes on its schedule.
+	steps := map[string]func() error{
+		"snapshot": func() error {
+			_, err := a.db.Snapshot(ctx)
+			return err
+		},
+		"retention": func() error {
+			minTXID, err := a.db.EnforceSnapshotRetention(ctx, time.Now())
+			for _, level := range []int{0, 1} {
+				err = errors.Join(err, a.db.EnforceRetentionByTXID(ctx, level, minTXID))
+			}
+			a.db.L0Retention = time.Nanosecond
+			return errors.Join(err, a.db.EnforceL0RetentionByTime(ctx))
+		},
+		"compaction": func() error {
+			_, err := a.db.Compact(ctx, 1)
+			return err
+		},
+	}
+	order := []string{"snapshot", "retention", "compaction"}
+	if i := slices.Index(order, sc.first); i > 0 {
+		order = append([]string{sc.first}, slices.Delete(order, i, i+1)...)
+	}
 	maintenance := func() {
-		_, errS := a.db.Snapshot(ctx)
-		minTXID, errR := a.db.EnforceSnapshotRetention(ctx, time.Now())
-		var errT error
-		for _, level := range []int{0, 1} {
-			errT = errors.Join(errT, a.db.EnforceRetentionByTXID(ctx, level, minTXID))
+		for _, step := range order {
+			t.Logf("A %s: %v", step, steps[step]())
 		}
-		a.db.L0Retention = time.Nanosecond
-		errL := a.db.EnforceL0RetentionByTime(ctx)
-		_, errC := a.db.Compact(ctx, 1)
-		t.Logf("A maintenance: snapshot=%v snapshot-retention=%v txid-retention=%v l0-retention=%v compact=%v", errS, errR, errT, errL, errC)
 	}
 	if sc.resetPosition {
 		// Litestream's own view of a write after a position reset.
-		if err := commitLocal(ctx, a, insertRow(ctx, 200, "a", nil)); err != nil {
+		if err := commitLocal(ctx, a, insertRow(ctx, 200, "a", false)); err != nil {
 			t.Fatal(err)
 		}
 		if err := a.db.SyncAndWait(ctx); err == nil {
 			t.Logf("A: SyncAndWait returned nil for write 200 at local position %v although client head is %s; Litestream uploaded nothing", mustPos(a), a.client.Head())
 		}
 	}
-	if sc.maintenanceFirst {
-		maintenance()
-		writes()
-	} else {
-		writes()
-		maintenance()
+	phases := []func(){writes, maintenance}
+	if sc.first != "" && sc.first != "writes" {
+		phases = []func(){maintenance, writes}
 	}
-	if err := leaseA.Renew(ctx, az, container); err == nil {
-		v = append(v, "A renewed a lease B had taken over")
+	// A listing after each phase, so a blob A overwrites and later deletes
+	// shows up as both.
+	listings := []map[string]azcore.ETag{before}
+	for _, phase := range phases {
+		phase()
+		listings = append(listings, listing(t, az, container))
 	}
-	if !sc.unsafe && a.Fenced() == nil {
-		v = append(v, "A is not fenced")
+	switch err := leaseA.Renew(ctx, az, container); {
+	case err == nil:
+		res.violations = append(res.violations, "A renewed a lease B had taken over")
+	case !bloberror.HasCode(err, bloberror.ConditionNotMet):
+		t.Fatalf("A's lease renewal failed with %v, want ConditionNotMet", err)
 	}
-
-	after := listing(t, az, container)
-	for key, etag := range before {
-		if got, ok := after[key]; !ok {
-			v = append(v, fmt.Sprintf("%s was deleted", key))
-		} else if got != etag {
-			v = append(v, fmt.Sprintf("%s was overwritten", key))
+	if !sc.unsafe {
+		switch fenced := a.Fenced(); {
+		case fenced == nil:
+			res.violations = append(res.violations, "A is not fenced")
+		case !strings.Contains(fenced.Error(), sc.wantFence):
+			res.violations = append(res.violations, fmt.Sprintf("A was fenced by %q, want the check %q", fenced, sc.wantFence))
+		default:
+			t.Logf("A fenced: %v", fenced)
 		}
 	}
-	for key := range after {
+
+	after := listings[len(listings)-1]
+	overwritten := map[string]bool{}
+	for i := 1; i < len(listings); i++ {
+		for key, etag := range listings[i-1] {
+			if got, ok := listings[i][key]; ok && got != etag {
+				overwritten[key] = true
+			}
+		}
+	}
+	res.overwritten = slices.Sorted(maps.Keys(overwritten))
+	for _, key := range slices.Sorted(maps.Keys(before)) {
+		if _, ok := after[key]; !ok {
+			res.deleted = append(res.deleted, key)
+		}
+	}
+	for _, key := range slices.Sorted(maps.Keys(after)) {
 		if _, ok := before[key]; !ok {
-			v = append(v, fmt.Sprintf("%s was added by A", key))
+			res.added = append(res.added, key)
 		}
 	}
 
 	// B is unharmed and can keep writing.
-	if err := b.Exec(ctx, insertRow(ctx, 106, "b", nil)); err != nil {
-		v = append(v, fmt.Sprintf("B write after A resumed: %v", err))
+	if err := b.Exec(ctx, insertRow(ctx, 106, "b", false)); err != nil {
+		res.violations = append(res.violations, fmt.Sprintf("B write after A resumed: %v", err))
 	} else {
-		want[106] = true
+		want[106] = record{writer: "b"}
 	}
-	return append(v, checkExactRestore(ctx, t, az, container, want, 2)...)
+	res.violations = append(res.violations, checkExactRestore(ctx, t, az, container, want, 2)...)
+	return res
 }
 
-// checkExactRestore restores on an empty directory and compares the row IDs
-// and epoch with what was acknowledged.
-func checkExactRestore(ctx context.Context, t *testing.T, az *azblob.Client, container string, want map[int64]bool, epoch int64) []string {
+// checkExactRestore restores on an empty directory and compares the records,
+// their content and the epoch with what was acknowledged. It fails the test
+// if the restore itself fails.
+func checkExactRestore(ctx context.Context, t *testing.T, az *azblob.Client, container string, want map[int64]record, epoch int64) []string {
 	t.Helper()
 	db, err := restoreFresh(ctx, t, az, container)
 	if err != nil {
-		return []string{fmt.Sprintf("restore: %v", err)}
+		t.Fatalf("restore: %v", err)
 	}
 	var v []string
 	if err := integrityCheck(db); err != nil {
 		v = append(v, err.Error())
 	}
-	got, err := rowIDs(db)
+	got, bad, err := readRecords(db)
 	if err != nil {
-		return append(v, err.Error())
+		t.Fatalf("read restored records: %v", err)
 	}
-	for id := range want {
-		if !got[id] {
-			v = append(v, fmt.Sprintf("acknowledged id %d missing from restore", id))
+	v = append(v, bad...)
+	for _, id := range slices.Sorted(maps.Keys(want)) {
+		if g, ok := got[id]; !ok {
+			v = append(v, fmt.Sprintf("acknowledged record %d missing from restore", id))
+		} else if g != want[id] {
+			v = append(v, fmt.Sprintf("acknowledged record %d restored as %+v, want %+v", id, g, want[id]))
 		}
 	}
-	for id := range got {
-		if !want[id] {
-			v = append(v, fmt.Sprintf("unacknowledged id %d present in restore", id))
+	for _, id := range slices.Sorted(maps.Keys(got)) {
+		if _, ok := want[id]; !ok {
+			v = append(v, fmt.Sprintf("unacknowledged record %d %+v present in restore", id, got[id]))
 		}
 	}
 	if e, err := epochOf(db); err != nil || e != epoch {
@@ -663,7 +906,7 @@ func checkExactRestore(ctx context.Context, t *testing.T, az *azblob.Client, con
 	}
 	gaps, err := l0Gaps(ctx, az, container)
 	if err != nil {
-		return append(v, err.Error())
+		t.Fatalf("l0 gaps: %v", err)
 	}
 	return append(v, gaps...)
 }
@@ -685,16 +928,39 @@ func mustPos(l *Leader) ltx.TXID {
 	return pos.TXID
 }
 
+// Fence reasons, as Client words them.
+const (
+	fenceL0Conflict = "already holds another leader's file"
+	fenceRemoteHead = "remote L0 head"
+	fencePastHead   = "is past head"
+	fenceAckCheck   = "is not the uploaded head"
+)
+
 func TestP2StaleLeaderCannotCommit(t *testing.T) {
 	azuriteEndpoint(t)
 	for name, sc := range map[string]staleCase{
-		"WritesFirstWithPendingUpload": {pendingUpload: true},
-		"MaintenanceFirst":             {maintenanceFirst: true},
-		"MaintenanceFirstWithPending":  {pendingUpload: true, maintenanceFirst: true},
-		"PositionResetAfterError":      {resetPosition: true},
+		"WritesFirstWithPendingUpload": {pendingUpload: true, wantFence: fenceL0Conflict},
+		"SnapshotFirst":                {first: "snapshot", wantFence: fenceRemoteHead},
+		"SnapshotFirstWithPending":     {pendingUpload: true, first: "snapshot", wantFence: fencePastHead},
+		"RetentionFirst":               {first: "retention", wantFence: fenceRemoteHead},
+		"CompactionFirst":              {first: "compaction", bSkipsCompact: true, wantFence: fencePastHead},
+		"PositionResetAfterError":      {resetPosition: true, wantFence: fenceAckCheck},
 	} {
 		t.Run(name, func(t *testing.T) {
-			for _, v := range staleLeaderScenario(t, sc) {
+			res := staleLeaderScenario(t, sc)
+			for _, id := range res.ackedAfter {
+				t.Errorf("A acknowledged post-takeover write %d", id)
+			}
+			for _, key := range res.overwritten {
+				t.Errorf("%s was overwritten", key)
+			}
+			for _, key := range res.deleted {
+				t.Errorf("%s was deleted", key)
+			}
+			for _, key := range res.added {
+				t.Errorf("%s was added by A", key)
+			}
+			for _, v := range res.violations {
 				t.Error(v)
 			}
 		})
@@ -702,16 +968,220 @@ func TestP2StaleLeaderCannotCommit(t *testing.T) {
 }
 
 // TestP2NegativeControl runs the stale-leader scenario with A's fencing
-// switched off. The P2 checks must report the damage.
+// switched off. Each kind of damage the P2 checks look for must be seen.
 func TestP2NegativeControl(t *testing.T) {
 	azuriteEndpoint(t)
-	v := staleLeaderScenario(t, staleCase{pendingUpload: true, unsafe: true})
-	if len(v) == 0 {
-		t.Fatal("an unfenced stale leader did no detectable damage; the P2 checks are blind")
+	res := staleLeaderScenario(t, staleCase{pendingUpload: true, unsafe: true})
+	if len(res.ackedAfter) == 0 {
+		t.Error("unfenced A acknowledged no post-takeover write")
 	}
-	for _, line := range v {
-		t.Logf("negative control: %s", line)
+	var bOverwritten []string
+	for _, key := range res.overwritten {
+		if res.bL0[key] {
+			bOverwritten = append(bOverwritten, key)
+		}
 	}
+	if len(bOverwritten) == 0 {
+		t.Errorf("unfenced A changed the ETag of none of B's %d L0 blobs (overwritten: %v)", len(res.bL0), res.overwritten)
+	}
+	if len(res.deleted) == 0 {
+		t.Error("unfenced A deleted no blob")
+	}
+	var snapshots []string
+	for _, key := range res.added {
+		if strings.HasPrefix(key, litestream.LTXLevelDir(DBPrefix, litestream.SnapshotLevel)+"/") {
+			snapshots = append(snapshots, key)
+		}
+	}
+	if len(snapshots) == 0 {
+		t.Errorf("unfenced A added no snapshot (added: %v)", res.added)
+	}
+	t.Logf("negative control: A acknowledged %d post-takeover writes %v", len(res.ackedAfter), res.ackedAfter)
+	t.Logf("negative control: A overwrote %d of B's %d L0 blobs %v", len(bOverwritten), len(res.bL0), bOverwritten)
+	t.Logf("negative control: A deleted %d blobs %v", len(res.deleted), res.deleted)
+	t.Logf("negative control: A added %d blobs %v, %d of them snapshots", len(res.added), res.added, len(snapshots))
+	for _, v := range res.violations {
+		t.Logf("negative control: %s", v)
+	}
+}
+
+// TestP2StaleMutationWindow measures the window between the client's
+// admission checks and the storage request. Leader A passes the checks for
+// one snapshot write, compaction write or retention delete and is paused
+// there; B takes office, writes and runs maintenance; A's operation is then
+// released. The test records exactly what A's operation added or removed
+// and asserts what matters for the product: A acknowledges nothing after
+// the takeover, B keeps working, and restores hold exactly the acknowledged
+// records at B's epoch.
+func TestP2StaleMutationWindow(t *testing.T) {
+	azuriteEndpoint(t)
+	for _, kind := range []string{"Snapshot", "Compaction", "RetentionDelete"} {
+		t.Run(kind, func(t *testing.T) { staleWindowCase(t, kind) })
+	}
+}
+
+func staleWindowCase(t *testing.T, kind string) {
+	ctx := context.Background()
+	az := newAzure(t, nil)
+	container := newContainer(t, az)
+	want := map[int64]record{}
+	write := func(l *Leader, id int64, writer string, big bool) {
+		t.Helper()
+		if err := l.Exec(ctx, insertRow(ctx, id, writer, big)); err != nil {
+			t.Fatalf("%s write %d: %v", writer, id, err)
+		}
+		want[id] = record{writer: writer, big: big}
+	}
+
+	if _, err := AcquireLease(ctx, az, container, "a"); err != nil {
+		t.Fatal(err)
+	}
+	a, _, err := TakeOffice(ctx, az, container, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Close(ctx) }()
+	if err := createSchema(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	// A's history: a snapshot and an L1 file over the first records, then an
+	// uncompacted L0 tail.
+	for id := int64(1); id <= 4; id++ {
+		write(a, id, "a", id == 1)
+	}
+	if _, err := a.db.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Compact(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	for id := int64(5); id <= 8; id++ {
+		write(a, id, "a", false)
+	}
+	headA := a.client.Head()
+
+	// A passes its admission checks for one operation and pauses before the
+	// storage request.
+	wantOp, wantLevel := "write", litestream.SnapshotLevel
+	switch kind {
+	case "Compaction":
+		wantLevel = 1
+	case "RetentionDelete":
+		wantOp, wantLevel = "delete", -1
+		a.db.L0Retention = time.Nanosecond
+	}
+	pausedCh := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	a.client.beforeMutation = func(op string, level int) {
+		if op == wantOp && level == wantLevel {
+			once.Do(func() {
+				close(pausedCh)
+				<-release
+			})
+		}
+	}
+	var errA error
+	doneA := make(chan struct{})
+	go func() {
+		defer close(doneA)
+		switch kind {
+		case "Snapshot":
+			_, errA = a.db.Snapshot(ctx)
+		case "Compaction":
+			_, errA = a.db.Compact(ctx, 1)
+		case "RetentionDelete":
+			errA = a.db.EnforceL0RetentionByTime(ctx)
+		}
+	}()
+	select {
+	case <-pausedCh:
+	case <-doneA:
+		t.Fatalf("A's %s finished without reaching its storage request: %v", kind, errA)
+	case <-time.After(time.Minute):
+		t.Fatalf("A's %s did not reach its storage request", kind)
+	}
+	t.Logf("A paused in its %s at head %s, after its admission checks", kind, headA)
+
+	// B takes office while A is paused, writes and runs maintenance.
+	if _, err := AcquireLease(ctx, az, container, "b"); err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := TakeOffice(ctx, az, container, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close(ctx) }()
+	maintainB := func(phase string, snapshotCutoff time.Time, l0Retention time.Duration) {
+		t.Helper()
+		if _, err := b.db.Compact(ctx, 1); err != nil {
+			t.Errorf("B %s compaction: %v", phase, err)
+		}
+		if _, err := b.db.Snapshot(ctx); err != nil {
+			t.Errorf("B %s snapshot: %v", phase, err)
+		}
+		minTXID, err := b.db.EnforceSnapshotRetention(ctx, snapshotCutoff)
+		if err != nil {
+			t.Errorf("B %s snapshot retention: %v", phase, err)
+		}
+		for _, level := range []int{0, 1} {
+			if err := b.db.EnforceRetentionByTXID(ctx, level, minTXID); err != nil {
+				t.Errorf("B %s level %d retention: %v", phase, level, err)
+			}
+		}
+		b.db.L0Retention = l0Retention
+		if err := b.db.EnforceL0RetentionByTime(ctx); err != nil {
+			t.Errorf("B %s L0 retention: %v", phase, err)
+		}
+	}
+	for id := int64(101); id <= 104; id++ {
+		write(b, id, "b", id == 101)
+	}
+	// Litestream's default retention, as a Store would run it now: nothing
+	// is old enough to delete yet, so A's stale delete meets the files B
+	// still keeps.
+	maintainB("first", time.Now().Add(-litestream.DefaultRetention), litestream.DefaultL0Retention)
+
+	// A's operation completes.
+	beforeRelease := listing(t, az, container)
+	close(release)
+	select {
+	case <-doneA:
+	case <-time.After(time.Minute):
+		t.Fatalf("A's %s did not finish after release", kind)
+	}
+	afterRelease := listing(t, az, container)
+	var changes []string
+	for _, key := range slices.Sorted(maps.Keys(beforeRelease)) {
+		if got, ok := afterRelease[key]; !ok {
+			changes = append(changes, "removed "+key)
+		} else if got != beforeRelease[key] {
+			changes = append(changes, "overwrote "+key)
+		}
+	}
+	for _, key := range slices.Sorted(maps.Keys(afterRelease)) {
+		if _, ok := beforeRelease[key]; !ok {
+			changes = append(changes, "added "+key)
+		}
+	}
+	t.Logf("A's released %s returned %v and changed %d blobs: %v", kind, errA, len(changes), changes)
+
+	if err := a.Exec(ctx, insertRow(ctx, 301, "a", false)); !errors.Is(err, ErrFenced) {
+		t.Errorf("A write after the takeover = %v, want ErrFenced", err)
+	}
+	for _, v := range checkExactRestore(ctx, t, az, container, want, 2) {
+		t.Errorf("restore after A's %s: %s", kind, v)
+	}
+
+	// B keeps going, now with retention that deletes everything it may.
+	for id := int64(105); id <= 108; id++ {
+		write(b, id, "b", id == 105)
+	}
+	maintainB("second", time.Now(), time.Nanosecond)
+	for _, v := range checkExactRestore(ctx, t, az, container, want, 2) {
+		t.Errorf("restore after B's second maintenance: %s", v)
+	}
+	t.Logf("blobs after B's second maintenance: %v", slices.Sorted(maps.Keys(listing(t, az, container))))
 }
 
 // TestTakeoverRace lets B take office while A is live and writing.
@@ -768,7 +1238,7 @@ func TestTakeoverRace(t *testing.T) {
 					}
 					renewed = time.Now()
 				}
-				if aErr = a.Exec(ctx, insertRow(ctx, id, "a", nil)); aErr != nil {
+				if aErr = a.Exec(ctx, insertRow(ctx, id, "a", false)); aErr != nil {
 					return
 				}
 				ackedA = append(ackedA, id)
@@ -788,7 +1258,7 @@ func TestTakeoverRace(t *testing.T) {
 		}
 		b, attempts, errB := TakeOffice(ctx, az, container, t.TempDir())
 		bOffice := time.Now()
-		want := map[int64]bool{}
+		want := map[int64]record{}
 		epoch := int64(2)
 		switch {
 		case errB != nil && honourLease:
@@ -802,10 +1272,10 @@ func TestTakeoverRace(t *testing.T) {
 			epoch = 1
 		default:
 			for id := int64(1_000_001); id <= 1_000_020; id++ {
-				if err := b.Exec(ctx, insertRow(ctx, id, "b", nil)); err != nil {
+				if err := b.Exec(ctx, insertRow(ctx, id, "b", false)); err != nil {
 					t.Fatalf("iteration %d: B write %d: %v", i, id, err)
 				}
-				want[id] = true
+				want[id] = record{writer: "b"}
 			}
 			select {
 			case <-aDone:
@@ -814,7 +1284,7 @@ func TestTakeoverRace(t *testing.T) {
 				<-aDone
 				t.Errorf("iteration %d: A kept acknowledging writes after B took office", i)
 			}
-			if err := a.Exec(ctx, insertRow(ctx, 999_999, "a", nil)); !errors.Is(err, ErrFenced) {
+			if err := a.Exec(ctx, insertRow(ctx, 999_999, "a", false)); !errors.Is(err, ErrFenced) {
 				t.Errorf("iteration %d: A write after B took office = %v, want ErrFenced", i, err)
 			}
 			_ = b.Close(ctx)
@@ -828,7 +1298,7 @@ func TestTakeoverRace(t *testing.T) {
 			t.Logf("iteration %d: A acknowledged %d writes and stopped %s; B took office in %d attempt(s)", i, len(ackedA), how, attempts)
 		}
 		for _, id := range ackedA {
-			want[id] = true
+			want[id] = record{writer: "a"}
 		}
 		for _, v := range checkExactRestore(ctx, t, az, container, want, epoch) {
 			t.Errorf("iteration %d: %s", i, v)
@@ -859,7 +1329,7 @@ func TestMeasure(t *testing.T) {
 	before := requests.Load()
 	for id := int64(1); id <= n; id++ {
 		start := time.Now()
-		if err := l.Exec(ctx, insertRow(ctx, id, "m", nil)); err != nil {
+		if err := l.Exec(ctx, insertRow(ctx, id, "m", false)); err != nil {
 			t.Fatal(err)
 		}
 		lat = append(lat, time.Since(start))
@@ -871,7 +1341,7 @@ func TestMeasure(t *testing.T) {
 
 	before = requests.Load()
 	start := time.Now()
-	if err := l.Exec(ctx, insertRow(ctx, n+1, "m", randomBytes(bigRowBytes))); err != nil {
+	if err := l.Exec(ctx, insertRow(ctx, n+1, "m", true)); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("one commit with a %d KiB row: %s, %d storage requests", bigRowBytes>>10, time.Since(start).Round(10*time.Microsecond), requests.Load()-before)
@@ -880,7 +1350,7 @@ func TestMeasure(t *testing.T) {
 	// compaction. CI keeps it small; set SKYLITE_SPIKE_MEASURE_MIB to grow it.
 	for i := range envInt(t, "SKYLITE_SPIKE_MEASURE_MIB", 16) / 4 {
 		if err := l.Exec(ctx, func(tx *sql.Tx) error {
-			_, err := tx.ExecContext(ctx, `INSERT INTO big (slot, data) VALUES (?, ?)`, 100+i, randomBytes(4<<20))
+			_, err := tx.ExecContext(ctx, `INSERT INTO big (slot, id, writer, data) VALUES (?, 0, 'm', ?)`, 100+i, randomBytes(4<<20))
 			return err
 		}); err != nil {
 			t.Fatal(err)

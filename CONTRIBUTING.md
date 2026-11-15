@@ -50,8 +50,9 @@ You need Go (the version in `go.mod` or newer) and
 Run `make check` before opening a pull request. `make integration` needs
 Docker; it picks a free local port and removes its Azurite container when it
 finishes. The durability kill test runs 20 rounds by default; set
-`SKYLITE_SPIKE_KILL_ROUNDS` for a longer soak, for example
-`SKYLITE_SPIKE_KILL_ROUNDS=300 make integration`. CI runs the same checks plus
+`SKYLITE_SPIKE_KILL_ROUNDS` for a longer soak and raise the 6-minute
+`INTEGRATION_TIMEOUT` with it, for example
+`SKYLITE_SPIKE_KILL_ROUNDS=300 INTEGRATION_TIMEOUT=60m make integration`. CI runs the same checks plus
 `go mod tidy -diff` and workflow linting. CodeQL code scanning runs through
 GitHub's default setup, which is managed at the organisation level, so there is
 no CodeQL workflow in this repository.

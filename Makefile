@@ -2,7 +2,9 @@ GOVULNCHECK_VERSION := v1.9.0
 
 # Azurite 3.37.0, pinned by the digest of its multi-architecture index.
 AZURITE_IMAGE := mcr.microsoft.com/azure-storage/azurite:3.37.0@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5
-INTEGRATION_TIMEOUT ?= 30m
+# Shorter than the CI job's 10-minute limit, so a hang prints its goroutine dump
+# and the Azurite log before the runner cancels the job.
+INTEGRATION_TIMEOUT ?= 6m
 
 .PHONY: build test vet lint vuln check integration
 
@@ -35,7 +37,7 @@ integration:
 	endpoint="http://127.0.0.1:$$port/devstoreaccount1"; \
 	for i in $$(seq 60); do curl -s -o /dev/null "$$endpoint" && break; sleep 1; done; \
 	curl -s -o /dev/null "$$endpoint" || { echo "integration: Azurite did not start" >&2; exit 1; }; \
-	rc=0; SKYLITE_TEST_AZURITE_BLOB_ENDPOINT="$$endpoint" go test -race -count=1 -timeout $(INTEGRATION_TIMEOUT) -tags integration ./... || rc=$$?; \
+	rc=0; SKYLITE_TEST_AZURITE_BLOB_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_TIMEOUT) -tags integration ./... || rc=$$?; \
 	if [ $$rc -ne 0 ]; then echo "integration: last Azurite log lines:" >&2; docker logs --tail 50 "$$name" >&2 || true; fi; \
 	exit $$rc
 

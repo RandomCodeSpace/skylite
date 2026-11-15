@@ -24,6 +24,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/benbjohnson/litestream"
 	"github.com/superfly/ltx"
 )
@@ -62,7 +63,48 @@ type Client struct {
 	// unsafe turns off every fencing measure. It exists only so the tests can
 	// show that their checks detect a stale leader that is not fenced.
 	unsafe bool
+
+	// Test hooks, nil in normal use. beforeMutation runs with c.mu held after
+	// the admission checks have passed and before the storage request; op is
+	// "write" or "delete". uploadBody runs once per LTX upload, after the HTTP
+	// transport has read half of the request body and before it reads more.
+	beforeMutation func(op string, level int)
+	uploadBody     func(level int, minTXID, maxTXID ltx.TXID)
 }
+
+// checkLTXSize rejects an LTX file that one Put Blob cannot carry. Above
+// blockblob.MaxUploadBlobBytes the SDK's UploadBuffer switches to staged
+// blocks, which an interrupted writer leaves behind (see WriteLTXFile).
+func checkLTXSize(n int) error {
+	if n > blockblob.MaxUploadBlobBytes {
+		return fmt.Errorf("ltx file of %d bytes exceeds the single Put Blob limit of %d bytes", n, blockblob.MaxUploadBlobBytes)
+	}
+	return nil
+}
+
+// hookedBody is an upload body that calls hook once, on its first pass, when
+// half of it has been read.
+type hookedBody struct {
+	*bytes.Reader
+	half  int64
+	hook  func()
+	fired bool
+}
+
+func (b *hookedBody) Read(p []byte) (int, error) {
+	if !b.fired {
+		off := b.Size() - int64(b.Len())
+		if off >= b.half {
+			b.fired = true
+			b.hook()
+		} else if int64(len(p)) > b.half-off {
+			p = p[:b.half-off]
+		}
+	}
+	return b.Reader.Read(p)
+}
+
+func (b *hookedBody) Close() error { return nil }
 
 // NewClient returns a client for LTX files under prefix in container.
 func NewClient(az *azblob.Client, container, prefix string) *Client {
@@ -152,6 +194,9 @@ func (c *Client) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID l
 	if err != nil {
 		return nil, err
 	}
+	if err := checkLTXSize(len(data)); err != nil {
+		return nil, err
+	}
 	hdr, _, err := ltx.PeekHeader(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("read ltx header: %w", err)
@@ -179,16 +224,19 @@ func (c *Client) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID l
 		}
 	}
 
+	if c.beforeMutation != nil {
+		c.beforeMutation("write", level)
+	}
+
 	key := litestream.LTXFilePath(c.path, level, minTXID, maxTXID)
 	// A single Put Blob is atomic. A staged multi-block upload that dies
 	// before Put Block List leaves uncommitted blocks that Azurite counts as
 	// an existing blob for If-None-Match, which would wedge the slot for
-	// every later leader.
-	// shortcut: UploadBuffer falls back to blocks above 256 MiB; a product
-	// must cap or split LTX files below the single Put Blob limit.
-	opts := &azblob.UploadBufferOptions{
+	// every later leader. Upload is one Put Blob, as UploadBuffer uses up to
+	// blockblob.MaxUploadBlobBytes; checkLTXSize refuses anything larger.
+	opts := &blockblob.UploadOptions{
 		HTTPHeaders: &blob.HTTPHeaders{BlobContentType: to.Ptr("application/octet-stream")},
-		AccessTier:  to.Ptr(blob.AccessTierHot),
+		Tier:        to.Ptr(blob.AccessTierHot),
 		Metadata:    map[string]*string{metadataKeyTimestamp: to.Ptr(createdAt.Format(time.RFC3339Nano))},
 	}
 	if !c.unsafe {
@@ -196,10 +244,16 @@ func (c *Client) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID l
 			ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfNoneMatch: to.Ptr(azcore.ETagAny)},
 		}
 	}
-	_, err = c.az.UploadBuffer(ctx, c.container, key, data, opts)
+	body := &hookedBody{Reader: bytes.NewReader(data), half: int64(len(data) / 2), fired: c.uploadBody == nil}
+	if c.uploadBody != nil {
+		body.hook = func() { c.uploadBody(level, minTXID, maxTXID) }
+	}
+	_, err = c.az.ServiceClient().NewContainerClient(c.container).NewBlockBlobClient(key).Upload(ctx, body, opts)
 	if bloberror.HasCode(err, bloberror.BlobAlreadyExists) {
-		// An identical blob means an earlier attempt of this same request
-		// succeeded and only its response was lost.
+		// If the blob already holds exactly these bytes, the write has had
+		// its effect; for example an earlier attempt of this request
+		// succeeded and only its response was lost. Equal content is all
+		// this shows, not that this client created the blob.
 		same, cmpErr := c.sameContent(ctx, key, data)
 		switch {
 		case cmpErr != nil:
@@ -250,6 +304,9 @@ func (c *Client) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
 		if err := c.checkRemoteHead(ctx); err != nil {
 			return err
 		}
+	}
+	if c.beforeMutation != nil {
+		c.beforeMutation("delete", -1)
 	}
 	for _, info := range a {
 		key := litestream.LTXFilePath(c.path, info.Level, info.MinTXID, info.MaxTXID)
