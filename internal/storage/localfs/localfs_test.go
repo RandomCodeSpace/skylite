@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/RandomCodeSpace/skylite/internal/storage"
 	"github.com/RandomCodeSpace/skylite/internal/storage/storagetest"
@@ -30,6 +31,8 @@ const (
 	envDir     = "LOCALFS_TEST_DIR"
 	envID      = "LOCALFS_TEST_ID"
 	envVersion = "LOCALFS_TEST_VERSION"
+	envOp      = "LOCALFS_TEST_OP"
+	envPoint   = "LOCALFS_TEST_POINT"
 	helperKey  = "lease"
 	rounds     = 10
 )
@@ -57,6 +60,9 @@ func helper(mode string) int {
 	}
 	_, _ = io.Copy(io.Discard, os.Stdin)
 	ctx := context.Background()
+	if mode == "crash" {
+		return crash(ctx, s, os.Getenv(envOp), os.Getenv(envPoint), os.Getenv(envVersion))
+	}
 	id := os.Getenv(envID)
 	versions := strings.Split(os.Getenv(envVersion), ",")
 	for r := range rounds {
@@ -66,8 +72,6 @@ func helper(mode string) int {
 			v, err = s.Create(ctx, roundKey(r), strings.NewReader(helperPayload(id)))
 		case "replace":
 			v, err = s.Replace(ctx, roundKey(r), versions[r], strings.NewReader(helperPayload(id)))
-		case "hang":
-			_, err = s.Create(ctx, helperKey, &hangingReader{})
 		default:
 			err = fmt.Errorf("unknown mode %q", mode)
 		}
@@ -84,20 +88,45 @@ func helper(mode string) int {
 	return 0
 }
 
-// hangingReader returns 64 KiB, then on the next read reports "writing" on
-// stdout, by which time the store has written that data, and blocks forever.
-type hangingReader struct{ calls int }
+var crashPayload = strings.Repeat("n", 64<<10)
 
-func (r *hangingReader) Read(p []byte) (int, error) {
-	r.calls++
-	if r.calls == 1 {
-		n := min(len(p), 64<<10)
-		copy(p, bytes.Repeat([]byte("h"), n))
-		return n, nil
+// crash runs one mutation of helperKey and stops it at point, where it prints
+// "at <point>" and sleeps until killed. Point "body" is inside the body's
+// Read, after the store has written crashPayload; any other point is a hook
+// point.
+func crash(ctx context.Context, s *Store, op, point, version string) int {
+	stop := func() {
+		fmt.Println("at", point)
+		time.Sleep(time.Hour)
 	}
-	fmt.Println("writing")
-	select {}
+	hook = func(p string) error {
+		if p == point {
+			stop()
+		}
+		return nil
+	}
+	body := io.MultiReader(strings.NewReader(crashPayload), readerFunc(func([]byte) (int, error) {
+		if point == "body" {
+			stop()
+		}
+		return 0, io.EOF
+	}))
+	var err error
+	switch op {
+	case "create":
+		_, err = s.Create(ctx, helperKey, body)
+	case "replace":
+		_, err = s.Replace(ctx, helperKey, version, body)
+	case "delete":
+		err = s.Delete(ctx, helperKey)
+	}
+	fmt.Println("finished without stopping:", err)
+	return 1
 }
+
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
 func helperCmd(t *testing.T, mode, dir, id, version string) *exec.Cmd {
 	t.Helper()
@@ -122,7 +151,10 @@ func open(t *testing.T, dir string) *Store {
 }
 
 func TestConformance(t *testing.T) {
-	storagetest.Run(t, func(t *testing.T) storage.Store { return open(t, t.TempDir()) })
+	storagetest.Run(t, func(t *testing.T) func() storage.Store {
+		dir := t.TempDir()
+		return func() storage.Store { return open(t, dir) }
+	})
 }
 
 // raceProcesses starts n helper processes, releases them together, checks
@@ -217,45 +249,216 @@ func TestMultiProcessReplace(t *testing.T) {
 	}
 }
 
-func TestKilledDuringWrite(t *testing.T) {
-	dir := t.TempDir()
-	cmd := helperCmd(t, "hang", dir, "0", "")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
+// TestKilled kills a process inside a mutation, at each point where the
+// mutation can stop, and checks that the store is consistent afterwards.
+func TestKilled(t *testing.T) {
+	cases := []struct{ op, point, want string }{
+		{"create", "body", "missing"},
+		{"create", "sync objects", "new"},
+		{"replace", "body", "old"},
+		{"replace", "locked", "old"},
+		{"replace", "sync objects", "new"},
+		{"delete", "locked", "old"},
+		{"delete", "sync objects", "missing"},
 	}
-	cmd.Stdin = strings.NewReader("")
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	line, err := bufio.NewReader(stdout).ReadString('\n')
-	if line != "writing\n" {
-		_ = cmd.Process.Kill()
-		t.Fatalf("helper printed %q, %v; want writing", line, err)
-	}
-	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
-		t.Fatal(err)
-	}
-	_ = cmd.Wait()
+	for _, tc := range cases {
+		t.Run(tc.op+" at "+tc.point, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			s := open(t, dir)
+			var old string
+			if tc.op != "create" {
+				var err error
+				if old, err = s.Create(ctx, helperKey, strings.NewReader("old")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := helperCmd(t, "crash", dir, "0", old)
+			cmd.Env = append(cmd.Env, envOp+"="+tc.op, envPoint+"="+tc.point)
+			cmd.Stdin = strings.NewReader("")
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			line, err := bufio.NewReader(stdout).ReadString('\n')
+			if line != "at "+tc.point+"\n" {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				t.Fatalf("helper printed %q, %v; want at %s", line, err, tc.point)
+			}
+			if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+				t.Fatal(err)
+			}
+			_ = cmd.Wait()
 
-	// The write was in progress: its temporary file is still there.
-	tmp, err := os.ReadDir(filepath.Join(dir, tmpDir))
-	if err != nil || len(tmp) != 1 {
-		t.Fatalf("tmp/ holds %v, %v; want the killed write's file", tmp, err)
+			// Readers see exactly the state the mutation had reached.
+			current := ""
+			switch tc.want {
+			case "missing":
+				if _, err := s.Head(ctx, helperKey); !errors.Is(err, storage.ErrNotFound) {
+					t.Fatalf("Head error = %v, want ErrNotFound", err)
+				}
+			case "old":
+				expectObject(t, s, helperKey, "old", old)
+				current = old
+			case "new":
+				info, err := s.Head(ctx, helperKey)
+				if err != nil || info.Version == old {
+					t.Fatalf("Head = %+v, %v; want a new version", info, err)
+				}
+				expectObject(t, s, helperKey, crashPayload, info.Version)
+				current = info.Version
+			}
+			if entries, err := s.List(ctx, "", "", 10); err != nil || (len(entries) == 1) != (current != "") {
+				t.Fatalf("List = %v, %v; want %s", entries, err, tc.want)
+			}
+			// Create-if-absent is not blocked, the lock is free, and later
+			// mutations behave.
+			lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			if _, err := s.Create(lctx, "fresh", strings.NewReader("x")); err != nil {
+				t.Fatalf("Create of another key: %v", err)
+			}
+			if current == "" {
+				if current, err = s.Create(lctx, helperKey, strings.NewReader("recreated")); err != nil {
+					t.Fatalf("Create after the kill: %v", err)
+				}
+			}
+			if _, err := s.Replace(lctx, helperKey, "stale", strings.NewReader("x")); !errors.Is(err, storage.ErrPreconditionFailed) {
+				t.Fatalf("Replace with a stale version error = %v, want ErrPreconditionFailed", err)
+			}
+			next, err := s.Replace(lctx, helperKey, current, strings.NewReader("next"))
+			if err != nil {
+				t.Fatalf("Replace after the kill: %v", err)
+			}
+			if err := s.Delete(lctx, helperKey); err != nil {
+				t.Fatalf("Delete after the kill: %v", err)
+			}
+			if _, err := s.Replace(lctx, helperKey, next, strings.NewReader("x")); !errors.Is(err, storage.ErrPreconditionFailed) {
+				t.Fatalf("Replace of the deleted version error = %v, want ErrPreconditionFailed", err)
+			}
+			if _, err := s.Create(lctx, helperKey, strings.NewReader("again")); err != nil {
+				t.Fatalf("Create after Delete: %v", err)
+			}
+		})
 	}
-	s := open(t, dir)
+}
+
+// setHook installs a test hook for the duration of the test.
+func setHook(t *testing.T, h func(point string) error) {
+	hook = h
+	t.Cleanup(func() { hook = nil })
+}
+
+// TestDeleteMissingSyncs: a Delete that finds the key missing still fsyncs
+// objects/, because the process that unlinked it may have died before its
+// fsync.
+func TestDeleteMissingSyncs(t *testing.T) {
+	s := open(t, t.TempDir())
+	var points []string
+	setHook(t, func(p string) error { points = append(points, p); return nil })
+	if err := s.Delete(context.Background(), "missing"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(points, "sync objects") {
+		t.Fatalf("Delete of a missing key passed %q, want a sync of objects", points)
+	}
+}
+
+// TestOutcome injects a failure at each hook point: before publication the
+// error is plain and nothing changes; after it the error wraps
+// ErrOutcomeUnknown and the mutation is visible.
+func TestOutcome(t *testing.T) {
 	ctx := context.Background()
-	if _, err := s.Head(ctx, helperKey); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("Head after the killed write error = %v, want ErrNotFound", err)
+	injected := errors.New("injected")
+	cases := []struct {
+		op, point string
+		existing  bool
+		published bool
+	}{
+		{"create", "sync objects", false, true},
+		{"replace", "locked", true, false},
+		{"replace", "sync objects", true, true},
+		{"delete", "locked", true, false},
+		{"delete", "sync objects", true, true},
+		{"delete", "sync objects", false, true},
 	}
-	if entries, err := s.List(ctx, "", "", 10); err != nil || len(entries) != 0 {
-		t.Fatalf("List after the killed write = %v, %v; want empty", entries, err)
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%s at %s, existing %v", tc.op, tc.point, tc.existing), func(t *testing.T) {
+			s := open(t, t.TempDir())
+			var old string
+			if tc.existing {
+				var err error
+				if old, err = s.Create(ctx, "k", strings.NewReader("old")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			setHook(t, func(p string) error {
+				if p == tc.point {
+					return injected
+				}
+				return nil
+			})
+			var err error
+			switch tc.op {
+			case "create":
+				_, err = s.Create(ctx, "k", strings.NewReader("new"))
+			case "replace":
+				_, err = s.Replace(ctx, "k", old, strings.NewReader("new"))
+			case "delete":
+				err = s.Delete(ctx, "k")
+			}
+			if !errors.Is(err, injected) || errors.Is(err, storage.ErrOutcomeUnknown) != tc.published {
+				t.Fatalf("error = %v, want the injected error, wrapping ErrOutcomeUnknown: %v", err, tc.published)
+			}
+			hook = nil
+			body, info, err := s.Get(ctx, "k")
+			got := "missing"
+			if err == nil {
+				b, _ := io.ReadAll(body)
+				_ = body.Close()
+				got = string(b)
+			}
+			want := map[bool]string{true: "old", false: "missing"}[tc.existing]
+			if tc.published {
+				want = map[string]string{"create": "new", "replace": "new", "delete": "missing"}[tc.op]
+			}
+			if got != want || want == "old" && info.Version != old {
+				t.Fatalf("after the failure the key holds %q at %q, want %q", got, info.Version, want)
+			}
+		})
 	}
-	v, err := s.Create(ctx, helperKey, strings.NewReader("after"))
-	if err != nil {
-		t.Fatalf("Create after the killed write: %v", err)
+}
+
+// TestValidationBeforeIO removes everything under the root and checks that
+// invalid keys are still rejected as invalid, and that nothing was created.
+func TestValidationBeforeIO(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	for _, name := range []string{lockName, tmpDir, objDir} {
+		if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
 	}
-	expectObject(t, s, helperKey, "after", v)
+	ctx := context.Background()
+	const key = "a/../b"
+	errs := map[string]error{}
+	_, errs["Create"] = s.Create(ctx, key, strings.NewReader("x"))
+	_, errs["Replace"] = s.Replace(ctx, key, "v", strings.NewReader("x"))
+	_, _, errs["Get"] = s.Get(ctx, key)
+	_, errs["Head"] = s.Head(ctx, key)
+	errs["Delete"] = s.Delete(ctx, key)
+	for op, err := range errs {
+		if !errors.Is(err, storage.ErrInvalidKey) {
+			t.Errorf("%s error = %v, want ErrInvalidKey", op, err)
+		}
+	}
+	if got := files(t, dir); !slices.Equal(got, []string{"."}) {
+		t.Fatalf("invalid-key calls created %q", got)
+	}
 }
 
 func TestFailedWriteRemovesTempFile(t *testing.T) {
@@ -304,12 +507,12 @@ func TestPathTraversal(t *testing.T) {
 	}
 	s := open(t, root)
 	ctx := context.Background()
-	for _, k := range []string{"../x", "../../x", "a/../../x", "/etc/x", `..\x`, "a/../x"} {
+	for _, k := range []string{"../x", "../../x", "a/../../x", "/etc/x", `..\x`, "a/../x", "a/.."} {
 		if _, err := s.Create(ctx, k, strings.NewReader("x")); !errors.Is(err, storage.ErrInvalidKey) {
 			t.Errorf("Create(%q) error = %v, want ErrInvalidKey", k, err)
 		}
 	}
-	pathLike := []string{"..a/b", "a/..b", "...", "etc/passwd", "root/..x", "%2e%2e/x"}
+	pathLike := []string{"..a/b", "a/..b", "...x", "etc/passwd", "root/..x", "tmp/x", "objects/x"}
 	for _, k := range pathLike {
 		if _, err := s.Create(ctx, k, strings.NewReader(k)); err != nil {
 			t.Fatalf("Create(%q): %v", k, err)

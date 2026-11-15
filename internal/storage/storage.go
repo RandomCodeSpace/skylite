@@ -6,64 +6,113 @@
 // conditional writes: a commit is a create-if-absent of a new object, and a
 // lease or manifest is updated by compare-and-swap on a version token. The
 // contract below exists so that those two operations mean the same thing on
-// every backend. A backend is accepted only if it passes the conformance suite
-// in package storagetest; this documentation is the specification that suite
-// checks.
+// every backend. This documentation is the specification; package storagetest
+// checks the parts of it that can be checked portably, and each backend
+// carries its own tests for the rest (see "Implementing a backend").
 //
 // # Keys
 //
-// A key is a flat, UTF-8 string. "/" separates segments by convention only:
-// there are no directories, and "a/b" and "a/b/c" can both exist. Every
-// backend calls [ValidateKey] on every key it receives, before any other work,
-// and returns its error unchanged inside an [*Error]. A key is rejected with
-// [ErrInvalidKey] if it:
+// skylite generates its own keys, so the key domain is small enough that
+// every backend can use a key as its native object name without encoding.
+// Every backend calls [ValidateKey] on every key it receives, before any other
+// work and before any I/O, and returns its error unchanged inside an
+// [*Error]. A key is valid if and only if:
 //
-//   - is empty or longer than [MaxKeyLen] bytes;
-//   - is not valid UTF-8;
-//   - starts or ends with "/", or contains an empty segment ("a//b");
-//   - contains a "." or ".." segment;
-//   - contains a backslash;
-//   - contains a control character (unicode.IsControl: C0 including NUL, DEL,
-//     and C1), or U+FFFE or U+FFFF; XML 1.0, which the Azure and S3 listing
-//     APIs use, cannot carry these.
+//   - it is 1 to [MaxKeyLen] bytes long;
+//   - it consists of 1 to [MaxKeySegments] segments separated by "/", so it
+//     has no leading or trailing "/" and no empty segment;
+//   - every segment is one or more of the characters A-Z, a-z, 0-9, ".", "_"
+//     and "-", and does not end with "." (which also excludes "." and "..";
+//     Azure Blob Storage advises against names ending in a dot).
 //
-// Keys are compared and sorted as byte strings. Keys that differ only in case
-// or in Unicode normalisation are different keys, and a backend must keep them
-// apart even if the underlying system would not.
+// "/" separates segments by convention only: there are no directories, and
+// "a/b" and "a/b/c" can both exist. Keys are case-sensitive and are compared
+// and sorted as byte strings. Keys that differ only in case are different
+// keys, and a backend must keep them apart even if the underlying system
+// would not.
 //
-// # Writes
+// # Mutations
 //
-// There is no unconditional put. The only writes are:
+// There is no unconditional put. The only mutations are:
 //
 //   - [Store.Create]: write the object only if no object exists at the key.
 //   - [Store.Replace]: write the object only if an object exists at the key and
 //     its current version token equals the one given (compare-and-swap).
+//   - [Store.Delete]: remove the object unconditionally. Deleting a missing
+//     key succeeds.
 //
 // A failed condition returns [ErrPreconditionFailed]. Replace on a missing key
 // is a precondition failure, not [ErrNotFound]. Replace with an empty version
-// always fails its precondition.
+// always fails its precondition. A Replace conditioned on a version that a
+// completed Delete removed fails, even if it started before the Delete.
 //
 // Writes are atomic. A concurrent or later reader sees the whole old object,
-// the whole new object, or not-found; never a partial object. A write that
-// fails before it commits (the reader returns an error, the context is
-// cancelled, the process is killed, the upload fails) leaves no visible
-// object and no visible change, and does not stop a later Create of the same key from
-// succeeding. Backends whose service keeps partial upload state against a key
-// (for example uncommitted blocks that make a later "If-None-Match: *" fail)
-// must not leave such state behind, or must make it irrelevant to later
-// writes. The one exception is an error from the commit step itself, such as
-// a response lost after the service committed the write, or a failed fsync
-// of the directory after the file was linked into place: then the write may
-// have taken effect, and a caller that must know reads the object back.
+// the whole new object, or not-found; never a partial object, and never the
+// body of one version with the [Info] of another.
+//
+// A write reads the caller's body to its end before it publishes anything.
+// Until then, nothing about the write is visible to readers, listings or
+// other writers, and a write that stops there (the body's Read fails, the
+// context ends, the process is killed, the upload fails) does not stop a later
+// Create of the same key from succeeding. While it reads the body, a write
+// must not hold anything that blocks other mutations: cancellation cannot
+// interrupt a Read of the caller's body (see below), so such a hold would let
+// one stalled caller stop every writer.
 //
 // Among any number of concurrent Create calls for one absent key, exactly one
 // succeeds; among concurrent Replace calls with the same current version,
-// exactly one succeeds. This holds across goroutines, processes and hosts that
-// share the store, to the extent stated by each backend's documentation.
+// exactly one succeeds. This holds across goroutines, clients, processes and
+// hosts that share the store, to the extent stated by each backend's
+// documentation.
 //
-// A write returns only after the object is durable in the backend: for a
-// cloud service, after the service has acknowledged the upload; for a local
-// filesystem, after the data and the directory entry have been fsynced.
+// A mutation returns success only after its effect is durable in the backend:
+// for a cloud service, after the service has acknowledged it; for a local
+// filesystem, after the data and the directory have been fsynced. For Delete
+// this means a later crash or power loss cannot bring the object back, also
+// when the key was already missing on entry, since another caller's Delete of
+// it may have unlinked it without making that durable.
+//
+// # Outcome of a failed mutation
+//
+// One rule covers every error from Create, Replace and Delete, whatever its
+// cause, cancellation included:
+//
+//   - nil means the mutation took effect and is durable;
+//   - an error wrapping [ErrOutcomeUnknown] means it may or may not have taken
+//     effect, now or after a crash; the caller reads the key back to find out.
+//     A failed write returns no version token, so a caller that must recognise
+//     its own write puts something unique in the content;
+//   - any other error means it had no effect, visible now or after a crash.
+//
+// Publication begins when a write has read its body to its end, or when a
+// Delete sends the request or makes the system call that removes the object.
+// Before publication begins a backend can always undo its work, so it never
+// returns [ErrOutcomeUnknown]. After it has begun, a backend returns
+// [ErrOutcomeUnknown] for any error unless it knows the mutation had no
+// effect. Examples: the context ended, or the connection failed, after the
+// request that commits the write was sent and before its response arrived; a
+// local link, rename or unlink succeeded and the following directory fsync
+// failed.
+//
+// Cancellation is a case of this rule, not an exception to it. A context that
+// is done when a call starts fails the call. A context that ends before
+// publication begins fails the mutation with the context's error and no
+// effect. A context that ends after publication has begun gives success, an
+// error with no effect, or an error wrapping both [ErrOutcomeUnknown] and the
+// context's error. Cancellation cannot interrupt a call that is blocked
+// inside the caller's own body Read: a backend sees the context end only when
+// that Read returns, so a caller that needs a bounded write gives it a reader
+// that returns.
+//
+// # Staged uploads
+//
+// The portable suite cannot force a backend onto its service's staged upload
+// path (S3 multipart upload, an Azure block list, a GCS resumable upload). A
+// backend therefore does one of two things. Either it publishes every object
+// with one atomic request and rejects a body larger than that request's limit
+// with [ErrInvalidArgument] and no effect, documenting the limit; or it
+// carries its own tests showing that an upload interrupted inside the staged
+// path leaves nothing visible and does not stop a later Create of the key.
 //
 // # Version tokens
 //
@@ -77,6 +126,14 @@
 // A hash of the content, such as an MD5-based ETag, is therefore not a valid
 // token on its own: two writes of the same bytes would share it, and a
 // compare-and-swap could succeed against an object rewritten in between.
+//
+// Implementation note for S3: an S3 ETag reflects the content, so it cannot be
+// the token by itself. Reading the object's version id and then writing with
+// an If-Match condition on the ETag does not close the gap either: another
+// writer can rewrite identical content between the read and the conditional
+// write, the ETag still matches, and the compare-and-swap succeeds against a
+// version it never saw. The token and the write condition must name the same
+// per-write identity.
 //
 // # Reads
 //
@@ -99,6 +156,14 @@
 // body. Errors while reading the body, including the end of the context the
 // body was opened with, are returned by the body's Read.
 //
+// An open body belongs to one version: every byte it returns comes from the
+// version its Info describes, whenever it is read. If that version is
+// replaced or deleted before the body has been read to its end, the body's
+// Read either keeps returning that version's bytes or fails with an error; it
+// never returns bytes of another version. (A cloud backend cannot promise to
+// finish such a read: a dropped connection cannot be resumed against a version
+// that no longer exists.)
+//
 // [Store.Head] returns the same [Info] without a body.
 //
 // # Listing
@@ -112,39 +177,47 @@
 // not be valid keys; an empty prefix lists everything and an empty startAfter
 // starts at the beginning.
 //
-// Listing is consistent with completed writes and deletes: an object whose
-// Create or Replace has returned is listed, and one whose Delete has returned
-// is not. A listing made with several pages while other writers are active
-// sees, on each page, the state at the time that page was fetched.
-//
-// # Delete
-//
-// [Store.Delete] removes the object unconditionally. Deleting a missing key
-// succeeds.
+// Listing is consistent with completed mutations: an object whose Create or
+// Replace has returned is listed with its new size, and one whose Delete has
+// returned is not. A listing made with several pages while other writers are
+// active sees, on each page, the state at the time that page was fetched.
 //
 // # Errors
 //
 // Every error returned by a [Store] method is an [*Error] carrying the
 // operation and the key (empty for List). It wraps one of [ErrNotFound],
 // [ErrPreconditionFailed], [ErrInvalidKey] or [ErrInvalidArgument], the
-// context's error when the context ended, the error returned by the caller's
-// reader, or the backend's own error. Test with [errors.Is]. Errors never
-// contain object contents.
+// context's error when the context ended, a [*BodyError] holding the error
+// returned by the caller's body reader, or the backend's own error, and
+// additionally [ErrOutcomeUnknown] when the rule above requires it. Test with
+// [errors.Is] and [errors.As].
 //
-// # Concurrency and cancellation
+// Error text never contains object contents or credentials (access keys,
+// tokens, signed URLs). A body reader's error is wrapped in a [*BodyError],
+// whose text is fixed, because the caller's reader may put anything in its
+// error. A backend whose SDK puts contents or credentials in its error
+// strings redacts them before returning the error. Errors from the operating
+// system keep their text.
 //
-// A Store is safe for concurrent use by many goroutines. Every method honours
-// its context: a context that is already done fails the call, and a context
-// that ends during a write fails the write with no visible effect.
+// # Concurrency
+//
+// A Store is safe for concurrent use by many goroutines.
 //
 // # Implementing a backend
 //
 // Call [ValidateKey] first in every method that takes a key. Return every
 // error as an [*Error] with Op set to "create", "replace", "get" (for Get and
-// GetRange), "head", "list" or "delete". Document what the backend does not
-// support, as package localfs does. Then call storagetest.Run from the
-// backend's tests with a function that returns a new, empty store; the
-// backend is done when every subtest passes.
+// GetRange), "head", "list" or "delete", wrap body reader errors in a
+// [*BodyError], and document what the backend does not support, as package
+// localfs does. Then call storagetest.Run from the backend's tests.
+//
+// Passing storagetest.Run is necessary, not sufficient. The suite runs its
+// clients in one process and cannot crash the backend, cut its network or
+// inspect its service, so each backend also tests, itself: races between
+// processes or hosts; a process killed during and just after publication;
+// its staged upload path (see above) or its size limit; that durability
+// holds where it can be observed, such as the directory fsync of a local
+// backend; and that its SDK's errors are redacted.
 package storage
 
 import (
@@ -153,13 +226,15 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 )
 
 // MaxKeyLen is the maximum key length in bytes. 1024 is the smallest limit
 // among Azure Blob Storage, Amazon S3 and Google Cloud Storage.
 const MaxKeyLen = 1024
+
+// MaxKeySegments is the maximum number of "/"-separated segments in a key,
+// well inside Azure Blob Storage's limit of 254.
+const MaxKeySegments = 32
 
 // MaxListLimit is the largest page size [Store.List] accepts. It is the page
 // size Amazon S3 returns at most, so every backend can fill a page with one
@@ -176,8 +251,12 @@ var (
 	// ErrInvalidKey means the key breaks the rules in [ValidateKey].
 	ErrInvalidKey = errors.New("invalid key")
 	// ErrInvalidArgument means an argument other than the key is out of range,
-	// such as a negative offset or a list limit outside 1..[MaxListLimit].
+	// such as a negative offset, a list limit outside 1..[MaxListLimit] or a
+	// body larger than the backend accepts.
 	ErrInvalidArgument = errors.New("invalid argument")
+	// ErrOutcomeUnknown means a mutation failed after its publication began
+	// and may or may not have taken effect; see the package documentation.
+	ErrOutcomeUnknown = errors.New("outcome unknown")
 )
 
 // Error is the error type returned by every [Store] method.
@@ -190,6 +269,15 @@ type Error struct {
 func (e *Error) Error() string { return fmt.Sprintf("storage: %s %q: %v", e.Op, e.Key, e.Err) }
 
 func (e *Error) Unwrap() error { return e.Err }
+
+// BodyError holds an error returned by the caller's body reader. Its text is
+// fixed, because the reader's error may carry object contents; the reader's
+// error stays reachable through Unwrap.
+type BodyError struct{ Err error }
+
+func (e *BodyError) Error() string { return "reading the body failed" }
+
+func (e *BodyError) Unwrap() error { return e.Err }
 
 // Info describes one version of an object.
 type Info struct {
@@ -227,33 +315,21 @@ type Store interface {
 // ValidateKey returns an error wrapping [ErrInvalidKey] if key breaks the key
 // rules in the package documentation, and nil otherwise.
 func ValidateKey(key string) error {
-	reason := ""
-	switch {
-	case key == "":
-		reason = "empty"
-	case len(key) > MaxKeyLen:
-		reason = "longer than 1024 bytes"
-	case !utf8.ValidString(key):
-		reason = "not valid UTF-8"
-	case strings.ContainsRune(key, '\\'):
-		reason = "contains a backslash"
-	case strings.ContainsFunc(key, func(r rune) bool { return unicode.IsControl(r) || r == 0xFFFE || r == 0xFFFF }):
-		reason = "contains a control character, U+FFFE or U+FFFF"
-	default:
-		for seg := range strings.SplitSeq(key, "/") {
-			switch seg {
-			case "":
-				reason = "has an empty segment or a leading or trailing slash"
-			case ".", "..":
-				reason = "has a . or .. segment"
-			}
-			if reason != "" {
-				break
-			}
+	if key == "" || len(key) > MaxKeyLen {
+		return fmt.Errorf("%w: length must be 1 to %d bytes", ErrInvalidKey, MaxKeyLen)
+	}
+	if strings.Count(key, "/") >= MaxKeySegments {
+		return fmt.Errorf("%w: more than %d segments", ErrInvalidKey, MaxKeySegments)
+	}
+	for seg := range strings.SplitSeq(key, "/") {
+		if seg == "" || seg[len(seg)-1] == '.' {
+			return fmt.Errorf("%w: empty segment, leading or trailing slash, or segment ending in a dot", ErrInvalidKey)
+		}
+		if strings.ContainsFunc(seg, func(r rune) bool {
+			return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '.' && r != '_' && r != '-'
+		}) {
+			return fmt.Errorf("%w: character outside A-Z a-z 0-9 . _ -", ErrInvalidKey)
 		}
 	}
-	if reason == "" {
-		return nil
-	}
-	return fmt.Errorf("%w: %s", ErrInvalidKey, reason)
+	return nil
 }

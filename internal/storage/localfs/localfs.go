@@ -14,9 +14,10 @@
 // version token, the key length as a big-endian uint16, and the key) followed
 // by the object's bytes. File names are the hex SHA-256 of the key, so a key
 // never becomes a path: path traversal through keys is impossible, keys that
-// differ only in case or Unicode normalisation stay apart on macOS, and "a/b"
-// and "a/b/c" can coexist. All file access goes through os.Root, which refuses
-// to follow a symbolic link that leads outside the root.
+// differ only in case stay apart on case-insensitive filesystems such as the
+// macOS default, and "a/b" and "a/b/c" can coexist. All file access goes
+// through os.Root, which refuses to follow a symbolic link that leads outside
+// the root.
 //
 // # Writes
 //
@@ -37,8 +38,14 @@
 // drops the lock of a killed process.
 //
 // After the commit, objects/ is fsynced, so a successful write has fsynced
-// both the file and its directory entry. On macOS, os.File.Sync issues
-// F_FULLFSYNC.
+// both the file and its directory entry. Delete fsyncs objects/ also when the
+// key is already missing, because another caller may have unlinked it and
+// died before its fsync. An error from that fsync, after the link, rename or
+// unlink took effect, wraps storage.ErrOutcomeUnknown. On macOS, os.File.Sync
+// issues F_FULLFSYNC.
+//
+// A read keeps the object file open, so an open body keeps returning its
+// version after a Replace or Delete.
 //
 // Version tokens are 128 random bits from crypto/rand, written in the header
 // and therefore replaced together with the content.
@@ -68,6 +75,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -89,6 +97,25 @@ const (
 )
 
 var errCorrupt = errors.New("localfs: corrupt object file")
+
+// hook is nil except in tests, which set it to stop or fail a mutation at a
+// named point.
+var hook func(point string) error
+
+func at(point string) error {
+	if hook == nil {
+		return nil
+	}
+	return hook(point)
+}
+
+// uncertain marks an error that happened after a mutation took effect.
+func uncertain(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", storage.ErrOutcomeUnknown, err)
+}
 
 // Store is a storage.Store on a local directory. Close it when done.
 type Store struct {
@@ -147,7 +174,7 @@ func (s *Store) create(ctx context.Context, key string, body io.Reader) (string,
 		}
 		return "", err
 	}
-	return version, syncDir(s.root, objDir)
+	return version, uncertain(syncDir(s.root, objDir))
 }
 
 // Replace implements storage.Store.
@@ -187,10 +214,13 @@ func (s *Store) replace(ctx context.Context, key, version string, body io.Reader
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if err := at("locked"); err != nil {
+		return "", err
+	}
 	if err := s.root.Rename(tmp, objPath(key)); err != nil {
 		return "", err
 	}
-	return newVersion, syncDir(s.root, objDir)
+	return newVersion, uncertain(syncDir(s.root, objDir))
 }
 
 // Get implements storage.Store.
@@ -303,13 +333,16 @@ func (s *Store) delete(ctx context.Context, key string) error {
 		return err
 	}
 	defer unlock()
-	if err := s.root.Remove(objPath(key)); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return syncDir(s.root, objDir)
+	if err := at("locked"); err != nil {
+		return err
+	}
+	if err := s.root.Remove(objPath(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return uncertain(syncDir(s.root, objDir))
 }
 
 func check(ctx context.Context, key string) error {
@@ -352,7 +385,7 @@ func (s *Store) writeTemp(ctx context.Context, key string, body io.Reader) (stri
 	if _, err := f.Write(head); err != nil {
 		return fail(err)
 	}
-	if _, err := io.Copy(f, ctxReader{ctx, body}); err != nil {
+	if _, err := io.Copy(f, ctxReader{ctx, bodyReader{body}}); err != nil {
 		return fail(err)
 	}
 	if err := f.Sync(); err != nil {
@@ -429,6 +462,9 @@ func (s *Store) lock(ctx context.Context) (unlock func(), err error) {
 }
 
 func syncDir(root *os.Root, name string) error {
+	if err := at("sync " + name); err != nil {
+		return err
+	}
 	d, err := root.Open(name)
 	if err != nil {
 		return err
@@ -451,4 +487,15 @@ func (c ctxReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return c.r.Read(p)
+}
+
+// bodyReader wraps errors from the caller's body in a storage.BodyError.
+type bodyReader struct{ r io.Reader }
+
+func (b bodyReader) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if err != nil && err != io.EOF { //nolint:errorlint // io.Reader returns io.EOF itself, never wrapped
+		err = &storage.BodyError{Err: err}
+	}
+	return n, err
 }

@@ -1,8 +1,25 @@
-// Package storagetest is the conformance suite for storage.Store backends.
+// Package storagetest is the portable part of the conformance suite for
+// storage.Store backends.
 //
-// A backend's tests call [Run] with a function that returns a new, empty
-// store. Every point of the contract in package storage is a subtest; a
-// backend is accepted only if all of them pass.
+// A backend's tests call [Run] with a function that creates a new, empty
+// namespace and returns a way to open independent clients onto it. Every
+// subtest gets its own namespace.
+//
+// The suite covers what can be checked through the interface from one
+// process: key validation, conditional writes and version tokens, range
+// reads, listing order and pagination, failed and cancelled writes, what
+// readers on other clients see while a write is in progress, open bodies
+// across a Replace or Delete, error contents, and races between independent
+// clients: Create against Create, Replace against Replace, Replace against
+// Delete and Create against Delete. Every race test proves that its calls
+// overlapped, so a serial run cannot pass it.
+//
+// It cannot cover races between processes or hosts, a process killed during
+// or just after publication, durability across a crash or power loss, an
+// interrupted staged upload, a size limit, or redaction of a service SDK's
+// errors. Each backend tests those itself, as the storage package
+// documentation requires. Passing [Run] is necessary for a backend to be
+// accepted, not sufficient.
 package storagetest
 
 import (
@@ -11,46 +28,60 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/iotest"
+	"time"
 
 	"github.com/RandomCodeSpace/skylite/internal/storage"
 )
 
-// Run runs the conformance suite. newStore must return a new, empty store and
-// register its cleanup with t.Cleanup.
-func Run(t *testing.T, newStore func(t *testing.T) storage.Store) {
+// Run runs the conformance suite. newNamespace is called once per subtest. It
+// creates a new, empty namespace (a directory, or a container and prefix) and
+// returns open, which opens a new client onto that namespace each time it is
+// called. Clients must be independent: they may share nothing in the process
+// that the backend's correctness depends on, so that two clients behave like
+// two processes or hosts. Register cleanup with the t given to newNamespace.
+func Run(t *testing.T, newNamespace func(t *testing.T) (open func() storage.Store)) {
+	one := func(fn func(*testing.T, storage.Store)) func(*testing.T, func() storage.Store) {
+		return func(t *testing.T, open func() storage.Store) { fn(t, open()) }
+	}
 	tests := []struct {
 		name string
-		fn   func(t *testing.T, s storage.Store)
+		fn   func(t *testing.T, open func() storage.Store)
 	}{
-		{"InvalidKeys", testInvalidKeys},
-		{"ValidKeys", testValidKeys},
-		{"NotFound", testNotFound},
-		{"CreateExisting", testCreateExisting},
-		{"Replace", testReplace},
-		{"VersionTokens", testVersionTokens},
-		{"Delete", testDelete},
-		{"RangeReads", testRangeReads},
-		{"ZeroLength", testZeroLength},
-		{"LargeObject", testLargeObject},
-		{"ListOrder", testListOrder},
-		{"ListPagination", testListPagination},
-		{"ListLimits", testListLimits},
+		{"InvalidKeys", one(testInvalidKeys)},
+		{"ValidKeys", one(testValidKeys)},
+		{"NotFound", one(testNotFound)},
+		{"CreateExisting", one(testCreateExisting)},
+		{"Replace", one(testReplace)},
+		{"VersionTokens", one(testVersionTokens)},
+		{"Delete", one(testDelete)},
+		{"RangeReads", one(testRangeReads)},
+		{"ZeroLength", one(testZeroLength)},
+		{"LargeObject", one(testLargeObject)},
+		{"ListOrder", one(testListOrder)},
+		{"ListPagination", one(testListPagination)},
+		{"ListLimits", one(testListLimits)},
 		{"ConcurrentCreate", testConcurrentCreate},
 		{"ConcurrentReplace", testConcurrentReplace},
-		{"ConcurrentReadsSeeWholeObjects", testConcurrentReads},
-		{"FailedReader", testFailedReader},
-		{"CancelledDuringWrite", testCancelledDuringWrite},
-		{"CancelledContext", testCancelledContext},
-		{"BodyHonoursContext", testBodyHonoursContext},
-		{"Errors", testErrors},
+		{"ReplaceDeleteRace", testReplaceDeleteRace},
+		{"CreateDeleteRace", testCreateDeleteRace},
+		{"ConcurrentReadsSeeWholeVersions", testConcurrentReads},
+		{"OpenBodyKeepsItsVersion", testOpenBodies},
+		{"WriteInProgress", testWriteInProgress},
+		{"CancelledContext", one(testCancelledContext)},
+		{"BodyHonoursContext", one(testBodyHonoursContext)},
+		{"Errors", one(testErrors)},
+		{"BodyErrorText", one(testBodyErrorText)},
 	}
 	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) { tc.fn(t, newStore(t)) })
+		t.Run(tc.name, func(t *testing.T) { tc.fn(t, newNamespace(t)) })
 	}
 }
 
@@ -140,13 +171,6 @@ func listAll(t *testing.T, s storage.Store, prefix string) []storage.Entry {
 	return entries
 }
 
-func expectEmpty(t *testing.T, s storage.Store) {
-	t.Helper()
-	if entries := listAll(t, s, ""); len(entries) != 0 {
-		t.Fatalf("List returned %v, want an empty store", entries)
-	}
-}
-
 func keys(entries []storage.Entry) []string {
 	out := make([]string, len(entries))
 	for i, e := range entries {
@@ -162,51 +186,61 @@ var invalidKeys = []struct{ name, key string }{
 	{"trailing slash", "a/"},
 	{"empty segment", "a//b"},
 	{"dot", "."},
-	{"leading dot segment", "./a"},
-	{"inner dot segment", "a/./b"},
-	{"trailing dot segment", "a/."},
 	{"dotdot", ".."},
-	{"leading dotdot segment", "../a"},
-	{"inner dotdot segment", "a/../b"},
-	{"trailing dotdot segment", "a/.."},
+	{"dot segment", "a/./b"},
+	{"dotdot segment", "a/../b"},
 	{"traversal", "../../etc/passwd"},
+	{"trailing dot", "a."},
+	{"segment ending in a dot", "a./b"},
+	{"space", "a b"},
+	{"backslash", `a\b`},
 	{"NUL", "a\x00b"},
 	{"newline", "a\nb"},
-	{"tab", "a\tb"},
-	{"escape", "a\x1bb"},
-	{"DEL", "a\x7fb"},
-	{"C1 control", "a\u0085b"},
-	{"U+FFFE", "a\ufffeb"},
-	{"U+FFFF", "a\uffffb"},
-	{"backslash", `a\b`},
-	{"backslash traversal", `..\a`},
+	{"tilde", "a~"},
+	{"percent", "%2e"},
+	{"colon", "a:b"},
+	{"plus", "a+b"},
+	{"non-ASCII", "\u00e9"},
+	{"private use", "a\ue000"},
 	{"invalid UTF-8", "a\xffb"},
-	{"truncated UTF-8", "a\xe6\x97"},
 	{"too long", strings.Repeat("a", storage.MaxKeyLen+1)},
-	{"too long multi-byte", strings.Repeat("\u00e9", storage.MaxKeyLen/2) + "a"},
+	{"too many segments", strings.Repeat("a/", storage.MaxKeySegments) + "a"},
 }
 
+// readerFunc is an io.Reader made of a function.
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+
+// testInvalidKeys checks that every method rejects every invalid key before
+// it does anything else: before it reads the body and before it looks at the
+// context.
 func testInvalidKeys(t *testing.T, s storage.Store) {
 	v := create(t, s, "valid", "x")
+	body := readerFunc(func([]byte) (int, error) {
+		t.Error("a write with an invalid key read its body")
+		return 0, io.EOF
+	})
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
 	for _, tc := range invalidKeys {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := storage.ValidateKey(tc.key); !errors.Is(err, storage.ErrInvalidKey) {
 				t.Errorf("ValidateKey error = %v, want ErrInvalidKey", err)
 			}
-			ops := map[string]func() error{
-				"Create": func() error { _, err := s.Create(ctx, tc.key, strings.NewReader("x")); return err },
-				"Replace": func() error {
-					_, err := s.Replace(ctx, tc.key, v, strings.NewReader("x"))
-					return err
-				},
-				"Get":      func() error { _, _, err := s.Get(ctx, tc.key); return err },
-				"GetRange": func() error { _, _, err := s.GetRange(ctx, tc.key, 0, 1); return err },
-				"Head":     func() error { _, err := s.Head(ctx, tc.key); return err },
-				"Delete":   func() error { return s.Delete(ctx, tc.key) },
-			}
-			for name, op := range ops {
-				if err := op(); !errors.Is(err, storage.ErrInvalidKey) {
-					t.Errorf("%s error = %v, want ErrInvalidKey", name, err)
+			for _, c := range []context.Context{ctx, cancelled} {
+				ops := map[string]func() error{
+					"Create":   func() error { _, err := s.Create(c, tc.key, body); return err },
+					"Replace":  func() error { _, err := s.Replace(c, tc.key, v, body); return err },
+					"Get":      func() error { _, _, err := s.Get(c, tc.key); return err },
+					"GetRange": func() error { _, _, err := s.GetRange(c, tc.key, 0, 1); return err },
+					"Head":     func() error { _, err := s.Head(c, tc.key); return err },
+					"Delete":   func() error { return s.Delete(c, tc.key) },
+				}
+				for name, op := range ops {
+					if err := op(); !errors.Is(err, storage.ErrInvalidKey) || errors.Is(err, context.Canceled) {
+						t.Errorf("%s error = %v, want ErrInvalidKey (context done: %v)", name, err, c.Err() != nil)
+					}
 				}
 			}
 		})
@@ -216,21 +250,20 @@ func testInvalidKeys(t *testing.T, s storage.Store) {
 	}
 }
 
-// validKeys sort awkwardly, look like paths, or differ only in case or
-// Unicode normalisation.
+// validKeys sort awkwardly, look like paths, differ only in case, or reach
+// the length and segment limits.
 var validKeys = []string{
-	"a", "a/b", "a.b", "a/b/c", "a0", "a-b", "a~", "b", "Z", "z",
-	"..a", "a..", ".a/b.", "...", "a/..b/c", "a b", "%2e%2e",
-	"\u00e9",  // e acute, NFC
-	"e\u0301", // e acute, NFD
-	"\u65e5\u672c/\u8a9e", "\u65e5\u672c\u8a9e", "emoji/\U0001f642", "\ufffd", "\U0010ffff",
-	`~!@#$%^&*()_+=-[]{};':",<>?|` + "`",
+	"a", "a/b", "a.b", "a/b/c", "a0", "a-b", "a_b", "b", "Z", "z", "A",
+	"..a", ".a/b", "...a", "a/..b/c", "-", "_", "Ab", "aB", "AB", "ab", "x.y.z",
 	strings.Repeat("k", storage.MaxKeyLen),
-	strings.Repeat("\u00e9", storage.MaxKeyLen/2),
-	strings.Repeat("s/", storage.MaxKeyLen/2-1) + "s",
+	strings.Repeat("s/", storage.MaxKeySegments-1) + "s",
+	strings.Repeat(strings.Repeat("m", 31)+"/", storage.MaxKeySegments-1) + strings.Repeat("m", 32),
 }
 
 func testValidKeys(t *testing.T, s storage.Store) {
+	if k := validKeys[len(validKeys)-1]; len(k) != storage.MaxKeyLen || strings.Count(k, "/") != storage.MaxKeySegments-1 {
+		t.Fatalf("fixture: longest key has %d bytes and %d segments", len(k), strings.Count(k, "/")+1)
+	}
 	for i, k := range validKeys {
 		if err := storage.ValidateKey(k); err != nil {
 			t.Fatalf("ValidateKey(%.40q): %v", k, err)
@@ -277,6 +310,9 @@ func testReplace(t *testing.T, s storage.Store) {
 		t.Fatalf("Replace returned the old version token %q", v1)
 	}
 	expectContent(t, s, "k", "two!", v2)
+	if got := listAll(t, s, "k"); !slices.Equal(got, []storage.Entry{{Key: "k", Size: 4}}) {
+		t.Fatalf("List after Replace = %+v, want k with the new size 4", got)
+	}
 	for _, stale := range []string{v1, "", "not-a-version", v2 + "x"} {
 		if _, err := s.Replace(ctx, "k", stale, strings.NewReader("three")); !errors.Is(err, storage.ErrPreconditionFailed) {
 			t.Fatalf("Replace with version %q error = %v, want ErrPreconditionFailed", stale, err)
@@ -452,8 +488,8 @@ func expectList(all []string, prefix, startAfter string, limit int) []string {
 
 func testListOrder(t *testing.T, s storage.Store) {
 	all := []string{
-		"a", "a/b", "a.b", "a/b/c", "a0", "a/b0", "a/c", "ab", "b", "B", "a-",
-		"\u65e5\u672c/\u8a9e", "\u65e5\u672c", "\u65e5", "\u00e9", "e\u0301", "e", "\U0010ffff", "~",
+		"a", "a/b", "a.b", "a/b/c", "a0", "a/b0", "a/c", "ab", "b", "B", "a-", "a_",
+		"A", "Z", "_", "-", "0", "9", "a/b_", "a/b-", "a/b.c", "z",
 	}
 	sizes := map[string]int64{}
 	for i, k := range all {
@@ -470,14 +506,14 @@ func testListOrder(t *testing.T, s storage.Store) {
 		{"a/", "", 1000},
 		{"a/b", "", 1000},
 		{"a/b/", "", 1000},
-		{"\u65e5", "", 1000},
+		{"A", "", 1000},
 		{"nothing", "", 1000},
 		{"", "a/b", 1000},
 		{"", "a/a", 1000},
 		{"", "a", 3},
 		{"a", "a/b", 2},
-		{"", "\U0010ffff", 1000},
-		{"", "~", 1000},
+		{"", "z", 1000},
+		{"", "_", 1000},
 		{"a/", "zzz", 1000},
 	}
 	for _, tc := range cases {
@@ -571,27 +607,115 @@ func testListLimits(t *testing.T, s storage.Store) {
 // that one round misses likely to be hit.
 const writers, rounds = 16, 10
 
+// overlapTimeout bounds how long a test waits for calls that must overlap.
+const overlapTimeout = 10 * time.Second
+
+func openClients(open func() storage.Store, n int) []storage.Store {
+	out := make([]storage.Store, n)
+	for i := range out {
+		out[i] = open()
+	}
+	return out
+}
+
 // payload is distinct per writer and large enough to take a few reads.
 func payload(i int) string {
 	return fmt.Sprintf("writer %d\n", i) + strings.Repeat(fmt.Sprint(i%10), 64<<10)
 }
 
-// race runs fn(i) for i in [0, writers) at once and returns the index of the
-// only call that returned nil. Every other call must fail with
-// ErrPreconditionFailed.
-func race(t *testing.T, fn func(i int) (string, error)) (winner int, version string) {
+// gatedBody is a write body whose first Read closes started and waits for
+// release before reading from r. A write blocked in it has begun and cannot
+// have published anything.
+type gatedBody struct {
+	r       io.Reader
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func newGatedBody(r io.Reader, release <-chan struct{}) *gatedBody {
+	return &gatedBody{r: r, started: make(chan struct{}), release: release}
+}
+
+func (g *gatedBody) Read(p []byte) (int, error) {
+	g.once.Do(func() { close(g.started); <-g.release })
+	return g.r.Read(p)
+}
+
+// pending is a write running in the background with a gated body.
+type pending struct {
+	body    *gatedBody
+	release func()
+	done    chan struct{}
+	version string
+	err     error
+}
+
+// start runs write in the background with a gated body over r and waits
+// until the write is blocked reading it. If the write returns before reading
+// its body, start fails the test unless mayReturnEarly is set.
+func start(t *testing.T, mayReturnEarly bool, r io.Reader, write func(body io.Reader) (string, error)) *pending {
 	t.Helper()
+	ch := make(chan struct{})
+	p := &pending{body: newGatedBody(r, ch), release: sync.OnceFunc(func() { close(ch) }), done: make(chan struct{})}
+	t.Cleanup(p.release)
+	go func() {
+		defer close(p.done)
+		p.version, p.err = write(p.body)
+	}()
+	select {
+	case <-p.body.started:
+	case <-p.done:
+		if !mayReturnEarly {
+			t.Fatalf("write returned %v before reading its body", p.err)
+		}
+	case <-time.After(overlapTimeout):
+		t.Fatalf("write did not start reading its body within %v", overlapTimeout)
+	}
+	return p
+}
+
+// finish releases the body and waits for the write to return.
+func (p *pending) finish() (string, error) {
+	p.release()
+	<-p.done
+	return p.version, p.err
+}
+
+// race runs fn(i, body) for i in [0, writers) at once and returns the index of
+// the only call that returned nil. Every other call must fail with
+// ErrPreconditionFailed. The bodies are gated: no write is released until
+// every write is blocked reading its body, which proves that all of them were
+// in progress at the same time.
+func race(t *testing.T, fn func(i int, body io.Reader) (string, error)) (winner int, version string) {
+	t.Helper()
+	release := make(chan struct{})
+	open := sync.OnceFunc(func() { close(release) })
 	var wg sync.WaitGroup
-	start := make(chan struct{})
+	defer wg.Wait()
+	defer open()
 	versions := make([]string, writers)
 	errs := make([]error, writers)
+	bodies := make([]*gatedBody, writers)
+	returned := make(chan int, writers)
 	for i := range writers {
+		bodies[i] = newGatedBody(strings.NewReader(payload(i)), release)
 		wg.Go(func() {
-			<-start
-			versions[i], errs[i] = fn(i)
+			versions[i], errs[i] = fn(i, bodies[i])
+			returned <- i
 		})
 	}
-	close(start)
+	timeout := time.After(overlapTimeout)
+	for i := range writers {
+		select {
+		case <-bodies[i].started:
+		case j := <-returned:
+			t.Fatalf("writer %d returned %v before every writer was reading its body", j, errs[j])
+		case <-timeout:
+			t.Fatalf("writer %d did not start reading its body within %v; writes must not block each other while reading their bodies", i, overlapTimeout)
+		}
+	}
+	open()
 	wg.Wait()
 	winner = -1
 	for i, err := range errs {
@@ -610,47 +734,186 @@ func race(t *testing.T, fn func(i int) (string, error)) (winner int, version str
 	return winner, versions[winner]
 }
 
-func testConcurrentCreate(t *testing.T, s storage.Store) {
+// testConcurrentCreate races Create calls for one absent key, each from its
+// own client.
+func testConcurrentCreate(t *testing.T, open func() storage.Store) {
+	clients := openClients(open, writers)
 	for r := range rounds {
 		key := fmt.Sprintf("k%d", r)
-		winner, v := race(t, func(i int) (string, error) {
-			return s.Create(ctx, key, strings.NewReader(payload(i)))
+		winner, v := race(t, func(i int, body io.Reader) (string, error) {
+			return clients[i].Create(ctx, key, body)
 		})
-		expectContent(t, s, key, payload(winner), v)
+		expectContent(t, clients[(winner+1)%writers], key, payload(winner), v)
 	}
 }
 
-func testConcurrentReplace(t *testing.T, s storage.Store) {
-	v := create(t, s, "k", "initial")
+// testConcurrentReplace races Replace calls with the same current version,
+// each from its own client.
+func testConcurrentReplace(t *testing.T, open func() storage.Store) {
+	clients := openClients(open, writers)
+	v := create(t, clients[0], "k", "initial")
 	for range rounds {
 		from := v
 		var winner int
-		winner, v = race(t, func(i int) (string, error) {
-			return s.Replace(ctx, "k", from, strings.NewReader(payload(i)))
+		winner, v = race(t, func(i int, body io.Reader) (string, error) {
+			return clients[i].Replace(ctx, "k", from, body)
 		})
-		expectContent(t, s, "k", payload(winner), v)
+		expectContent(t, clients[(winner+1)%writers], "k", payload(winner), v)
 	}
 }
 
-// testConcurrentReads replaces an object between two contents of different
-// sizes while readers check that every read is one whole version.
-func testConcurrentReads(t *testing.T, s storage.Store) {
-	contents := []string{strings.Repeat("a", 256<<10), strings.Repeat("b", 64<<10)}
-	v := create(t, s, "k", contents[0])
+// deleteNow deletes key and fails the test if that takes longer than
+// overlapTimeout, as it would if a write in progress blocked it.
+func deleteNow(t *testing.T, s storage.Store, key string) {
+	t.Helper()
+	dctx, cancel := context.WithTimeout(ctx, overlapTimeout)
+	defer cancel()
+	if err := s.Delete(dctx, key); err != nil {
+		t.Fatalf("Delete(%q) while a write was reading its body: %v", key, err)
+	}
+}
+
+// deleteDuring starts Delete on another goroutine, waits until it is about
+// to be called, and returns a channel that receives its result.
+func deleteDuring(s storage.Store, key string) <-chan error {
+	calling := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		close(calling)
+		result <- s.Delete(ctx, key)
+	}()
+	<-calling
+	return result
+}
+
+// testReplaceDeleteRace checks that a Replace cannot bring back an object
+// that a Delete removed. First a Delete completes while a Replace conditioned
+// on the deleted version is reading its body, so the Replace must fail; then
+// Delete and Replace race for the commit, and either order must leave the
+// key missing.
+func testReplaceDeleteRace(t *testing.T, open func() storage.Store) {
+	a, b := open(), open()
+	v := create(t, a, "k", "old")
+	p := start(t, false, strings.NewReader("resurrected"), func(body io.Reader) (string, error) {
+		return a.Replace(ctx, "k", v, body)
+	})
+	deleteNow(t, b, "k")
+	if _, err := p.finish(); !errors.Is(err, storage.ErrPreconditionFailed) {
+		t.Fatalf("Replace conditioned on a version that a completed Delete removed: error = %v, want ErrPreconditionFailed", err)
+	}
+	expectMissing(t, a, "k")
+	expectMissing(t, b, "k")
+
+	for r := range rounds {
+		key := fmt.Sprintf("r%d", r)
+		v := create(t, a, key, "old")
+		p := start(t, false, strings.NewReader("new"), func(body io.Reader) (string, error) {
+			return a.Replace(ctx, key, v, body)
+		})
+		deleted := deleteDuring(b, key)
+		_, err := p.finish()
+		if derr := <-deleted; derr != nil {
+			t.Fatalf("Delete racing a Replace: %v", derr)
+		}
+		if err != nil && !errors.Is(err, storage.ErrPreconditionFailed) {
+			t.Fatalf("Replace racing a Delete: error = %v, want nil or ErrPreconditionFailed", err)
+		}
+		expectMissing(t, a, key)
+	}
+}
+
+// testCreateDeleteRace races Create against Delete. A Create of an absent key
+// is not disturbed by a Delete of that missing key. When the key exists, a
+// Create that succeeds must leave its object in place and one that fails
+// must leave the key missing.
+func testCreateDeleteRace(t *testing.T, open func() storage.Store) {
+	a, b := open(), open()
+	p := start(t, false, strings.NewReader("created"), func(body io.Reader) (string, error) {
+		return a.Create(ctx, "k", body)
+	})
+	deleteNow(t, b, "k")
+	v, err := p.finish()
+	if err != nil {
+		t.Fatalf("Create of an absent key after a Delete of it: %v", err)
+	}
+	expectContent(t, b, "k", "created", v)
+
+	for r := range rounds {
+		key := fmt.Sprintf("c%d", r)
+		create(t, a, key, "old")
+		p := start(t, true, strings.NewReader("new"), func(body io.Reader) (string, error) {
+			return a.Create(ctx, key, body)
+		})
+		deleted := deleteDuring(b, key)
+		v, err := p.finish()
+		if derr := <-deleted; derr != nil {
+			t.Fatalf("Delete racing a Create: %v", derr)
+		}
+		switch {
+		case err == nil:
+			expectContent(t, b, key, "new", v)
+		case errors.Is(err, storage.ErrPreconditionFailed):
+			expectMissing(t, b, key)
+		default:
+			t.Fatalf("Create racing a Delete: error = %v, want nil or ErrPreconditionFailed", err)
+		}
+	}
+}
+
+// replacement returns the content of the n-th version in
+// testConcurrentReads: it names n, and its size alternates.
+func replacement(n int) string {
+	size := 256 << 10
+	if n%2 == 1 {
+		size = 64 << 10
+	}
+	head := fmt.Sprintf("replacement %d\n", n)
+	return head + strings.Repeat(string(rune('a'+n%26)), size-len(head))
+}
+
+// testConcurrentReads replaces an object repeatedly while readers on other
+// clients, and one on the writer's client, check that every read is one
+// whole version and that the Info returned with it is the one the write of
+// that version returned.
+func testConcurrentReads(t *testing.T, open func() storage.Store) {
+	const readers, replacements = 4, 40
+	writer := open()
+	versions := make([]string, replacements+1) // versions[n] is the token the write of replacement(n) returned
+	versions[0] = create(t, writer, "k", replacement(0))
+	var phase atomic.Int64 // odd while a Replace is in progress
+	var during atomic.Int64
+	type seen struct {
+		n       int
+		version string
+	}
+	observed := make([][]seen, readers)
 	done := make(chan struct{})
 	var wg sync.WaitGroup
-	defer func() { close(done); wg.Wait() }() // also when replace calls Fatal
-	for range 4 {
+	stop := sync.OnceFunc(func() { close(done); wg.Wait() })
+	defer stop() // also when replace calls Fatal
+	for i := range readers {
+		s := writer
+		if i > 0 {
+			s = open()
+		}
 		wg.Go(func() {
-			for {
+			for j := 0; ; j++ {
 				select {
 				case <-done:
 					return
 				default:
 				}
-				body, info, err := s.Get(ctx, "k")
+				before := phase.Load()
+				var body io.ReadCloser
+				var info storage.Info
+				var err error
+				if j%2 == 0 {
+					body, info, err = s.Get(ctx, "k")
+				} else {
+					body, info, err = s.GetRange(ctx, "k", 0, math.MaxInt64)
+				}
 				if err != nil {
-					t.Errorf("Get: %v", err)
+					t.Errorf("read: %v", err)
 					return
 				}
 				b, err := io.ReadAll(body)
@@ -659,95 +922,160 @@ func testConcurrentReads(t *testing.T, s storage.Store) {
 					t.Errorf("reading body: %v", err)
 					return
 				}
-				if string(b) != contents[0] && string(b) != contents[1] || int64(len(b)) != info.Size {
-					t.Errorf("read %d bytes starting %.8q with info %+v: not one whole version", len(b), b, info)
+				var n int
+				if _, err := fmt.Sscanf(string(b), "replacement %d\n", &n); err != nil || n < 0 || n > replacements || string(b) != replacement(n) || int64(len(b)) != info.Size {
+					t.Errorf("read %d bytes starting %.16q with info %+v: not one whole version", len(b), b, info)
 					return
+				}
+				observed[i] = append(observed[i], seen{n, info.Version})
+				if before%2 == 1 && phase.Load() == before {
+					during.Add(1)
 				}
 			}
 		})
 	}
-	for i := range 40 {
-		v = replace(t, s, "k", v, contents[(i+1)%2])
+	for n := 1; n <= replacements; n++ {
+		phase.Add(1)
+		versions[n] = replace(t, writer, "k", versions[n-1], replacement(n))
+		phase.Add(1)
+	}
+	stop()
+	for _, obs := range observed {
+		for _, o := range obs {
+			if o.version != versions[o.n] {
+				t.Fatalf("read replacement %d with version %q, but its write returned %q", o.n, o.version, versions[o.n])
+			}
+		}
+	}
+	if during.Load() == 0 {
+		t.Fatal("no read ran while a Replace was in progress; the test proved nothing")
+	}
+}
+
+// testOpenBodies opens a Get and a GetRange body, replaces or deletes the
+// object from another client, and only then reads the bodies. Each must
+// return bytes of the version its Info describes, or fail.
+func testOpenBodies(t *testing.T, open func() storage.Store) {
+	old, repl := strings.Repeat("old-", 32<<10), strings.Repeat("NEW!", 32<<10)
+	const off, n = 1000, 50000
+	s, other := open(), open()
+	for _, change := range []string{"Replace", "Delete"} {
+		t.Run(change, func(t *testing.T) {
+			key := strings.ToLower(change)
+			v := create(t, s, key, old)
+			want := storage.Info{Size: int64(len(old)), Version: v}
+			whole, wholeInfo, err := s.Get(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			part, partInfo, err := s.GetRange(ctx, key, off, n)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if change == "Replace" {
+				replace(t, other, key, v, repl)
+			} else if err := other.Delete(ctx, key); err != nil {
+				t.Fatal(err)
+			}
+			expectSnapshot(t, "Get", whole, wholeInfo, old, want)
+			expectSnapshot(t, "GetRange", part, partInfo, old[off:off+n], want)
+		})
+	}
+}
+
+func expectSnapshot(t *testing.T, name string, body io.ReadCloser, info storage.Info, content string, want storage.Info) {
+	t.Helper()
+	defer func() { _ = body.Close() }()
+	if info != want {
+		t.Errorf("%s info = %+v, want %+v", name, info, want)
+	}
+	b, err := io.ReadAll(body)
+	if !strings.HasPrefix(content, string(b)) {
+		t.Errorf("%s body opened before the change returned %d bytes starting %.16q: not the version it was opened at", name, len(b), b)
+	}
+	if err == nil && len(b) != len(content) {
+		t.Errorf("%s body returned %d bytes and no error, want %d", name, len(b), len(content))
 	}
 }
 
 var errReader = errors.New("storagetest: reader failed")
 
-// failingReader returns n bytes and then fails with errReader.
-type failingReader struct{ n int }
-
-func (r *failingReader) Read(p []byte) (int, error) {
-	if r.n == 0 {
-		return 0, errReader
+// testWriteInProgress blocks a Create or Replace inside its body's Read and
+// checks from the writer's client and from another one that nothing of the
+// write is visible, both before it is released and, for a write that is
+// about to fail or be cancelled, after the failure is decided. Then it checks
+// the outcome and that a failed write does not block the next one.
+func testWriteInProgress(t *testing.T, open func() storage.Store) {
+	w, r := open(), open()
+	for _, op := range []string{"Create", "Replace"} {
+		for _, outcome := range []string{"succeeds", "fails", "cancelled"} {
+			t.Run(op+" "+outcome, func(t *testing.T) {
+				key := strings.ToLower(op + "-" + outcome)
+				var old string
+				if op == "Replace" {
+					old = create(t, w, key, "old")
+				}
+				before := listAll(t, r, "")
+				unchanged := func(when string) {
+					t.Helper()
+					for _, s := range []storage.Store{w, r} {
+						if op == "Create" {
+							expectMissing(t, s, key)
+						} else {
+							expectContent(t, s, key, "old", old)
+						}
+						if got := listAll(t, s, ""); !slices.Equal(got, before) {
+							t.Fatalf("%s: List = %+v, want %+v", when, got, before)
+						}
+					}
+				}
+				cctx, cancel := context.WithCancel(ctx)
+				defer cancel()
+				var rest io.Reader
+				switch outcome {
+				case "succeeds":
+					rest = strings.NewReader("new")
+				case "fails":
+					rest = io.MultiReader(strings.NewReader(strings.Repeat("f", 1<<20)), iotest.ErrReader(errReader))
+				case "cancelled": // the body keeps returning data, so only the store can stop the write
+					rest = io.LimitReader(readerFunc(func(p []byte) (int, error) { clear(p); return len(p), nil }), 64<<20)
+				}
+				p := start(t, false, rest, func(body io.Reader) (string, error) {
+					if op == "Create" {
+						return w.Create(cctx, key, body)
+					}
+					return w.Replace(cctx, key, old, body)
+				})
+				unchanged("while the write reads its body")
+				if outcome == "cancelled" {
+					cancel()
+					unchanged("after the write's context was cancelled")
+				}
+				v, err := p.finish()
+				switch {
+				case outcome == "succeeds":
+					if err != nil {
+						t.Fatalf("%s: %v", op, err)
+					}
+					expectContent(t, r, key, "new", v)
+					return
+				case outcome == "fails" && !errors.Is(err, errReader):
+					t.Fatalf("%s with a failing body: error = %v, want the reader's error", op, err)
+				case outcome == "cancelled" && !errors.Is(err, context.Canceled):
+					t.Fatalf("%s cancelled while reading its body: error = %v, want context.Canceled", op, err)
+				case errors.Is(err, storage.ErrOutcomeUnknown):
+					t.Fatalf("%s failed before publication, but its error %v wraps ErrOutcomeUnknown", op, err)
+				}
+				unchanged("after the write failed")
+				if op == "Create" {
+					v = create(t, w, key, "after")
+				} else {
+					v = replace(t, w, key, old, "after")
+				}
+				expectContent(t, r, key, "after", v)
+			})
+		}
 	}
-	k := min(len(p), r.n)
-	for i := range k {
-		p[i] = 'f'
-	}
-	r.n -= k
-	return k, nil
-}
-
-func testFailedReader(t *testing.T, s storage.Store) {
-	_, err := s.Create(ctx, "k", &failingReader{n: 1 << 20})
-	if !errors.Is(err, errReader) {
-		t.Fatalf("Create with a failing reader error = %v, want the reader's error", err)
-	}
-	expectMissing(t, s, "k")
-	expectEmpty(t, s)
-	v := create(t, s, "k", "after")
-	expectContent(t, s, "k", "after", v)
-
-	_, err = s.Replace(ctx, "k", v, &failingReader{n: 1 << 20})
-	if !errors.Is(err, errReader) {
-		t.Fatalf("Replace with a failing reader error = %v, want the reader's error", err)
-	}
-	expectContent(t, s, "k", "after", v)
-	v = replace(t, s, "k", v, "replaced")
-	expectContent(t, s, "k", "replaced", v)
-}
-
-// cancellingReader cancels its context after 256 KiB and then keeps
-// returning data, up to 64 MiB, so only the store can stop the write.
-type cancellingReader struct {
-	cancel context.CancelFunc
-	n      int
-}
-
-func (r *cancellingReader) Read(p []byte) (int, error) {
-	if r.n >= 64<<20 {
-		return 0, io.EOF
-	}
-	if r.n >= 256<<10 {
-		r.cancel()
-	}
-	k := min(len(p), 64<<20-r.n)
-	for i := range k {
-		p[i] = 'c'
-	}
-	r.n += k
-	return k, nil
-}
-
-func testCancelledDuringWrite(t *testing.T, s storage.Store) {
-	cctx, cancel := context.WithCancel(ctx)
-	_, err := s.Create(cctx, "k", &cancellingReader{cancel: cancel})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Create cancelled during the write error = %v, want context.Canceled", err)
-	}
-	expectMissing(t, s, "k")
-	expectEmpty(t, s)
-	v := create(t, s, "k", "after")
-	expectContent(t, s, "k", "after", v)
-
-	cctx, cancel = context.WithCancel(ctx)
-	_, err = s.Replace(cctx, "k", v, &cancellingReader{cancel: cancel})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Replace cancelled during the write error = %v, want context.Canceled", err)
-	}
-	expectContent(t, s, "k", "after", v)
-	v = replace(t, s, "k", v, "replaced")
-	expectContent(t, s, "k", "replaced", v)
 }
 
 func testCancelledContext(t *testing.T, s storage.Store) {
@@ -767,8 +1095,8 @@ func testCancelledContext(t *testing.T, s storage.Store) {
 		"Delete":   func() error { return s.Delete(cctx, "k") },
 	}
 	for name, op := range ops {
-		if err := op(); !errors.Is(err, context.Canceled) {
-			t.Errorf("%s with a cancelled context error = %v, want context.Canceled", name, err)
+		if err := op(); !errors.Is(err, context.Canceled) || errors.Is(err, storage.ErrOutcomeUnknown) {
+			t.Errorf("%s with a cancelled context error = %v, want context.Canceled and no ErrOutcomeUnknown", name, err)
 		}
 	}
 	expectContent(t, s, "k", "content", v)
@@ -829,4 +1157,25 @@ func testErrors(t *testing.T, s storage.Store) {
 			t.Errorf("%s error %q contains object contents", tc.op, msg)
 		}
 	}
+}
+
+// testBodyErrorText fails writes with a body reader whose error text is
+// object contents, and checks that the text does not reach the error message
+// while the reader's error stays reachable.
+func testBodyErrorText(t *testing.T, s storage.Store) {
+	const secret = "secret-payload-9f2c41"
+	leak := errors.New(secret)
+	_, createErr := s.Create(ctx, "k", iotest.ErrReader(leak))
+	v := create(t, s, "k", "x")
+	_, replaceErr := s.Replace(ctx, "k", v, io.MultiReader(strings.NewReader("y"), iotest.ErrReader(leak)))
+	for op, err := range map[string]error{"Create": createErr, "Replace": replaceErr} {
+		var be *storage.BodyError
+		if !errors.Is(err, leak) || !errors.As(err, &be) {
+			t.Errorf("%s error %v does not wrap the reader's error in a *storage.BodyError", op, err)
+		}
+		if err != nil && strings.Contains(err.Error(), secret) {
+			t.Errorf("%s error %q contains the reader's error text", op, err)
+		}
+	}
+	expectContent(t, s, "k", "x", v)
 }
