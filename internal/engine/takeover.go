@@ -191,6 +191,10 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 		return Office{}, nil, err
 	}
 	o.Head = head + 1
+	// Without a renewal in the walk the lease goes unchecked: this candidacy
+	// wrote it less than a third of its time to live ago, so another holder
+	// took it only with a clock off by most of the time to live or under the
+	// same holder name, and such a holder can take any rewrite of it again.
 	if lease.taken {
 		// Taken during the walk, typically by a candidacy that lost and
 		// released it: take it back by acquireLease's rules, best effort.

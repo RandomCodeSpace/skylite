@@ -947,10 +947,40 @@ func TestLeaseTakenByLoserKeepsWinner(t *testing.T) {
 	if !slices.Contains(e.g.takeTrace(), "replace "+e.keys.Lease()) {
 		t.Fatal("w's walk never tried to renew the lease")
 	}
+	if ls, err := format.DecodeLease(must(get(bg, e.g, e.keys.Lease(), 1<<40))); err != nil || ls.Holder != "w" || ls.Epoch != w.o.Epoch {
+		t.Fatalf("lease %+v, %v; want w's at epoch %d", ls, err, w.o.Epoch)
+	}
 	if err := w.l.Renew(bg); err != nil {
 		t.Fatalf("w cannot renew the lease of its office: %v", err)
 	}
 	e.check(append(offices(t, w, x), e.l.o), []*leader{e.l}, true)
+}
+
+// TestFailedTakeBackKeepsWinner: x takes w's lease, which is a time to live
+// old by x's clock, and is still a candidate with an unexpired lease when w,
+// which won the swap, finishes. w's take-back fails, and w takes office
+// anyway.
+func TestFailedTakeBackKeepsWinner(t *testing.T) {
+	e := newEnv(t, 305)
+	wc := newClock(7 * time.Second)
+	wc.advance(1000 * time.Hour)
+	xc := newClock(0)
+	xc.advance(1000*time.Hour + 75*time.Second)
+	w := e.g.candidate(t, e.keys, Candidate{Holder: "w", TTL: time.Minute, Now: wc.now})
+	if w.until("replace", e.keys.Manifest()) == nil {
+		t.Fatal("w never swaps")
+	}
+	x := e.g.candidate(t, e.keys, Candidate{Holder: "x", TTL: time.Minute, Now: xc.now})
+	if x.until("replace", e.keys.Manifest()) == nil {
+		t.Fatalf("x never swaps: %v", x.err)
+	}
+	w.finish()
+	if w.err != nil {
+		t.Fatalf("w, which holds the manifest at its epoch, gave up: %v", w.err)
+	}
+	if err := w.l.Renew(bg); !errors.Is(err, ErrLeaseHeld) || !w.l.taken {
+		t.Fatalf("Renew: %v, taken %v; want the take-back to have failed", err, w.l.taken)
+	}
 }
 
 // TestFailedRenewalTriedOncePerThird: a renewal that fails is tried again
