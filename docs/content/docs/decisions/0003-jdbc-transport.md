@@ -19,10 +19,11 @@ The project fixed the rule before testing: candidate A is chosen only if a reali
 
 ## Method
 
-The pull request that adds this record also adds three things, all of which run without skylite, because no skylite server exists yet:
+The pull request that adds this record also adds four things, all of which run without skylite, because no skylite server exists yet:
 
-- **An acceptance suite** in `clients/java/acceptance/`: a Spring Boot application with Spring Data JPA, Hibernate and HikariCP, and 20 tests covering schema creation and validation, CRUD with database-generated ids, lazy one-to-many and many-to-one associations, a JPQL `join fetch`, `@Transactional` commit and rollback checked from a second connection, derived, JPQL and native queries, pagination and sorting, optimistic locking on a detached copy and on a managed entity whose update matches no row, batch inserts, column types and nulls, a `@Lob`, unique, foreign-key and not-null constraint violations, and isolation between pooled connections. Its README says what each test stands for. The JDBC URL, driver class and dialect come from configuration.
+- **An acceptance suite** in `clients/java/acceptance/`: a Spring Boot application with Spring Data JPA, Hibernate and HikariCP, and 28 tests covering schema creation and validation, CRUD with database-generated ids, lazy one-to-many and many-to-one associations, a JPQL `join fetch`, cascade and orphan removal, `@Transactional` commit and rollback checked from a second connection, a commit seen by a connection that is already open, savepoints, a failed statement inside a transaction, derived, JPQL and native queries, pagination and sorting, bulk update counts, column lookup by a duplicated label, optimistic locking on a detached copy and on a managed entity whose update matches no row, batch inserts read back in full, column types, `false`, the empty string and nulls, a `@Lob`, unique, foreign-key and not-null constraint violations, isolation between pooled connections, generated keys on two connections, and the product name and version in `DatabaseMetaData`. Its README says what each test stands for. The JDBC URL, driver class and dialect come from configuration, and the suite fails start-up unless the connection it actually uses matches them.
 - **A baseline run** of that suite through the reference SQLite JDBC driver on a temporary file database, to show that the suite and the dialect work, so that a failure on candidate A belongs to A. CI runs it on every pull request as the `java-acceptance` job.
+- **A check of the suite itself**: a wrapper JDBC driver around sqlite-jdbc that repairs the five baseline failures and then injects one driver fault at a time, such as a `commit()` that does nothing, a stale read, a batch that binds wrong values or a long truncated to an int. The suite runs once with no fault, where every test must pass with none skipped, and once per fault, where at least one test must fail. All 38 faults were caught. The README lists them and the tests that caught each; the `java-acceptance` CI job runs this check as well. It shows which faults the suite is known to catch, not that a driver that passes it is correct.
 - **A Flight SQL server** in `internal/spike/flightsql/`, a nested Go module that serves the SQLite example server from the Apache Arrow Go module on a SQLite file in WAL mode. The suite ran against it through the Arrow Flight SQL JDBC driver.
 
 Versions:
@@ -57,12 +58,17 @@ Only driver and dialect-and-driver failures count against candidate A.
 | `CrudTest.createReadUpdateDelete` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `RelationsTest.lazyAssociationsLoadInsideTransaction` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `RelationsTest.joinFetchLoadsParentAndChildren` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
+| `RelationsTest.cascadeAndOrphanRemovalDeleteBooks` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
 | `TransactionTest.commitIsVisibleFromSecondConnection` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `TransactionTest.exceptionRollsBackEveryWrite` | Pass | Fail | [F1](#f1-generated-identifiers); [F3](#f3-transactions) would follow | Dialect and driver; driver |
 | `QueryTest.derivedQuery` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
 | `QueryTest.jpqlQuery` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
 | `QueryTest.nativeQuery` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
+| `TransactionTest.rollbackToSavepointKeepsEarlierWrites` | Pass | Fail | [F2](#f2-parameter-and-result-schemas) | Server |
+| `TransactionTest.failedStatementLeavesTransactionUsable` | Pass | Fail | [F2](#f2-parameter-and-result-schemas) | Server |
 | `QueryTest.paginationAndSorting` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
+| `QueryTest.bulkUpdateReportsAffectedRows` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
+| `QueryTest.duplicateColumnLabelReadsTheFirstColumn` | Pass | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
 | `OptimisticLockingTest.versionIncrementsAndStaleUpdateFails` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `OptimisticLockingTest.updateMatchingNoRowFailsOnFlush` | Pass | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `BatchInsertTest.insertsAreBatched` | Pass | Fail | [F2](#f2-parameter-and-result-schemas) | Server |
@@ -73,8 +79,11 @@ Only driver and dialect-and-driver failures count against candidate A.
 | `ConstraintTest.referenceToMissingRowIsDataIntegrityViolation` | Fail (known, skipped) | Fail | [F1](#f1-generated-identifiers) | Dialect and driver |
 | `ConstraintTest.nullInRequiredColumnIsDataIntegrityViolation` | Fail (known, skipped) | Fail | [F1](#f1-generated-identifiers), while inserting test data | Dialect and driver |
 | `ConnectionPoolTest.uncommittedWriteIsInvisibleToAnotherPooledConnection` | Pass | Fail | [F2](#f2-parameter-and-result-schemas); [F3](#f3-transactions) would follow | Server; driver |
+| `ConnectionPoolTest.commitIsVisibleToAnOpenPooledConnection` | Pass | Fail | `NullPointerException` from the driver's result set on the prepared count query; inferred to be F2's missing result schema, not traced | Server (inferred) |
+| `ConnectionPoolTest.generatedKeyBelongsToTheStatementsOwnInsert` | Pass | Fail | [F1](#f1-generated-identifiers): the test calls `prepareStatement(sql, RETURN_GENERATED_KEYS)` itself, and the driver throws `SQLFeatureNotSupportedException` | Driver |
+| `MetadataTest.productNameAndVersionMatchTheEngine` | Pass | Fail | [F2](#f2-parameter-and-result-schemas): `select sqlite_version()` failed with `Statement did not return a result set`. The driver also reported the product name `db_name` and version `sqlite 3`, which the test would then have rejected | Server |
 
-Baseline: 15 passed and 5 failed when every test was run; by default, as in the CI job, those 5 are skipped, so 15 pass and 5 are skipped. Candidate A: 0 of 20 passed (18 errors and 2 assertion failures; the 2 assertion failures, in `TransactionTest.exceptionRollsBackEveryWrite` and `ConstraintTest.referenceToMissingRowIsDataIntegrityViolation`, are the F1 exception arriving where the test expected another). Each test stops at its first failure, so the table names the first cause, and the steps after it did not run. Where a later step depends on transactions, the table adds [F3](#f3-transactions), which was shown separately.
+Baseline: 23 passed and 5 failed when every test was run; by default, as in the CI job, those 5 are skipped, so 23 pass and 5 are skipped. Candidate A: 0 of 28 passed (26 errors and 2 assertion failures; the 2 assertion failures, in `TransactionTest.exceptionRollsBackEveryWrite` and `ConstraintTest.referenceToMissingRowIsDataIntegrityViolation`, are the F1 exception arriving where the test expected another). Each test stops at its first failure, so the table names the first cause, and the steps after it did not run. Where a later step depends on transactions, the table adds [F3](#f3-transactions), which was shown separately.
 
 Hibernate's `ddl-auto=create` did run on candidate A: the tables were created, and the tests then failed on their first insert or parameter bind.
 
@@ -125,7 +134,7 @@ Not run. The rule called for an Envoy run only if the suite passed on candidate 
 
 ## Decision
 
-The rule produces candidate B: skylite will ship its own JDBC driver over its HTTPS API. Candidate A failed 20 of 20 tests, including failures of the driver kind (transactions, F3) and of the dialect-and-driver kind (generated identifiers, F1), which count against it under the rule. F3 is decisive on its own: `commit` and `rollback` are empty in the driver itself, so, as read from the source, a server, a Hibernate setting or a dialect has no call to act on.
+The rule produces candidate B: skylite will ship its own JDBC driver over its HTTPS API. Candidate A failed 28 of 28 tests, including failures of the driver kind (transactions, F3) and of the dialect-and-driver kind (generated identifiers, F1), which count against it under the rule. F3 is decisive on its own: `commit` and `rollback` are empty in the driver itself, so, as read from the source, a server, a Hibernate setting or a dialect has no call to act on.
 
 ## Alternatives considered
 
@@ -147,7 +156,8 @@ The rule produces candidate B: skylite will ship its own JDBC driver over its HT
 - Each test stopped at its first failure, so most later steps on candidate A were not reached. Results beyond the first failure come from the source and the separate probes, not from the suite.
 - No server that returns parameter and result schemas was built, so how candidate A would fare against a more complete Flight SQL server is untested; F1 and F3 do not depend on the server.
 - No HTTP/2 proxy, TLS, authentication or performance was tested.
-- The baseline covers the suite's 20 tests only. It does not show that sqlite-jdbc or the community dialect work for features the suite does not test.
+- The baseline covers the suite's 28 tests only. It does not show that sqlite-jdbc or the community dialect work for features the suite does not test; the suite's README lists routine behaviour it does not cover.
+- The fault check shows that the suite catches the 38 faults it injects, each in isolation, on SQLite. It does not show that a driver that passes the suite is correct.
 
 ## Appendix: the rollback probe
 
