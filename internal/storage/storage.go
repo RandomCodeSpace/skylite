@@ -49,7 +49,10 @@
 // Writes are atomic. A new version becomes visible at one instant and
 // complete: a concurrent or later reader sees the whole old object, the whole
 // new object, or not-found; never a partial object, and never the body of one
-// version with the [Info] of another.
+// version with the [Info] of another. Not-found is seen only before a Create
+// or after a Delete: a Replace is a single atomic overwrite, so a key being
+// replaced never reads as missing and a Create on it never succeeds. A
+// backend does not implement Replace as a delete followed by a create.
 //
 // Reads are strongly consistent with completed mutations, on every client: a
 // Get, GetRange, Head or List that starts after a mutation returned success,
