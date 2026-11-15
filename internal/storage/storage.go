@@ -46,9 +46,16 @@
 // always fails its precondition. A Replace conditioned on a version that a
 // completed Delete removed fails, even if it started before the Delete.
 //
-// Writes are atomic. A concurrent or later reader sees the whole old object,
-// the whole new object, or not-found; never a partial object, and never the
-// body of one version with the [Info] of another.
+// Writes are atomic. A new version becomes visible at one instant and
+// complete: a concurrent or later reader sees the whole old object, the whole
+// new object, or not-found; never a partial object, and never the body of one
+// version with the [Info] of another.
+//
+// Reads are strongly consistent with completed mutations, on every client: a
+// Get, GetRange, Head or List that starts after a mutation returned success,
+// on any client of the store, observes that mutation or a later one. skylite
+// relies on this for correctness, so a backend never answers from a cache or
+// a replica that can lag behind the store.
 //
 // A write reads the caller's body to its end before it publishes anything.
 // Until then, nothing about the write is visible to readers, listings or
@@ -84,19 +91,22 @@
 //
 // An unknown outcome is not resolved by reading the key once. A request to a
 // cloud service can still be in flight after the call has returned, so a read
-// can see the old state and the original request can commit afterwards.
-// Reading tells the caller only this: seeing the write's own content confirms
-// that write took effect (a failed write returns no version token, so a caller
-// that must recognise its own write puts something unique in the content);
-// seeing older content, other content or no object does not establish that it
-// failed. The caller then does one of two things. Either it repeats the same
-// conditional write until it gets a definite answer: success, or
-// [ErrPreconditionFailed] followed by a read that shows whose content is
+// can see the old state and the original request can commit afterwards. Reading
+// tells the caller only this: finding content that only this write could have
+// produced confirms that it took effect; finding older content, other content
+// or no object does not establish that it failed. A failed write returns no
+// version token, so a caller that resolves an unknown outcome by reading
+// content is responsible for that content being unique to its write, for
+// example by including a random value, or its own identity and a sequence
+// number. Otherwise equal content proves nothing: another writer may have
+// written the same bytes. The caller then does one of two things. Either it
+// repeats the same conditional write until it gets a definite answer: success,
+// or [ErrPreconditionFailed] followed by a read that shows whose content is
 // there. Or it arranges that the outstanding request can no longer matter, for
 // example by making sure its condition can never hold again. Delete has no
 // condition: repeating it until it succeeds leaves the key missing when it
-// returns, but the first request may still remove an object created at the
-// key afterwards, so a caller does not create a key again after a Delete of it
+// returns, but the first request may still remove an object created at the key
+// afterwards, so a caller does not create a key again after a Delete of it
 // whose outcome was unknown, unless that removal would not matter.
 //
 // Publication begins when a write has read its body to its end, or when a
@@ -123,11 +133,24 @@
 // not of its last attempt. A precondition failure returned after a retry of an
 // attempt whose response was lost does not prove that the first attempt had no
 // effect: it may have committed, and the retry then failed its condition
-// against it, or against a later write. Such a backend classifies the failure
-// by reading the object back: its own content means the write took effect;
-// anything else is [ErrOutcomeUnknown], never [ErrPreconditionFailed]. The
-// portable suite cannot lose a response or make an SDK retry, so classifying
-// lost responses and retries is each cloud backend's own test obligation.
+// against it, or against a later write. Such a backend may turn that failure
+// into success only by a per-write identity: a value unique to this one
+// write (for example a random value in the object's metadata) that it sent
+// with the write and then reads back from the stored object. Finding its own
+// identity means the write took effect, at the version that carries it;
+// anything else is [ErrOutcomeUnknown], never [ErrPreconditionFailed]. It never
+// compares payloads: equal content does not identify a write, because another
+// writer may have stored the same bytes in between. A backend that attaches no
+// such identity returns [ErrOutcomeUnknown] for every precondition failure
+// that follows a retry.
+//
+// The portable suite cannot lose a response, make an SDK retry or observe a
+// request that is still in flight after its call returned. A backend that
+// returns a definite error and lets the request commit afterwards passes it.
+// Each cloud backend therefore carries controlled tests of its own: lost
+// responses and retries, classified as above; and requests still pending when
+// the call returns, showing that every definite error it returns leaves no
+// effect, then or later.
 //
 // # Staged uploads
 //
@@ -141,12 +164,13 @@
 //
 // # Version tokens
 //
-// A version token is an opaque, non-empty string. Every successful write to a
-// key produces a token that differs from every token that key has had before,
-// including when the content is identical and including after the key was
-// deleted and created again. Callers compare tokens only for equality and
-// never parse them. Create, Replace, Get, GetRange and Head all return the
-// token of the object they wrote or observed.
+// A version token is an opaque, non-empty string that identifies exactly one
+// stored version of its key. Every successful write to a key produces a token
+// that differs from every token that key has had before, including when the
+// content is identical (an empty body included) and including after the key was
+// deleted and created again, so a token never repeats for a key. Callers
+// compare tokens only for equality and never parse them. Create, Replace, Get,
+// GetRange and Head all return the token of the object they wrote or observed.
 //
 // A hash of the content, such as an MD5-based ETag, is therefore not a valid
 // token on its own: two writes of the same bytes would share it, and a
@@ -176,7 +200,8 @@
 // empty body with the object's Info.
 //
 // Both return the object's [Info] (size and version token) for the version the
-// body comes from, so a caller can tell whether the object changed between two
+// body comes from, and every byte of the body comes from that version, also for
+// a bounded range; so a caller can tell whether the object changed between two
 // reads. A missing key fails with [ErrNotFound]. The caller must close the
 // body. Errors while reading the body, including the end of the context the
 // body was opened with, are returned by the body's Read.
@@ -195,17 +220,26 @@
 //
 // [Store.List] returns the objects whose keys start with prefix and sort after
 // startAfter, in ascending byte order of the full key, at most limit of them.
-// limit must be between 1 and [MaxListLimit]. A page shorter than limit is the
-// last page; a backend whose service returns short pages must keep fetching
-// until it has limit entries or the listing ends. To get the next page, pass
-// the last key of the previous page as startAfter. prefix and startAfter need
-// not be valid keys; an empty prefix lists everything and an empty startAfter
-// starts at the beginning.
+// limit must be between 1 and [MaxListLimit]. A result shorter than limit
+// means there are no more entries. Services may return fewer entries than
+// requested, and Azure Blob Storage and Google Cloud Storage document that
+// they do; a backend on such a service keeps requesting until it has limit
+// entries or the listing ends. That is each such backend's obligation, and
+// its own tests force its service to return short pages. To get the next
+// page, pass the last key of the previous page as startAfter. prefix and
+// startAfter need not be valid keys; an empty prefix lists everything and an
+// empty startAfter starts at the beginning.
 //
 // Listing is consistent with completed mutations: an object whose Create or
-// Replace has returned is listed with its new size, and one whose Delete has
-// returned is not. A listing made with several pages while other writers are
-// active sees, on each page, the state at the time that page was fetched.
+// Replace returned before List was called is listed with its new size, and
+// one whose Delete returned before is not. A listing is not a snapshot. Each
+// entry reports a state its key actually had at some moment during the call.
+// A key that exists, unchanged, for the whole call appears exactly once. A key
+// created, replaced or deleted during the call is listed in the state it had
+// before or after that change, which for a create or a delete may be absent.
+// Entries are in strictly ascending key order with no duplicates. Nothing
+// above the storage layer may rely on a listing, or on a sequence of pages,
+// being a point-in-time view.
 //
 // # Errors
 //
@@ -247,14 +281,15 @@
 // Passing storagetest.Run is necessary, not sufficient. The suite runs its
 // clients in one process and cannot crash the backend, cut its network or
 // inspect its service, so each backend also tests, itself: races between
-// processes or hosts; the critical interleavings of its own conditional
-// writes, forced with its own barriers or hooks (the suite's race tests only
-// stress the scheduler); a process killed during and just after publication;
-// lost responses and SDK retries, and that it classifies them as the outcome
-// rule requires; page filling, if its service can return pages shorter than
-// requested; its staged upload path (see above) or its size limit; that
-// durability holds where it can be observed, such as the directory fsync of a
-// local backend; and that its SDK's errors are redacted.
+// processes or hosts; the critical interleavings of its own conditional writes,
+// forced with its own barriers or hooks (the suite's race tests only stress the
+// scheduler); a process killed during and just after publication; lost
+// responses and SDK retries, and that it classifies them as the outcome rule
+// requires; requests still pending when a call returns, and that a definite
+// error leaves no effect, then or later; page filling, if its service can
+// return pages shorter than requested; its staged upload path (see above) or
+// its size limit; that durability holds where it can be observed, such as the
+// directory fsync of a local backend; and that its SDK's errors are redacted.
 package storage
 
 import (
@@ -273,9 +308,10 @@ const MaxKeyLen = 1024
 // well inside Azure Blob Storage's limit of 254.
 const MaxKeySegments = 32
 
-// MaxListLimit is the largest page size [Store.List] accepts. It is the page
-// size Amazon S3 returns at most, so every backend can fill a page with one
-// service call.
+// MaxListLimit is the largest page size [Store.List] accepts. It is the most
+// entries Amazon S3 returns in one response. A backend whose service returns
+// fewer keeps requesting until the page is full; see the package
+// documentation.
 const MaxListLimit = 1000
 
 var (
