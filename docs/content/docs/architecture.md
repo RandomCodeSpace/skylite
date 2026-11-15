@@ -40,7 +40,7 @@ Two client libraries are planned:
 - A Go `database/sql` driver. The target is that it works with GORM.
 - A JDBC driver and a Hibernate dialect. The target is that they work with Spring Data JPA.
 
-Both drivers are planned to speak one protocol, specified in [0005: Client protocol](/docs/decisions/0005-client-protocol/): ordinary HTTP requests with JSON bodies under `/v1`, results as newline-delimited JSON with a required final frame, sessions only for explicit transactions, and a commit identifier on every write so that a driver can find out whether a commit whose response was lost happened.
+Both drivers are planned to speak one protocol, specified in [0005: Client protocol](/docs/decisions/0005-client-protocol/): ordinary HTTP requests with JSON bodies under `/v1`, results as newline-delimited JSON with a required final frame, and channels with sequence numbers for every request that can write, so that no request takes effect twice and a driver reports an outcome only when it can prove it.
 
 ## Storage backends
 
