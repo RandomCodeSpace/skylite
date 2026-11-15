@@ -208,7 +208,9 @@ func TestFencedByEpochBump(t *testing.T) {
 // bound to the key and checked by CheckKey.)
 func TestForeignObjectAtNextNameStops(t *testing.T) {
 	id := []byte("commit-identifier-000001")
-	for _, tc := range []string{"identifier", "epoch", "bytes", "absent"} {
+	// A retired object keeps only its header: the identifier and epoch are
+	// all there is to tell another leader's commit from this one's.
+	for _, tc := range []string{"identifier", "epoch", "bytes", "absent", "identifier, retired", "epoch, retired"} {
 		t.Run(tc, func(t *testing.T) {
 			st, keys, o, l, c := setup(t)
 			txn := o.Head + 2
@@ -216,7 +218,7 @@ func TestForeignObjectAtNextNameStops(t *testing.T) {
 				st.setRule(commitRules(fault{noEffect: true, err: storage.ErrPreconditionFailed}))
 			} else {
 				h := format.CommitHeader{DB: o.DB, PageSize: 4096, Txn: txn, Epoch: o.Epoch, DBSize: 2, PageCount: 1, CommitID: id}
-				switch tc {
+				switch strings.TrimSuffix(tc, ", retired") {
 				case "identifier":
 					h.CommitID = []byte("someone-elses-identifier")
 				case "epoch":
@@ -228,6 +230,9 @@ func TestForeignObjectAtNextNameStops(t *testing.T) {
 				}
 				if _, err := st.Store.Create(context.Background(), keys.Commit(o.DB, txn), &b); err != nil {
 					t.Fatal(err)
+				}
+				if strings.HasSuffix(tc, ", retired") {
+					retire(t, st.Store, keys, o.DB, txn)
 				}
 			}
 			_, err := c.Run(id, func(db *sqlite3.Conn) error { return db.Exec("INSERT INTO t VALUES (1)") })
