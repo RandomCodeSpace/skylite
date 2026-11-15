@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
+	"time"
 
 	"github.com/RandomCodeSpace/skylite/internal/format"
 	"github.com/RandomCodeSpace/skylite/internal/storage"
@@ -20,6 +20,26 @@ var ErrExists = errors.New("engine: a database already exists under this prefix"
 // gives up on it.
 const createAttempts = 5
 
+// createWait waits before the next attempt of a create. A variable so
+// that tests do not wait.
+var createWait = backoff
+
+// backoff waits 10 milliseconds before the second attempt, doubling to 80
+// before the fifth, 150 in all, and returns early with the context's error.
+func backoff(ctx context.Context, attempt int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	t := time.NewTimer(10 * time.Millisecond << min(attempt, 3))
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 // Create creates a new database under keys' prefix, as decision 3 of the
 // storage engine record describes: it draws a database identifier, creates
 // the first commit object (transaction 1, epoch 1, holding the empty WAL-mode
@@ -28,10 +48,11 @@ const createAttempts = 5
 //
 // If another creator's manifest is already there, Create returns that
 // database's identifier and an error wrapping ErrExists; the caller uses the
-// database that won. Objects a losing or abandoned creator wrote stay under an
-// identifier no manifest names. Create gives up with an error when it cannot
-// resolve either create within its attempts; an error that wraps
-// storage.ErrOutcomeUnknown means a create may still land.
+// database that won. A manifest present before Create starts is found by
+// reading it, and nothing is written. Objects a losing or abandoned creator
+// wrote stay under an identifier no manifest names. Create gives up with an
+// error when it cannot resolve either create within its attempts; an error
+// that wraps storage.ErrOutcomeUnknown means a create may still land.
 func Create(ctx context.Context, st storage.Store, keys format.Keys, pageSize, groupSize uint32) (format.DatabaseID, error) {
 	var id format.DatabaseID
 	var nonce [16]byte
@@ -43,14 +64,27 @@ func Create(ctx context.Context, st storage.Store, keys format.Keys, pageSize, g
 			return format.DatabaseID{}, err
 		}
 	}
+	// Encoding the manifest validates the page and group sizes before
+	// anything else is built.
+	manifest, err := format.EncodeManifest(format.Manifest{DB: id, PageSize: pageSize, GroupSize: groupSize, Epoch: 1, Nonce: nonce})
+	if err != nil {
+		return format.DatabaseID{}, err
+	}
+
+	switch b, err := get(ctx, st, keys.Manifest(), format.MaxManifestSize+1); {
+	case err == nil:
+		winner, err := existing(b)
+		if err != nil {
+			return format.DatabaseID{}, err
+		}
+		return winner, fmt.Errorf("%w: database %x", ErrExists, winner)
+	case !errors.Is(err, storage.ErrNotFound):
+		return format.DatabaseID{}, err
+	}
 
 	var commit bytes.Buffer
 	h := format.CommitHeader{DB: id, PageSize: pageSize, Txn: 1, Epoch: 1, DBSize: 1, PageCount: 1}
 	if err := format.EncodeCommit(&commit, h, []uint32{1}, bytes.NewReader(emptyDatabase(pageSize))); err != nil {
-		return format.DatabaseID{}, err
-	}
-	manifest, err := format.EncodeManifest(format.Manifest{DB: id, PageSize: pageSize, GroupSize: groupSize, Epoch: 1, Nonce: nonce})
-	if err != nil {
 		return format.DatabaseID{}, err
 	}
 
@@ -69,12 +103,9 @@ func Create(ctx context.Context, st storage.Store, keys format.Keys, pageSize, g
 	// replacement keeps the identifier, and nobody else has it.
 	var winner format.DatabaseID
 	own, err := create(ctx, st, keys.Manifest(), manifest, func(b []byte) (bool, error) {
-		m, err := format.DecodeManifest(b, format.DatabaseID{})
-		if err != nil {
-			return false, fmt.Errorf("engine: reading the existing manifest: %w", err)
-		}
-		winner = m.DB
-		return m.DB == id, nil
+		var err error
+		winner, err = existing(b)
+		return winner == id, err
 	})
 	switch {
 	case err != nil:
@@ -85,21 +116,37 @@ func Create(ctx context.Context, st storage.Store, keys format.Keys, pageSize, g
 	return id, nil
 }
 
+// existing returns the identifier of the database whose manifest is b.
+func existing(b []byte) (format.DatabaseID, error) {
+	m, err := format.DecodeManifest(b, format.DatabaseID{})
+	if err != nil {
+		return format.DatabaseID{}, fmt.Errorf("engine: reading the existing manifest: %w", err)
+	}
+	return m.DB, nil
+}
+
 // create creates key with body and resolves the outcome as decision 6 of
-// the record says. It repeats the identical create after any failure, up to
-// createAttempts. Success resolves it as ours; a precondition failure is
-// resolved by reading the key and asking own, whose error ends the
-// operation. Failures with no effect resolve nothing, because an earlier
-// attempt with an unknown outcome may still land.
+// the record says. It repeats the identical create after any failure but an
+// invalid argument or key, up to createAttempts, waiting between attempts.
+// Success resolves it as ours; a precondition failure is resolved by reading
+// the key and asking own, whose error ends the operation. Failures with no
+// effect resolve nothing, because an earlier attempt with an unknown outcome
+// may still land.
 func create(ctx context.Context, st storage.Store, key string, body []byte, own func([]byte) (bool, error)) (bool, error) {
 	var unknown, last error
-	for range createAttempts {
+	for attempt := range createAttempts {
+		if attempt > 0 {
+			if err := createWait(ctx, attempt-1); err != nil {
+				last = err
+				break
+			}
+		}
 		_, err := st.Create(ctx, key, bytes.NewReader(body))
 		if err == nil {
 			return true, nil
 		}
 		if errors.Is(err, storage.ErrPreconditionFailed) {
-			b, rerr := get(ctx, st, key)
+			b, rerr := get(ctx, st, key, int64(max(len(body), format.MaxManifestSize))+1)
 			if rerr == nil {
 				return own(b)
 			}
@@ -109,7 +156,7 @@ func create(ctx context.Context, st storage.Store, key string, body []byte, own 
 			unknown = err
 		}
 		last = err
-		if ctx.Err() != nil {
+		if errors.Is(err, storage.ErrInvalidArgument) || errors.Is(err, storage.ErrInvalidKey) {
 			break
 		}
 	}
@@ -119,13 +166,13 @@ func create(ctx context.Context, st storage.Store, key string, body []byte, own 
 	return false, fmt.Errorf("engine: create %s unresolved: %w", key, last)
 }
 
-func get(ctx context.Context, st storage.Store, key string) ([]byte, error) {
-	rc, _, err := st.Get(ctx, key)
+// get reads key whole, or its first limit bytes.
+func get(ctx context.Context, st storage.Store, key string, limit int64) ([]byte, error) {
+	rc, info, err := st.Get(ctx, key)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rc.Close() }()
-	return io.ReadAll(rc)
+	return readBody(rc, info, 0, limit)
 }
 
 // emptyDatabase returns page 1 of an empty SQLite database whose header

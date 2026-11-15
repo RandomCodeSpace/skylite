@@ -18,6 +18,9 @@ import (
 
 var errInjected = errors.New("injected failure")
 
+// Retries in tests do not wait; TestCreateWaits checks the waits.
+func init() { createWait = func(context.Context, int) error { return nil } }
+
 // testStore wraps a store, counts requests and the body bytes read, and
 // lets a test fail or delay any request.
 type testStore struct {
@@ -524,7 +527,7 @@ func (h *history) checkReader(ctx context.Context, r *Reader, behind bool) error
 			return fmt.Errorf("page %d at transaction %d: wrong content", p+1, r.Txn())
 		}
 	}
-	if _, err := r.ReadPage(ctx, r.Size()+1); !errors.Is(err, errPageRange) {
+	if _, err := r.ReadPage(ctx, r.Size()+1); !errors.Is(err, ErrPageRange) {
 		return fmt.Errorf("page past the end at transaction %d: %w", r.Txn(), err)
 	}
 	return nil

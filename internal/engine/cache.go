@@ -6,12 +6,13 @@ import (
 )
 
 // Cache holds verified page bodies fetched from storage, up to a fixed
-// number of bytes, and evicts the least recently used. Entries are keyed by
-// the immutable identity of what was fetched (object key, version token and
-// offset), so a hit is always the bytes that object version holds there;
-// which object a page is read from is decided by the reader, never by the
-// cache. Correctness never depends on it. A Cache is safe for concurrent
-// use, and its lock is never held while storage is read.
+// number of bytes of heap, and evicts the least recently used. Entries are
+// keyed by the immutable identity of what was fetched (object key, version
+// token and offset), so a hit is always the bytes that object version holds
+// there; which object a page is read from is decided by the reader, never by
+// the cache. Correctness never depends on it. A Cache is safe for concurrent
+// use, and its lock is never held while storage is read. A nil *Cache caches
+// nothing.
 type Cache struct {
 	mu     sync.Mutex
 	budget int64
@@ -25,13 +26,23 @@ type cacheEntry struct {
 	body []byte
 }
 
-// NewCache returns a cache that holds at most budget bytes of keys and page
-// bodies. A budget of zero or less caches nothing.
+// entryOverhead is the heap an entry takes besides its key and body: its
+// list element, its cacheEntry and its map slot. TestCacheHeap measures it.
+const entryOverhead = 160
+
+func entrySize(key string, body []byte) int64 { return int64(len(key)+len(body)) + entryOverhead }
+
+// NewCache returns a cache that holds at most budget bytes: keys, page
+// bodies and a fixed overhead per entry. A budget of zero or less caches
+// nothing.
 func NewCache(budget int64) *Cache {
 	return &Cache{budget: budget, ll: list.New(), m: make(map[string]*list.Element)}
 }
 
 func (c *Cache) get(key string) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.m[key]
@@ -42,14 +53,18 @@ func (c *Cache) get(key string) ([]byte, bool) {
 	return e.Value.(*cacheEntry).body, true
 }
 
-// put stores body, which the caller must not modify afterwards.
+// put stores a copy of body, so that the cache holds exactly its bytes.
 func (c *Cache) put(key string, body []byte) {
-	size := int64(len(key) + len(body))
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c == nil {
+		return
+	}
+	size := entrySize(key, body)
 	if size > c.budget {
 		return
 	}
+	body = append([]byte(nil), body...)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if _, ok := c.m[key]; ok {
 		return
 	}
@@ -60,6 +75,6 @@ func (c *Cache) put(key string, body []byte) {
 		ce := e.Value.(*cacheEntry)
 		c.ll.Remove(e)
 		delete(c.m, ce.key)
-		c.used -= int64(len(ce.key) + len(ce.body))
+		c.used -= entrySize(ce.key, ce.body)
 	}
 }
