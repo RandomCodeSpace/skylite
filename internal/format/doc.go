@@ -173,9 +173,8 @@
 // writer shares. If storage broke create-if-absent, or two writers shared
 // an epoch, the format would not notice.
 //
-// Epochs need not be non-decreasing along the commit log, and readers must
-// not require it: a paused candidate can leave an epoch bump with a lower
-// epoch after commits of a higher one.
+// The engine writes non-decreasing epochs along the commit log; readers
+// must not require it.
 //
 // # Commit object
 //

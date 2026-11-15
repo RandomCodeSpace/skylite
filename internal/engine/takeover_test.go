@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"math"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,6 +46,11 @@ func TestTakeoverAlone(t *testing.T) {
 		t.Fatalf("manifest after swap %+v, before %+v", m, before)
 	case l == nil:
 		t.Fatal("no lease")
+	}
+	if b, err := get(bg, e.g, e.keys.Lease()); err != nil {
+		t.Fatal(err)
+	} else if ls, err := format.DecodeLease(b); err != nil || ls.Holder != "b" || ls.Epoch != o.Epoch {
+		t.Fatalf("lease %+v, %v; want holder b at epoch %d", ls, err, o.Epoch)
 	}
 	for g := range m.Groups {
 		if m.Groups[g] != before.Groups[g] {
@@ -109,6 +116,7 @@ func TestRecognise(t *testing.T) {
 	}{
 		{"own live", built, FoundOwn},
 		{"own retired", retired, FoundOwn},
+		{"own retired with trailing bytes", append(bytes.Clone(retired), 0), FoundUnknown},
 		{"bump lower epoch", enc(txn, o.DB, o.Epoch-1, true), FoundBump},
 		{"bump higher epoch", enc(txn, o.DB, o.Epoch+1, true), FoundBump},
 		{"bump at own epoch", enc(txn, o.DB, o.Epoch, true), FoundUnknown},
@@ -135,6 +143,54 @@ func TestRecognise(t *testing.T) {
 	}
 	if got, _ := (Office{DB: o.DB, Epoch: o.Epoch + 1, Head: o.Head, Nonce: o.Nonce}).Recognise(built, built); got != FoundUnknown {
 		t.Errorf("a commit of another office recognised: %v", got)
+	}
+	if got, _ := (Office{DB: o.DB, Epoch: o.Epoch, Head: bh.Txn, Nonce: o.Nonce}).Recognise(built, built); got != FoundUnknown {
+		t.Errorf("a commit at the office's bump recognised: %v", got)
+	}
+}
+
+// TestRecogniseProperty: random corruptions of the objects that can be at a
+// leader's next name are FoundOwn only as built or its retired form, and
+// FoundBump only as a valid bump of this database at this name at another
+// epoch.
+func TestRecogniseProperty(t *testing.T) {
+	e := newEnv(t, 110)
+	o := e.l.o
+	built, bh := e.l.build()
+	retired, err := bh.Retire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.h.mu.Lock()
+	bump, _ := e.h.encodeCommit(bh.Txn, o.DB, o.Epoch+1, e.l.size, nil, true)
+	lowBump, _ := e.h.encodeCommit(bh.Txn, o.DB, o.Epoch-1, e.l.size, nil, true)
+	e.h.mu.Unlock()
+	rng := seeded(7)
+	bases := [][]byte{built, retired, bump, lowBump}
+	for i := range 200000 {
+		x := bytes.Clone(bases[rng.IntN(len(bases))])
+		switch rng.IntN(4) {
+		case 0:
+			x[rng.IntN(len(x))] ^= byte(1 << rng.IntN(8))
+		case 1:
+			x = x[:rng.IntN(len(x)+1)]
+		case 2:
+			x = append(x, byte(rng.IntN(256))) //nolint:gosec // below 256
+		case 3:
+			j, k := rng.IntN(len(x)), rng.IntN(len(x))
+			x[j], x[k] = x[k], x[j]
+		}
+		want := FoundUnknown
+		h, herr := format.DecodeCommitHeader(x[:min(len(x), format.CommitHeaderSize)], o.DB)
+		switch {
+		case bytes.Equal(x, built), bytes.Equal(x, retired):
+			want = FoundOwn
+		case herr == nil && len(x) == format.CommitHeaderSize && h.EpochBump && h.Txn == bh.Txn && h.Epoch != o.Epoch:
+			want = FoundBump
+		}
+		if got, err := o.Recognise(built, x); got != want || (got == FoundUnknown) != (err != nil) {
+			t.Fatalf("corruption %d of %d bytes: %v, %v; want %v", i, len(x), got, err, want)
+		}
 	}
 }
 
@@ -285,6 +341,10 @@ func TestTakeoverRejectsBadLog(t *testing.T) {
 			if err != nil {
 				e.t.Fatal(err)
 			}
+			return b
+		},
+		"commit at the candidate's epoch": func(e *env) []byte {
+			b, _ := e.h.encodeCommit(7, e.h.db, e.l.o.Epoch+1, e.l.size, nil, true)
 			return b
 		},
 		"bump of the wrong size": func(e *env) []byte {
@@ -494,13 +554,16 @@ func TestStickySwap(t *testing.T) {
 	c.until("replace", e.keys.Manifest())
 	c.step(late)
 	c.until("replace", e.keys.Manifest())
-	d, _ := mustTakeover(t, e, "d")
+	d, dl := mustTakeover(t, e, "d")
 	c.finish()
 	if !errors.Is(c.err, ErrLost) {
 		t.Fatalf("candidate after its swap's version was replaced: %v", c.err)
 	}
 	if ok, err := e.g.land(); !ok || !errors.Is(err, storage.ErrPreconditionFailed) {
 		t.Fatalf("late swap: %v", err)
+	}
+	if b, _ := get(bg, e.g, e.keys.Lease()); !bytes.Equal(b, leaseBytes(t, dl)) {
+		t.Fatal("the losing candidate's release changed the winner's lease")
 	}
 	e.check([]Office{e.l.o, d}, nil, true)
 }
@@ -536,12 +599,23 @@ func TestLease(t *testing.T) {
 	}
 	e.h.sync()
 	e.g.takeTrace()
-	if _, _, err := Takeover(bg, e.g, e.keys, at("b")); !errors.Is(err, ErrLeaseHeld) {
+	_, _, err = Takeover(bg, e.g, e.keys, at("b"))
+	var held *LeaseHeldError
+	if !errors.As(err, &held) || !errors.Is(err, ErrLeaseHeld) || held.Holder != "a" || !held.Expires.Equal(clk.now().Add(time.Minute)) {
 		t.Fatalf("takeover under a live lease: %v", err)
 	}
 	for _, c := range e.g.takeTrace() {
 		if !strings.HasPrefix(c, "get ") {
 			t.Fatalf("a candidate refused the lease wrote: %s", c)
+		}
+	}
+	for range 2 { // the clock stands still, and every write still has bytes of its own
+		prev := la.l.Renewed
+		if err := la.Renew(bg); err != nil || la.l.Renewed != prev+1 {
+			t.Fatalf("renewal at the same clock reading: %d after %d, %v", la.l.Renewed, prev, err)
+		}
+		if tr := e.g.takeTrace(); len(tr) != 1 || tr[0] != "replace "+e.keys.Lease() {
+			t.Fatalf("an uncontended renewal made %v", tr)
 		}
 	}
 	clk.advance(50 * time.Second)
@@ -602,12 +676,18 @@ func TestLeaseFailStop(t *testing.T) {
 	}
 }
 
+// TestLeaseUnreadable: a lease object that is not a lease of any version is
+// replaced like an expired one; a lease of a newer version is refused and
+// never overwritten.
 func TestLeaseUnreadable(t *testing.T) {
-	for name, body := range map[string]string{
-		"garbage":        "not a lease",
-		"newer version":  `{"format":"skylite-lease","version":2,"anything":true}`,
-		"non-canonical":  `{"format":"skylite-lease","version":1,"holder":"x", "epoch":1,"renewed":0}`,
-		"invalid holder": `{"format":"skylite-lease","version":1,"holder":"a b","epoch":1,"renewed":0}`,
+	for name, c := range map[string]struct {
+		body     string
+		replaced bool
+	}{
+		"garbage":        {"not a lease", true},
+		"newer version":  {`{"format":"skylite-lease","version":2,"anything":true}`, false},
+		"non-canonical":  {`{"format":"skylite-lease","version":1,"holder":"x", "epoch":1,"renewed":0}`, true},
+		"invalid holder": {`{"format":"skylite-lease","version":1,"holder":"a b","epoch":1,"renewed":0}`, true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t, 18)
@@ -615,14 +695,21 @@ func TestLeaseUnreadable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			e.h.replace(e.keys.Lease(), info.Version, []byte(body))
+			e.h.replace(e.keys.Lease(), info.Version, []byte(c.body))
 			e.g.takeTrace()
-			if _, _, err := Takeover(bg, e.g, e.keys, e.cand("b")); err == nil {
-				t.Fatal("took an unreadable lease")
+			o, l, err := Takeover(bg, e.g, e.keys, e.cand("b"))
+			if c.replaced {
+				if err != nil || !bytes.Equal(must(get(bg, e.g, e.keys.Lease())), leaseBytes(t, l)) {
+					t.Fatalf("takeover over an undecodable lease: %+v %v", o, err)
+				}
+				return
+			}
+			if err == nil || errors.Is(err, ErrLeaseHeld) {
+				t.Fatalf("takeover over a newer lease: %v", err)
 			}
 			for _, c := range e.g.takeTrace() {
 				if !strings.HasPrefix(c, "get ") {
-					t.Fatalf("wrote over an unreadable lease: %s", c)
+					t.Fatalf("wrote over a newer lease: %s", c)
 				}
 			}
 		})
@@ -644,4 +731,458 @@ func TestLeaseRace(t *testing.T) {
 	}
 	e.h.sync()
 	e.check(offices(t, a, b), nil, true)
+}
+
+func leaseBytes(t testing.TB, l *Lease) []byte {
+	t.Helper()
+	b, err := format.EncodeLease(l.l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func must(b []byte, err error) []byte {
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// TestLeaseClockAhead: a lease renewed more than its time to live ahead of
+// a node's clock is expired for that node; one exactly that far ahead is
+// not.
+func TestLeaseClockAhead(t *testing.T) {
+	for _, c := range []struct {
+		ahead time.Duration
+		held  bool
+	}{
+		{time.Minute, true},
+		{time.Minute + time.Millisecond, false},
+		{100 * 365 * 24 * time.Hour, false},
+	} {
+		e := newEnv(t, 104)
+		clk := newClock(0)
+		clk.advance(1000 * time.Hour)
+		ahead := newClock(0)
+		ahead.advance(1000*time.Hour + c.ahead)
+		if _, _, err := Takeover(bg, e.g, e.keys, Candidate{Holder: "a", TTL: time.Minute, Now: ahead.now}); err != nil {
+			t.Fatal(err)
+		}
+		e.h.sync()
+		_, _, err := Takeover(bg, e.g, e.keys, Candidate{Holder: "b", TTL: time.Minute, Now: clk.now})
+		if errors.Is(err, ErrLeaseHeld) != c.held || (!c.held && err != nil) {
+			t.Fatalf("lease %v ahead: %v", c.ahead, err)
+		}
+	}
+}
+
+// TestLeaseOwnUnresolvedWrite: a renewal or release that follows a renewal
+// whose outcome stayed unknown, and landed, finds the holder's own earlier
+// write and succeeds.
+func TestLeaseOwnUnresolvedWrite(t *testing.T) {
+	for _, release := range []bool{false, true} {
+		e := newEnv(t, 103)
+		clk := newClock(time.Millisecond)
+		clk.advance(1000 * time.Hour)
+		_, l, err := Takeover(bg, e.g, e.keys, Candidate{Holder: "a", TTL: time.Minute, Now: clk.now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := e.keys.Lease()
+		a := e.g.spawn(t, func(ctx context.Context) { err = l.Renew(ctx) })
+		for _, act := range []action{drop, fail, fail, fail, fail} {
+			if a.until("replace", key) == nil {
+				t.Fatal("renewal not repeated")
+			}
+			a.step(act)
+		}
+		a.finish()
+		if !errors.Is(err, storage.ErrOutcomeUnknown) {
+			t.Fatalf("unresolved renewal: %v", err)
+		}
+		op := l.Renew
+		if release {
+			op = l.Release
+		}
+		if err := op(bg); err != nil {
+			t.Fatalf("release %v after an unresolved renewal: %v", release, err)
+		}
+		if ls, err := format.DecodeLease(must(get(bg, e.g, key))); err != nil || ls != l.l || (ls.Renewed == 0) != release {
+			t.Fatalf("lease %+v, %v; the handle has %+v", ls, err, l.l)
+		}
+	}
+}
+
+// TestLeaseRenewedDuringWalk: a candidate renews its lease once a third of
+// its time to live has passed since its last lease write, and gives up when
+// the renewal finds the lease taken.
+func TestLeaseRenewedDuringWalk(t *testing.T) {
+	setup := func(t *testing.T) (*env, Candidate) {
+		e := newEnv(t, 105)
+		for range 30 {
+			if out := e.l.commit(bg); out != committed {
+				t.Fatal(out)
+			}
+		}
+		e.h.sync()
+		e.g.takeTrace()
+		clk := newClock(5 * time.Second) // each reading is 5s after the last
+		clk.advance(1000 * time.Hour)
+		return e, Candidate{Holder: "b", TTL: time.Minute, Now: clk.now}
+	}
+	t.Run("renewed", func(t *testing.T) {
+		e, c := setup(t)
+		if _, _, err := Takeover(bg, e.g, e.keys, c); err != nil {
+			t.Fatal(err)
+		}
+		writes, gap, maxGap, last := 0, 0, 0, ""
+		for _, call := range e.g.takeTrace() {
+			switch op, key, _ := strings.Cut(call, " "); {
+			case key == e.keys.Lease() && op != "get":
+				writes, gap = writes+1, 0
+			case op == "getrange" && strings.HasPrefix(key, e.keys.CommitPrefix(e.h.db)) && key != last:
+				last, gap = key, gap+1
+				maxGap = max(maxGap, gap)
+			}
+		}
+		// The walk reads the clock once per commit, and a renewal reads it
+		// once more: 20s pass every four commits.
+		if writes < 8 || maxGap > 4 {
+			t.Fatalf("%d lease writes, up to %d commits read between them", writes, maxGap)
+		}
+	})
+	t.Run("taken", func(t *testing.T) {
+		e, c := setup(t)
+		k := e.g.candidate(t, e.keys, c)
+		if k.until("getrange", e.keys.Commit(e.h.db, 20)) == nil {
+			t.Fatal("no walk")
+		}
+		later := newClock(0)
+		later.advance(2000 * time.Hour)
+		if _, err := acquireLease(bg, e.g, e.keys, Candidate{Holder: "d", TTL: time.Minute, Now: later.now}, 99); err != nil {
+			t.Fatal(err)
+		}
+		e.g.takeTrace()
+		k.finish()
+		if !errors.Is(k.err, ErrLeaseHeld) {
+			t.Fatalf("candidate whose lease was taken: %v", k.err)
+		}
+		for _, call := range e.g.takeTrace() {
+			if strings.HasPrefix(call, "create "+e.keys.CommitPrefix(e.h.db)) {
+				t.Fatalf("bumped after losing the lease: %s", call)
+			}
+		}
+	})
+}
+
+// TestTakeoverReleasesLease: a candidate whose swap definitely did not land
+// releases its lease; one whose swap may still land leaves it to expire.
+func TestTakeoverReleasesLease(t *testing.T) {
+	for _, c := range []struct {
+		acts     []action
+		released bool
+	}{
+		{[]action{fail, fail, fail, fail, fail}, true},
+		{[]action{late, fail, fail, fail, fail}, false},
+	} {
+		e := newEnv(t, 20)
+		k := e.g.candidate(t, e.keys, e.cand("b"))
+		for _, act := range c.acts {
+			if k.until("replace", e.keys.Manifest()) == nil {
+				t.Fatal("swap not repeated")
+			}
+			k.step(act)
+		}
+		k.finish()
+		if k.err == nil || errors.Is(k.err, storage.ErrOutcomeUnknown) == c.released {
+			t.Fatalf("swap %v: %v", c.acts, k.err)
+		}
+		ls, err := format.DecodeLease(must(get(bg, e.g, e.keys.Lease())))
+		if err != nil || ls.Holder != "b" || (ls.Renewed == 0) != c.released {
+			t.Fatalf("swap %v: lease %+v %v", c.acts, ls, err)
+		}
+		e.g.landAll()
+	}
+}
+
+// TestBeforeErrorKeepsUnknown: a bump attempt is unknown, and the re-read
+// before the next attempt finds another candidacy's manifest. The error
+// says both, because the first attempt can still land, and it does.
+func TestBeforeErrorKeepsUnknown(t *testing.T) {
+	e := newEnv(t, 102)
+	key := e.keys.Commit(e.h.db, 7)
+	c := e.g.candidate(t, e.keys, e.cand("c"))
+	c.until("create", key)
+	c.step(late)
+	d := e.g.candidate(t, e.keys, e.cand("d"))
+	d.until("create", key) // d has swapped the manifest and not bumped yet
+	c.finish()
+	if !errors.Is(c.err, storage.ErrOutcomeUnknown) || !errors.Is(c.err, ErrLost) {
+		t.Fatalf("candidate whose re-read failed after an unknown bump: %v", c.err)
+	}
+	if ok, err := e.g.land(); !ok || err != nil {
+		t.Fatalf("the late bump did not land: %v", err)
+	}
+	d.finish()
+	e.h.sync()
+	e.check(offices(t, c, d), nil, true)
+}
+
+// getCounter counts the body bytes read by Get from one key.
+type getCounter struct {
+	storage.Store
+	key string
+
+	mu sync.Mutex
+	n  int64
+}
+
+func (s *getCounter) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	rc, info, err := s.Store.Get(ctx, key)
+	if err != nil || key != s.key {
+		return rc, info, err
+	}
+	return countedBody{rc, s}, info, nil
+}
+
+type countedBody struct {
+	io.ReadCloser
+	s *getCounter
+}
+
+func (r countedBody) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.s.mu.Lock()
+	r.s.n += int64(n)
+	r.s.mu.Unlock()
+	return n, err
+}
+
+// TestLostBumpReadsLittle: a candidate whose bump loses to a 2 MB commit
+// reads back at most one byte more than its bump.
+func TestLostBumpReadsLittle(t *testing.T) {
+	st, keys := newMemStore(t)
+	gc := &getCounter{Store: st}
+	e := newEnvOn(t, gc, keys, 101)
+	key := e.keys.Commit(e.h.db, 7)
+	gc.key = key
+	c := e.g.candidate(t, e.keys, e.cand("c"))
+	if c.until("create", key) == nil {
+		t.Fatal("no bump")
+	}
+	pages := map[uint32][]byte{}
+	for p := uint32(1); p <= 4000; p++ {
+		pages[p] = e.h.bytes(512)
+	}
+	big, _ := e.h.encodeCommit(7, e.h.db, e.l.o.Epoch, 4000, pages, false)
+	e.h.create(key, big) // the old leader's commit takes the name
+	c.finish()
+	if c.err != nil || c.o.Head != 8 {
+		t.Fatalf("%+v %v", c.o, c.err)
+	}
+	if gc.n > format.CommitHeaderSize+1 {
+		t.Fatalf("the candidate read %d bytes of the %d-byte commit that beat its bump", gc.n, len(big))
+	}
+}
+
+// lagStore hides one key from ranged reads only, as a lagging replica
+// would, and cancels the operation after too many creates.
+type lagStore struct {
+	storage.Store
+	hide    string
+	creates int
+	cancel  func()
+}
+
+func (s *lagStore) GetRange(ctx context.Context, key string, off, n int64) (io.ReadCloser, storage.Info, error) {
+	if key == s.hide {
+		return nil, storage.Info{}, &storage.Error{Op: "getrange", Key: key, Err: storage.ErrNotFound}
+	}
+	return s.Store.GetRange(ctx, key, off, n)
+}
+
+func (s *lagStore) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	if s.creates++; s.creates > 10 {
+		s.cancel()
+	}
+	return s.Store.Create(ctx, key, body)
+}
+
+// TestTakeoverNoProgress: storage whose ranged reads do not see a name
+// that creates do breaks decision 3. The candidate's walk then never
+// reaches the name its bump lost to, and it gives up instead of trying the
+// same name again.
+func TestTakeoverNoProgress(t *testing.T) {
+	e := newEnv(t, 108)
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	ls := &lagStore{Store: e.g.Store, hide: e.keys.Commit(e.h.db, 6), cancel: cancel}
+	if _, _, err := Takeover(ctx, ls, e.keys, e.cand("x")); !errors.Is(err, ErrCorrupt) || ls.creates != 1 {
+		t.Fatalf("%d creates: %v", ls.creates, err)
+	}
+}
+
+// TestTakeoverEmptyLog: a database whose manifest is at 0 and whose first
+// commit is missing has no history to bump after.
+func TestTakeoverEmptyLog(t *testing.T) {
+	st, keys := newMemStore(t)
+	g := &gated{Store: st}
+	h := newHistory(t, st, keys, 21, 512, 4)
+	if err := st.Delete(bg, keys.Commit(h.db, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Takeover(bg, g, keys, Candidate{Holder: "a", TTL: time.Minute, Now: newClock(0).now}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("takeover of an empty log: %v", err)
+	}
+	for _, c := range g.takeTrace() {
+		if strings.HasPrefix(c, "create "+keys.CommitPrefix(h.db)) {
+			t.Fatalf("bumped an empty log: %s", c)
+		}
+	}
+}
+
+// TestAbsentAfterPreconditionFailure: a create that fails its precondition
+// at a key a read then finds absent breaks decision 3.
+func TestAbsentAfterPreconditionFailure(t *testing.T) {
+	ts, keys := newStore(t)
+	newHistory(t, ts, keys, 22, 512, 4)
+	ts.setInject(func(_ context.Context, op, key string) (bool, error) {
+		if op == "create" && key == keys.Lease() {
+			return false, &storage.Error{Op: op, Key: key, Err: storage.ErrPreconditionFailed}
+		}
+		return false, nil
+	})
+	if _, _, err := Takeover(bg, ts, keys, Candidate{Holder: "a", TTL: time.Minute, Now: newClock(0).now}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("lease absent after a precondition failure: %v", err)
+	}
+}
+
+// TestLostSwapReadsLittle: a candidate whose swap loses to a compaction that
+// grew the manifest reads back at most one byte more than its swap, and
+// releases its lease, which nobody has taken since.
+func TestLostSwapReadsLittle(t *testing.T) {
+	st, keys := newMemStore(t)
+	gc := &getCounter{Store: st, key: keys.Manifest()}
+	e := newEnvOn(t, gc, keys, 24)
+	e.g.manifest = "" // its record of replacements would read the manifest too
+	before := len(must(get(bg, st, keys.Manifest())))
+	c := e.g.candidate(t, e.keys, e.cand("c"))
+	if c.until("replace", e.keys.Manifest()) == nil {
+		t.Fatal("no swap")
+	}
+	m, _ := e.h.manifest()
+	m.DBSize, m.Groups = 4000, make([]format.GroupRef, format.GroupCount(4000, m.GroupSize))
+	e.h.publish(m)
+	gc.mu.Lock()
+	gc.n = 0
+	gc.mu.Unlock()
+	c.finish()
+	if !errors.Is(c.err, ErrLost) {
+		t.Fatalf("swap after a compaction: %v", c.err)
+	}
+	if gc.n > int64(before)+1 {
+		t.Fatalf("the candidate read %d bytes of a %d-byte manifest after its %d-byte swap lost", gc.n, len(must(get(bg, st, keys.Manifest()))), before)
+	}
+	if ls, err := format.DecodeLease(must(get(bg, st, keys.Lease()))); err != nil || ls.Holder != "c" || ls.Renewed != 0 {
+		t.Fatalf("lease after a lost swap: %+v %v", ls, err)
+	}
+}
+
+// TestLeaseOwnUnresolvedCreate: an earlier candidacy of the same holder at
+// the same epoch created the lease, with an outcome that stayed unknown. The
+// next candidacy finds that lease after its own create fails, and takes it.
+func TestLeaseOwnUnresolvedCreate(t *testing.T) {
+	st, keys := newMemStore(t)
+	g := &gated{Store: st}
+	newHistory(t, st, keys, 23, 512, 4)
+	c := Candidate{Holder: "a", TTL: time.Minute, Now: newClock(time.Millisecond).now}
+	first := g.candidate(t, keys, c)
+	for _, act := range []action{late, fail, fail, fail, fail} {
+		if first.until("create", keys.Lease()) == nil {
+			t.Fatal("lease create not repeated")
+		}
+		first.step(act)
+	}
+	first.finish()
+	if !errors.Is(first.err, storage.ErrOutcomeUnknown) {
+		t.Fatalf("unresolved lease create: %v", first.err)
+	}
+	second := g.candidate(t, keys, c)
+	if second.until("create", keys.Lease()) == nil {
+		t.Fatal("no lease create")
+	}
+	if ok, err := g.land(); !ok || err != nil {
+		t.Fatalf("the first create did not land: %v", err)
+	}
+	second.finish()
+	if second.err != nil || !bytes.Equal(must(get(bg, st, keys.Lease())), leaseBytes(t, second.l)) {
+		t.Fatalf("second candidacy: %v", second.err)
+	}
+}
+
+// TestLeaseReadFailure: a failed read of the lease ends the candidacy before
+// any write.
+func TestLeaseReadFailure(t *testing.T) {
+	ts, keys := newStore(t)
+	newHistory(t, ts, keys, 25, 512, 4)
+	var writes []string
+	ts.setInject(func(_ context.Context, op, key string) (bool, error) {
+		switch {
+		case op == "get" && key == keys.Lease():
+			return false, &storage.Error{Op: op, Key: key, Err: errInjected}
+		case op == "create" || op == "replace":
+			writes = append(writes, op+" "+key)
+		}
+		return false, nil
+	})
+	if _, _, err := Takeover(bg, ts, keys, Candidate{Holder: "a", TTL: time.Minute, Now: newClock(0).now}); !errors.Is(err, errInjected) || len(writes) != 0 {
+		t.Fatalf("takeover after a failed lease read: %v, wrote %v", err, writes)
+	}
+}
+
+// TestLeaseRewrittenUnderWriter: storage rewrites the lease before every
+// replace of it. A rewrite that names the writer's holder and epoch is
+// adopted once, not again; one that does not decode is another holder's,
+// whose lease may be retried at once.
+func TestLeaseRewrittenUnderWriter(t *testing.T) {
+	for _, garbage := range []bool{false, true} {
+		ts, keys := newStore(t)
+		newHistory(t, ts, keys, 26, 512, 4)
+		clk := newClock(0)
+		_, l, err := Takeover(bg, ts, keys, Candidate{Holder: "a", TTL: time.Minute, Now: clk.now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(bg)
+		replaces := 0
+		ts.setInject(func(ctx context.Context, op, key string) (bool, error) {
+			if op != "replace" || key != keys.Lease() {
+				return false, nil
+			}
+			if replaces++; replaces > 10 {
+				cancel()
+			}
+			body := []byte("not a lease")
+			if !garbage {
+				body = leaseBytes(t, &Lease{l: format.Lease{Holder: "a", Epoch: l.l.Epoch, Renewed: int64(replaces)}})
+			}
+			info, err := ts.Store.Head(ctx, key)
+			if err == nil {
+				_, err = ts.Store.Replace(ctx, key, info.Version, bytes.NewReader(body))
+			}
+			return false, err
+		})
+		err = l.Renew(ctx)
+		cancel()
+		var held *LeaseHeldError
+		switch {
+		case !errors.As(err, &held):
+			t.Fatalf("garbage %v: %v", garbage, err)
+		case garbage && (held.Holder != "" || !held.Expires.Equal(clk.now()) || replaces != 1):
+			t.Fatalf("an undecodable lease found after %d replaces: %+v", replaces, held)
+		case !garbage && replaces != 2:
+			t.Fatalf("own holder and epoch adopted for %d replaces", replaces)
+		}
+	}
 }

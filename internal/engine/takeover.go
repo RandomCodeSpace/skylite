@@ -48,13 +48,17 @@ type Candidate struct {
 //     decision 6 says, recognising its own swap by its bytes.
 //  3. It walks the commit log from the manifest's transaction number to the
 //     head. A retired commit or a log object whose version changes under it
-//     sends it back to the manifest.
+//     sends it back to the manifest. Once a third of the lease's time to live
+//     has passed since its last lease write it renews the lease, and gives up
+//     if the renewal finds the lease taken.
 //  4. Before every attempt at its epoch-bump commit it re-reads the manifest
 //     and gives up unless the manifest still carries its epoch and nonce. It
 //     creates the bump at the head plus one, recognising its own bump by its
-//     bytes, which its epoch determines. If another object holds the name,
-//     it walks on and tries again; it moves only past a name another object
-//     occupies, so a candidacy has at most one bump in the log.
+//     bytes, which its epoch determines, reading back at most one byte more
+//     than the bump. If another object holds the name, it walks on and tries
+//     again; it moves only past a name another object occupies, so a
+//     candidacy has at most one bump in the log, and a walk that does not
+//     reach that name is corruption.
 //  5. It reads the manifest again and takes office only if the manifest
 //     still carries its epoch and nonce.
 //
@@ -63,8 +67,9 @@ type Candidate struct {
 // for its swap or its bump the candidate gives up: Takeover returns an error,
 // and one that wraps storage.ErrOutcomeUnknown means that write may still
 // land. An error means the candidate never serves at that epoch. It holds no
-// Office and gets no Lease; a lease it took expires, or is taken back by the
-// same holder's next candidacy.
+// Office and gets no Lease. A candidacy whose swap definitely did not land
+// releases the lease it took; any other leaves it to expire, or to be taken
+// back by the same holder's next candidacy.
 func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candidate) (Office, *Lease, error) {
 	r := &Reader{st: st, keys: keys} // for its manifest and log reads
 	a, err := r.readManifest(ctx, anchor{})
@@ -79,17 +84,23 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 	if err != nil {
 		return Office{}, nil, err
 	}
+	// release gives up a candidacy whose swap definitely did not land. Its
+	// error is dropped: the lease decides only who attempts a takeover.
+	release := func(err error) (Office, *Lease, error) {
+		_ = lease.Release(ctx)
+		return Office{}, nil, err
+	}
 
 	o := Office{DB: m.DB, Epoch: m.Epoch + 1}
 	for o.Nonce == [16]byte{} {
 		if _, err := rand.Read(o.Nonce[:]); err != nil {
-			return Office{}, nil, err
+			return release(err)
 		}
 	}
 	m.Epoch, m.Nonce = o.Epoch, o.Nonce
 	swap, err := format.EncodeManifest(m)
 	if err != nil {
-		return Office{}, nil, err
+		return release(err)
 	}
 	key := keys.Manifest()
 	own, err := settle(ctx, nil,
@@ -98,14 +109,20 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 			return err
 		},
 		func() (bool, error) {
-			b, err := get(ctx, st, key)
+			b, _, err := readObject(ctx, st, key, len(swap)+1)
 			return bytes.Equal(b, swap), err
 		})
 	switch {
-	case err != nil:
+	case errors.Is(err, storage.ErrOutcomeUnknown):
 		return Office{}, nil, fmt.Errorf("engine: epoch swap to %d unresolved: %w", o.Epoch, err)
+	case err != nil:
+		return release(fmt.Errorf("engine: epoch swap to %d failed: %w", o.Epoch, err))
 	case !own:
-		return Office{}, nil, fmt.Errorf("%w: the manifest at epoch %d was replaced first", ErrLost, o.Epoch-1)
+		// The version the swap was conditioned on is gone for good. If an
+		// earlier attempt landed and was replaced since, the lease was
+		// taken since too, and the release, conditioned on this
+		// candidacy's version, changes nothing.
+		return release(fmt.Errorf("%w: the manifest at epoch %d was replaced first", ErrLost, o.Epoch-1))
 	}
 
 	held := func() error {
@@ -119,8 +136,9 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 		return nil
 	}
 	head, size := m.Txn, m.DBSize
+	var occupied uint64 // the name the last bump attempt found another object at
 	for {
-		if head, size, err = walk(ctx, r, m, o.Epoch, head, size); err != nil {
+		if head, size, err = walk(ctx, r, lease, m, o.Epoch, head, size); err != nil {
 			var stale *staleError
 			if !errors.As(err, &stale) {
 				return Office{}, nil, err
@@ -130,6 +148,9 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 				return Office{}, nil, err
 			}
 			return Office{}, nil, fmt.Errorf("%w: %v above manifest %d, which this candidacy still holds", ErrCorrupt, stale, m.Txn) //nolint:errorlint // stale is not the cause
+		}
+		if head < occupied {
+			return Office{}, nil, fmt.Errorf("%w: commit %d is occupied, but the walk ends at %d", ErrCorrupt, occupied, head)
 		}
 		switch head {
 		case 0:
@@ -142,13 +163,14 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 			return Office{}, nil, err
 		}
 		bkey := keys.Commit(o.DB, head+1)
+		occupied = head + 1
 		own, err := settle(ctx, held,
 			func() error {
 				_, err := st.Create(ctx, bkey, bytes.NewReader(bump))
 				return err
 			},
 			func() (bool, error) {
-				b, err := get(ctx, st, bkey)
+				b, _, err := readObject(ctx, st, bkey, len(bump)+1)
 				return bytes.Equal(b, bump), err
 			})
 		if err != nil {
@@ -169,9 +191,13 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 // walk reads the log upward from the commit after head, which has database
 // size size, until a name is absent, and returns the last commit's number
 // and size. Every object is checked as a reader checks it; one that carries
-// epoch, which only this candidacy's bump may, breaks invariant 1.
-func walk(ctx context.Context, r *Reader, m format.Manifest, epoch, head uint64, size uint32) (uint64, uint32, error) {
+// epoch, which only this candidacy's bump may, breaks invariant 1. It keeps
+// lease renewed between reads.
+func walk(ctx context.Context, r *Reader, lease *Lease, m format.Manifest, epoch, head uint64, size uint32) (uint64, uint32, error) {
 	for head < math.MaxUint64 {
+		if err := lease.keep(ctx); err != nil {
+			return 0, 0, err
+		}
 		c, err := r.fetchCommit(ctx, m, head+1, size)
 		switch {
 		case errors.Is(err, storage.ErrNotFound):
@@ -210,6 +236,9 @@ func settle(ctx context.Context, before, send func() error, mine func() (bool, e
 	for range createAttempts {
 		if before != nil {
 			if err := before(); err != nil {
+				if unknown != nil {
+					err = fmt.Errorf("%w, after an attempt whose outcome is unknown: %w", err, unknown)
+				}
 				return false, err
 			}
 		}

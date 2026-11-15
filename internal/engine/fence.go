@@ -31,6 +31,13 @@ const (
 // form, and FoundBump if it is a valid epoch bump of database o.DB at that
 // name with an epoch other than o.Epoch. Anything else, an absent object
 // (found empty) included, is FoundUnknown, with an error saying why.
+//
+// built must be an ordinary commit of office o above o.Head, the office's
+// epoch bump, which never changes: the commit path keeps its own head. A
+// caller reads at most len(built)+1 bytes at the name: every object
+// Recognise accepts is at most len(built) bytes long, because a retired form
+// and a bump are a commit header, so a longer object cut there is
+// FoundUnknown as it would be whole.
 func (o Office) Recognise(built, found []byte) (Found, error) {
 	if len(built) < format.CommitHeaderSize {
 		return FoundUnknown, fmt.Errorf("%w: built commit of %d bytes", ErrCorrupt, len(built))
@@ -40,7 +47,7 @@ func (o Office) Recognise(built, found []byte) (Found, error) {
 		return FoundUnknown, fmt.Errorf("engine: built commit: %w", err)
 	}
 	if bh.EpochBump || bh.Retired || bh.Epoch != o.Epoch || bh.Txn <= o.Head {
-		return FoundUnknown, fmt.Errorf("%w: commit %d at epoch %d is not a commit of office %d after %d", ErrCorrupt, bh.Txn, bh.Epoch, o.Epoch, o.Head)
+		return FoundUnknown, fmt.Errorf("%w: commit %d at epoch %d is not a commit of office %d above its bump at %d", ErrCorrupt, bh.Txn, bh.Epoch, o.Epoch, o.Head)
 	}
 	if bytes.Equal(found, built) {
 		return FoundOwn, nil

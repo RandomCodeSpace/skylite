@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"os"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -34,9 +35,12 @@ const (
 type gated struct {
 	storage.Store
 
-	mu      sync.Mutex
-	pending []func() error // late mutations, in the order they were sent
-	trace   []string       // every call, as "op key"
+	manifest string // the key whose replacements are recorded, if set
+
+	mu       sync.Mutex
+	pending  []func() error // late mutations, in the order they were sent
+	trace    []string       // every call, as "op key"
+	replaced [][2][]byte    // every replacement of manifest that landed: the bytes before and after
 }
 
 type actorKey struct{}
@@ -141,7 +145,19 @@ func (g *gated) Replace(ctx context.Context, key, version string, body io.Reader
 	}
 	var v string
 	err = g.mutate(ctx, "replace", key, func(ctx context.Context) (err error) {
+		if key != g.manifest {
+			v, err = g.Store.Replace(ctx, key, version, bytes.NewReader(b))
+			return err
+		}
+		// Versions are never reused, so if the replacement lands, old is
+		// what it replaced.
+		old, info, rerr := readObject(ctx, g.Store, key, format.MaxManifestSize+1)
 		v, err = g.Store.Replace(ctx, key, version, bytes.NewReader(b))
+		if err == nil && rerr == nil && info.Version == version {
+			g.mu.Lock()
+			g.replaced = append(g.replaced, [2][]byte{old, b})
+			g.mu.Unlock()
+		}
 		return err
 	})
 	return v, err
@@ -436,7 +452,7 @@ func (l *leader) create(ctx context.Context, txn uint64, b []byte) outcome {
 // has no definite success.
 func (l *leader) compact(ctx context.Context) bool {
 	key := l.h.keys.Manifest()
-	b, info, err := readObject(ctx, l.st, key)
+	b, info, err := readObject(ctx, l.st, key, format.MaxManifestSize+1)
 	if err != nil {
 		return true
 	}
@@ -467,7 +483,7 @@ func (l *leader) compact(ctx context.Context) bool {
 	}
 	for k := from + 1; k <= m.Txn; k++ {
 		ck := l.h.keys.Commit(l.o.DB, k)
-		b, info, err := readObject(ctx, l.st, ck)
+		b, info, err := readObject(ctx, l.st, ck, format.MaxCommitSize+1)
 		if err != nil {
 			continue
 		}
@@ -492,7 +508,7 @@ func (h *history) sync() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	ctx := context.Background()
-	b, info, err := readObject(ctx, h.st, h.keys.Manifest())
+	b, info, err := readObject(ctx, h.st, h.keys.Manifest(), format.MaxManifestSize+1)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -538,8 +554,10 @@ func (h *history) sync() {
 // that the manifest is also checked against its own past.
 type invariants struct {
 	st   storage.Store
+	g    *gated // if set, every replacement of the manifest through it is checked
 	keys format.Keys
 	db   format.DatabaseID
+	seen int // replacements of g already checked
 
 	epoch, txn, retired uint64
 	nonces              map[uint64][16]byte
@@ -569,6 +587,17 @@ func (v *invariants) check(offices []Office, leaders []*leader, final bool) erro
 		return fmt.Errorf("epoch %d has two writer nonces", m.Epoch)
 	}
 	v.epoch, v.txn, v.retired, v.nonces[m.Epoch] = m.Epoch, m.Txn, m.RetiredThrough, m.Nonce
+	if v.g != nil {
+		v.g.mu.Lock()
+		rs := v.g.replaced[v.seen:]
+		v.seen = len(v.g.replaced)
+		v.g.mu.Unlock()
+		for _, r := range rs {
+			if err := v.checkReplace(r[0], r[1]); err != nil {
+				return err
+			}
+		}
+	}
 
 	var keys []string
 	for after := ""; ; {
@@ -609,6 +638,9 @@ func (v *invariants) check(offices []Office, leaders []*leader, final bool) erro
 		if err != nil {
 			return fmt.Errorf("commit %d: %w", txn, err)
 		}
+		if txn > 1 && h.Epoch < prev.Epoch {
+			return fmt.Errorf("commit %d at epoch %d follows an object at epoch %d", txn, h.Epoch, prev.Epoch)
+		}
 		switch {
 		case h.EpochBump:
 			if t, ok := bumps[h.Epoch]; ok {
@@ -643,16 +675,49 @@ func (v *invariants) check(offices []Office, leaders []*leader, final bool) erro
 	}
 	for _, l := range leaders {
 		for id, out := range l.told {
-			_, in := ids[id]
+			txn, in := ids[id]
 			switch {
 			case out == committed && !in:
 				return fmt.Errorf("leader at epoch %d acknowledged a commit that is not in the log", l.o.Epoch)
 			case out == notCommitted && in && final:
-				return fmt.Errorf("leader at epoch %d told not committed for commit %d", l.o.Epoch, ids[id])
+				return fmt.Errorf("leader at epoch %d told not committed for commit %d", l.o.Epoch, txn)
+			}
+			for epoch, bump := range bumps {
+				if out == committed && epoch > l.o.Epoch && txn > bump {
+					return fmt.Errorf("leader at epoch %d acknowledged commit %d above the bump at %d of epoch %d", l.o.Epoch, txn, bump, epoch)
+				}
 			}
 		}
 		if l.head > uint64(len(keys)) {
 			return fmt.Errorf("leader at epoch %d has head %d beyond the log", l.o.Epoch, l.head)
+		}
+	}
+	return nil
+}
+
+// checkReplace checks one replacement of the manifest against invariant 1:
+// it keeps the epoch and the nonce, or it is an epoch swap, to the epoch
+// plus one with a new nonce and every other field carried forward.
+func (v *invariants) checkReplace(old, next []byte) error {
+	a, err := format.DecodeManifest(old, v.db)
+	if err != nil {
+		return fmt.Errorf("replaced manifest: %w", err)
+	}
+	b, err := format.DecodeManifest(next, v.db)
+	if err != nil {
+		return fmt.Errorf("replacing manifest: %w", err)
+	}
+	switch {
+	case b.Epoch == a.Epoch:
+		if b.Nonce != a.Nonce {
+			return fmt.Errorf("a replacement at epoch %d changed the nonce", a.Epoch)
+		}
+	case b.Epoch != a.Epoch+1 || b.Nonce == a.Nonce:
+		return fmt.Errorf("manifest swapped from epoch %d to %d, nonce kept: %v", a.Epoch, b.Epoch, b.Nonce == a.Nonce)
+	default:
+		a.Epoch, a.Nonce = b.Epoch, b.Nonce
+		if !reflect.DeepEqual(a, b) {
+			return fmt.Errorf("the swap to epoch %d changed more than the epoch and the nonce", b.Epoch)
 		}
 	}
 	return nil
@@ -721,13 +786,20 @@ type env struct {
 func newEnv(t *testing.T, seed uint64) *env {
 	t.Helper()
 	st, keys := newMemStore(t)
-	g := &gated{Store: st}
+	return newEnvOn(t, st, keys, seed)
+}
+
+// newEnvOn is newEnv on store st.
+func newEnvOn(t *testing.T, st storage.Store, keys format.Keys, seed uint64) *env {
+	t.Helper()
+	g := &gated{Store: st, manifest: keys.Manifest()}
 	h := newHistory(t, st, keys, seed, 512, 4)
 	for range 3 {
 		h.randomCommit(8)
 	}
 	h.compact(3)
-	e := &env{t: t, g: g, keys: keys, h: h, inv: newInvariants(st, keys, h.db), clk: newClock(time.Hour)}
+	e := &env{t: t, g: g, keys: keys, h: h, inv: newInvariants(st, keys, h.db), clk: newClock(0)}
+	e.inv.g = g
 	o, _, err := Takeover(context.Background(), g, keys, e.cand("l"))
 	if err != nil {
 		t.Fatal(err)
@@ -742,9 +814,14 @@ func newEnv(t *testing.T, seed uint64) *env {
 	return e
 }
 
-// cand describes a candidate whose clock sees every earlier lease expired.
+// cand describes a candidate with a clock of its own, fixed two lease
+// lifetimes after the previous candidate's. It sees every earlier lease
+// expired, every earlier candidate sees its lease more than a lifetime ahead
+// and so expired too, and it never renews its lease during a walk.
 func (e *env) cand(holder string) Candidate {
-	return Candidate{Holder: holder, TTL: time.Minute, Now: e.clk.now}
+	e.clk.advance(2 * time.Minute)
+	now := e.clk.now()
+	return Candidate{Holder: holder, TTL: time.Minute, Now: func() time.Time { return now }}
 }
 
 func (e *env) check(offices []Office, leaders []*leader, final bool) {
