@@ -40,6 +40,8 @@ Two client libraries are planned:
 - A Go `database/sql` driver. The target is that it works with GORM.
 - A JDBC driver and a Hibernate dialect. The target is that they work with Spring Data JPA.
 
+Both drivers are planned to speak one protocol, specified in [0005: Client protocol](/docs/decisions/0005-client-protocol/): ordinary HTTP requests with JSON bodies under `/v1`, results as newline-delimited JSON with a required final frame, sessions only for explicit transactions, and a commit identifier on every write so that a driver can find out whether a commit whose response was lost happened.
+
 ## Storage backends
 
 All storage access goes through one storage interface. Azure Blob Storage comes first, then AWS S3, Google Cloud Storage and the local filesystem. The backends are meant to share one test suite that runs against storage emulators.
@@ -72,4 +74,4 @@ Should the JDBC driver use the same HTTP API as everything else, or a protocol s
 
 ### Client authentication
 
-How do clients authenticate to the query endpoint?
+Partly settled by [0005: Client protocol](/docs/decisions/0005-client-protocol/): every request is planned to carry an OIDC JWT bearer token, verified by every pod that handles the request, including after a pod forwards it. How token claims map to permissions, and the SQL lockdown rules, are still open.
