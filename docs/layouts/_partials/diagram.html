@@ -2,8 +2,8 @@
 <figure class="sheet" aria-labelledby="sheet-caption">
   <div class="sheet-draw">
     <svg class="dg dg-wide" viewBox="0 0 1136 500" role="img" aria-labelledby="dgw-t dgw-d">
-      <title id="dgw-t">Target architecture of skylite (design direction, not implemented)</title>
-      <desc id="dgw-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes and keeps a working copy on ephemeral disk; followers forward writes to the leader and fetch pages on demand. Object storage holds the lease object, change files and snapshots. A write is acknowledged only after the upload is confirmed. The lease plus conditional writes fence a stale leader.</desc>
+      <title id="dgw-t">Target architecture of skylite (planned design, not implemented)</title>
+      <desc id="dgw-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes, uploads each commit and reads pages on demand; followers forward writes to the leader and fetch pages on demand. Object storage holds the lease object, the commit log, the base page groups and the manifest. A write is acknowledged only after the upload is confirmed. The lease plus conditional writes fence a stale leader.</desc>
       <defs>
         <marker id="dgw-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="dg-head" d="M0 1 9 5 0 9z"/></marker>
       </defs>
@@ -31,7 +31,7 @@
       <rect class="dg-box dg-leader" x="336" y="104" width="280" height="110" rx="6"/>
       <text class="dg-t" x="354" y="138">Leader</text>
       <text x="354" y="166">Takes all writes</text>
-      <text class="dg-m" x="354" y="192">Working copy on ephemeral disk</text>
+      <text class="dg-m" x="354" y="192">Pages on demand, local cache</text>
       <g class="dg-disk" transform="translate(584 124)"><ellipse cx="0" cy="0" rx="12" ry="4"/><path d="M-12 0v18M12 0v18"/><path class="dg-dash" d="M-12 18a12 4 0 0 0 24 0"/></g>
 
       <rect class="dg-box dg-back" x="352" y="316" width="280" height="130" rx="6"/>
@@ -53,9 +53,11 @@
       <rect class="dg-chip" x="876" y="116" width="220" height="40" rx="4"/>
       <text x="892" y="141">Lease object</text>
       <rect class="dg-chip" x="876" y="186" width="220" height="40" rx="4"/>
-      <text x="892" y="211">Change files</text>
+      <text x="892" y="211">Commit log</text>
       <rect class="dg-chip" x="876" y="240" width="220" height="40" rx="4"/>
-      <text x="892" y="265">Snapshots</text>
+      <text x="892" y="265">Base page groups</text>
+      <rect class="dg-chip" x="876" y="294" width="220" height="40" rx="4"/>
+      <text x="892" y="319">Manifest</text>
       <text class="dg-m" x="876" y="424">All durable state lives here.</text>
       <!-- leader to storage -->
       <path class="dg-arrow" d="M618 136H872" marker-end="url(#dgw-head)"/>
@@ -76,8 +78,8 @@
     </svg>
 
     <svg class="dg dg-narrow" viewBox="0 0 340 830" role="img" aria-labelledby="dgn-t dgn-d">
-      <title id="dgn-t">Target architecture of skylite (design direction, not implemented)</title>
-      <desc id="dgn-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes and keeps a working copy on ephemeral disk; followers forward writes to the leader and fetch pages on demand. Object storage holds change files, snapshots and the lease object. A write is acknowledged only after the upload is confirmed. The lease plus conditional writes fence a stale leader.</desc>
+      <title id="dgn-t">Target architecture of skylite (planned design, not implemented)</title>
+      <desc id="dgn-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes, uploads each commit and reads pages on demand; followers forward writes to the leader and fetch pages on demand. Object storage holds the commit log, the base page groups, the manifest and the lease object. A write is acknowledged only after the upload is confirmed. The lease plus conditional writes fence a stale leader.</desc>
       <defs>
         <marker id="dgn-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="dg-head" d="M0 1 9 5 0 9z"/></marker>
       </defs>
@@ -102,7 +104,7 @@
       <rect class="dg-box dg-leader" x="26" y="220" width="288" height="92" rx="6"/>
       <text class="dg-t" x="40" y="248">Leader</text>
       <text x="40" y="272">Takes all writes</text>
-      <text class="dg-m" x="40" y="295">Working copy on ephemeral disk</text>
+      <text class="dg-m" x="40" y="295">Pages on demand, local cache</text>
       <g class="dg-disk" transform="translate(288 236)"><ellipse cx="0" cy="0" rx="12" ry="4"/><path d="M-12 0v18M12 0v18"/><path class="dg-dash" d="M-12 18a12 4 0 0 0 24 0"/></g>
 
       <path class="dg-arrow" d="M70 376V316" marker-end="url(#dgn-head)"/>
@@ -131,10 +133,11 @@
       <text class="dg-h" x="26" y="668">Object storage</text>
       <text class="dg-m" x="26" y="690">Azure Blob, S3, GCS or local filesystem</text>
       <rect class="dg-chip" x="26" y="706" width="92" height="56" rx="4"/>
-      <text class="dg-c" x="72" y="730" text-anchor="middle">Change</text>
-      <text class="dg-c" x="72" y="749" text-anchor="middle">files</text>
+      <text class="dg-c" x="72" y="730" text-anchor="middle">Commit</text>
+      <text class="dg-c" x="72" y="749" text-anchor="middle">log</text>
       <rect class="dg-chip" x="124" y="706" width="92" height="56" rx="4"/>
-      <text class="dg-c" x="170" y="739" text-anchor="middle">Snapshots</text>
+      <text class="dg-c" x="170" y="730" text-anchor="middle">Base and</text>
+      <text class="dg-c" x="170" y="749" text-anchor="middle">manifest</text>
       <rect class="dg-chip" x="222" y="706" width="92" height="56" rx="4"/>
       <text class="dg-c" x="268" y="730" text-anchor="middle">Lease</text>
       <text class="dg-c" x="268" y="749" text-anchor="middle">object</text>
@@ -145,7 +148,7 @@
   <figcaption id="sheet-caption" class="titleblock">
     <span class="tb-cell tb-name"><span class="tb-k">Drawing</span> Target architecture</span>
     <span class="tb-cell tb-status"><span class="tb-k">Status</span> Not implemented</span>
-    <span class="tb-cell"><span class="tb-k">Revision</span> Design direction, subject to change after the durability spike</span>
+    <span class="tb-cell"><span class="tb-k">Revision</span> Planned design, see decision record 0004</span>
   </figcaption>
 
   <details class="sheet-alt">
