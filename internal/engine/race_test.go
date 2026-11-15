@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 )
 
 // raceCheck checks the end of a race between candidates: no failed
@@ -95,14 +96,38 @@ func TestThreeCandidatesEveryPairOfBoundaries(t *testing.T) {
 // invariants are checked after every step. A failure names its seed.
 func TestRandomSchedules(t *testing.T) {
 	for seed := uint64(1); seed <= 90; seed++ {
-		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) { randomSchedule(t, seed) })
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) { randomSchedule(t, seed, false) })
 	}
 }
 
-func randomSchedule(t *testing.T, seed uint64) {
+// TestRandomSchedulesTickingClocks is TestRandomSchedules with a clock of
+// its own for each candidate, skewed by up to five hours and advancing on
+// every reading, so that leases lapse and walks renew them mid-candidacy,
+// and with candidates that try again after failing.
+func TestRandomSchedulesTickingClocks(t *testing.T) {
+	for seed := uint64(1001); seed <= 1060; seed++ {
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) { randomSchedule(t, seed, true) })
+	}
+}
+
+func randomSchedule(t *testing.T, seed uint64, ticking bool) {
 	rng := seeded(seed)
 	faults := []int{8, 25, 50}[seed%3] // percent of mutations not simply passed
 	e := newEnv(t, seed)
+	cand, tries := e.cand, 1
+	if ticking {
+		offsets := []time.Duration{-5 * time.Hour, -2 * time.Minute, -time.Minute, 0, 30 * time.Second, 2 * time.Minute, 5 * time.Hour}
+		steps := []time.Duration{0, 3 * time.Second, 7 * time.Second, 25 * time.Second}
+		clocks := map[string]*clock{}
+		for _, name := range []string{"a", "b", "c"} {
+			clocks[name] = newClock(steps[rng.IntN(len(steps))])
+			clocks[name].advance(time.Hour + offsets[rng.IntN(len(offsets))])
+		}
+		cand = func(holder string) Candidate {
+			return Candidate{Holder: holder, TTL: time.Minute, Now: clocks[holder].now}
+		}
+		tries = 1 + int(seed%3) //nolint:gosec // below 3
+	}
 	var mu sync.Mutex
 	offs := []Office{e.l.o}
 	leaders := []*leader{e.l}
@@ -123,8 +148,25 @@ func randomSchedule(t *testing.T, seed uint64) {
 	actors := []scheduled{{e.g.spawn(t, func(ctx context.Context) { lead(ctx, e.l) }), 0}}
 	for _, name := range []string{"a", "b", "c"} {
 		a := e.g.spawn(t, func(ctx context.Context) {
-			o, _, err := Takeover(ctx, e.g, e.keys, e.cand(name))
-			if err != nil {
+			var o Office
+			for range tries {
+				var lease *Lease
+				var err error
+				if o, lease, err = Takeover(ctx, e.g, e.keys, cand(name)); err == nil {
+					break
+				}
+				var held *LeaseHeldError
+				switch {
+				case o != Office{} || lease != nil:
+					t.Errorf("seed %d: %s failed with office %+v: %v", seed, name, o, err)
+				case errors.Is(err, ErrCorrupt):
+					t.Errorf("seed %d: %s: %v", seed, name, err)
+				case errors.Is(err, ErrLeaseHeld) && !errors.As(err, &held):
+					t.Errorf("seed %d: %s: untyped %v", seed, name, err)
+				}
+				o = Office{}
+			}
+			if o == (Office{}) {
 				return
 			}
 			l := newLeader(e.h, e.g, o)

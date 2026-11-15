@@ -39,7 +39,7 @@ type Candidate struct {
 
 // Takeover runs one candidacy for the database under keys' prefix, as
 // decision 9 of the storage engine record describes, and returns the
-// resulting Office and the lease the node holds:
+// resulting Office and the node's lease:
 //
 //  1. It reads the manifest and takes the lease for the manifest's epoch
 //     plus one.
@@ -49,8 +49,9 @@ type Candidate struct {
 //  3. It walks the commit log from the manifest's transaction number to the
 //     head. A retired commit or a log object whose version changes under it
 //     sends it back to the manifest. Once a third of the lease's time to live
-//     has passed since its last lease write it renews the lease, and gives up
-//     if the renewal finds the lease taken.
+//     has passed since its last lease write, or its last attempt at one, it
+//     tries to renew the lease; the outcome ends nothing, because only the
+//     manifest decides whether the candidacy goes on.
 //  4. Before every attempt at its epoch-bump commit it re-reads the manifest
 //     and gives up unless the manifest still carries its epoch and nonce. It
 //     creates the bump at the head plus one, recognising its own bump by its
@@ -60,7 +61,12 @@ type Candidate struct {
 //     candidacy has at most one bump in the log, and a walk that does not
 //     reach that name is corruption.
 //  5. It reads the manifest again and takes office only if the manifest
-//     still carries its epoch and nonce.
+//     still carries its epoch and nonce. If a renewal in step 3 found the
+//     lease taken, it takes it back by step 1's rules, best effort.
+//
+// Another candidacy can take the lease while this one runs, so the returned
+// Lease may be one that another holder holds: its Renew then reports
+// ErrLeaseHeld.
 //
 // Every conditional write is repeated identically after an unknown outcome
 // until it has a definite answer, up to a bound. Without a definite success
@@ -185,19 +191,24 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 		return Office{}, nil, err
 	}
 	o.Head = head + 1
+	if lease.taken {
+		// Taken during the walk, typically by a candidacy that lost and
+		// released it: take it back by acquireLease's rules, best effort.
+		if l, err := acquireLease(ctx, st, keys, c, o.Epoch); err == nil {
+			lease = l
+		}
+	}
 	return o, lease, nil
 }
 
 // walk reads the log upward from the commit after head, which has database
 // size size, until a name is absent, and returns the last commit's number
 // and size. Every object is checked as a reader checks it; one that carries
-// epoch, which only this candidacy's bump may, breaks invariant 1. It keeps
-// lease renewed between reads.
+// epoch, which only this candidacy's bump may, breaks invariant 1. Between
+// reads it tries to keep lease renewed.
 func walk(ctx context.Context, r *Reader, lease *Lease, m format.Manifest, epoch, head uint64, size uint32) (uint64, uint32, error) {
 	for head < math.MaxUint64 {
-		if err := lease.keep(ctx); err != nil {
-			return 0, 0, err
-		}
+		lease.keep(ctx)
 		c, err := r.fetchCommit(ctx, m, head+1, size)
 		switch {
 		case errors.Is(err, storage.ErrNotFound):

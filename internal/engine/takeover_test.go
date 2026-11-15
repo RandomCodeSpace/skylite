@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"slices"
@@ -231,6 +232,21 @@ func TestRecogniseProperty(t *testing.T) {
 		}
 		if got, err := o.Recognise(built, x); got != want || (got == FoundUnknown) != (err != nil) {
 			t.Fatalf("corruption %d of %d bytes: %v, %v; want %v", i, len(x), got, err, want)
+		}
+	}
+}
+
+// TestRecogniseShortFound: a found object of every length up to one byte
+// past a header, with no capacity beyond its length, is FoundUnknown with
+// an error, never a panic.
+func TestRecogniseShortFound(t *testing.T) {
+	e := newEnv(t, 322)
+	built, _ := e.l.build()
+	for n := range format.CommitHeaderSize + 2 {
+		found := make([]byte, n)
+		copy(found, built)
+		if got, err := e.l.o.Recognise(built, found); got != FoundUnknown || err == nil {
+			t.Fatalf("%d bytes found: %v, %v", n, got, err)
 		}
 	}
 }
@@ -856,8 +872,7 @@ func TestLeaseOwnUnresolvedWrite(t *testing.T) {
 }
 
 // TestLeaseRenewedDuringWalk: a candidate renews its lease once a third of
-// its time to live has passed since its last lease write, and gives up when
-// the renewal finds the lease taken.
+// its time to live has passed since its last lease write.
 func TestLeaseRenewedDuringWalk(t *testing.T) {
 	setup := func(t *testing.T) (*env, Candidate) {
 		e := newEnv(t, 105)
@@ -893,28 +908,201 @@ func TestLeaseRenewedDuringWalk(t *testing.T) {
 			t.Fatalf("%d lease writes, up to %d commits read between them", writes, maxGap)
 		}
 	})
-	t.Run("taken", func(t *testing.T) {
-		e, c := setup(t)
-		k := e.g.candidate(t, e.keys, c)
-		if k.until("getrange", e.keys.Commit(e.h.db, 20)) == nil {
-			t.Fatal("no walk")
+}
+
+// TestLeaseTakenByLoserKeepsWinner: x, whose clock is two hours ahead, takes
+// w's lease before w's swap lands, loses its own swap and releases the
+// lease. w's walk then finds the lease taken when it renews, and takes
+// office anyway, because it still holds the manifest.
+func TestLeaseTakenByLoserKeepsWinner(t *testing.T) {
+	e := newEnv(t, 303)
+	for range 30 {
+		if out := e.l.commit(bg); out != committed {
+			t.Fatal(out)
 		}
-		later := newClock(0)
-		later.advance(2000 * time.Hour)
-		if _, err := acquireLease(bg, e.g, e.keys, Candidate{Holder: "d", TTL: time.Minute, Now: later.now}, 99); err != nil {
-			t.Fatal(err)
+	}
+	e.h.sync()
+	wc := newClock(5 * time.Second) // each reading is 5s after the last
+	wc.advance(1000 * time.Hour)
+	xc := newClock(0)
+	xc.advance(1002 * time.Hour)
+	w := e.g.candidate(t, e.keys, Candidate{Holder: "w", TTL: time.Minute, Now: wc.now})
+	if w.until("replace", e.keys.Manifest()) == nil {
+		t.Fatal("w never swaps")
+	}
+	x := e.g.candidate(t, e.keys, Candidate{Holder: "x", TTL: time.Minute, Now: xc.now})
+	if x.until("replace", e.keys.Manifest()) == nil {
+		t.Fatal("x never swaps")
+	}
+	w.step(pass) // w's swap lands
+	x.finish()
+	if ls, err := format.DecodeLease(must(get(bg, e.g, e.keys.Lease(), 1<<40))); !errors.Is(x.err, ErrLost) || err != nil || ls.Holder != "x" || ls.Renewed != 0 {
+		t.Fatalf("x: %v; lease %+v, %v; want x's lease released", x.err, ls, err)
+	}
+	e.g.takeTrace()
+	w.finish()
+	if w.err != nil {
+		t.Fatalf("w, which holds the manifest at its epoch, gave up: %v", w.err)
+	}
+	if !slices.Contains(e.g.takeTrace(), "replace "+e.keys.Lease()) {
+		t.Fatal("w's walk never tried to renew the lease")
+	}
+	if err := w.l.Renew(bg); err != nil {
+		t.Fatalf("w cannot renew the lease of its office: %v", err)
+	}
+	e.check(append(offices(t, w, x), e.l.o), []*leader{e.l}, true)
+}
+
+// TestFailedRenewalTriedOncePerThird: a renewal that fails is tried again
+// only once a third of the lease's time to live has passed since the last
+// try, not at every step of the walk, and its failure does not end the
+// takeover.
+func TestFailedRenewalTriedOncePerThird(t *testing.T) {
+	e := newEnv(t, 304)
+	for range 30 {
+		if out := e.l.commit(bg); out != committed {
+			t.Fatal(out)
 		}
-		e.g.takeTrace()
-		k.finish()
-		if !errors.Is(k.err, ErrLeaseHeld) {
-			t.Fatalf("candidate whose lease was taken: %v", k.err)
+	}
+	e.h.sync()
+	clk := newClock(5 * time.Second)
+	clk.advance(1000 * time.Hour)
+	c := Candidate{Holder: "w", TTL: time.Minute, Now: clk.now}
+	k := e.g.candidate(t, e.keys, c)
+	if k.until("getrange", e.keys.Commit(e.h.db, 8)) == nil {
+		t.Fatal("no walk")
+	}
+	var tries []time.Time // the clock at the first write of each try
+	writes, inTry := 0, false
+	for call := k.next(); call != nil; call = k.next() {
+		if call.op != "replace" || call.key != e.keys.Lease() {
+			inTry = false
+			k.step(pass)
+			continue
 		}
-		for _, call := range e.g.takeTrace() {
-			if strings.HasPrefix(call, "create "+e.keys.CommitPrefix(e.h.db)) {
-				t.Fatalf("bumped after losing the lease: %s", call)
-			}
+		if !inTry {
+			clk.mu.Lock()
+			tries = append(tries, clk.t)
+			clk.mu.Unlock()
 		}
-	})
+		writes, inTry = writes+1, true
+		k.step(fail) // every lease write from here on fails with no effect
+	}
+	if k.err != nil {
+		t.Fatalf("takeover with every renewal failing: %v", k.err)
+	}
+	if len(tries) < 3 || writes > createAttempts*len(tries) {
+		t.Fatalf("%d lease writes in %d renewal tries", writes, len(tries))
+	}
+	for i := 1; i < len(tries); i++ {
+		if d := tries[i].Sub(tries[i-1]); d < c.TTL/3 {
+			t.Fatalf("renewal try %d came %v after the one before", i, d)
+		}
+	}
+	e.check(append(offices(t, k), e.l.o), []*leader{e.l}, true)
+}
+
+// TestLeaseReadBound: a candidate reads at most MaxLeaseSize+1 bytes of an
+// oversized lease object, and replaces it like one that does not decode.
+func TestLeaseReadBound(t *testing.T) {
+	st, keys := newMemStore(t)
+	gc := &getCounter{Store: st, key: keys.Lease()}
+	e := newEnvOn(t, gc, keys, 301)
+	info, err := e.g.Head(bg, keys.Lease())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.h.replace(keys.Lease(), info.Version, bytes.Repeat([]byte{'x'}, 4<<20))
+	gc.n = 0
+	if _, _, err := Takeover(bg, e.g, keys, e.cand("b")); err != nil {
+		t.Fatal(err)
+	}
+	if gc.n > int64(format.MaxLeaseSize+1) {
+		t.Fatalf("read %d bytes of the lease", gc.n)
+	}
+}
+
+// TestLeaseReadBackBound: a candidate whose lease replace fails because an
+// oversized object replaced the lease first reads at most MaxLeaseSize+1
+// bytes of it back, and gives up.
+func TestLeaseReadBackBound(t *testing.T) {
+	st, keys := newMemStore(t)
+	gc := &getCounter{Store: st, key: keys.Lease()}
+	e := newEnvOn(t, gc, keys, 302)
+	k := e.g.candidate(t, keys, e.cand("b"))
+	if k.until("replace", keys.Lease()) == nil {
+		t.Fatal("no lease replace")
+	}
+	info, err := e.g.Head(bg, keys.Lease())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.h.replace(keys.Lease(), info.Version, bytes.Repeat([]byte{'x'}, 4<<20))
+	gc.mu.Lock()
+	gc.n = 0
+	gc.mu.Unlock()
+	k.finish()
+	if !errors.Is(k.err, ErrLeaseHeld) || gc.n > int64(format.MaxLeaseSize+1) {
+		t.Fatalf("read %d bytes of the lease back: %v", gc.n, k.err)
+	}
+}
+
+// TestLeaseHeldErrorIs: a LeaseHeldError matches ErrLeaseHeld through a
+// wrap and no other error, and errors.As recovers it.
+func TestLeaseHeldErrorIs(t *testing.T) {
+	err := fmt.Errorf("wrap: %w", &LeaseHeldError{Holder: "x"})
+	if !errors.Is(err, ErrLeaseHeld) {
+		t.Fatal("does not match ErrLeaseHeld")
+	}
+	for _, target := range []error{ErrLost, ErrCorrupt, ErrExhausted, storage.ErrOutcomeUnknown, storage.ErrNotFound, storage.ErrPreconditionFailed, context.Canceled, errors.New(ErrLeaseHeld.Error())} {
+		if errors.Is(err, target) {
+			t.Errorf("matches %v", target)
+		}
+	}
+	var held *LeaseHeldError
+	if !errors.As(err, &held) || held.Holder != "x" {
+		t.Fatalf("errors.As: %+v", held)
+	}
+}
+
+// TestLeaseHeldErrorMessages: a released lease may be taken now, not at the
+// time to live after time 0, and a lease taken by another candidacy of the
+// same holder is not reported as another holder's.
+func TestLeaseHeldErrorMessages(t *testing.T) {
+	st, keys := newMemStore(t)
+	wc, xc := newClock(time.Second), newClock(0)
+	xc.advance(2 * time.Hour)
+	w, err := acquireLease(bg, st, keys, Candidate{Holder: "w", TTL: time.Minute, Now: wc.now}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := acquireLease(bg, st, keys, Candidate{Holder: "x", TTL: time.Minute, Now: xc.now}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := x.Release(bg); err != nil {
+		t.Fatal(err)
+	}
+	var held *LeaseHeldError
+	err = w.Renew(bg)
+	wc.mu.Lock()
+	now := wc.t
+	wc.mu.Unlock()
+	if !errors.As(err, &held) || held.Holder != "x" || !held.Expires.Equal(now) {
+		t.Fatalf("renewing over a released lease: %v; want it free at %s", err, now)
+	}
+	a := Candidate{Holder: "a", TTL: time.Minute, Now: xc.now}
+	a5, err := acquireLease(bg, st, keys, a, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireLease(bg, st, keys, a, 6); err != nil {
+		t.Fatal(err)
+	}
+	err = a5.Renew(bg)
+	if !errors.Is(err, ErrLeaseHeld) || strings.Contains(err.Error(), "another holder") || !strings.Contains(err.Error(), `"a"`) {
+		t.Fatalf("renewing a lease the same holder's next candidacy took: %v", err)
+	}
 }
 
 // TestTakeoverReleasesLease: a candidate whose swap definitely did not land

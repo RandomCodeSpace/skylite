@@ -25,10 +25,16 @@ type LeaseHeldError struct {
 	// Expires is when the lease expires by this node's clock unless it is
 	// renewed: a candidate may try again then.
 	Expires time.Time
+
+	self bool // Holder is the holder that got this error
 }
 
 func (e *LeaseHeldError) Error() string {
-	return fmt.Sprintf("%v: %q until %s", ErrLeaseHeld, e.Holder, e.Expires.UTC().Format(time.RFC3339Nano))
+	until := e.Expires.UTC().Format(time.RFC3339Nano)
+	if e.self {
+		return fmt.Sprintf("engine: the lease is held by another candidacy of this holder, %q, until %s", e.Holder, until)
+	}
+	return fmt.Sprintf("%v: %q until %s", ErrLeaseHeld, e.Holder, until)
 }
 
 // Is makes a LeaseHeldError match ErrLeaseHeld.
@@ -65,6 +71,8 @@ type Lease struct {
 
 	l       format.Lease // the lease as this holder last wrote it
 	version string       // its version token
+	tried   int64        // when keep last tried to renew, in milliseconds
+	taken   bool         // keep found the lease taken by another
 }
 
 // acquireLease takes the lease for c.Holder at epoch: it creates it if
@@ -90,7 +98,7 @@ func acquireLease(ctx context.Context, st storage.Store, keys format.Keys, c Can
 		case err != nil:
 			// Not a lease of any version; it is replaced like an expired one.
 		case cur.Holder != c.Holder && !l.expired(cur):
-			return nil, l.heldError(cur)
+			return nil, l.heldError(cur, c.Holder)
 		}
 		l.version = info.Version
 	}
@@ -101,9 +109,9 @@ func acquireLease(ctx context.Context, st storage.Store, keys format.Keys, c Can
 }
 
 // Renew refreshes the lease's renewal time. ErrLeaseHeld means another
-// holder has taken it; the holder should then leave office, because a
-// takeover is under way, although only the log and the manifest can depose
-// it.
+// holder has taken it: a candidacy that is under way, or one that has
+// since lost. Renew never takes the lease back. The error does not depose
+// the holder; only the log and the manifest can.
 func (l *Lease) Renew(ctx context.Context) error {
 	next := l.l
 	next.Renewed = l.stamp(l.l.Renewed)
@@ -119,18 +127,19 @@ func (l *Lease) Release(ctx context.Context) error {
 	return l.put(ctx, next, false)
 }
 
-// keep renews the lease once a third of its time to live has passed since
-// this holder last wrote it, and returns only an ErrLeaseHeld from it: any
-// other failure leaves the lease to the next renewal, because the lease
-// decides only who attempts a takeover.
-func (l *Lease) keep(ctx context.Context) error {
-	if l.now().UnixMilli()-l.l.Renewed < l.ttl.Milliseconds()/3 {
-		return nil
+// keep renews the lease, best effort, once a third of its time to live has
+// passed since this holder last wrote it or last tried to. Its failure,
+// a taken lease included, ends nothing: the lease decides only who attempts
+// a takeover, and the manifest decides whether a candidacy goes on.
+func (l *Lease) keep(ctx context.Context) {
+	now := l.now().UnixMilli()
+	if now-max(l.l.Renewed, l.tried) < l.ttl.Milliseconds()/3 {
+		return
 	}
-	if err := l.Renew(ctx); errors.Is(err, ErrLeaseHeld) {
-		return err
+	l.tried = now
+	if errors.Is(l.Renew(ctx), ErrLeaseHeld) {
+		l.taken = true
 	}
-	return nil
 }
 
 // expired reports whether lease cur has expired by this node's clock.
@@ -139,8 +148,13 @@ func (l *Lease) expired(cur format.Lease) bool {
 	return age >= l.ttl.Milliseconds() || age < -l.ttl.Milliseconds()
 }
 
-func (l *Lease) heldError(cur format.Lease) error {
-	return &LeaseHeldError{Holder: cur.Holder, Expires: time.UnixMilli(cur.Renewed).Add(l.ttl)}
+// heldError is the error of finding lease cur, which holder did not write.
+func (l *Lease) heldError(cur format.Lease, holder string) error {
+	expires := time.UnixMilli(cur.Renewed).Add(l.ttl)
+	if cur.Renewed == 0 {
+		expires = l.now() // released: free to take now
+	}
+	return &LeaseHeldError{Holder: cur.Holder, Expires: expires, self: cur.Holder == holder}
 }
 
 // stamp is the clock in milliseconds, kept above prev so that each of this
@@ -190,7 +204,7 @@ func (l *Lease) put(ctx context.Context, next format.Lease, create bool) error {
 			l.version, create = version, false
 			continue
 		}
-		return l.heldError(found)
+		return l.heldError(found, next.Holder)
 	}
 }
 
