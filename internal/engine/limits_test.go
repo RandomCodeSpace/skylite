@@ -357,3 +357,30 @@ func TestMaxTransactionNumberStops(t *testing.T) {
 		t.Fatal("the leader did not stop at the last transaction number")
 	}
 }
+
+// Covers: Commit outcomes, "A client is told exactly one of committed, not
+// committed or unknown, and never not committed for a commit that is in the
+// history", for a Run whose commit completed before maintenance interrupted
+// the rest of it.
+func TestMaintenanceAfterCommitInSameRun(t *testing.T) {
+	st, keys, _, l, c := setup(t)
+	txn, err := c.Run(newID(), func(db *sqlite3.Conn) error {
+		if err := db.Exec("INSERT INTO t VALUES (1)"); err != nil {
+			return err
+		}
+		startMaintenance(l)
+		// Runs until maintenance interrupts it.
+		_, err := query(db, "SELECT count(*) FROM generate_series(1, 1000000000000)")
+		return err
+	})
+	if txn == 0 || errors.Is(err, ErrNotCommitted) {
+		t.Fatalf("Run: %d, %v; want the commit reported, not \"not committed\"", txn, err)
+	}
+	if err == nil {
+		t.Fatal("the interrupted statement's error was lost")
+	}
+	waitMaintenance(t, l)
+	if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,1" {
+		t.Fatalf("durable rows %s", got)
+	}
+}

@@ -376,7 +376,10 @@ func (c *Conn) pragma(name string) (string, error) {
 // commit without one, or a second commit in one Run, is refused as not
 // committed. A transaction that changes no page commits nothing and needs
 // none. Run returns the transaction number of the commit f made, or 0, and
-// f's error together with the commit's outcome if it was not committed.
+// f's error together with the commit's outcome if it was not committed. A
+// nonzero transaction number is committed whatever the error says; the error
+// then reports what failed later in the Run, and never matches
+// ErrNotCommitted.
 func (c *Conn) Run(id []byte, f func(db *sqlite3.Conn) error) (txn uint64, err error) {
 	if len(id) > format.MaxCommitIDLen {
 		return 0, fmt.Errorf("engine: commit identifier of %d bytes", len(id))
@@ -479,7 +482,12 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 		ferr = fmt.Errorf("%w: %w: %w", ErrNotCommitted, ErrRetry, ferr)
 	}
 	if outcome != nil {
-		return done, errors.Join(outcome, ferr)
+		ferr = errors.Join(outcome, ferr)
+	}
+	if done != 0 && errors.Is(ferr, ErrNotCommitted) {
+		// The Run's commit stands: what failed after it must not read as its
+		// outcome.
+		ferr = fmt.Errorf("transaction %d committed, then: %s", done, ferr)
 	}
 	return done, ferr
 }
