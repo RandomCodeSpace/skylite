@@ -1165,6 +1165,29 @@ func staleWindowCase(t *testing.T, kind string) {
 		}
 	}
 	t.Logf("A's released %s returned %v and changed %d blobs: %v", kind, errA, len(changes), changes)
+	// The case only means something if storage accepted exactly the stale
+	// mutation it is about; a rejected or no-op request would also leave the
+	// restores below intact.
+	if errA != nil {
+		t.Errorf("A's released %s = %v, want nil", kind, errA)
+	}
+	ltxKey := func(level int, minTXID, maxTXID uint64) string {
+		return fmt.Sprintf("db/ltx/%d/%016x-%016x.ltx", level, minTXID, maxTXID)
+	}
+	var wantChanges []string
+	switch kind {
+	case "Snapshot":
+		wantChanges = []string{"added " + ltxKey(litestream.SnapshotLevel, 1, 0xa)}
+	case "Compaction":
+		wantChanges = []string{"added " + ltxKey(1, 7, 0xa)}
+	case "RetentionDelete":
+		for txid := uint64(1); txid <= 6; txid++ {
+			wantChanges = append(wantChanges, "removed "+ltxKey(0, txid, txid))
+		}
+	}
+	if !slices.Equal(changes, wantChanges) {
+		t.Errorf("A's released %s changed %v, want %v", kind, changes, wantChanges)
+	}
 
 	if err := a.Exec(ctx, insertRow(ctx, 301, "a", false)); !errors.Is(err, ErrFenced) {
 		t.Errorf("A write after the takeover = %v, want ErrFenced", err)
@@ -1181,7 +1204,17 @@ func staleWindowCase(t *testing.T, kind string) {
 	for _, v := range checkExactRestore(ctx, t, az, container, want, 2) {
 		t.Errorf("restore after B's second maintenance: %s", v)
 	}
-	t.Logf("blobs after B's second maintenance: %v", slices.Sorted(maps.Keys(listing(t, az, container))))
+	// B's retention has removed whatever A's stale operation left behind.
+	wantFinal := []string{
+		ltxKey(0, 0x13, 0x13),
+		ltxKey(1, 7, 0xf),
+		ltxKey(1, 0x10, 0x13),
+		ltxKey(litestream.SnapshotLevel, 1, 0x13),
+		"lease.json",
+	}
+	if got := slices.Sorted(maps.Keys(listing(t, az, container))); !slices.Equal(got, wantFinal) {
+		t.Errorf("blobs after B's second maintenance = %v, want %v", got, wantFinal)
+	}
 }
 
 // TestTakeoverRace lets B take office while A is live and writing.
