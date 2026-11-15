@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"reflect"
 	"testing"
 	"testing/iotest"
 
@@ -484,5 +485,36 @@ func TestManifestReplacementChecked(t *testing.T) {
 		if err := h.checkReader(ctx, r, false); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
+	}
+}
+
+// A base object that is gone while a newer manifest still references it is
+// corruption, not "compacted", even if that manifest is above the reader.
+func TestMissingReferencedBase(t *testing.T) {
+	ctx := context.Background()
+	st, keys, h := corruptFixture(t)
+	r, err := Open(ctx, st, keys, NewCache(0), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.st.Delete(ctx, h.baseKey(0)); err != nil {
+		t.Fatal(err)
+	}
+	h.compact(6)
+	if _, err := r.ReadPage(ctx, 1); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("page 1: %v", err)
+	}
+}
+
+// An anchor gives back the manifest it was built from, group references
+// included, because a manifest is written back from it.
+func TestAnchorManifest(t *testing.T) {
+	_, _, h := corruptFixture(t)
+	m, v := h.manifest()
+	if len(m.Groups) == 0 {
+		t.Fatal("the fixture's manifest has no groups")
+	}
+	if got := newAnchor(m, v).manifest(); !reflect.DeepEqual(got, m) {
+		t.Fatalf("manifest\n got %+v\nwant %+v", got, m)
 	}
 }

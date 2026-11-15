@@ -108,7 +108,7 @@ func explore(t *testing.T, seed uint64, ps, gs uint32, budget int64, acts map[in
 		t.Helper()
 		t.Fatalf("seed %d, page size %d, group size %d, budget %d, acts %d: %s", seed, ps, gs, budget, len(acts), fmt.Sprintf(format, args...))
 	}
-	for _, target := range []uint64{0, m.Txn, m.Txn + (head-m.Txn)/2 + 1, head} {
+	for _, target := range []uint64{0, m.Txn, min(head, m.Txn+(head-m.Txn)/2+1), head} {
 		if target == 0 && m.Txn == 0 {
 			continue
 		}

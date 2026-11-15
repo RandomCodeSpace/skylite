@@ -27,6 +27,9 @@ var createWait = backoff
 // backoff waits 10 milliseconds before the second attempt, doubling to 80
 // before the fifth, 150 in all, and returns early with the context's error.
 func backoff(ctx context.Context, attempt int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	t := time.NewTimer(10 * time.Millisecond << min(attempt, 3))
 	defer t.Stop()
 	select {

@@ -29,8 +29,8 @@
 // cache hit returns the bytes of the version the reader pinned.
 //
 // Looking for the head, a reader probes one name above the first absent one:
-// a present name there is a gap in the log. A reader walks at most maxTail
-// commits and indexes at most maxTailPages page entries above the manifest,
+// a present name there is a gap in the log. A reader walks at most 65,536
+// commits and indexes at most 4,194,304 page entries above the manifest,
 // and fails closed with ErrLimit beyond them. Readers whose manifests hold
 // equal group references share one copy of them.
 //
@@ -146,6 +146,17 @@ func newAnchor(m format.Manifest, version string) anchor {
 }
 
 func (a anchor) groupCount() uint32 { return uint32(len(a.groups.Value()) / 16) } //nolint:gosec // at most MaxPages groups
+
+// manifest returns the anchor's manifest with its group references, which
+// the compactor and the epoch swap of a takeover write back.
+func (a anchor) manifest() format.Manifest {
+	m := a.m
+	m.Groups = make([]format.GroupRef, a.groupCount())
+	for g := range m.Groups {
+		m.Groups[g] = a.group(uint32(g)) //nolint:gosec // at most MaxPages groups
+	}
+	return m
+}
 
 // group returns the reference of group g, which is below groupCount.
 func (a anchor) group(g uint32) format.GroupRef {
@@ -287,7 +298,8 @@ func (r *Reader) reset(a anchor, cs []*commit) {
 	}
 }
 
-// add indexes c, which must be the commit after r.txn.
+// add indexes c, which must be the commit after r.txn. It panics otherwise,
+// so a caller that cannot rule that out checks first.
 func (r *Reader) add(c *commit) {
 	if r.txn == math.MaxUint64 || c.h.Txn != r.txn+1 {
 		panic(fmt.Sprintf("engine: commit %d indexed after transaction %d", c.h.Txn, r.txn))
