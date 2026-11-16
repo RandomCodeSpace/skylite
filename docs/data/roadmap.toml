@@ -25,7 +25,7 @@ detail = "A storage layer under SQLite (ncruces/go-sqlite3) that uploads each co
 [[items]]
 title = "Leader lease and failover"
 status = "planned"
-detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader."
+detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader. So far the takeover, the lease and a loop that takes office, renews the lease, steps down when deposed or stopped, and drains and releases on shutdown exist as library packages; the server cannot use them yet."
 
 [[items]]
 title = "Read replicas"
