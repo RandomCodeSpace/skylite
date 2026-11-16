@@ -22,8 +22,9 @@ import (
 
 const usage = `skylite - a SQL database server where object storage is the source of truth.
 
-Status: pre-alpha. The server authenticates requests and creates databases;
-it serves no queries yet.
+Status: pre-alpha. The server authenticates requests, creates databases,
+leads the databases its configuration lists and answers read-only queries
+on them; it runs no writes yet.
 
 Usage:
   skylite <command>

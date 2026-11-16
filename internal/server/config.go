@@ -12,6 +12,7 @@ import (
 
 	"github.com/RandomCodeSpace/skylite/internal/auth"
 	"github.com/RandomCodeSpace/skylite/internal/format"
+	"github.com/RandomCodeSpace/skylite/internal/wire"
 )
 
 // Config is the server's configuration, read from a JSON file by Load. It
@@ -30,6 +31,15 @@ type Config struct {
 	Auth auth.Config `json:"auth"`
 	// Storage is the object store that holds the databases.
 	Storage Storage `json:"storage"`
+	// Databases names the databases this server stands for: for each, it
+	// takes office when it can and serves query and describe while it
+	// leads. A database need not exist yet; the server takes office once it
+	// does.
+	Databases []string `json:"databases"`
+	// ProbeListen, if set, is a TCP address for a plain HTTP listener that
+	// answers GET /readyz: 200 while this server leads one of Databases
+	// and serves it, 503 otherwise.
+	ProbeListen string `json:"probe_listen"`
 }
 
 // TLS names PEM files holding the server's certificate chain and its key.
@@ -102,6 +112,16 @@ func (c Config) Validate() error {
 	}
 	if err := c.Auth.Validate(); err != nil {
 		return err
+	}
+	if len(c.Databases) >= maxDatabases {
+		return fmt.Errorf("databases lists %d, want at most %d: each led database holds a connection of the memory budget", len(c.Databases), maxDatabases-1)
+	}
+	seen := map[string]bool{}
+	for _, d := range c.Databases {
+		if !wire.ValidDatabaseName(d) || seen[d] {
+			return fmt.Errorf("databases: %q is not a database name (1 to 63 of a-z, 0-9 and -, not starting with -), or is listed twice", d)
+		}
+		seen[d] = true
 	}
 	return c.Storage.validate()
 }
