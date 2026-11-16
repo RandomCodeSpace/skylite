@@ -64,10 +64,11 @@ func (e *LeaseHeldError) Is(target error) bool { return target == ErrLeaseHeld }
 // for the database, and its lease expires. A Lease is not safe for concurrent
 // use.
 type Lease struct {
-	st  storage.Store
-	key string
-	ttl time.Duration
-	now func() time.Time
+	st   storage.Store
+	keys format.Keys
+	key  string
+	ttl  time.Duration
+	now  func() time.Time
 
 	l       format.Lease // the lease as this holder last wrote it
 	version string       // its version token
@@ -75,47 +76,78 @@ type Lease struct {
 	taken   bool         // keep found the lease taken by another
 }
 
-// acquireLease takes the lease for c.Holder at epoch: it creates it if
-// absent, and otherwise replaces a lease of the same holder, an expired one
-// or one that does not decode, conditioned on the version it read. An
-// unexpired lease of another holder gives ErrLeaseHeld, and a lease of a
-// newer format version an error; neither is overwritten.
+// acquireLease takes the lease for c.Holder at epoch by take's rules.
 func acquireLease(ctx context.Context, st storage.Store, keys format.Keys, c Candidate, epoch uint64) (*Lease, error) {
 	if c.TTL <= 0 || c.Now == nil {
 		return nil, errors.New("engine: a candidate needs a positive lease time to live and a clock")
 	}
-	l := &Lease{st: st, key: keys.Lease(), ttl: c.TTL, now: c.Now}
-	b, info, err := readObject(ctx, st, l.key, format.MaxLeaseSize+1)
-	create := errors.Is(err, storage.ErrNotFound)
-	if err != nil && !create {
-		return nil, err
-	}
-	if !create {
-		cur, err := format.DecodeLease(b)
-		switch {
-		case errors.Is(err, format.ErrVersion):
-			return nil, fmt.Errorf("engine: lease: %w", err)
-		case err != nil:
-			// Not a lease of any version; it is replaced like an expired one.
-		case cur.Holder != c.Holder && !l.expired(cur):
-			return nil, l.heldError(cur, c.Holder)
-		}
-		l.version = info.Version
-	}
-	if err := l.put(ctx, format.Lease{Holder: c.Holder, Epoch: epoch, Renewed: l.stamp(0)}, create); err != nil {
+	l := &Lease{st: st, keys: keys, key: keys.Lease(), ttl: c.TTL, now: c.Now}
+	if err := l.take(ctx, c.Holder, epoch); err != nil {
 		return nil, err
 	}
 	return l, nil
 }
 
+// take writes the lease for holder at epoch: it creates it if absent, and
+// otherwise replaces a lease of the same holder, an expired one or one that
+// does not decode, conditioned on the version it read. An unexpired lease of
+// another holder gives ErrLeaseHeld, and a lease of a newer format version
+// an error; neither is overwritten.
+func (l *Lease) take(ctx context.Context, holder string, epoch uint64) error {
+	b, info, err := readObject(ctx, l.st, l.key, format.MaxLeaseSize+1)
+	create := errors.Is(err, storage.ErrNotFound)
+	if err != nil && !create {
+		return err
+	}
+	if !create {
+		cur, err := format.DecodeLease(b)
+		switch {
+		case errors.Is(err, format.ErrVersion):
+			return fmt.Errorf("engine: lease: %w", err)
+		case err != nil:
+			// Not a lease of any version; it is replaced like an expired one.
+		case cur.Holder != holder && !l.expired(cur):
+			return l.heldError(cur, holder)
+		}
+		l.version = info.Version
+	}
+	return l.put(ctx, format.Lease{Holder: holder, Epoch: epoch, Renewed: l.stamp(l.l.Renewed)}, create)
+}
+
 // Renew refreshes the lease's renewal time. ErrLeaseHeld means another
 // holder has taken it: a candidacy that is under way, or one that has
-// since lost. Renew never takes the lease back. The error does not depose
-// the holder; only the log and the manifest can.
+// since lost. Renew never takes the lease back; Retake does. The error
+// does not depose the holder; only the log and the manifest can.
 func (l *Lease) Renew(ctx context.Context) error {
 	next := l.l
 	next.Renewed = l.stamp(l.l.Renewed)
 	return l.put(ctx, next, false)
+}
+
+// Retake takes the lease back for this holder at its epoch, by the rules of
+// a candidate's lease step: it writes the lease if the stored one is this
+// holder's, or another holder's that is released or expired, and returns
+// ErrLeaseHeld, writing nothing, if another holder's lease is live. A leader
+// calls it when Renew reports ErrLeaseHeld and the lease reads as released
+// or expired. The epoch it writes is the lease's own, never another.
+//
+// It first reads the manifest and returns ErrLost, writing nothing, unless
+// the manifest still carries the lease's epoch: a deposed leader must not
+// hold back the next takeover. That check is not a fence. The manifest can
+// move between the read and the lease write, so a deposed leader may still
+// take the lease once; it remains deposed, because only the log and the
+// manifest decide who leads. Retake gives no right to write.
+func (l *Lease) Retake(ctx context.Context) error {
+	a, err := (&Reader{st: l.st, keys: l.keys}).readManifest(ctx, anchor{}, nil)
+	if err != nil {
+		return err
+	}
+	// Epochs are never reused, so the manifest carries this lease's epoch only
+	// while the office that holds this lease leads.
+	if a.m.Epoch != l.l.Epoch {
+		return fmt.Errorf("%w: the manifest is at epoch %d, this lease's is %d", ErrLost, a.m.Epoch, l.l.Epoch)
+	}
+	return l.take(ctx, l.l.Holder, l.l.Epoch)
 }
 
 // Release gives the lease up on a clean stop, by rewriting it with renewal

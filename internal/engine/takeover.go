@@ -18,7 +18,8 @@ var (
 	// candidacy changed the manifest: the epoch swap was beaten, or the
 	// manifest no longer carries the candidate's epoch and nonce. The
 	// candidate never serves at that epoch; a node may start a new
-	// candidacy.
+	// candidacy. Lease.Retake returns it when the manifest has moved past
+	// the lease's epoch: its leader is deposed.
 	ErrLost = errors.New("engine: candidacy lost to another")
 	// ErrExhausted means an epoch or a transaction number is at its maximum,
 	// so the database cannot take another takeover or another commit. It

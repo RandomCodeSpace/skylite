@@ -1445,3 +1445,154 @@ func TestLeaseRewrittenUnderWriter(t *testing.T) {
 		}
 	}
 }
+
+// retakeSetup: a takes office, and b, a time to live later, takes the lease
+// for the next epoch without swapping the manifest, as a candidacy that has
+// not swapped yet, or has lost, does.
+func retakeSetup(t *testing.T, seed uint64) (*testStore, format.Keys, *clock, Office, *Lease, *Lease) {
+	t.Helper()
+	ts, keys := newStore(t)
+	newHistory(t, ts, keys, seed, 512, 4)
+	clk := newClock(0)
+	o, la, err := Takeover(bg, ts, keys, Candidate{Holder: "a", TTL: time.Minute, Now: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(time.Minute)
+	lb, err := acquireLease(bg, ts, keys, Candidate{Holder: "b", TTL: time.Minute, Now: clk.now}, o.Epoch+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ts, keys, clk, o, la, lb
+}
+
+func storedLease(t *testing.T, st storage.Store, keys format.Keys) format.Lease {
+	t.Helper()
+	l, err := format.DecodeLease(must(get(bg, st, keys.Lease(), 1<<40)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+// checkRetaken: la holds the lease at office o's epoch, the manifest still
+// carries o, and la can renew.
+func checkRetaken(t *testing.T, st storage.Store, keys format.Keys, o Office, la *Lease) {
+	t.Helper()
+	a, err := (&Reader{st: st, keys: keys}).readManifest(bg, anchor{}, nil)
+	if err != nil || !o.Holds(a.m) {
+		t.Fatalf("manifest %+v, %v; want office at epoch %d", a.m, err, o.Epoch)
+	}
+	if ls := storedLease(t, st, keys); ls != la.l || ls.Holder != "a" || ls.Epoch != o.Epoch {
+		t.Fatalf("lease %+v; the handle has %+v, office epoch %d", ls, la.l, o.Epoch)
+	}
+	if err := la.Renew(bg); err != nil {
+		t.Fatalf("renewal after a retake: %v", err)
+	}
+}
+
+func TestRetakeAfterCandidateReleased(t *testing.T) {
+	ts, keys, _, o, la, lb := retakeSetup(t, 27)
+	if err := lb.Release(bg); err != nil {
+		t.Fatal(err)
+	}
+	if err := la.Renew(bg); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("renewal of a released foreign lease: %v", err)
+	}
+	if err := la.Retake(bg); err != nil {
+		t.Fatalf("retake of a released lease: %v", err)
+	}
+	checkRetaken(t, ts, keys, o, la)
+}
+
+func TestRetakeAfterExpiry(t *testing.T) {
+	ts, keys, clk, o, la, _ := retakeSetup(t, 28)
+	clk.advance(time.Minute)
+	if err := la.Renew(bg); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("renewal of an expired foreign lease: %v", err)
+	}
+	if err := la.Retake(bg); err != nil {
+		t.Fatalf("retake of an expired lease: %v", err)
+	}
+	checkRetaken(t, ts, keys, o, la)
+}
+
+func TestRetakeRefusesLiveHolder(t *testing.T) {
+	ts, keys, _, _, la, lb := retakeSetup(t, 29)
+	var writes []string
+	ts.setInject(func(_ context.Context, op, key string) (bool, error) {
+		if op == "create" || op == "replace" || op == "delete" {
+			writes = append(writes, op+" "+key)
+		}
+		return false, nil
+	})
+	err := la.Retake(bg)
+	var held *LeaseHeldError
+	if !errors.As(err, &held) || !errors.Is(err, ErrLeaseHeld) || held.Holder != "b" || !held.Expires.Equal(time.UnixMilli(lb.l.Renewed).Add(time.Minute)) {
+		t.Fatalf("retake of a live foreign lease: %v", err)
+	}
+	if len(writes) != 0 {
+		t.Fatalf("a refused retake wrote %v", writes)
+	}
+	if ls := storedLease(t, ts, keys); ls != lb.l {
+		t.Fatalf("lease %+v; want b's %+v", ls, lb.l)
+	}
+}
+
+func TestRetakeAdoptsOwnUnknownWrite(t *testing.T) {
+	ts, keys, _, o, la, lb := retakeSetup(t, 30)
+	if err := lb.Release(bg); err != nil {
+		t.Fatal(err)
+	}
+	replaces := 0
+	ts.setInject(func(_ context.Context, op, key string) (bool, error) {
+		if op != "replace" || key != keys.Lease() {
+			return false, nil
+		}
+		if replaces++; replaces == 1 { // lands, but its outcome is unknown
+			return true, &storage.Error{Op: op, Key: key, Err: storage.ErrOutcomeUnknown}
+		}
+		return false, nil
+	})
+	if err := la.Retake(bg); err != nil || replaces != 2 {
+		t.Fatalf("retake whose write landed with an unknown outcome: %v after %d replaces", err, replaces)
+	}
+	ts.setInject(nil)
+	checkRetaken(t, ts, keys, o, la)
+}
+
+// TestRetakeRefusesDeposed: b takes over from a and releases its lease; a,
+// deposed, does not take the lease back.
+func TestRetakeRefusesDeposed(t *testing.T) {
+	ts, keys := newStore(t)
+	newHistory(t, ts, keys, 31, 512, 4)
+	clk := newClock(0)
+	_, la, err := Takeover(bg, ts, keys, Candidate{Holder: "a", TTL: time.Minute, Now: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(time.Minute)
+	_, lb, err := Takeover(bg, ts, keys, Candidate{Holder: "b", TTL: time.Minute, Now: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lb.Release(bg); err != nil {
+		t.Fatal(err)
+	}
+	var writes []string
+	ts.setInject(func(_ context.Context, op, key string) (bool, error) {
+		if op == "create" || op == "replace" || op == "delete" {
+			writes = append(writes, op+" "+key)
+		}
+		return false, nil
+	})
+	if err := la.Retake(bg); !errors.Is(err, ErrLost) || errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("retake by a deposed leader: %v", err)
+	}
+	if len(writes) != 0 {
+		t.Fatalf("a deposed leader's retake wrote %v", writes)
+	}
+	if ls := storedLease(t, ts, keys); ls != lb.l {
+		t.Fatalf("lease %+v; want b's released %+v", ls, lb.l)
+	}
+}
