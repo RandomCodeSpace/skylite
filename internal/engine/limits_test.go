@@ -372,7 +372,7 @@ func TestTailBoundCountsBumps(t *testing.T) {
 		db.SetInterrupt(context.Background())
 		return db.Exec("INSERT INTO u VALUES (1)")
 	})
-	if txn == 0 || err == nil || !strings.Contains(err.Error(), "tail is at its bound") || strings.Contains(err.Error(), "maintenance") {
+	if txn == 0 || err == nil || !strings.Contains(err.Error(), "tail is at its bound") || strings.Contains(err.Error(), "maintenance") || strings.Contains(err.Error(), "interrupted") {
 		t.Fatalf("a second commit in the Run that reached the bound: %d, %v", txn, err)
 	}
 	atBound("a read after it", read())

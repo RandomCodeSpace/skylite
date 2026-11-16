@@ -287,38 +287,65 @@ func runClass(txn uint64, err error) string {
 // Covers: decision 6's commit path for a writing statement closed before
 // its end: SQLite commits an INSERT ... RETURNING closed after one step
 // inside sqlite3_finalize, where it calls no WAL hook, and the Run reports
-// that commit as any other, with the leader serving on.
+// that commit as any other, with the leader serving on, whatever f does
+// next in the Run: a second write is refused as a second commit, a
+// rollback or an open read touches nothing committed, and a panic
+// discards just the connection.
 func TestReturningClosedEarly(t *testing.T) {
 	for _, steps := range []string{"one step", "to its end"} {
-		t.Run(steps, func(t *testing.T) {
-			st, keys, _, l, c := setup(t)
-			other := open(t, l)
-			want := l.Head() + 1
-			txn, err := c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
-				s, _, err := db.Prepare("INSERT INTO t VALUES (5), (6) RETURNING x")
-				if err != nil {
-					return err
+		for _, then := range []string{"nothing", "a second write", "a rollback", "a read left open", "a panic"} {
+			t.Run(steps+", then "+then, func(t *testing.T) {
+				st, keys, _, l, c := setup(t)
+				other := open(t, l)
+				want := l.Head() + 1
+				txn, err := c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
+					s, _, err := db.Prepare("INSERT INTO t VALUES (5), (6) RETURNING x")
+					if err != nil {
+						return err
+					}
+					if !s.Step() {
+						return errors.Join(errors.New("no row returned"), s.Close())
+					}
+					for steps == "to its end" && s.Step() {
+					}
+					if err := s.Close(); err != nil {
+						return err
+					}
+					switch then {
+					case "a second write":
+						return db.Exec("INSERT INTO t VALUES (9)")
+					case "a rollback":
+						return db.Exec("BEGIN; ROLLBACK")
+					case "a read left open":
+						if err := db.Exec("BEGIN"); err != nil {
+							return err
+						}
+						_, err := query(db, "SELECT count(*) FROM t")
+						return err
+					case "a panic":
+						panic("injected")
+					}
+					return nil
+				})
+				failed := then == "a second write" || then == "a panic"
+				if txn != want || runClass(txn, err) != "committed" || (err != nil) != failed || l.Err() != nil {
+					t.Fatalf("Run: %d, %v; leader: %v; want %d and serving", txn, err, l.Err(), want)
 				}
-				if !s.Step() {
-					return errors.Join(errors.New("no row returned"), s.Close())
+				if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,5,6" {
+					t.Fatalf("durable rows %s, want 0,5,6", got)
 				}
-				for steps == "to its end" && s.Step() {
+				if got := queryConn(t, other, "SELECT count(*) FROM t"); got[0] != "3" {
+					t.Fatalf("another connection reads %v rows, want 3", got)
 				}
-				return s.Close()
+				later := c // discarded after the panic, in a transaction after the read
+				if then == "a panic" || then == "a read left open" {
+					later = other
+				}
+				if _, err := exec(later, "INSERT INTO t VALUES (7)"); err != nil {
+					t.Fatalf("a later commit: %v", err)
+				}
 			})
-			if txn != want || err != nil || l.Err() != nil {
-				t.Fatalf("Run: %d, %v; leader: %v; want %d and serving", txn, err, l.Err(), want)
-			}
-			if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,5,6" {
-				t.Fatalf("durable rows %s, want 0,5,6", got)
-			}
-			if got := queryConn(t, other, "SELECT count(*) FROM t"); got[0] != "3" {
-				t.Fatalf("another connection reads %v rows, want 3", got)
-			}
-			if _, err := exec(c, "INSERT INTO t VALUES (7)"); err != nil {
-				t.Fatalf("a later commit on the same connection: %v", err)
-			}
-		})
+		}
 	}
 }
 
@@ -544,6 +571,43 @@ func TestMaintenanceEndsHungOpen(t *testing.T) {
 	if got := queryConn(t, w, "SELECT count(*) FROM t"); got[0] != "50" || l.Err() != nil {
 		t.Fatalf("after maintenance: %v; leader: %v", got, l.Err())
 	}
+}
+
+// Covers: Open's retry class belongs only to an Open that maintenance
+// ended: one whose storage read fails with no maintenance running, and one
+// that Close ends, are not told to retry.
+func TestOpenFailureNotRetry(t *testing.T) {
+	t.Run("storage error", func(t *testing.T) {
+		st, keys, o := newDatabase(t, 4096)
+		cfg := testConfig()
+		cfg.Cache = NewCache(0)
+		l := lead(t, st, keys, o, cfg)
+		mustRun(t, open(t, l), "CREATE TABLE t(x)")
+		st.setRule(func(op, key string) fault {
+			if op == "getrange" {
+				return fault{noEffect: true, err: errInjected}
+			}
+			return fault{}
+		})
+		if _, err := l.Open(); err == nil || errors.Is(err, ErrRetry) {
+			t.Fatalf("Open through a failed read: %v, want an error that does not match ErrRetry", err)
+		}
+	})
+	t.Run("Close", func(t *testing.T) {
+		var armed atomic.Bool
+		hs, l, _ := hungReadSetup(t, func(_ context.Context, op string) bool { return op == "getrange" && armed.Load() })
+		armed.Store(true)
+		opened := make(chan error, 1)
+		go func() {
+			_, err := l.Open()
+			opened <- err
+		}()
+		reached(t, hs)
+		_ = l.Close()
+		if err := within(t, hs, opened, "the Open parked in a storage read"); err == nil || errors.Is(err, ErrRetry) {
+			t.Fatalf("Open ended by Close: %v, want an error that does not match ErrRetry", err)
+		}
+	})
 }
 
 // Covers: decision 10's steps 4 to 6 for an Open that begins after

@@ -360,6 +360,28 @@ func (f *mainFile) DeviceCharacteristics() vfs.DeviceCharacteristic {
 	return 0
 }
 
+// CommitPhaseTwo runs when SQLite has completed a commit on the connection,
+// in sqlite3_step or, for a statement closed before its end, in
+// sqlite3_finalize, which calls no WAL hook. SQLite sends it for no commit
+// that fails.
+func (f *mainFile) CommitPhaseTwo() error {
+	l, c := f.l, f.c
+	l.cmu.Lock()
+	defer l.cmu.Unlock()
+	if c.uploaded == 0 {
+		return nil
+	}
+	c.done, c.uploaded, c.inCommit = c.uploaded, 0, false
+	l.uploading = false
+	l.cond.Broadcast()
+	if c.retired {
+		// Only a later leader's compaction retires a commit the leader had
+		// not resolved yet, so the leader is deposed (decision 6).
+		_ = l.stopLocked(fmt.Errorf("%w: own commit %d already retired", ErrFenced, c.done))
+	}
+	return nil
+}
+
 func (f *mainFile) CheckpointStart() { f.inCkpt, f.ckptDone = true, false }
 func (f *mainFile) CheckpointDone()  { f.inCkpt, f.ckptDone = false, true }
 

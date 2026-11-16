@@ -117,10 +117,12 @@ func TestLostResponseIsRepeated(t *testing.T) {
 // (first review)", "The freed-name sequence" and "A retire races a
 // leader's read-back". A later leader's takeover bumps the next name and
 // retires the commit; the old leader reports committed and commits nothing
-// further.
+// further. The commit is also an INSERT ... RETURNING closed after one
+// step, which SQLite completes inside sqlite3_finalize.
 func TestLostResponseRetiredByLaterLeader(t *testing.T) {
-	for _, when := range []string{"before", "during", "after"} {
-		t.Run(when, func(t *testing.T) {
+	for _, name := range []string{"before", "during", "after", "before, closed early"} {
+		t.Run(name, func(t *testing.T) {
+			when, early := strings.CutSuffix(name, ", closed early")
 			st, keys, o, l, c := setup(t)
 			txn := o.Head + 2
 			landed, read := newGate(), newGate()
@@ -146,7 +148,19 @@ func TestLostResponseRetiredByLaterLeader(t *testing.T) {
 			}
 			done := make(chan result)
 			go func() {
-				txn, err := exec(c, "INSERT INTO t VALUES (1)")
+				if !early {
+					txn, err := exec(c, "INSERT INTO t VALUES (1)")
+					done <- result{txn, err}
+					return
+				}
+				txn, err := c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
+					s, _, err := db.Prepare("INSERT INTO t VALUES (1), (2) RETURNING x")
+					if err != nil {
+						return err
+					}
+					s.Step()
+					return s.Close()
+				})
 				done <- result{txn, err}
 			}()
 			<-landed.reached

@@ -33,11 +33,13 @@ import (
 // its sector padding, and roll it back. A panic through db.Exec leaves the
 // connection unclosable; the cases "in a step" panic inside a prepared
 // statement's step, which leaves it closable, as ncruces's out-of-memory
-// panic does.
+// panic does. SQLite rolls a failed VACUUM back without calling the
+// rollback hook.
 func TestFailureAfterUpload(t *testing.T) {
-	for _, tc := range []string{"panic after upload", "panic in create", "SQLite error after upload", "panic after upload, in a step", "panic in create, in a step"} {
+	for _, tc := range []string{"panic after upload", "panic in create", "SQLite error after upload", "panic after upload, in a step", "panic in create, in a step", "SQLite error after upload, in VACUUM"} {
 		t.Run(tc, func(t *testing.T) {
 			how, step := strings.CutSuffix(tc, ", in a step")
+			how, vacuum := strings.CutSuffix(how, ", in VACUUM")
 			st, keys, o := newDatabase(t, 4096)
 			l := lead(t, st, keys, o, testConfig())
 			w, other := open(t, l), open(t, l)
@@ -80,9 +82,12 @@ func TestFailureAfterUpload(t *testing.T) {
 			var otherErr error
 			txn, err := w.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
 				var err error
-				if step {
+				switch {
+				case vacuum:
+					err = db.Exec("VACUUM")
+				case step:
 					_, err = query(db, "INSERT INTO t VALUES (1)")
-				} else {
+				default:
 					err = db.Exec("INSERT INTO t VALUES (1)")
 				}
 				if tc == "SQLite error after upload" {
@@ -102,8 +107,11 @@ func TestFailureAfterUpload(t *testing.T) {
 			if errors.Is(err, ErrNotCommitted) {
 				t.Fatalf("told not committed after the upload may have started: %v", err)
 			}
-			durableRows := rows(t, durable(t, st.Store, keys, 0))
-			if how != "panic in create" && (txn != o.Head+2 || durableRows != "0,1") {
+			durableRows, want := rows(t, durable(t, st.Store, keys, 0)), "0,1"
+			if vacuum {
+				want = "0"
+			}
+			if how != "panic in create" && (txn != o.Head+2 || durableRows != want) {
 				t.Fatalf("committed in storage: reported %d, durable rows %s", txn, durableRows)
 			}
 			if _, err := other.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
