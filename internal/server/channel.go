@@ -231,16 +231,17 @@ func (s *Server) openChannel(d *database, leader *engine.Leader, req *wire.Reque
 }
 
 // lookup returns the live channel that token names on t for who, with
-// s.chMu held, or the refusal: checks 7 to 9 of ADR 0005. In this version
-// only the leader in office holds write channels, so a channel of another
-// server process ended when that process left office.
+// s.chMu held, or the refusal: checks 7 to 9 of ADR 0005. A token naming
+// another server process matches no channel here and gets channel_lost: in
+// this version only the leader in office holds write channels, so that
+// process's channels ended when it left office.
 func (s *Server) lookup(t *table, token, who string) (*channel, *wire.Error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 5 || parts[0] != channelTokenPrefix || parts[2] != hex.EncodeToString(t.office.DB[:]) {
 		return nil, wire.NewError(wire.CodeInvalidRequest, "the token does not name this database")
 	}
 	ch := t.chans[token]
-	if parts[1] != s.instance || ch == nil || ch.who != who || ch.ended {
+	if ch == nil || ch.who != who || ch.ended {
 		return nil, wire.NewError(wire.CodeChannelLost, "the channel does not exist on this server, belongs to another principal, or has ended")
 	}
 	return ch, nil

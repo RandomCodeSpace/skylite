@@ -1067,6 +1067,12 @@ func stopInUpload(t *testing.T, e *env, hs *holdStore, unknown bool) {
 	if r := <-ra; r.status != 200 || r.code() != want || r.err()["not_executed"] != false {
 		t.Errorf("upload unknown %v: %d %v, want %s", unknown, r.status, r.frames, want)
 	}
+	e.s.chMu.Lock()
+	left := tb.chans[a] != nil
+	e.s.chMu.Unlock()
+	if left {
+		t.Error("the channel stayed in the table after its request ended")
+	}
 	if err := <-closed; err != nil {
 		t.Error(err)
 	}
