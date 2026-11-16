@@ -245,7 +245,8 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 		return l.fail(w, cp.start, refuse)
 	}
 	// A panic in build creates nothing and leaves no phase two to clear the
-	// flag; clear it here, or every later writer would wait on it.
+	// flag. The connection's discard or the leader's stop clears it today;
+	// this does not depend on that.
 	building := true
 	defer func() {
 		if building {
