@@ -24,14 +24,14 @@ A new database has 4,096-byte pages and base groups of 256 pages. When the store
 
 ### Checks before acceptance
 
-The server runs [0005's checks](/docs/decisions/0005-client-protocol/#checks-before-acceptance) that apply to a `PUT`, a `query` and a `describe`, in their order, except that routing comes before the body:
+The server runs [0005's checks](/docs/decisions/0005-client-protocol/#checks-before-acceptance) that apply to a `PUT`, a `query` and a `describe`, in this order, with routing before the body as 0005 allows:
 
 1. The header block is at most 64 KiB, to which Go's HTTP/1.1 server adds 4 KiB of slack (otherwise `431` from the HTTP layer), and arrives within 10 seconds on HTTP/1.1; the method and path are known, and the path has no query string.
 2. *Admission is implemented only for connections:* the server accepts at most 1,024 connections at a time, and one beyond that waits in the operating system's listen queue until another closes. There are no request bounds yet.
 3. The bearer token verifies, read from the headers only (`401` `unauthenticated`). The body is never read before this.
 4. The principal holds `read` on the name, and `admin` for a `PUT` (`403` `forbidden`). This comes before routing and before anything that depends on whether the database exists, so the answer is the same either way.
-5. For a `query` or `describe`, this server leads the database (`503` `not_serving`, the body unread). 0005 routes after the body; a server that does not lead the database cannot serve it whatever the body holds, so it does not read it.
-6. The body share of the memory budget has room for 8 × `Content-Length` (`429` `overloaded`, the body unread). The share is half the memory budget, 1 GiB, and a body is charged from before its read until its request ends.
+5. For a `query` or `describe`, this server leads the database (`503` `not_serving`, the body unread). A server that does not lead the database cannot serve it whatever the body holds, so it does not read it; 0005 allows `not_serving` there, and does not promise the order of refusals before acceptance.
+6. The body share of the memory budget has room for 8 × `Content-Length`, and so does the principal's part of it (`429` `overloaded`, the body unread). The share is half the memory budget, 1 GiB; a principal, an issuer and a subject, may hold a quarter of it, 256 MiB, at once. A body is charged from before its read until its request ends, so one that is declared and never sent stays charged until the 30-second body read deadline or the client's close.
 7. `Content-Type` is `application/json`, compared without regard to case, with parameters ignored; `Content-Length` is present once, with one value, and at most 16 MiB (`413` `request_too_large` above it); there is no `Transfer-Encoding`. The whole body is read within 30 seconds and must be exactly `Content-Length` bytes: one JSON object of 0005's form with only the fields its request allows, and exactly `{}` for a `PUT`. A cut body, a reset stream or a body that arrives late is `400` `invalid_request`, and nothing is created or run.
 8. For a `query` or `describe`, the server reserves a SQLite connection (`429` `overloaded`; see [Connections for queries](#connections-for-queries)), and the leader is not in maintenance (`503` `maintenance`).
 
@@ -64,11 +64,13 @@ From there the statement has started executing, and the answer is `200` whatever
 | Frame size; a `columns` frame above it fails with `result_too_large` | 1 MiB |
 | `min_txn` above the snapshot's transaction number | `503` `behind` |
 
-A `describe` compiles the statement under the same policy and makes checks 1 and 3, then answers its result columns and parameter names without binding or stepping it; any statement can be described, writes included. A dropped connection stops a query's rows.
+A `describe` compiles the statement under the same policy and makes checks 1 and 3, then answers its result columns and parameter names without binding or stepping it; any statement can be described, writes included. A dropped connection stops a query's rows, and a client that stops reading them holds its connection until the statement time ends.
+
+A pragma's table-valued function, such as `SELECT * FROM pragma_user_version`, is compiled by SQLite when the statement first scans it, not when it is prepared, so the policy refuses it only at the first step: `describe` answers `200` with its columns, and `query` answers `200` with `statement_forbidden` as its terminal frame. Nothing is executed either way.
 
 ### Connections for queries
 
-Each of the server's SQLite connections is charged a 64 MiB ceiling against a memory budget of 2 GiB, so the server holds at most 32, less one for each database in `databases`, whose leader keeps a connection of its own. A principal, an issuer and a subject, may use a quarter of them at once, at least one. A query that finds its principal's share in use, or every connection in use with none idle, gets `429` `overloaded`. An idle connection of another database is closed to make room.
+The memory budget is 2 GiB, and it charges exactly two things: request bodies, at 8 × `Content-Length`, within the body share of 1 GiB; and SQLite connections, at a 64 MiB ceiling each, within the other 1 GiB. So the server holds at most 16 SQLite connections, less one for each database in `databases`, whose leader keeps a connection of its own; with every limit reached, bodies and connections hold the whole 2 GiB and no more. Nothing else is charged: not HTTP connections or their header blocks, not response frames, and not the engine's page cache (64 MiB per led database) or temporary files (256 MiB per led database), which must fit in what the container has beyond the budget. A principal, an issuer and a subject, may use a quarter of them at once, at least one. A query that finds its principal's share in use, or every connection in use with none idle, gets `429` `overloaded`. An idle connection of another database is closed to make room.
 
 A connection is reset before every reuse, [as 0007 requires](/docs/decisions/0007-sql-policy/#session-state): an open transaction is rolled back, temporary objects are dropped, foreign keys are enforced and the last inserted row id is cleared. A connection whose reset fails is closed and replaced. A statement that breaks its connection, by overflowing SQLite's C stack or exhausting the connection's memory, gets `internal`; the engine discards the connection without running SQLite on it again, and the leader serves on.
 
@@ -78,7 +80,12 @@ While the leader is in maintenance, a query or describe gets `503` `maintenance`
 
 ### Readiness
 
-With `probe_listen` set, the server answers `GET /readyz` on that address, in plain HTTP and without authentication: `200` while it leads at least one database of `databases` and none it leads is at its tail bound, and `503` otherwise and from the start of shutdown. A server whose databases do not exist yet is not ready, so the first `PUT` must reach a server directly, for example through a port forward.
+With `probe_listen` set, the server answers `GET /readyz` on that address, in plain HTTP and without authentication: `200` while it leads at least one database of `databases` and none it leads is at its tail bound, and `503` otherwise and from the start of shutdown. A server whose databases do not exist yet is not ready, so a Service that sends traffic only to ready pods never delivers the first `PUT`. Send it through a second Kubernetes Service over the same pods with `publishNotReadyAddresses: true`, or through `kubectl port-forward` to one pod.
+
+Known limits of readiness in this version:
+
+- Readiness is per pod, not per database. One database at its tail bound makes the pod not ready for every database it leads.
+- Each database's office loop runs on its own, so the databases of a set of pods can be led by different pods, and readiness cannot steer a request to the pod that leads its database; the others answer `not_serving`. List each database on one set of active pods, or run one active pod.
 
 ## Configuration
 
@@ -116,7 +123,7 @@ The configuration is one JSON file. Unknown fields are refused, and the server d
 | `storage.localfs.path` | A local directory. For trying the server out; a pod's local disk is not durable |
 | `storage.s3` | `bucket` and `region` (required), `endpoint` for an S3-compatible service, `path_style` to address the bucket in the path |
 | `storage.gcs` | `bucket` (required) and `endpoint` for an emulator, which then gets no credentials |
-| `databases` | The databases this server leads and answers queries on: names of the `{db}` form, each once, at most 31. Optional; without it the server serves `PUT` alone. The leaders' local files go in a directory under the system's temporary directory (`TMPDIR`), removed on shutdown |
+| `databases` | The databases this server leads and answers queries on: names of the `{db}` form, each once, at most 15. Optional; without it the server serves `PUT` alone. The leaders' local files go in a directory under the system's temporary directory (`TMPDIR`), removed on shutdown |
 | `probe_listen` | TCP address of the [readiness probe](#readiness). Optional |
 
 An `endpoint` must be an `http` or `https` URL with a host and no user information, query string or fragment, so that it carries no credential; the server does not start with one that breaks this, and the error does not repeat the value.
@@ -154,7 +161,7 @@ curl -i -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data '{"sql":"SELECT 1 + ? AS two","params":[1]}' http://127.0.0.1:8080/v1/databases/orders/query
 ```
 
-The query answers `503` `not_serving` until the server has taken office for the new database, a second or so after the `PUT`. A new database has no tables, and there is no write path yet to create one.
+The query answers `503` `not_serving` until the server has taken office for the new database. Its office loop retries a candidacy that fails, as one does while the database does not exist, with a backoff that doubles up to 20 seconds, so that can take about 20 seconds after the `PUT`. A new database has no tables, and there is no write path yet to create one.
 
 ## Not built yet, and not verified
 
