@@ -627,3 +627,146 @@ func TestTailBoundCompactionRefused(t *testing.T) {
 		t.Fatalf("at the bound with compaction refused: %v", err)
 	}
 }
+
+// Covers: decision 8, "Scheduling": a leader far below half its tail bound
+// compacts once the commit objects above the manifest reach CompactBytes,
+// or once CompactInterval has passed, and not otherwise.
+func TestCompactionTriggers(t *testing.T) {
+	fastCompaction(t)
+	for _, tc := range []struct {
+		name     string
+		bytes    int64
+		interval time.Duration
+		want     bool
+	}{
+		{"bytes", 64 << 10, time.Hour, true},
+		{"interval", 1 << 40, 50 * time.Millisecond, true},
+		{"neither", 1 << 40, time.Hour, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, keys, o := newDatabase(t, 4096)
+			cfg := testConfig()
+			cfg.CompactBytes, cfg.CompactInterval, cfg.Grace = tc.bytes, tc.interval, time.Hour
+			l := lead(t, st, keys, o, cfg)
+			c := open(t, l)
+			mustRun(t, c, "CREATE TABLE t(x)")
+			for i := range 20 {
+				mustRun(t, c, fmt.Sprintf("INSERT INTO t VALUES (%d)", i))
+			}
+			compacted := func() bool {
+				l.cmu.Lock()
+				defer l.cmu.Unlock()
+				return l.manifestTxn > 0
+			}
+			if tc.want {
+				eventually(t, "a compaction", compacted)
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+			if compacted() {
+				t.Fatal("compacted below every threshold")
+			}
+		})
+	}
+}
+
+// swapEpochRaw replaces the manifest with one at the next epoch and a new
+// nonce, as a candidate's swap does, without a bump.
+func swapEpochRaw(t *testing.T, st storage.Store, keys format.Keys, db format.DatabaseID) {
+	t.Helper()
+	ctx := context.Background()
+	b, info, err := readObject(ctx, st, keys.Manifest(), format.MaxManifestSize+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := format.DecodeManifest(b, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Epoch++
+	m.Nonce[0]++
+	nb, err := format.EncodeManifest(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Replace(ctx, keys.Manifest(), info.Version, bytes.NewReader(nb)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Covers: decision 8, a collector that reads a manifest at a higher epoch
+// than its leader's: the leader leaves office and deletes nothing.
+func TestCollectorAfterEpochSwapLeavesOffice(t *testing.T) {
+	fastCompaction(t)
+	ctx := context.Background()
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.Grace, cfg.CompactInterval = time.Hour, time.Hour
+	l := lead(t, st, keys, o, cfg)
+	c := open(t, l)
+	// The loop stays out: the collector looks once, after the swap.
+	l.cmpMu.Lock()
+	defer l.cmpMu.Unlock()
+	mustRun(t, c, "CREATE TABLE t(x)")
+	if err := l.compactLocked(); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, c, "INSERT INTO t VALUES (1)")
+	if err := l.compactLocked(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := st.Store.List(ctx, keys.BasePrefix(o.DB), "", 100)
+	swapEpochRaw(t, st.Store, keys, o.DB)
+	l.collectLocked()
+	if err := l.Err(); !errors.Is(err, ErrStopped) || !strings.Contains(err.Error(), "fenced") {
+		t.Fatalf("a collector under a higher epoch: leader %v", err)
+	}
+	if after, _ := st.Store.List(ctx, keys.BasePrefix(o.DB), "", 100); len(after) != len(before) {
+		t.Fatalf("%d base objects before, %d after", len(before), len(after))
+	}
+}
+
+// Covers: decision 8, a leader's own read around its own compaction: a
+// main-file read that located a page in a commit, and whose ranged read
+// lands after the leader compacted past that commit and retired it, locates
+// the page again in the new base instead of stopping the leader.
+func TestLeaderReadAcrossOwnCompaction(t *testing.T) {
+	fastCompaction(t)
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.Cache, cfg.Grace, cfg.CompactInterval = NewCache(0), time.Hour, time.Hour
+	l := lead(t, st, keys, o, cfg)
+	c, r := open(t, l), open(t, l)
+	mustRun(t, c, "CREATE TABLE t(x)")
+	for i := range 5 {
+		mustRun(t, c, fmt.Sprintf("INSERT INTO t VALUES (%d)", i))
+	}
+	l.tryCheckpoint() // the base version is the head: every page is read from storage
+	gate := newGate()
+	st.setRule(nth("getrange", isCommit, 1, fault{before: gate}))
+	got := make(chan string, 1)
+	go func() {
+		var out []string
+		_, err := r.Run(context.Background(), nil, func(db *sqlite3.Conn) (err error) {
+			out, err = query(db, "SELECT group_concat(x) FROM t")
+			return err
+		})
+		got <- fmt.Sprint(out, err)
+	}()
+	<-gate.reached
+	if err := compactNow(l); err != nil {
+		t.Fatal(err)
+	}
+	l.cmpMu.Lock()
+	l.cfg.Grace = time.Nanosecond
+	l.retireLocked()
+	retired := l.retiredThrough
+	l.cmpMu.Unlock()
+	if retired < l.Head() {
+		t.Fatalf("retired through %d, head %d", retired, l.Head())
+	}
+	gate.open()
+	if res := <-got; res != "[0,1,2,3,4] <nil>" || l.Err() != nil {
+		t.Fatalf("a read across the leader's own compaction: %s; leader %v", res, l.Err())
+	}
+}
