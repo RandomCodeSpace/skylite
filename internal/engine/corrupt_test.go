@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"reflect"
+	"slices"
 	"testing"
 	"testing/iotest"
 
@@ -510,9 +511,13 @@ func TestMissingReferencedBase(t *testing.T) {
 // included, because a manifest is written back from it.
 func TestAnchorManifest(t *testing.T) {
 	_, _, h := corruptFixture(t)
+	h.compact(6) // so that the groups do not all hold the same reference
 	m, v := h.manifest()
 	if len(m.Groups) == 0 {
 		t.Fatal("the fixture's manifest has no groups")
+	}
+	if !slices.ContainsFunc(m.Groups, func(g format.GroupRef) bool { return g != m.Groups[0] }) {
+		t.Fatal("the fixture's groups all hold the same reference")
 	}
 	if got := newAnchor(m, v).manifest(); !reflect.DeepEqual(got, m) {
 		t.Fatalf("manifest\n got %+v\nwant %+v", got, m)

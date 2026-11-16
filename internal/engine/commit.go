@@ -183,14 +183,14 @@ func (w *offsetWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// outcome is how a create resolved.
-type outcome int
+// createOutcome is how a create resolved.
+type createOutcome int
 
 const (
-	committed outcome = iota
-	notCommitted
-	fenced
-	indeterminate
+	createCommitted createOutcome = iota
+	createNotCommitted
+	createFenced
+	createIndeterminate
 )
 
 // commit turns the captured transaction into the commit object at the head
@@ -241,7 +241,7 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 	l.cmu.Unlock()
 	res, version, retired, err := l.create(b)
 	switch res {
-	case committed:
+	case createCommitted:
 		l.cmu.Lock()
 		l.head, l.headSize = h.Txn, h.DBSize
 		l.tailPages += int(h.PageCount)
@@ -260,10 +260,10 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 			l.afterUpload()
 		}
 		return nil
-	case notCommitted:
+	case createNotCommitted:
 		err = l.fail(w, cp.start, fmt.Errorf("%w: every attempt to create commit %d had no effect: %w", ErrNotCommitted, h.Txn, err))
 		return err
-	case fenced:
+	case createFenced:
 		err = l.fail(w, cp.start, fmt.Errorf("%w: %w: commit %d", ErrNotCommitted, ErrFenced, h.Txn))
 		_ = l.stop(err)
 		return err
@@ -318,7 +318,7 @@ func (l *Leader) truncateWAL(w *walFile, start int64) error {
 // says. It repeats the identical create after any failure, up to
 // createAttempts. An unknown outcome is sticky. A precondition failure is
 // resolved by reading the name.
-func (l *Leader) create(b *built) (res outcome, version string, retired bool, err error) {
+func (l *Leader) create(b *built) (res createOutcome, version string, retired bool, err error) {
 	var unknown, occupied bool
 	for range createAttempts {
 		if l.ctx.Err() != nil {
@@ -328,24 +328,24 @@ func (l *Leader) create(b *built) (res outcome, version string, retired bool, er
 		version, err = l.st.Create(l.ctx, b.key, io.NewSectionReader(l.scratch, 0, b.size))
 		switch {
 		case err == nil:
-			return committed, version, false, nil
+			return createCommitted, version, false, nil
 		case errors.Is(err, storage.ErrPreconditionFailed):
 			occupied = true
 			res, version, retired, err = l.readName(b)
 			if err == nil {
 				return res, version, retired, nil
 			}
-			if res == indeterminate {
-				return indeterminate, "", false, err
+			if res == createIndeterminate {
+				return createIndeterminate, "", false, err
 			}
 		case errors.Is(err, storage.ErrOutcomeUnknown):
 			unknown = true
 		}
 	}
 	if unknown || occupied {
-		return indeterminate, "", false, err
+		return createIndeterminate, "", false, err
 	}
-	return notCommitted, "", false, err
+	return createNotCommitted, "", false, err
 }
 
 // readName reads the object at the commit's name after a precondition
@@ -354,18 +354,18 @@ func (l *Leader) create(b *built) (res outcome, version string, retired bool, er
 // or not; an epoch bump means it is fenced. Anything else breaks an
 // invariant. A failed read returns notCommitted with the error, to be
 // retried.
-func (l *Leader) readName(b *built) (outcome, string, bool, error) {
+func (l *Leader) readName(b *built) (createOutcome, string, bool, error) {
 	rc, info, err := l.st.Get(l.ctx, b.key)
 	if errors.Is(err, storage.ErrNotFound) {
-		return indeterminate, "", false, fmt.Errorf("%w: commit %d absent after its create failed its precondition", ErrCorrupt, b.h.Txn)
+		return createIndeterminate, "", false, fmt.Errorf("%w: commit %d absent after its create failed its precondition", ErrCorrupt, b.h.Txn)
 	}
 	if err != nil {
-		return notCommitted, "", false, err
+		return createNotCommitted, "", false, err
 	}
 	defer func() { _ = rc.Close() }()
 	front := make([]byte, format.CommitHeaderSize)
 	if _, err := io.ReadFull(rc, front); err != nil {
-		return notCommitted, "", false, err
+		return createNotCommitted, "", false, err
 	}
 	h, err := format.DecodeCommitHeader(front, l.office.DB)
 	if err == nil {
@@ -373,21 +373,21 @@ func (l *Leader) readName(b *built) (outcome, string, bool, error) {
 	}
 	switch {
 	case err != nil:
-		return indeterminate, "", false, fmt.Errorf("engine: commit %d: %w", b.h.Txn, err)
+		return createIndeterminate, "", false, fmt.Errorf("engine: commit %d: %w", b.h.Txn, err)
 	case h.EpochBump:
-		return fenced, "", false, nil
+		return createFenced, "", false, nil
 	case h.Epoch != b.h.Epoch || !bytes.Equal(h.CommitID, b.h.CommitID):
-		return indeterminate, "", false, fmt.Errorf("%w: commit %d is not this leader's: epoch %d, identifier %x", ErrCorrupt, b.h.Txn, h.Epoch, h.CommitID)
+		return createIndeterminate, "", false, fmt.Errorf("%w: commit %d is not this leader's: epoch %d, identifier %x", ErrCorrupt, b.h.Txn, h.Epoch, h.CommitID)
 	case h.Retired:
-		return committed, "", true, nil
+		return createCommitted, "", true, nil
 	}
 	hash := sha256.New()
 	hash.Write(front)
 	if _, err := io.Copy(hash, rc); err != nil {
-		return notCommitted, "", false, err
+		return createNotCommitted, "", false, err
 	}
 	if !bytes.Equal(hash.Sum(nil), b.sum[:]) || info.Size != b.size {
-		return indeterminate, "", false, fmt.Errorf("%w: commit %d holds other bytes than this leader built", ErrCorrupt, b.h.Txn)
+		return createIndeterminate, "", false, fmt.Errorf("%w: commit %d holds other bytes than this leader built", ErrCorrupt, b.h.Txn)
 	}
-	return committed, info.Version, false, nil
+	return createCommitted, info.Version, false, nil
 }

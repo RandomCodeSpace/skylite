@@ -2,10 +2,8 @@
 // storage as decision record 0004 (docs/content/docs/decisions/0004-storage-engine.md)
 // lays it out, in the objects package format encodes. It creates a database
 // (Create), reads its pages as of a transaction number (Open, Reader), and
-// serves it as the holder of office (Lead, Leader): SQLite with a main file
-// read from storage and every commit created in the log before SQLite
-// reports it. Compaction, retirement, garbage collection and takeover are
-// not part of it yet.
+// takes office by lease, epoch swap and epoch bump (Takeover, Office,
+// Lease).
 //
 // # Reading
 //
@@ -503,14 +501,7 @@ func (r *Reader) locate(pgno uint32) source {
 // readPage returns page pgno, which is in range, possibly shared with the
 // cache.
 func (r *Reader) readPage(ctx context.Context, pgno uint32) ([]byte, error) {
-	return r.fetch(ctx, r.locate(pgno), pgno)
-}
-
-// fetch reads page pgno from s. It uses only the reader's store, keys and
-// cache, which never change, so it is safe while the index changes; the
-// leader reads that way outside its lock.
-func (r *Reader) fetch(ctx context.Context, s source, pgno uint32) ([]byte, error) {
-	switch {
+	switch s := r.locate(pgno); {
 	case s.c != nil:
 		return r.commitPage(ctx, s.c, s.e)
 	case s.base.Txn != 0:

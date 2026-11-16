@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -190,6 +191,19 @@ type mainFile struct {
 
 	inCkpt   bool // between the checkpoint-start and -done file controls
 	ckptDone bool // a checkpoint finished; it may now truncate the file
+}
+
+// fetch reads page pgno from s, as readPage does after locate. It uses only
+// the reader's store, keys and cache, which never change, so it is safe while
+// the index changes; the leader reads that way outside its lock.
+func (r *Reader) fetch(ctx context.Context, s source, pgno uint32) ([]byte, error) {
+	switch {
+	case s.c != nil:
+		return r.commitPage(ctx, s.c, s.e)
+	case s.base.Txn != 0:
+		return r.basePage(ctx, s.base, pgno)
+	}
+	return make([]byte, r.a.m.PageSize), nil
 }
 
 func (f *mainFile) ReadAt(p []byte, off int64) (int, error) {
