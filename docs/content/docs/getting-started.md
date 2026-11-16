@@ -42,4 +42,4 @@ make build
 
 ## What comes next
 
-There is no way to write to a database and no driver to connect with yet. To follow the work, read the [architecture direction](/docs/architecture/) and the [roadmap](/docs/roadmap/). The planned storage design is recorded in [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/).
+There is no way to write to a database yet, and the [Go driver](/docs/go-driver/) has a read path only. To follow the work, read the [architecture direction](/docs/architecture/) and the [roadmap](/docs/roadmap/). The planned storage design is recorded in [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/).
