@@ -12,8 +12,10 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -85,15 +87,37 @@ func (c httpCredential) GetToken(ctx context.Context, _ policy.TokenRequestOptio
 	return azcore.AccessToken{Token: "t", ExpiresOn: time.Now().Add(time.Hour)}, nil
 }
 
-// closedURL returns the URL of a local port that refuses connections.
+// closedURL returns the URL of a local port that refuses connections until
+// t ends. The port stays bound, never listened on, so that no server started
+// meanwhile, in this process or another, can take it.
 func closedURL(t *testing.T) string {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := l.Addr().String()
-	_ = l.Close()
-	return "http://" + addr
+	t.Cleanup(func() { _ = syscall.Close(fd) })
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	sa, err := syscall.Getsockname(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "http://127.0.0.1:" + strconv.Itoa(sa.(*syscall.SockaddrInet4).Port)
+}
+
+func TestClosedURL(t *testing.T) {
+	addr := strings.TrimPrefix(closedURL(t), "http://")
+	if l, err := net.Listen("tcp", addr); err == nil {
+		_ = l.Close()
+		t.Fatalf("%s could be listened on", addr)
+	}
+	if c, err := net.Dial("tcp", addr); err == nil || !errors.Is(err, syscall.ECONNREFUSED) {
+		if c != nil {
+			_ = c.Close()
+		}
+		t.Fatalf("dial %s: %v, want connection refused", addr, err)
+	}
 }
 
 // TestCredentialFailure: a mutation whose request never reaches the container
