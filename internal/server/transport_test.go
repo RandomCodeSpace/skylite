@@ -237,6 +237,12 @@ func TestBodyDeadline(t *testing.T) {
 	if s := h.status(1, 3*time.Second); s != "400" {
 		t.Errorf("HTTP/2 body never sent: status %q, want 400", s)
 	}
+	// The whole body, but a stream that never ends: only the read error refuses it.
+	h.must(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: block(h2Put("slow-4", tok, "content-type", "application/json", "content-length", "2")...), EndHeaders: true}))
+	h.must(t, h.fr.WriteData(3, false, []byte("{}")))
+	if s := h.status(3, 3*time.Second); s != "400" {
+		t.Errorf("HTTP/2 stream never ended: status %q, want 400", s)
+	}
 	// A refusal before the body leaves it unread; net/http reads it after
 	// the answer, within the same deadline, then closes the connection.
 	resp3, c, br := rawConn(t, e.addr, "PUT /v1/databases/slow-3 HTTP/1.1\r\nHost: skylite\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n")

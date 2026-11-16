@@ -145,7 +145,7 @@ func validEndpoint(e string) bool {
 	}
 	u, err := url.Parse(e)
 	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" &&
-		u.User == nil && u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && !strings.Contains(e, "#")
+		u.User == nil && u.RawQuery == "" && !u.ForceQuery && !strings.Contains(e, "#")
 }
 
 // keys returns the keys of database db.
