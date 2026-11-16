@@ -51,12 +51,14 @@ var (
 	// version has none, so a retry does not help: reads and writes stay
 	// refused for the life of the leader.
 	ErrTailBound = errors.New("engine: the log tail is at its bound, and this version has no compaction to clear it")
-	// ErrBroken, with ErrNotCommitted, means the Run panicked outside the
-	// commit path, as on a stack overflow in SQLite, or its function
-	// reported the connection broken by returning an error that wraps
-	// ErrBroken. The engine has discarded the connection without SQLite's
-	// cooperation and released its locks; nothing of the Run's open
-	// transaction is visible. The leader serves on (record 0004, decision 6).
+	// ErrBroken means the Run panicked outside the commit path, as on a
+	// stack overflow in SQLite, or its function reported the connection
+	// broken by returning an error that wraps ErrBroken. The engine has
+	// discarded the connection without SQLite's cooperation and released its
+	// locks; nothing of the Run's open transaction is visible. With
+	// ErrNotCommitted the Run committed nothing; with a nonzero txn its
+	// commit stands and the connection broke after it. The leader serves on
+	// (record 0004, decision 6).
 	ErrBroken = errors.New("engine: connection broken and discarded")
 	// ErrFenced means another candidacy's epoch bump holds the leader's next
 	// transaction number. The leader has stopped.
@@ -418,7 +420,8 @@ func (l *Leader) err() error {
 
 // Open opens a new SQLite connection to the database. ctx bounds the Open:
 // its storage reads and SQLite's set-up statements end when ctx is done, and
-// a panic in them discards the connection (record 0007, requirement 5). An
+// a panic in them discards the connection if SQLite then closes it, and
+// otherwise stops the leader (record 0007, requirement 5). An
 // Open that fails without a panic after maintenance has cancelled its
 // storage reads fails with an error that matches ErrNotCommitted and
 // ErrRetry, whatever ended it: SQLite reports a failed read as an I/O error
@@ -589,9 +592,10 @@ func (c *Conn) setup() error {
 		return err
 	}
 	// Exceeding the memory ceiling panics in ncruces, and a panic costs the
-	// connection, or the database when the connection cannot be closed (see
-	// finish). Capping values and statements well below the ceiling turns
-	// the commonest way there, one huge value, into an SQLITE_TOOBIG error.
+	// connection (see finish), or, in Open, the database when SQLite cannot
+	// close the connection. Capping values and statements well below the
+	// ceiling turns the commonest way there, one huge value, into an
+	// SQLITE_TOOBIG error.
 	limit := int(min(1e9, c.l.cfg.MaxMemory/4))
 	c.db.Limit(sqlite3.LIMIT_LENGTH, limit)
 	c.db.Limit(sqlite3.LIMIT_SQL_LENGTH, limit)
@@ -641,7 +645,8 @@ func (c *Conn) pragma(name string) (string, error) {
 //   - txn is nonzero: f's commit is in the durable history. A non-nil error
 //     then means committed-then-failed: it reports what failed later in the
 //     Run and matches neither ErrNotCommitted nor ErrUnknown, so a caller
-//     must look at txn before err.
+//     must look at txn before err. It matches ErrBroken if the connection
+//     broke after the commit.
 //   - txn is 0 and err is nil: f succeeded and committed nothing.
 //   - err matches ErrNotCommitted: the Run committed nothing, and nothing
 //     of it can enter the history. It also matches ErrStopped if the leader
@@ -792,8 +797,12 @@ func classify(done uint64, err, stopped error) (uint64, error) {
 	case done != 0:
 		if errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrUnknown) {
 			// The Run's commit stands: what failed after it must not read
-			// as its outcome.
-			err = fmt.Errorf("transaction %d committed, then: %s", done, err) //nolint:errorlint // must not match either class
+			// as its outcome. A broken connection is still reported broken.
+			if errors.Is(err, ErrBroken) {
+				err = fmt.Errorf("transaction %d committed, then: %w: %s", done, ErrBroken, err) //nolint:errorlint // must not match either class
+			} else {
+				err = fmt.Errorf("transaction %d committed, then: %s", done, err) //nolint:errorlint // must not match either class
+			}
 		}
 	case errors.Is(err, ErrUnknown):
 		if errors.Is(err, ErrNotCommitted) {

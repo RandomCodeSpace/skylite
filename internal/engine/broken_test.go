@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -52,6 +54,12 @@ func mustBreak(t *testing.T, l *Leader, c *Conn, txn uint64, err error) {
 	if txn != 0 || !errors.Is(err, ErrBroken) || !errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrStopped) || errors.Is(err, ErrUnknown) {
 		t.Fatalf("Run: %d, %v; want not committed and broken", txn, err)
 	}
+	mustBeDiscarded(t, l, c)
+}
+
+// mustBeDiscarded checks that the leader serves on and c is gone.
+func mustBeDiscarded(t *testing.T, l *Leader, c *Conn) {
+	t.Helper()
 	if err := l.Err(); err != nil {
 		t.Fatalf("the leader stopped after a broken connection: %v", err)
 	}
@@ -233,12 +241,117 @@ func TestRunReportsBroken(t *testing.T) {
 	d := brokenSetup(t)
 	l := d.l
 	v := open(t, l)
+	rolledBack := false
 	txn, err := v.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
 		if err := db.Exec("BEGIN IMMEDIATE; UPDATE t SET v = 'lost'"); err != nil {
 			return err
 		}
+		// sqlite3_close would roll the transaction back and call this.
+		db.RollbackHook(func() { rolledBack = true })
 		return fmt.Errorf("contained: %w", ErrBroken)
 	})
 	mustBreak(t, l, v, txn, err)
+	if rolledBack {
+		t.Fatal("SQLite ran on the broken connection: it rolled the transaction back")
+	}
 	d.mustServe(t)
+}
+
+// Covers: a connection that breaks after its Run committed: the commit
+// stands, and the Run still reports the connection broken and discarded
+// (record 0007, requirement 1).
+func TestStackOverflowAfterACommit(t *testing.T) {
+	d := brokenSetup(t)
+	l := d.l
+	v := open(t, l)
+	sql := "INSERT INTO t VALUES (1000, 'committed')"
+	txn, err := v.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
+		if err := db.Exec(sql); err != nil {
+			return err
+		}
+		return db.Exec(overflowSQL)
+	})
+	if txn == 0 || txn != l.Head() || !errors.Is(err, ErrBroken) || errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrUnknown) || errors.Is(err, ErrStopped) {
+		t.Fatalf("Run: %d, %v; want committed with Head %d, then broken", txn, err, l.Head())
+	}
+	d.or.exec(t, sql)
+	mustBeDiscarded(t, l, v)
+	d.mustServe(t)
+}
+
+// Covers: decision 6 as amended: a broken connection that release cannot
+// free stops the leader, as before, and release reports a connection it
+// cannot reach instead of panicking.
+func TestFailedReleaseStops(t *testing.T) {
+	if release(nil) || release(new(sqlite3.Conn)) {
+		t.Fatal("release freed a connection without an SQLite instance")
+	}
+	d := brokenSetup(t)
+	l := d.l
+	v := open(t, l)
+	db := v.db
+	t.Cleanup(func() { _ = db.Close() })
+	txn, err := v.Run(context.Background(), newID(), func(*sqlite3.Conn) error {
+		v.db = new(sqlite3.Conn) // release cannot free this one
+		panic("injected")
+	})
+	if txn != 0 || !errors.Is(err, ErrStopped) || !errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrBroken) || l.Err() == nil {
+		t.Fatalf("Run: %d, %v, leader %v; want not committed and the leader stopped", txn, err, l.Err())
+	}
+	if _, err := exec(d.w, "SELECT 1"); !errors.Is(err, ErrStopped) {
+		t.Fatalf("another connection served after a failed release: %v", err)
+	}
+}
+
+// Covers: release closes the broken connection's files at once, not at a
+// later garbage collection: its main file, WAL, shared-memory index and
+// temporary files, whose bytes leave the temporary-file budget.
+func TestStackOverflowReleasesFiles(t *testing.T) {
+	d := brokenSetup(t)
+	l := d.l
+	before := dirFiles(t, l.dir)
+	v := open(t, l)
+	var during []string
+	var used int64
+	txn, err := v.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
+		if err := db.Exec("PRAGMA cache_size=5; PRAGMA temp_store=FILE; BEGIN IMMEDIATE; UPDATE t SET v = 'lost'; CREATE TEMP TABLE x AS SELECT * FROM t; SAVEPOINT s; UPDATE t SET v = 'lost2'"); err != nil {
+			return err
+		}
+		during, used = dirFiles(t, l.dir), l.tempUsed.Load()
+		return db.Exec(overflowSQL)
+	})
+	// Before mustBreak, and before any collection, whose finalizers would
+	// close leaked files.
+	after, usedAfter := dirFiles(t, l.dir), l.tempUsed.Load()
+	mustBreak(t, l, v, txn, err)
+	if used == 0 || !slices.ContainsFunc(during, func(f string) bool { return strings.Contains(f, "temp-") }) || len(during) < len(before)+3 {
+		t.Fatalf("the broken connection held no temporary files (%d bytes) or too few files: %q, from %q", used, during, before)
+	}
+	if usedAfter != 0 || !slices.Equal(after, before) {
+		t.Fatalf("after the release: %d bytes of temporary files, open files %q, from %q", usedAfter, after, before)
+	}
+	if m, err := filepath.Glob(filepath.Join(l.dir, "temp-*")); err != nil || len(m) != 0 {
+		t.Fatalf("temporary files left: %q, %v", m, err)
+	}
+}
+
+// dirFiles lists, sorted, the files under dir that the process holds open.
+func dirFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skipf("no /proc: %v", err)
+	}
+	var out []string
+	for _, e := range ents {
+		if f, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name())); err == nil && strings.HasPrefix(f, dir+"/") {
+			out = append(out, f)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
