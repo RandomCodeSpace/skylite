@@ -164,7 +164,7 @@
 //     to one attempt, which binds it to one encoding of the group's content
 //     at that transaction number.
 //   - Base objects are deleted only as Garbage collection describes.
-//   - Every object fetched by key is checked with CheckKey, and every read
+//   - Every header decoded is checked with CheckKey, and every read
 //     after the manifest's discovery passes the identifier it learned.
 //
 // So there is no predecessor digest and no writer-instance field. A log
@@ -173,9 +173,8 @@
 // writer shares. If storage broke create-if-absent, or two writers shared
 // an epoch, the format would not notice.
 //
-// Epochs need not be non-decreasing along the commit log, and readers must
-// not require it: a paused candidate can leave an epoch bump with a lower
-// epoch after commits of a higher one.
+// The engine writes non-decreasing epochs along the commit log; readers
+// must not require it.
 //
 // # Commit object
 //
