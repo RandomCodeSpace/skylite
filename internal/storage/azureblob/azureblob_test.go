@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -57,9 +59,42 @@ func (failingCredential) GetToken(context.Context, policy.TokenRequestOptions) (
 	return azcore.AccessToken{}, errors.New("token endpoint unavailable")
 }
 
-// TestCredentialFailure: a credential that cannot get a token fails each
-// mutation in the SDK before any request is sent, so the error is definite,
-// for a Delete and an empty body too.
+// httpCredential asks a token endpoint with the call's context, as azidentity's
+// credentials do, and returns a token only if the endpoint answers 200.
+type httpCredential struct{ url string }
+
+func (c httpCredential) GetToken(ctx context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
+	if err != nil {
+		return azcore.AccessToken{}, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return azcore.AccessToken{}, err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return azcore.AccessToken{}, errors.New("token endpoint answered " + resp.Status)
+	}
+	return azcore.AccessToken{Token: "t", ExpiresOn: time.Now().Add(time.Hour)}, nil
+}
+
+// closedURL returns the URL of a local port that refuses connections.
+func closedURL(t *testing.T) string {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+	return "http://" + addr
+}
+
+// TestCredentialFailure: a mutation whose request never reaches the container
+// fails with a definite error, for a Delete and an empty body too: a
+// credential that gets no token, with or without asking a token endpoint
+// (which shares the call's connection trace), or a token followed by a refused
+// connection to the container.
 func TestCredentialFailure(t *testing.T) {
 	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -67,22 +102,37 @@ func TestCredentialFailure(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	c, err := container.NewClient(srv.URL+"/c", failingCredential{}, &container.ClientOptions{
-		ClientOptions: azcore.ClientOptions{InsecureAllowCredentialWithHTTP: true},
-	})
-	if err != nil {
-		t.Fatal(err)
+	tokens := func(status int) string {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+		t.Cleanup(ts.Close)
+		return ts.URL
 	}
-	s := New(c, t.TempDir())
-	ctx := context.Background()
-	for op, call := range map[string]func() error{
-		"delete":        func() error { return s.Delete(ctx, "k") },
-		"create empty":  func() error { _, err := s.Create(ctx, "k", strings.NewReader("")); return err },
-		"create":        func() error { _, err := s.Create(ctx, "k", strings.NewReader("x")); return err },
-		"replace empty": func() error { _, err := s.Replace(ctx, "k", `"v"`, strings.NewReader("")); return err },
+	for name, tc := range map[string]struct {
+		cred azcore.TokenCredential
+		blob string
+	}{
+		"no request":       {failingCredential{}, srv.URL},
+		"token 500":        {httpCredential{tokens(http.StatusInternalServerError)}, srv.URL},
+		"token refused":    {httpCredential{closedURL(t)}, srv.URL},
+		"container closed": {httpCredential{tokens(http.StatusOK)}, closedURL(t)},
 	} {
-		if err := call(); err == nil || errors.Is(err, storage.ErrOutcomeUnknown) {
-			t.Errorf("%s: %v, want a definite error", op, err)
+		c, err := container.NewClient(tc.blob+"/c", tc.cred, &container.ClientOptions{
+			ClientOptions: azcore.ClientOptions{InsecureAllowCredentialWithHTTP: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := New(c, t.TempDir())
+		ctx := context.Background()
+		for op, call := range map[string]func() error{
+			"delete":        func() error { return s.Delete(ctx, "k") },
+			"create empty":  func() error { _, err := s.Create(ctx, "k", strings.NewReader("")); return err },
+			"create":        func() error { _, err := s.Create(ctx, "k", strings.NewReader("x")); return err },
+			"replace empty": func() error { _, err := s.Replace(ctx, "k", `"v"`, strings.NewReader("")); return err },
+		} {
+			if err := call(); err == nil || errors.Is(err, storage.ErrOutcomeUnknown) {
+				t.Errorf("%s, %s: %v, want a definite error", name, op, err)
+			}
 		}
 	}
 	if n := hits.Load(); n != 0 {

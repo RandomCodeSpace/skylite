@@ -10,7 +10,10 @@
 // constructors of package container. The container must exist, and nothing
 // else may write to it. The client's transport must be net/http's (the SDK's
 // default or an *http.Client): the backend learns whether a request reached a
-// connection from net/http's client trace (see "Outcomes"). The transport
+// connection from net/http's client trace (see "Outcomes"). The trace names
+// a request's first hop, so a proxy, if the transport uses one, must be the
+// one the environment names (http.ProxyFromEnvironment, as in the SDK's
+// default transport). The transport
 // must also close an idle connection before the service, or anything between
 // (a load balancer, a proxy), does: set http.Transport.IdleConnTimeout below
 // the shortest idle timeout on the path (the SDK's default transport keeps
@@ -73,18 +76,21 @@
 //   - a response with status 409 BlobAlreadyExists or 412 (Create or Replace),
 //     or 404 BlobNotFound (Replace), is storage.ErrPreconditionFailed;
 //   - any other 4xx status except 408 is a definite error with no effect;
-//   - if the request never reached a connection (net/http's trace reports no
-//     connection obtained, or the SDK failed before calling its transport, as
-//     when a credential gets no token), or the transport did not read the
-//     body to its end, the service cannot have applied it, and the error is
-//     definite;
+//   - if the request never reached a connection to the container (net/http's
+//     trace reports none obtained to its endpoint or the proxy for it, or the
+//     SDK failed before calling its transport, as when a credential gets no
+//     token), or the transport did not read the body to its end, the service
+//     cannot have applied it, and the error is definite;
 //   - anything else, such as a 5xx status, 408, a 2xx or 3xx status other than
 //     the one the request expects (from a non-conforming proxy), a lost
 //     response, a reset connection or the context ending while the request is
 //     in flight, wraps storage.ErrOutcomeUnknown.
 //
 // A credential that calls its token endpoint with the call's context shares
-// its client trace, so its failure there can be reported as unknown.
+// its client trace, so only connections to the container's endpoint, or the
+// proxy for it, count. A credential's failure is still reported as unknown
+// when the context ends while it waits for a token, or when it reaches its
+// token endpoint through that same proxy.
 //
 // Once a mutation call returns, its request body refuses further reads, so a
 // request that net/http is still sending when the call returns can never be
@@ -124,9 +130,10 @@
 // # Tested
 //
 // Only against Azurite 3.37.0, with its well-known development account and a
-// container SAS, and a failing token credential against a local HTTP server.
-// The real service, working Entra ID credentials and real latency are not
-// tested.
+// container SAS, and token credentials against local HTTP servers: one that
+// fails without a request, and some that call a local token endpoint.
+// The real service, working Entra ID credentials, real latency and a proxy
+// are not tested.
 package azureblob
 
 import (
@@ -136,11 +143,13 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -170,12 +179,23 @@ const listPage = 5000
 type Store struct {
 	c        *container.Client
 	spoolDir string
+	hops     []string // "host:port" of the container's endpoint, and of the proxy the environment names for it
 }
 
 // New returns a Store on the container that c addresses. Bodies longer than
 // 4 MiB are spooled to files in spoolDir, or in os.TempDir if it is empty.
 func New(c *container.Client, spoolDir string) *Store {
-	return &Store{c: c, spoolDir: spoolDir}
+	s := &Store{c: c, spoolDir: spoolDir}
+	if c == nil {
+		return s
+	}
+	if u, err := url.Parse(c.URL()); err == nil {
+		s.hops = []string{hostPort(u)}
+		if p, err := http.ProxyFromEnvironment(&http.Request{URL: u}); err == nil && p != nil {
+			s.hops = append(s.hops, hostPort(p))
+		}
+	}
+	return s
 }
 
 // Create implements storage.Store.
@@ -220,7 +240,7 @@ func (s *Store) put(ctx context.Context, key, ifMatch string, body io.Reader) (s
 	if ifMatch != "" {
 		cond = &blob.ModifiedAccessConditions{IfMatch: to.Ptr(azcore.ETag(ifMatch))}
 	}
-	tctx, conn := mutation(ctx)
+	tctx, conn := s.mutation(ctx)
 	resp, err := s.c.NewBlockBlobClient(key).Upload(tctx, up, &blockblob.UploadOptions{
 		AccessConditions: &blob.AccessConditions{ModifiedAccessConditions: cond},
 	})
@@ -398,7 +418,7 @@ func (s *Store) delete(ctx context.Context, key string) error {
 	if err := check(ctx, key); err != nil {
 		return err
 	}
-	tctx, conn := mutation(ctx)
+	tctx, conn := s.mutation(ctx)
 	_, err := s.c.NewBlobClient(key).Delete(tctx, nil)
 	if err == nil || bloberror.HasCode(err, bloberror.BlobNotFound) {
 		return nil
@@ -427,31 +447,61 @@ func isETag(v string) bool {
 	return true
 }
 
-// connTrace records what net/http's client trace reports for one call.
-type connTrace struct{ getConn, gotConn atomic.Bool }
+// hostPort returns u's "host:port", as net/http's client trace names it.
+func hostPort(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443", "socks5": "1080", "socks5h": "1080"}[u.Scheme]
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
+// connTrace records what net/http's client trace reports for one call about
+// connections to hops, the container's first hops. A credential shares the
+// call's trace, so connections to other hosts, such as its token endpoint,
+// are left out.
+type connTrace struct {
+	hops             []string
+	getConn, gotConn atomic.Bool
+}
 
 // reached reports whether the request that failed with err may have reached a
-// connection. With net/http's trace, that is whether it obtained one. Without
-// a trace (a transport that is not net/http's reports none), the request was
-// handed to the transport only if err holds a response or a *url.Error, in
-// which http.Client wraps every transport error; any other error came from
-// the SDK before its transport, such as a credential that got no token.
+// connection to the container. With net/http's trace, that is whether it
+// obtained one. Without one (a transport that is not net/http's reports none),
+// the request may have been handed to the transport if err holds a response, a
+// *url.Error for the container, in which http.Client wraps every transport
+// error, or the context's error, which the SDK returns in place of the
+// transport's once the context has ended; any other error came from the SDK
+// before its transport, such as a credential that got no token.
 func (c *connTrace) reached(err error) bool {
-	if c.getConn.Load() || c.gotConn.Load() {
+	if c.getConn.Load() {
 		return c.gotConn.Load()
 	}
 	var ue *url.Error
+	if errors.As(err, &ue) {
+		if u, perr := url.Parse(ue.URL); perr != nil || slices.Contains(c.hops, hostPort(u)) {
+			return true
+		}
+	}
 	var re *azcore.ResponseError
-	return errors.As(err, &ue) || errors.As(err, &re)
+	return errors.As(err, &re) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // mutation returns a context for one mutation request: SDK retries are off,
 // and the returned trace records whether the request reached a connection.
-func mutation(ctx context.Context) (context.Context, *connTrace) {
-	c := &connTrace{}
+func (s *Store) mutation(ctx context.Context) (context.Context, *connTrace) {
+	c := &connTrace{hops: s.hops}
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-		GetConn: func(string) { c.getConn.Store(true) },
-		GotConn: func(httptrace.GotConnInfo) { c.gotConn.Store(true) },
+		GetConn: func(hp string) {
+			if slices.Contains(c.hops, hp) {
+				c.getConn.Store(true)
+			}
+		},
+		GotConn: func(httptrace.GotConnInfo) {
+			if c.getConn.Load() {
+				c.gotConn.Store(true)
+			}
+		},
 	})
 	return policy.WithRetryOptions(ctx, policy.RetryOptions{MaxRetries: -1}), c
 }

@@ -260,8 +260,8 @@ func statusBefore(status int, code string) faultFunc {
 	}
 }
 
-// refused sends the request to a closed local port: the dial fails, so
-// nothing is sent.
+// refused dials a closed local port for the request, unchanged, so the trace
+// still names the container's endpoint: the dial fails, so nothing is sent.
 func refused(t *testing.T) faultFunc {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -270,11 +270,25 @@ func refused(t *testing.T) faultFunc {
 	addr := l.Addr().String()
 	_ = l.Close()
 	return func(req *http.Request, next http.RoundTripper) (*http.Response, error) {
-		r := req.Clone(req.Context())
-		r.URL.Host = addr
-		r.Host = ""
-		return next.RoundTrip(r)
+		tr := next.(*http.Transport).Clone()
+		tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		}
+		defer tr.CloseIdleConnections()
+		return tr.RoundTrip(req)
 	}
+}
+
+// noTrace sends the request with a context that carries no client trace, as
+// a RoundTripper that is not net/http's may, and answers with the context's
+// error once the call's context has ended.
+func noTrace(req *http.Request, next http.RoundTripper) (*http.Response, error) {
+	resp, err := next.RoundTrip(req.Clone(context.Background()))
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+	<-req.Context().Done()
+	return nil, req.Context().Err()
 }
 
 // unsent fails the request without reading its body or sending it.
@@ -389,6 +403,11 @@ func TestMutationFaults(t *testing.T) {
 		// error wraps the context's error.
 		{"SlowResponse", func(*testing.T) faultFunc {
 			return slowResponse
+		}, [3]outcome{unknownDone, unknownDone, unknownDone}, true},
+		// The same through a transport that reports no connection trace: the
+		// SDK returns the context's error in place of the transport's.
+		{"NoTraceDeadline", func(*testing.T) faultFunc {
+			return noTrace
 		}, [3]outcome{unknownDone, unknownDone, unknownDone}, true},
 		// The connection was refused, so nothing was sent: a definite error.
 		{"Refused", refused, [3]outcome{noEffect, noEffect, noEffect}, false},
