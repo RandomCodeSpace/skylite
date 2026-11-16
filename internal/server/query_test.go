@@ -1,14 +1,18 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,7 +21,9 @@ import (
 	"github.com/ncruces/go-sqlite3"
 
 	"github.com/RandomCodeSpace/skylite/internal/engine"
+	"github.com/RandomCodeSpace/skylite/internal/format"
 	"github.com/RandomCodeSpace/skylite/internal/sqlpolicy"
+	"github.com/RandomCodeSpace/skylite/internal/storage/localfs"
 )
 
 // The tests in this file serve database "d", which exists before the
@@ -363,6 +369,8 @@ func TestTxnControlRefusedStateless(t *testing.T) {
 		for _, sql := range []string{
 			"SAVEPOINT a", " /* c */ savepoint a", "RELEASE a", "RELEASE SAVEPOINT a", "ROLLBACK TO a", "ROLLBACK",
 			"BEGIN", "BEGIN IMMEDIATE", "COMMIT", "END", "EXPLAIN SAVEPOINT a", "EXPLAIN QUERY PLAN SAVEPOINT a",
+			// SQLite reads a UTF-8 byte order mark as white space.
+			"\ufeffSAVEPOINT a", ";\ufeff\ufeff;SAVEPOINT a", "EXPLAIN \ufeffQUERY \ufeffPLAN \ufeffSAVEPOINT a",
 		} {
 			if a := e.post(t, path, "reader", q(sql)); a.code() != "invalid_request" || len(a.frames) != 1 {
 				t.Errorf("%s %q: %d %v, want invalid_request alone", path, sql, a.status, a.frames)
@@ -379,6 +387,7 @@ func FuzzKeywordAgreesWithPolicy(f *testing.F) {
 		"SAVEPOINT a", "release a", "ROLLBACK TO a", "ROLLBACK", "BEGIN", "END", "COMMIT TRANSACTION", "-- x\nCOMMIT",
 		"/* x */ END", "EXPLAIN SAVEPOINT a", "EXPLAIN QUERY PLAN BEGIN", "explain select 1", "SELECT 1", ";SAVEPOINT a",
 		"WITH x AS (SELECT 1) SELECT * FROM x", "endx", "\fBEGIN", "VALUES (1)", "PRAGMA foreign_keys",
+		"\ufeffSAVEPOINT a", ";\ufeff;\ufeffBEGIN", "EXPLAIN \ufeffQUERY \ufeffPLAN \ufeffEND", "SELECT\ufeff1",
 	} {
 		f.Add(s)
 	}
@@ -634,12 +643,31 @@ func TestConnectionLimits(t *testing.T) {
 }
 
 func TestBodyShareOverloaded(t *testing.T) {
-	e := newQueryEnv(t, func(e *env) { e.s.bodyShare = 8*int64(len(q("SELECT 1"))) - 1 })
+	// A principal's quarter of the share is one byte short of this body.
+	e := newQueryEnv(t, func(e *env) { e.s.bodyShare = 4*8*int64(len(q("SELECT 1"))) - 1 })
 	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
 		t.Errorf("%d %v, want overloaded", a.status, a.last())
 	}
 	if a := e.post(t, "query", "reader", q("SELECT")); a.code() == "overloaded" {
 		t.Errorf("a body within the share: %d %v", a.status, a.last())
+	}
+	// Five principals at their quarter each: the fifth finds the share full.
+	e.s.bodyShare = 4 * 80
+	r := &http.Request{ContentLength: 10}
+	var release []func()
+	for i := range 4 {
+		f, we := e.s.chargeBody(r, fmt.Sprint(i))
+		if we != nil {
+			t.Fatalf("principal %d: %v", i, we)
+		}
+		release = append(release, f)
+	}
+	if _, we := e.s.chargeBody(r, "4"); we == nil || we.Code != "overloaded" {
+		t.Errorf("a full share: %v, want overloaded", we)
+	}
+	release[0]()
+	if _, we := e.s.chargeBody(r, "4"); we != nil {
+		t.Errorf("after a release: %v", we)
 	}
 }
 
@@ -736,4 +764,335 @@ func TestNotReadyWhileShuttingDown(t *testing.T) {
 		t.Error("the server left office before the running query ended")
 	}
 	<-got
+}
+
+// TestDeadlineBeforeTheStatement ends the statement time while the server
+// opens, sets up or resets a connection: the answer is timeout, not
+// internal.
+func TestDeadlineBeforeTheStatement(t *testing.T) {
+	e := newQueryEnv(t, nil)
+	l, d := e.leader(t), e.s.dbs["d"]
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	// The pool is empty: Open and the policy's set-up meet the deadline.
+	if _, we, err := e.s.conn(expired, d, l, "x"); we == nil || we.Code != "timeout" {
+		t.Errorf("open: %v (%v), want timeout", we, err)
+	}
+	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != 200 || len(e.s.pool.idle) != 1 {
+		t.Fatalf("%d %v, %d idle", a.status, a.last(), len(e.s.pool.idle))
+	}
+	// An idle connection: its Reset meets the deadline.
+	if _, we, err := e.s.conn(expired, d, l, "x"); we == nil || we.Code != "timeout" {
+		t.Errorf("reset: %v (%v), want timeout", we, err)
+	}
+	if n := e.s.pool.open; n != 0 {
+		t.Errorf("%d connections open after the failed reset, want 0", n)
+	}
+	for range 60 {
+		if a := e.post(t, "query", "reader", `{"sql":"SELECT 1","timeout_ms":1}`); a.code() != "timeout" && a.status != 200 {
+			t.Fatalf("%d %v, want timeout or the row", a.status, a.last())
+		}
+	}
+}
+
+// TestTailBoundKeepsIdleConnection: a refusal by the engine before the
+// Reset runs leaves the idle connection pooled.
+func TestTailBoundKeepsIdleConnection(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) { e.s.engine.TailBound = 3 })
+	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != 200 {
+		t.Fatalf("before the bound: %d %v", a.status, a.last())
+	}
+	e.exec(t, "CREATE TABLE t (a)") // the third commit: the bound
+	if a := e.post(t, "query", "reader", q("SELECT 1")); a.code() != "maintenance" {
+		t.Fatalf("%d %v, want maintenance", a.status, a.last())
+	}
+	if open, idle := e.s.pool.open, len(e.s.pool.idle); open != 1 || idle != 1 {
+		t.Errorf("%d open, %d idle, want the one connection kept", open, idle)
+	}
+}
+
+// bodyCharge returns what the body share holds, in all and per principal.
+func (e *env) bodyCharge() (int64, map[string]int64) {
+	e.s.bodyMu.Lock()
+	defer e.s.bodyMu.Unlock()
+	return e.s.bodyUsed, maps.Clone(e.s.bodyBy)
+}
+
+// TestBodySharePerPrincipal: one principal declaring bodies it never sends
+// holds at most a quarter of the body share, and every charge is released.
+func TestBodySharePerPrincipal(t *testing.T) {
+	body := q("SELECT 1")
+	n := 8 * int64(len(body))
+	e := newQueryEnv(t, func(e *env) { e.s.bodyShare = 4 * n }) // a principal's quarter holds one body
+	token := e.sig.token(t, "reader")
+	refused := make(chan int, 4)
+	var held []net.Conn
+	for range 4 {
+		c, err := net.Dial("tcp", e.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, c)
+		t.Cleanup(func() { _ = c.Close() })
+		if _, err := fmt.Fprintf(c, "POST /v1/databases/d/query HTTP/1.1\r\nHost: skylite\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", token, len(body)); err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+			if err != nil {
+				return
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusTooManyRequests {
+				refused <- 1
+			}
+		}()
+	}
+	got := 0
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		for len(refused) > 0 {
+			got += <-refused
+		}
+		used, _ := e.bodyCharge()
+		if used/n+int64(got) == 4 {
+			if used != n {
+				t.Errorf("the principal holds %d of the share, want one body, %d", used, n)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d charged, %d refused, want 4 in all", used, got)
+		}
+	}
+	if a := e.post(t, "query", "writer", body); a.status != 200 {
+		t.Errorf("another principal: %d %v, want served", a.status, a.last())
+	}
+	for range 5 {
+		if a := e.post(t, "query", "writer", body); a.status != 200 {
+			t.Fatalf("%d %v", a.status, a.last())
+		}
+	}
+	if used, by := e.bodyCharge(); used != n || len(by) != 1 {
+		t.Errorf("after the requests: %d charged, %v, want the reader's %d alone", used, by, n)
+	}
+	// The client that never sent its body goes away: its charge is released.
+	for _, c := range held {
+		_ = c.Close()
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		used, by := e.bodyCharge()
+		if used == 0 && len(by) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d still charged, %v", used, by)
+		}
+	}
+}
+
+// TestMemoryBudgetHolds: whatever the number of databases, the body share
+// and the SQLite connections at their ceiling, the leaders' included, stay
+// within the memory budget, and clients keep a connection.
+func TestMemoryBudgetHolds(t *testing.T) {
+	for n := range maxDatabases + 1 {
+		cfg := testConfig(t, jwksFile(t, newSigner(t, "k1")))
+		for i := range n {
+			cfg.Databases = append(cfg.Databases, fmt.Sprint("d", i))
+		}
+		if n == maxDatabases {
+			if cfg.Validate() == nil {
+				t.Errorf("%d databases accepted", n)
+			}
+			continue
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("%d databases: %v", n, err)
+		}
+		s, err := newServer(cfg, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total := s.bodyShare + int64(s.pool.capacity+n)*connCeiling; total > memoryBudget || s.pool.capacity < 1 {
+			t.Errorf("%d databases: %d bytes charged at most, %d client connections; budget %d", n, total, s.pool.capacity, memoryBudget)
+		}
+	}
+}
+
+// TestSlowReaderBounded: a client that stops reading a query's rows holds
+// its SQLite connection only until the statement time ends.
+func TestSlowReaderBounded(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) { e.s.shutdownTimeout = time.Second })
+	body := fmt.Sprintf(`{"sql":%q,"timeout_ms":1000}`, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 200000) SELECT printf('%200d', x) FROM c")
+	c, err := net.Dial("tcp", e.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := fmt.Fprintf(c, "POST /v1/databases/d/query HTTP/1.1\r\nHost: skylite\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", e.sig.token(t, "reader"), len(body), body); err != nil {
+		t.Fatal(err)
+	}
+	e.running(t, 1)
+	e.running(t, 0) // the client never reads
+}
+
+// TestTransientMaintenance: maintenance for the local WAL bound ends a
+// running query with maintenance, and the leader serves again after it.
+func TestTransientMaintenance(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) { e.s.engine.WALBound = 64 << 10 })
+	e.exec(t, "CREATE TABLE t (a)")
+	got := e.postAsync(t, "query", "reader", q(cpuBound))
+	e.running(t, 1)
+	c, err := e.leader(t).Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	for i := 0; ; i++ {
+		_, err := c.Run(context.Background(), fmt.Appendf(nil, "test-%d", commitIDs.Add(1)), func(db *sqlite3.Conn) error {
+			return db.Exec("INSERT INTO t VALUES (randomblob(4000))")
+		})
+		if errors.Is(err, engine.ErrRetry) {
+			break
+		}
+		if err != nil || i == 100 {
+			t.Fatalf("write %d: %v, want the WAL bound", i, err)
+		}
+	}
+	select {
+	case a := <-got:
+		if a.status != 200 || a.code() != "maintenance" {
+			t.Errorf("%d %v, want maintenance as the terminal frame", a.status, a.last())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("maintenance did not end the running query")
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		a := e.post(t, "query", "reader", q("SELECT 1"))
+		if a.status == 200 {
+			break
+		}
+		if a.code() != "maintenance" || time.Now().After(deadline) {
+			t.Fatalf("after maintenance: %d %v", a.status, a.last())
+		}
+	}
+}
+
+// TestShutdownLeavesOffice: shutdown releases the lease and removes the
+// leaders' directory.
+func TestShutdownLeavesOffice(t *testing.T) {
+	e := newQueryEnv(t, nil)
+	if _, err := os.Stat(e.s.dir); err != nil {
+		t.Fatalf("the leaders' directory: %v", err)
+	}
+	if err := e.halt(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(e.s.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the leaders' directory after shutdown: %v", err)
+	}
+	keys, err := e.s.cfg.Storage.keys("d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := localfs.Open(e.s.cfg.Storage.LocalFS.Path) // Serve closed its own
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	r, _, err := st.Get(context.Background(), keys.Lease())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l, err := format.DecodeLease(b); err != nil || l.Renewed != 0 {
+		t.Errorf("lease %+v, %v, want released", l, err)
+	}
+}
+
+// TestTxnIsTheSnapshotRead: with commits landing concurrently, txn is the
+// transaction number of the state the rows were read from.
+func TestTxnIsTheSnapshotRead(t *testing.T) {
+	e := newQueryEnv(t, nil)
+	e.exec(t, "CREATE TABLE t (a)")
+	l := e.leader(t)
+	base := int64(l.Head()) //nolint:gosec // a test's few commits
+	c, err := l.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	stop, wrote := make(chan struct{}), make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				wrote <- nil
+				return
+			default:
+			}
+			if _, err := c.Run(context.Background(), fmt.Appendf(nil, "test-%d", commitIDs.Add(1)), func(db *sqlite3.Conn) error {
+				return db.Exec("INSERT INTO t VALUES (1)") // one row per commit
+			}); err != nil {
+				wrote <- err
+				return
+			}
+		}
+	}()
+	// Each query reads the count, then runs long enough for commits to land
+	// before its done frame.
+	sql := q("SELECT count(*), (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 100000) SELECT count(*) FROM c) FROM t")
+	for range 20 {
+		a := e.post(t, "query", "reader", sql)
+		var rows int64
+		if len(a.rows()) != 1 || a.done() == nil {
+			t.Fatalf("%d %v", a.status, a.frames)
+		}
+		_, _ = fmt.Sscanf(a.rows()[0], "[%d,", &rows)
+		if txn, _ := a.done()["txn"].(json.Number).Int64(); txn != base+rows {
+			t.Fatalf("txn %d for %d rows, want %d", txn, rows, base+rows)
+		}
+	}
+	close(stop)
+	if err := <-wrote; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMemoryExhaustionDiscardsConnection: a pure read that exhausts its
+// connection's memory gets internal, and the engine discards the connection.
+func TestMemoryExhaustionDiscardsConnection(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) { e.s.engine.MaxMemory = 16 << 20 })
+	a := e.post(t, "query", "reader", q("SELECT count(*) FROM (SELECT randomblob(1000000) AS b FROM generate_series(1, 64) ORDER BY b)"))
+	if a.code() != "internal" {
+		t.Fatalf("%d %v, want internal", a.status, a.last())
+	}
+	if !strings.Contains(e.logs.String(), `"class":"broken"`) {
+		t.Errorf("the engine did not discard the connection: %s", e.logs.String())
+	}
+	if n := e.s.pool.open; n != 0 {
+		t.Errorf("%d connections open", n)
+	}
+	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != 200 {
+		t.Errorf("the next query: %d %v", a.status, a.last())
+	}
+}
+
+// TestStoppedLeaderNotServing: a leader that stopped serves nothing and
+// leaves the server not ready, before the office loop notices.
+func TestStoppedLeaderNotServing(t *testing.T) {
+	e := newQueryEnv(t, nil)
+	if err := e.leader(t).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if e.s.ready() {
+		t.Error("ready with the leader stopped")
+	}
+	a := e.post(t, "query", "reader", q("SELECT 1"))
+	if msg := fmt.Sprint(a.last()); a.status != http.StatusServiceUnavailable || a.code() != "not_serving" || !strings.Contains(msg, "does not lead") {
+		t.Errorf("%d %v, want not_serving before the body", a.status, a.last())
+	}
 }

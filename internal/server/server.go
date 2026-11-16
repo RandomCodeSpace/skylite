@@ -53,6 +53,7 @@ const (
 	bodyDeadline   = 30 * time.Second // body read deadline, from the end of the header block
 	maxStreams     = 16               // concurrent streams per HTTP/2 connection
 	maxConns       = 1024             // HTTP connections accepted
+	probeConns     = 64               // connections the readiness probe accepts
 )
 
 const (
@@ -69,17 +70,21 @@ const (
 	groupSize = 256
 )
 
-// The memory budget of ADR 0005 decision 9 and what it is divided into.
+// The memory budget of ADR 0005 decision 9 and what it is divided into:
+// the body share, and SQLite connections at their ceiling in what is left.
+// Nothing else is charged; see docs/content/docs/server.md.
 //
 // shortcut: the budget is the decision's default without a container limit;
 // derive it from the cgroup limit with the rest of admission.
 const (
 	memoryBudget = 2 << 30
-	connCeiling  = 64 << 20 // SQLite connection memory ceiling
-	maxConnLimit = 256      // SQLite connections per pod
-	// maxDatabases bounds the configured databases: each led database's
-	// engine connection is charged a ceiling, and one must stay for clients.
-	maxDatabases = memoryBudget / connCeiling
+	bodyShare    = memoryBudget / 2 // request bodies, charged at 8 × Content-Length
+	connCeiling  = 64 << 20         // SQLite connection memory ceiling
+	maxConnLimit = 256              // SQLite connections per pod
+	// maxDatabases is the SQLite connections the budget holds after the
+	// body share: each led database's engine connection is charged a
+	// ceiling, and one must stay for clients.
+	maxDatabases = min(maxConnLimit, (memoryBudget-bodyShare)/connCeiling)
 )
 
 // engineConfig is each leader's configuration. The tail bound is the
@@ -106,7 +111,8 @@ type Server struct {
 	stopping atomic.Bool          // Serve is shutting down: not ready
 
 	bodyMu              sync.Mutex
-	bodyUsed, bodyShare int64 // request bodies' share of the memory budget, charged at 8 × Content-Length
+	bodyUsed, bodyShare int64            // request bodies' share of the memory budget, charged at 8 × Content-Length
+	bodyBy              map[string]int64 // the charge per principal, at most a quarter of the share
 	statementTime       time.Duration
 
 	// The constants above, and the response deadline of limits, as set by
@@ -160,10 +166,9 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 	if err != nil {
 		return nil, err
 	}
-	conns := min(maxConnLimit, memoryBudget/connCeiling) - len(cfg.Databases)
 	s := &Server{
 		cfg: cfg, log: log, guard: g, store: st, limits: l,
-		policy: policy, pool: newPool(conns), engine: engineConfig(), bodyShare: memoryBudget / 2, statementTime: stmt,
+		policy: policy, pool: newPool(maxDatabases - len(cfg.Databases)), engine: engineConfig(), bodyShare: bodyShare, bodyBy: map[string]int64{}, statementTime: stmt,
 		headerDeadline: headerDeadline, bodyDeadline: bodyDeadline, responseDeadline: time.Duration(l.ResponseMS) * time.Millisecond,
 		idleTimeout: idleTimeout, createTimeout: createTimeout, shutdownTimeout: shutdownTimeout, maxConns: maxConns,
 	}
@@ -211,8 +216,8 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		if err != nil {
 			return fmt.Errorf("server: probe: %w", err)
 		}
-		probe := &http.Server{Handler: http.HandlerFunc(s.readyz), ReadHeaderTimeout: s.headerDeadline, ErrorLog: slog.NewLogLogger(s.log.Handler(), slog.LevelWarn)}
-		go func() { _ = probe.Serve(pln) }()
+		probe := &http.Server{Handler: http.HandlerFunc(s.readyz), ReadHeaderTimeout: s.headerDeadline, IdleTimeout: s.idleTimeout, ErrorLog: slog.NewLogLogger(s.log.Handler(), slog.LevelWarn)}
+		go func() { _ = probe.Serve(netutil.LimitListener(pln, probeConns)) }()
 		defer func() { _ = probe.Close() }()
 	}
 	var p http.Protocols
@@ -500,7 +505,8 @@ func (s *Server) handle(st *stream, r *http.Request, log *slog.Logger) (done *wi
 	if kind != wire.KindPut && leader == nil {
 		return nil, wire.NewError(wire.CodeNotServing, "this server does not lead the database; in this version only its leader serves it"), false
 	}
-	release, e := s.chargeBody(r)
+	who := principal(p)
+	release, e := s.chargeBody(r, who)
 	if e != nil {
 		return nil, e, false
 	}
@@ -516,25 +522,35 @@ func (s *Server) handle(st *stream, r *http.Request, log *slog.Logger) (done *wi
 	if kind == wire.KindPut {
 		done, e = s.create(r.Context(), db, p, log)
 	} else {
-		done, e = s.statement(r.Context(), st, d, leader, req, p, log)
+		done, e = s.statement(r.Context(), st, d, leader, req, who, log)
 	}
 	return done, e, true
 }
 
+// principal identifies an authenticated principal in the per-principal
+// bounds: its issuer and subject.
+func principal(p *auth.Principal) string { return p.Issuer + "\x00" + p.Subject }
+
 // chargeBody charges a body's 8 × Content-Length to the body share of the
-// memory budget before it is read (ADR 0005, check 5), and returns the
-// function that releases it. A body over its limit is left to readBody.
-func (s *Server) chargeBody(r *http.Request) (release func(), e *wire.Error) {
+// memory budget before it is read (ADR 0005, checks 3 and 5), and returns
+// the function that releases it. One principal, who, may hold a quarter of
+// the share, as of the SQLite connections. A body over its limit is left
+// to readBody.
+func (s *Server) chargeBody(r *http.Request, who string) (release func(), e *wire.Error) {
 	n := 8 * min(max(r.ContentLength, 0), s.limits.RequestBodyBytes)
 	s.bodyMu.Lock()
 	defer s.bodyMu.Unlock()
-	if s.bodyUsed+n > s.bodyShare {
-		return nil, wire.NewError(wire.CodeOverloaded, "the request bodies' share of the memory budget is full; retry later")
+	if s.bodyUsed+n > s.bodyShare || s.bodyBy[who]+n > s.bodyShare/4 {
+		return nil, wire.NewError(wire.CodeOverloaded, "the request bodies' share of the memory budget, or the principal's part of it, is full; retry later")
 	}
 	s.bodyUsed += n
+	s.bodyBy[who] += n
 	return func() {
 		s.bodyMu.Lock()
 		s.bodyUsed -= n
+		if s.bodyBy[who] -= n; s.bodyBy[who] == 0 {
+			delete(s.bodyBy, who)
+		}
 		s.bodyMu.Unlock()
 	}, nil
 }

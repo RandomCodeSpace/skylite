@@ -13,7 +13,6 @@ import (
 
 	"github.com/ncruces/go-sqlite3"
 
-	"github.com/RandomCodeSpace/skylite/internal/auth"
 	"github.com/RandomCodeSpace/skylite/internal/engine"
 	"github.com/RandomCodeSpace/skylite/internal/sqlpolicy"
 	"github.com/RandomCodeSpace/skylite/internal/wire"
@@ -34,9 +33,10 @@ type pconn struct {
 
 // pool holds the server's SQLite connections for stateless requests. Each
 // connection is charged a ceiling of the memory budget from its open to its
-// close, idle or not; capacity is how many the budget holds, and a principal
-// may hold a quarter of them at once (ADR 0005 decision 9). An admission
-// that finds the pool full closes an idle connection first.
+// close, idle or not; capacity is how many the budget holds after the body
+// share and the leaders' own connections, and a principal may hold a
+// quarter of them at once (ADR 0005 decision 9). An admission that finds
+// the pool full closes an idle connection first.
 type pool struct {
 	mu           sync.Mutex
 	capacity     int
@@ -99,30 +99,42 @@ func (p *pool) release(who string, c *pconn, keep bool) {
 }
 
 // conn returns a connection of leader for who, reset for its new holder, or
-// the refusal before acceptance.
-func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, who string) (*pconn, *wire.Error) {
+// the refusal before acceptance and the engine's error behind it, if any.
+func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, who string) (*pconn, *wire.Error, error) {
 	c, evict, ok := s.pool.take(leader, who)
 	if !ok {
-		return nil, wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later")
+		return nil, wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later"), nil
 	}
 	if evict != nil {
 		_ = evict.ec.Close()
+	}
+	refuse := func(err error) *wire.Error {
+		if ctx.Err() == context.DeadlineExceeded { //nolint:errorlint // context.Err returns the sentinel itself
+			return timeoutError(0)
+		}
+		return s.engineError(d, leader, err)
 	}
 	if c != nil {
 		_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
 			return broken(c.pc.Reset(db.GetInterrupt()))
 		})
-		if err == nil {
-			return c, nil
+		switch {
+		case err == nil:
+			return c, nil, nil
+		case !errors.Is(err, engine.ErrBroken) && !errors.Is(err, engine.ErrStopped):
+			// Refused before the Reset ran, as at the tail bound or in
+			// maintenance: the connection is as it was.
+			s.pool.release(who, c, true)
+			return nil, refuse(err), err
 		}
-		_ = c.ec.Close() // a failed Reset breaks the connection; open another in its place
+		_ = c.ec.Close() // a failed Reset broke the connection; open another in its place
 	}
 	c, err := s.open(ctx, leader)
 	if err != nil {
 		s.pool.release(who, nil, false)
-		return nil, s.engineError(d, leader, err)
+		return nil, refuse(err), err
 	}
-	return c, nil
+	return c, nil, nil
 }
 
 // open opens an engine connection and applies the policy once, inside a Run
@@ -159,7 +171,7 @@ func broken(err error) error {
 var errEnded = errors.New("server: the statement ended")
 
 // statement serves a query or describe on d, which leader leads.
-func (s *Server) statement(ctx context.Context, st *stream, d *database, leader *engine.Leader, req *wire.Request, p *auth.Principal, log *slog.Logger) (*wire.Done, *wire.Error) {
+func (s *Server) statement(ctx context.Context, st *stream, d *database, leader *engine.Leader, req *wire.Request, who string, log *slog.Logger) (*wire.Done, *wire.Error) {
 	limit := s.statementTime
 	if req.TimeoutMS > 0 {
 		limit = min(limit, time.Duration(req.TimeoutMS)*time.Millisecond)
@@ -169,14 +181,14 @@ func (s *Server) statement(ctx context.Context, st *stream, d *database, leader 
 	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	st.deadline, _ = ctx.Deadline()
-	who := p.Issuer + "\x00" + p.Subject
-	c, e := s.conn(ctx, d, leader, who)
+	c, e, err := s.conn(ctx, d, leader, who)
 	if e != nil {
+		logInternal(ctx, log, e, err)
 		return nil, e
 	}
 	var done *wire.Done
 	keep := true
-	_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
+	_, err = c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
 		var ferr error
 		done, e, keep, ferr = s.run(db, c, req, st)
 		return ferr
@@ -196,11 +208,16 @@ func (s *Server) statement(ctx context.Context, st *stream, d *database, leader 
 		keep = false
 		done, e = nil, s.engineError(d, leader, err)
 	}
+	logInternal(ctx, log, e, err)
+	s.pool.release(who, c, keep)
+	return done, e
+}
+
+// logInternal logs an internal answer with the engine's class of err.
+func logInternal(ctx context.Context, log *slog.Logger, e *wire.Error, err error) {
 	if e != nil && e.Code == wire.CodeInternal {
 		log.LogAttrs(ctx, slog.LevelError, "statement failed", slog.String("class", engineClass(err)))
 	}
-	s.pool.release(who, c, keep)
-	return done, e
 }
 
 // run serves the request inside the Run on c. It returns the answer, and
@@ -435,12 +452,15 @@ func txnControl(sql string) bool {
 
 // firstWord returns the identifier characters at the start of s after white
 // space, comments and semicolons, as SQLite's parser reads them, and the
-// rest of s.
+// rest of s. SQLite's tokenizer reads a UTF-8 byte order mark as white space.
 func firstWord(s string) (word, rest string) {
 	for s != "" {
 		switch {
 		case strings.IndexByte(" \t\n\f\r;", s[0]) >= 0: // SQLite skips empty statements before the first
 			s = s[1:]
+			continue
+		case strings.HasPrefix(s, "\xef\xbb\xbf"):
+			s = s[3:]
 			continue
 		case strings.HasPrefix(s, "--"):
 			_, s, _ = strings.Cut(s, "\n")

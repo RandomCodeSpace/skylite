@@ -418,3 +418,56 @@ func TestServeClosesTheStore(t *testing.T) {
 		t.Error("Serve returned without closing the store")
 	}
 }
+
+// TestProbeConnections: the readiness probe, unauthenticated, accepts at
+// most probeConns connections and closes idle ones.
+func TestProbeConnections(t *testing.T) {
+	e := newEnv(t, nil)
+	e.s.idleTimeout = 200 * time.Millisecond
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.s.cfg.ProbeListen = free.Addr().String()
+	_ = free.Close()
+	e.start(t)
+	addr := e.s.cfg.ProbeListen
+	var held []net.Conn
+	for deadline := time.Now().Add(5 * time.Second); len(held) < probeConns; {
+		c, err := net.Dial("tcp", addr) // retried until the probe listens
+		if err != nil {
+			if time.Now().After(deadline) {
+				t.Fatal(err)
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		held = append(held, c)
+	}
+	defer func() {
+		for _, c := range held {
+			_ = c.Close()
+		}
+	}()
+	extra, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = extra.Close() }()
+	if _, err := io.WriteString(extra, "GET /readyz HTTP/1.1\r\nHost: skylite\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = extra.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, err := extra.Read(make([]byte, 1)); n != 0 || err == nil {
+		t.Fatalf("a probe connection beyond the bound was served: %d bytes, %v", n, err)
+	}
+	_ = held[0].Close()
+	_ = extra.SetReadDeadline(time.Now().Add(3 * time.Second))
+	b := make([]byte, 12)
+	if _, err := io.ReadFull(extra, b); err != nil || string(b) != "HTTP/1.1 503" {
+		t.Fatalf("after one closed: %q, %v", b, err)
+	}
+	if !closedWithin(extra, extra, 3*time.Second) {
+		t.Error("an idle probe connection stayed open")
+	}
+}
