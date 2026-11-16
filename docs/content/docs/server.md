@@ -5,7 +5,7 @@ weight: 15
 status: current
 ---
 
-`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it does one thing: it creates a database. It runs no SQL, opens no channels and leads no database. Drivers do not exist yet.
+`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it does one thing: it creates a database. It runs no SQL, opens no channels and leads no database. The [Go driver](/docs/go-driver/) has a read path, which this server does not serve yet.
 
 ## What it serves
 

@@ -40,7 +40,7 @@ detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio
 [[items]]
 title = "Clients: Go driver, JDBC driver and Hibernate dialect"
 status = "planned"
-detail = "A Go database/sql driver (target: works with GORM) and a JDBC driver with a Hibernate dialect (target: works with Spring Data JPA)."
+detail = "A Go database/sql driver (target: works with GORM) and a JDBC driver with a Hibernate dialect (target: works with Spring Data JPA). Exists now: the Go driver's read path (queries, prepared statements through describe, ping), tested against an in-process fake server only, because the server does not serve queries yet. Not yet: writes, transactions, GORM, the JDBC driver and the Hibernate dialect."
 
 [[items]]
 title = "Endpoint auth and SQL lockdown"
