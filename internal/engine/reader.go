@@ -501,13 +501,7 @@ func (r *Reader) locate(pgno uint32) source {
 // readPage returns page pgno, which is in range, possibly shared with the
 // cache.
 func (r *Reader) readPage(ctx context.Context, pgno uint32) ([]byte, error) {
-	switch s := r.locate(pgno); {
-	case s.c != nil:
-		return r.commitPage(ctx, s.c, s.e)
-	case s.base.Txn != 0:
-		return r.basePage(ctx, s.base, pgno)
-	}
-	return make([]byte, r.a.m.PageSize), nil
+	return r.fetch(ctx, r.locate(pgno), pgno)
 }
 
 func (r *Reader) basePage(ctx context.Context, h format.BaseHeader, pgno uint32) ([]byte, error) {
