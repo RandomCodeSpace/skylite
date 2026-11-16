@@ -35,7 +35,7 @@ detail = "Followers read pages from object storage on demand through a read-only
 [[items]]
 title = "HTTPS query API and sessions"
 status = "planned"
-detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests."
+detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, and database creation (PUT). Not yet: SQL, sessions, admission control, forwarding."
 
 [[items]]
 title = "Clients: Go driver, JDBC driver and Hibernate dialect"

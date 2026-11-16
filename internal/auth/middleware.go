@@ -29,7 +29,7 @@ func PrincipalFromContext(ctx context.Context) (*Principal, bool) {
 // more than that; the specific Code is logged.
 func (g *Guard) Require(need Role, database func(*http.Request) string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token, err := bearerToken(r.Header)
+		token, err := BearerToken(r.Header)
 		var p *Principal
 		if err == nil {
 			p, err = g.Verify(r.Context(), token)
@@ -62,9 +62,9 @@ func (g *Guard) Require(need Role, database func(*http.Request) string, next htt
 	})
 }
 
-// bearerToken returns the token of the request's single Authorization header
+// BearerToken returns the token of the request's single Authorization header
 // with the Bearer scheme, or an *Error with CodeMissingToken or CodeMalformed.
-func bearerToken(h http.Header) (string, error) {
+func BearerToken(h http.Header) (string, error) {
 	values := h.Values("Authorization")
 	if len(values) > 1 {
 		return "", &Error{Code: CodeMalformed}

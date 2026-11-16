@@ -58,7 +58,7 @@ integration:
 
 # Starts a uniquely named RustFS container on a free local port, with its data
 # in memory, runs the S3 backend's tests (the conformance suite included)
-# against it with the race detector, and removes it. RustFS's documented
+# and the server's tests against it with the race detector, and removes it. RustFS's documented
 # default credentials are public and only work against the emulator. RustFS
 # does not reclaim the space under /data/.rustfs.sys during the run (5.3 GB at
 # its peak, in one measured run), so a 4 GB tmpfs filled up and RustFS
@@ -75,13 +75,13 @@ integration-s3:
 	endpoint="http://127.0.0.1:$$port"; \
 	for i in $$(seq 60); do curl -s -o /dev/null "$$endpoint" && break; sleep 1; done; \
 	curl -s -o /dev/null "$$endpoint" || { echo "integration-s3: RustFS did not start" >&2; exit 1; }; \
-	rc=0; SKYLITE_TEST_S3_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_S3_TIMEOUT) -tags integration -skip '^TestConformance$$/^ValidKeys$$' ./internal/storage/s3/ || rc=$$?; \
+	rc=0; SKYLITE_TEST_S3_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_S3_TIMEOUT) -tags integration -skip '^TestConformance$$/^ValidKeys$$' ./internal/storage/s3/ ./internal/server/ || rc=$$?; \
 	if [ $$rc -ne 0 ]; then echo "integration-s3: last RustFS log lines:" >&2; docker logs --tail 50 "$$name" >&2 || true; fi; \
 	exit $$rc
 
 # Starts a uniquely named in-memory fake-gcs-server on a free local port, runs
-# the gcs backend's tests (fault tests and conformance suite) against it with
-# the race detector, and removes it. The emulator puts its own URL into
+# the gcs backend's tests (fault tests and conformance suite) and the server's
+# tests against it with the race detector, and removes it. The emulator puts its own URL into
 # resumable upload session URLs, so it must be told the published port: the
 # port is chosen before the container starts.
 integration-gcs:
@@ -93,7 +93,7 @@ integration-gcs:
 	endpoint="http://127.0.0.1:$$port/storage/v1/"; \
 	for i in $$(seq 60); do curl -sf -o /dev/null "$${endpoint}b" && break; sleep 1; done; \
 	curl -sf -o /dev/null "$${endpoint}b" || { echo "integration-gcs: fake-gcs-server did not start" >&2; exit 1; }; \
-	rc=0; SKYLITE_TEST_GCS_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_GCS_TIMEOUT) -tags integration ./internal/storage/gcs/ || rc=$$?; \
+	rc=0; SKYLITE_TEST_GCS_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_GCS_TIMEOUT) -tags integration ./internal/storage/gcs/ ./internal/server/ || rc=$$?; \
 	if [ $$rc -ne 0 ]; then echo "integration-gcs: last fake-gcs-server log lines:" >&2; docker logs --tail 50 "$$name" >&2 || true; fi; \
 	exit $$rc
 

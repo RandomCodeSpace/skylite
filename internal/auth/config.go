@@ -20,9 +20,9 @@ import (
 // Config is the authentication and authorisation configuration of a server.
 type Config struct {
 	// Issuers are the token issuers the server trusts. At least one is required.
-	Issuers []Issuer
+	Issuers []Issuer `json:"issuers"`
 	// Rules grant roles. A principal no rule matches is denied everything.
-	Rules []Rule
+	Rules []Rule `json:"rules"`
 }
 
 // Issuer is one trusted token issuer.
@@ -31,12 +31,12 @@ type Issuer struct {
 	// JWKSFile is set, it must be an https URL without query, fragment, user
 	// info or white space, and the issuer's discovery
 	// document is fetched from Issuer + "/.well-known/openid-configuration".
-	Issuer string
+	Issuer string `json:"issuer"`
 	// Audience is the value a token's aud claim must contain.
-	Audience string
+	Audience string `json:"audience"`
 	// JWKSFile, if set, is the path of a JSON Web Key Set file holding the
 	// issuer's public keys. No network request is then made for this issuer.
-	JWKSFile string
+	JWKSFile string `json:"jwks_file"`
 }
 
 // Role is a level of access to a database. Each role includes the ones
@@ -67,21 +67,21 @@ func (r Role) rank() int {
 // Issuer that have the given Subject, or, if Claim is set instead, whose
 // token has the claim Claim equal to Value or, for an array claim, containing it.
 type Rule struct {
-	Issuer string
+	Issuer string `json:"issuer"`
 	// Subject matches the sub claim exactly. Exactly one of Subject and
 	// Claim must be set.
-	Subject string
+	Subject string `json:"subject"`
 	// Claim names a top-level claim, for example "groups" or "roles".
-	Claim string
+	Claim string `json:"claim"`
 	// Value is the string the claim must equal or contain.
-	Value string
+	Value string `json:"value"`
 	// Database is a database name, which is 1 to 63 bytes of lower-case ASCII
-	// letters, digits, '-' and '_', starting with a letter or a digit, or a pattern.
+	// letters, digits and '-', starting with a letter or a digit, or a pattern.
 	// A pattern may also hold '*', which matches any run of characters, and
 	// '?', which matches one character. It is 1 to 63 bytes long and starts
 	// with a letter, a digit, '*' or '?'.
-	Database string
-	Role     Role
+	Database string `json:"database"`
+	Role     Role   `json:"role"`
 }
 
 // Validate reports the first problem with the configuration, if any.
@@ -145,8 +145,8 @@ func (r Rule) validate(issuers map[string]bool) error {
 }
 
 // validDatabaseName reports whether name is a valid database name: 1 to 63
-// bytes of lower-case ASCII letters, digits, '-' and '_', starting with a
-// letter or a digit.
+// bytes of lower-case ASCII letters, digits and '-', starting with a letter
+// or a digit, as in ADR 0005.
 func validDatabaseName(name string) bool {
 	return len(name) <= 63 && name != "" && nameStart(name[0]) && strings.Trim(name, nameChars) == ""
 }
@@ -157,6 +157,6 @@ func validDatabasePattern(p string) bool {
 	return len(p) <= 63 && p != "" && (nameStart(p[0]) || p[0] == '*' || p[0] == '?') && strings.Trim(p, nameChars+"*?") == ""
 }
 
-const nameChars = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+const nameChars = "abcdefghijklmnopqrstuvwxyz0123456789-"
 
 func nameStart(c byte) bool { return 'a' <= c && c <= 'z' || '0' <= c && c <= '9' }

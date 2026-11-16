@@ -7,7 +7,7 @@ status: current
 
 Every durable byte in skylite is to go through one interface, the `storage.Store` of package `internal/storage`. Its package documentation is the contract: create-if-absent and compare-and-swap as the only writes, version tokens that never repeat for a key, strongly consistent reads and listings, and a rule for writes whose outcome is unknown. Package `internal/storage/storagetest` is the conformance suite every backend must pass.
 
-The backends below are library packages. The server cannot be configured to use any of them yet.
+The [server](/docs/server/) can be configured to use `localfs`, `s3` or `gcs`.
 
 | Package | Service | Status |
 |---|---|---|
