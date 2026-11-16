@@ -58,7 +58,7 @@ The URL is `jdbc:skylite:https://host[:port][/base]/<database>`: the server's ba
 | `tlsRootCertificates` | A PEM file of the certificates to trust, such as a private CA, instead of the JVM's trust store. The file is read when a connection is made. |
 | `allowPlaintext` | `true` permits an `http://` URL. Without it only `https://` is accepted. |
 
-Exactly one of `tokenProvider` and `tokenFile` is required. `user` and `password` are ignored. No secret goes in the URL. The driver never logs; its exceptions never hold the token or the request URL, though an exception from the network or TLS can name the host and port it could not reach. A token that is empty or holds characters a bearer token cannot hold, such as a space, is refused before anything is sent.
+Exactly one of `tokenProvider` and `tokenFile` is required. Connection properties are trusted configuration: whoever sets them chooses the class the driver instantiates and the file whose contents it sends, as a bearer token, to the URL's host, so never build them from untrusted input. `user` and `password` are ignored. No secret goes in the URL. The driver never logs; its exceptions never hold the token or the request URL, though an exception from the network or TLS can name the host and port it could not reach. A token that is empty or holds characters a bearer token cannot hold, such as a space, is refused before anything is sent.
 
 The driver uses HTTP/2 when the server offers it, and refuses every redirect, so a request and its token go only to the URL's host. It waits up to 60 seconds for the headers of each response, or `Connection.setNetworkTimeout`'s value when that is set. HTTP clients are shared by connections with the same trust settings.
 

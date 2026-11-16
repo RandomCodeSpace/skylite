@@ -83,7 +83,8 @@ public final class SkyliteDriver implements Driver {
         }
         try {
             ClassLoader cl = Thread.currentThread().getContextClassLoader();
-            Class<?> c = Class.forName(String.valueOf(v), true, cl != null ? cl : SkyliteDriver.class.getClassLoader());
+            // Not initialised until it is known to be a TokenProvider: no other class's static code runs.
+            Class<?> c = Class.forName(String.valueOf(v), false, cl != null ? cl : SkyliteDriver.class.getClassLoader());
             if (!TokenProvider.class.isAssignableFrom(c)) {
                 throw config("the tokenProvider class does not implement " + TokenProvider.class.getName());
             }
