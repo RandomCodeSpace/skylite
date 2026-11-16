@@ -7,13 +7,14 @@ status: current
 
 Every durable byte in skylite is to go through one interface, the `storage.Store` of package `internal/storage`. Its package documentation is the contract: create-if-absent and compare-and-swap as the only writes, version tokens that never repeat for a key, strongly consistent reads and listings, and a rule for writes whose outcome is unknown. Package `internal/storage/storagetest` is the conformance suite every backend must pass.
 
-The backends below are library packages. The server cannot be configured to use any of them yet.
+The backends below are library packages, each tested against an emulator only (RustFS, fake-gcs-server, Azurite). The server cannot be configured to use any of them yet.
 
 | Package | Service | Status |
 |---|---|---|
 | `internal/storage/localfs` | a local directory (Linux and macOS) | reference backend |
 | `internal/storage/s3` | Amazon S3 and S3-compatible stores | tested against the RustFS emulator only; one conformance subtest is skipped there (see below) |
 | `internal/storage/gcs` | Google Cloud Storage | tested against the fake-gcs-server emulator only |
+| `internal/storage/azureblob` | Azure Blob Storage | tested against the Azurite emulator only |
 
 ## Amazon S3 and S3-compatible stores
 
@@ -121,3 +122,62 @@ The emulator ignores `ifGenerationMatch` on a delete and `ifMetagenerationMatch`
 - The real Google Cloud Storage service. Its behaviour where the emulator may differ is unverified: when a resumable upload evaluates `ifGenerationMatch`, the headers of a 416 response, how it answers a repeated chunk, its page sizes, which 412 reason it sends when an organization policy refuses a write, and whether its front end resets with `PROTOCOL_ERROR` an HTTP/2 stream it has applied.
 - Real credentials. The Application Default Credentials path has never run.
 - Real latency, throttling (429) and service-side 5xx errors.
+
+## Azure Blob Storage
+
+Package `internal/storage/azureblob` stores each object as a block blob in one container of an Azure Blob Storage account with a flat namespace (not Data Lake Storage). The blob name is the key.
+
+### How the contract maps onto the service
+
+| Contract | Blob service request |
+|---|---|
+| `Create` | one Put Blob with `If-None-Match: *` |
+| `Replace` | one Put Blob with `If-Match: <version token>` |
+| `Delete` | Delete Blob; 404 `BlobNotFound` counts as success |
+| `Get`, `GetRange` | one Get Blob, with `x-ms-range` for a range |
+| `Head`, `GetRange` of length 0 | Get Blob Properties |
+| `List` | List Blobs, flat, with the prefix, following `NextMarker` |
+
+**Version tokens.** The token is the blob's ETag, quotes included, and `Replace` sends it unchanged in `If-Match`. Azure documents that a blob's ETag changes on every write. The contract also needs an ETag never to repeat for a key, also after the blob is deleted and created again. Azure does not document that. The backend uses the ETag as the token on the assumption, not a documented guarantee, that the service never issues the same ETag twice for one blob name. That has not been verified against the service. If it proves false, the backend must change to a per-write identity stored with the blob and compared under a blob lease. A version that is not a quoted entity tag, `*` included, fails `Replace` without a request.
+
+**Conditions.** A write's condition is checked by the service inside its one Put Blob request, so among concurrent writers exactly one succeeds. 409 `BlobAlreadyExists` and 412 are precondition failures, and so is 404 `BlobNotFound` for `Replace`.
+
+**Upload path.** Every write is one Put Blob request; the backend never stages blocks. Azurite counts a blob that has only uncommitted blocks as existing for `If-None-Match: *`, and the real service's behaviour there is not documented, so an interrupted staged upload could block a later `Create`. Put Blob needs the body's length, so a write reads its whole body first. Up to 4 MiB stays in memory; a longer body is written to a spool file in a directory the caller chooses. The file is unlinked as soon as it is created and closed when the write returns, so it never outlives the write. A body longer than 5,000 MiB, the most one Put Blob accepts, fails with `ErrInvalidArgument` before anything is sent.
+
+**Unknown outcomes and retries.** The SDK's retries are turned off for `Create`, `Replace` and `Delete`, so a retry can never meet a write's own effect and turn its success into a precondition failure. Go's `net/http` can still send a request twice on its own: over HTTP/2 it re-sends a request whose stream the server reset with `PROTOCOL_ERROR`, and it retries on a new connection a request it wrote nothing of on a reused one. An answer or a failed dial may then belong to the second attempt, after a first that took effect. The backend proves a single attempt from `net/http`'s client trace of the call's context: the connections `net/http` hands the request and the connections it asks for. A failed mutation is a definite error, with no effect, only when the error and that trace prove it:
+
+- the transport did not read the write's body to its end (so a 409 or 412 answering a re-send whose body was not read to its end is a definite error, but not a precondition failure);
+- the SDK failed with an error it marks non-retriable (the credential got no token, a token would go over plain HTTP, or a 401 challenge failed), and the trace saw at most one connection handed to the request and none asked for after it;
+- the trace saw exactly one connection handed to the request and none asked for after it, and the service answered 409 `BlobAlreadyExists` or 412 (a precondition failure), 404 `BlobNotFound` for `Replace` (a precondition failure), or any other 4xx except 408 (a definite error). The backend assumes that such a 4xx comes from the service, or from an intermediary that refused the request itself, never from one that forwarded the request and replaced the answer;
+- the trace saw a connection asked for and none handed to the request, and the error is `net/http`'s failed dial (`dial`, or `proxyconnect` through a proxy), so no connection was made.
+
+The client's transport must pass the request's context on to `net/http`, as the SDK's default transport, any `*http.Transport` and any `*http.Client` do. A transport that drops it is not supported: a credential that fetches its token over HTTP with the call's context then puts its own connections in the trace, and a failed mutation that took effect can be reported as having none. With a transport that passes the context on, a credential's connections can only turn an answer into `ErrOutcomeUnknown`, and a non-retriable error the SDK raises after a 401 challenge counts as no effect only when the trace shows a single attempt. Everything else is `ErrOutcomeUnknown`: a lost response, a reset connection, `EOF`, the context ending, any other transport error, a 5xx, a 408, a 2xx or 3xx other than the one the request expects (201 for Put Blob, 202 for Delete Blob), which only a non-conforming proxy sends, and any failure after a response arrived, such as a response body that breaks off or a header that does not parse. The backend therefore answers `ErrOutcomeUnknown` for some requests that were never sent or had no effect, as the contract allows when a backend cannot tell: for `Delete` and a write with an empty body when the context ends while the credential waits for a token or before the transport dials, or when a refused connection follows a credential's own connection in the trace; for any request when the credential fails with an error the SDK does not mark non-retriable, or fails with one it does mark after its own connections put more than one in the trace, when the SDK fails before sending with such an error (for example, a shared key that cannot sign), when a connection fails in another way than `net/http`'s dial error, such as a TLS handshake failure or any failure through a transport that hides `net/http`'s errors, or when `net/http` retries on a new connection a request it wrote nothing of on a reused one (an HTTP/2 connection found unusable, or one the server closed with `GOAWAY`) and the new dial is refused; and, through a transport that does not pass the request's context on (not supported, see above), for a refused connection and any 4xx. Once a call returns, its request body refuses further reads, so a request still being sent cannot complete later. Reads keep the client's retries.
+
+**Listing.** The service may return fewer entries than requested, so `List` keeps requesting until it has the number asked for or the listing ends. List Blobs has no start-after parameter on a flat namespace, so `List` reads the keys under the prefix up to `startAfter` and skips them, up to 5,000 per request.
+
+**Errors.** An error from the service keeps only its HTTP status and Azure error code. Other errors keep their text with every URL query string removed, since a SAS URL carries its signature there.
+
+### Configuration
+
+`azureblob.New(client, spoolDir)` takes a `*container.Client` from the Azure SDK for Go (`github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container`) and the spool directory (empty means the system temporary directory). The package does not choose a credential: a caller builds the client with a shared key, a SAS URL, or `container.NewClient` and any `azcore.TokenCredential`, which is how Entra ID, including workload identity, can be wired in later. The container must already exist and nothing else may write to it. Any transport works, with two limits: a refused connection is a definite error only if the transport returns net/http's dial error, and through a transport that hides it the failure is `ErrOutcomeUnknown`; and the transport must not send a request again on its own, except for net/http's own re-sends, which the backend detects only if the transport passes the request's context, with its connection trace, on to net/http.
+
+The transport must also close an idle connection before the service, or a load balancer or proxy in between, does: set `http.Transport.IdleConnTimeout` below the shortest idle timeout on the path. The SDK's default transport keeps idle connections for 90 seconds, and Azurite closes them after 5. A mutation is never retried, so a write sent on a pooled connection that the other end is closing fails, often with `ErrOutcomeUnknown`. The tests set 2 seconds.
+
+### Limits
+
+- The spool file relies on Linux or macOS, where an open file can be unlinked.
+- A `List` with `startAfter` costs requests in proportion to the keys before `startAfter` under the prefix.
+- Blobs with snapshots cannot be deleted; the backend never creates snapshots.
+- The SDK is pinned at azblob v1.8.0. Version 1.8.1 and later add Apache Arrow (`arrow-go`) to the dependency graph, so Dependabot is told to ignore them.
+
+### What was tested
+
+Tested against Azurite 3.37.0 (`mcr.microsoft.com/azure-storage/azurite`, pinned by digest in the Makefile), with Azurite's well-known development account and a container SAS:
+
+- the full conformance suite, `storagetest.Run`;
+- this backend's own tests, with a fault-injecting HTTP transport between the SDK and Azurite: responses lost after the service applied a `Create`, a `Replace` and a `Delete`; a refused connection (net/http's dial error) and a request that failed before its body was read; a connection cut in the middle of the body; a request still being sent when its call returned; a response slower than the context's deadline, also through a transport that reports no connection trace; through such a transport, an applied request whose response body then fails, and one whose success has an unparseable `Date` header; 500, 503 and 408 before and after the effect; 400, 403 and a 409 with another code than `BlobAlreadyExists`; a 200 after the effect; that a successful write sends one request and returns the token of its response; a deleted container; writes on connections idle for about as long as Azurite keeps them; read retries; listings in short pages, including one longer than `storage.MaxListLimit`, and one whose second page keeps failing; a 416 for a blob that has grown; the size limit; the spool directory; and redaction of the SAS signature from the errors of every call;
+- against local HTTP servers, token credentials that fail: one before any request, one whose token endpoint answers 500, one whose token endpoint refuses the connection; a token followed by a container endpoint that refuses the connection, definite without a token request and unknown after one; a token credential with a transport that reports no connection trace, against a server whose answers' bodies break off; a refused container endpoint through net/http's transport (definite) and through one that drops the connection trace (unknown); a transport that reports a second attempt in the trace and then fails a dial or answers 409, 412 or, for `Delete`, 404 `BlobNotFound` (a success); a transport that reports one attempt and answers 404 `BlobNotFound` (a precondition failure for `Replace`, a success for `Delete`) or fails with a read error or a dial error (unknown), a transport that reports a second attempt and then fails with an error the SDK marks non-retriable (unknown), and one that reports a connection asked for and none handed over and fails a `proxyconnect` (definite) or a read or write (unknown); and a local HTTP/2 server that applies a request and resets its stream with `PROTOCOL_ERROR`, so `net/http` re-sends it, with the trace intact and dropped, the re-send answered 409 or refused at the dial (unknown in every case); and a credential that fails to reach a closed proxy, with a transport that drops the trace, against a server that applies the request and closes the connection without an answer.
+
+`make integration` runs them in CI. It keeps Azurite's data on the container's disk: Azurite frees the data of deleted blobs only every 10 minutes, and the suite writes more than its in-memory store holds on a CI runner.
+
+Not tested: the real Azure Blob Storage service, working real credentials (Entra ID, workload identity, managed identity, account keys of a real account), real latency and throttling, HTTP/2 against the service, a proxy between the backend and the service, and the assumption that an ETag never repeats for a key. Azurite derives its ETags from the time in milliseconds multiplied by a random factor, so on the emulator two writes in the same millisecond can, rarely, share one.

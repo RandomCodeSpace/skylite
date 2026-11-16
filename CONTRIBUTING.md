@@ -20,9 +20,8 @@ A ruleset on `main` enforces the following, with no bypass for anyone:
 
 - Required status checks, on the pull request and again on the merge queue's
   combined commit: `build`, `vet`, `lint`, `test`, `govulncheck`, `actionlint`,
-  `docs`, `integration`, `integration-s3` and `java-acceptance`.
-  `integration-gcs` becomes required once the pull request that adds it has
-  merged; until the ruleset lists it, it runs without blocking.
+  `docs`, `integration`, `integration-s3`, `integration-gcs` and
+  `java-acceptance`.
 - CodeQL code scanning must report no new alert of severity error, or security
   severity high or above, before a pull request can enter the queue. Merge
   queue groups are not scanned again; GitHub does not apply this rule to them,
@@ -61,7 +60,7 @@ Run `make check` before opening a pull request. `make integration` needs
 Docker; it picks a free local port and removes its Azurite container when it
 finishes. `make integration-gcs` does the same with fake-gcs-server and also
 needs Python 3, which it uses to pick the port. The durability kill test runs 20 rounds by default; set
-`SKYLITE_SPIKE_KILL_ROUNDS` for a longer soak and raise the 6-minute
+`SKYLITE_SPIKE_KILL_ROUNDS` for a longer soak and raise the 9-minute
 `INTEGRATION_TIMEOUT` with it, for example
 `SKYLITE_SPIKE_KILL_ROUNDS=300 INTEGRATION_TIMEOUT=60m make integration`. CI runs the same checks plus
 `go mod tidy -diff` and workflow linting. CodeQL code scanning runs through
