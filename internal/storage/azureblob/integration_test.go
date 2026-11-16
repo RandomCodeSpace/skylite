@@ -261,8 +261,8 @@ func statusBefore(status int, code string) faultFunc {
 	}
 }
 
-// refused dials a closed local port for the request, unchanged, so the trace
-// still names the container's endpoint: the dial fails, so nothing is sent.
+// refused dials a closed local port for the request: the dial fails with
+// net/http's dial error, so nothing is sent.
 func refused(t *testing.T) faultFunc {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -439,12 +439,12 @@ func TestMutationFaults(t *testing.T) {
 		{"NoTraceBadDate", func(*testing.T) faultFunc {
 			return noTraceAnswer(func(resp *http.Response) { resp.Header.Set("Date", "not a date") })
 		}, [3]outcome{unknownDone, unknownDone, unknownDone}, false},
-		// The connection was refused, so nothing was sent: a definite error.
+		// The connection was refused, net/http's dial error, so nothing was
+		// sent: a definite error.
 		{"Refused", refused, [3]outcome{noEffect, noEffect, noEffect}, false},
 		// The request failed before its body was read: nothing reached the
-		// service, a definite error. A Delete has no body, and a transport
-		// that reports no connection attempt could have sent it, so the
-		// backend cannot know: unknown.
+		// service, a definite error. A Delete has no body, and the error
+		// proves nothing about whether it was sent: unknown.
 		{"Unsent", func(*testing.T) faultFunc {
 			return unsent
 		}, [3]outcome{noEffect, noEffect, unknownNoEff}, false},

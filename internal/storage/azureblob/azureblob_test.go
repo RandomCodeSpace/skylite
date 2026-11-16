@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -95,6 +97,10 @@ func closedURL(t *testing.T) string {
 // credential that gets no token, with or without asking a token endpoint
 // (which shares the call's connection trace), or a token followed by a refused
 // connection to the container.
+//
+// A token from a token endpoint followed by a refused connection used to be
+// definite too; it is now unknown: the credential's connection in the shared
+// trace, then the container's dial, look like a re-send.
 func TestCredentialFailure(t *testing.T) {
 	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -108,30 +114,36 @@ func TestCredentialFailure(t *testing.T) {
 		return ts.URL
 	}
 	for name, tc := range map[string]struct {
-		cred azcore.TokenCredential
-		blob string
+		cred    azcore.TokenCredential
+		blob    string
+		unknown bool
 	}{
-		"no request":       {failingCredential{}, srv.URL},
-		"token 500":        {httpCredential{tokens(http.StatusInternalServerError)}, srv.URL},
-		"token refused":    {httpCredential{closedURL(t)}, srv.URL},
-		"container closed": {httpCredential{tokens(http.StatusOK)}, closedURL(t)},
+		"no request":                    {failingCredential{}, srv.URL, false},
+		"token 500":                     {httpCredential{tokens(http.StatusInternalServerError)}, srv.URL, false},
+		"token refused":                 {httpCredential{closedURL(t)}, srv.URL, false},
+		"container closed":              {tokenCredential{}, closedURL(t), false},
+		"token asked, container closed": {httpCredential{tokens(http.StatusOK)}, closedURL(t), true},
 	} {
-		c, err := container.NewClient(tc.blob+"/c", tc.cred, &container.ClientOptions{
-			ClientOptions: azcore.ClientOptions{InsecureAllowCredentialWithHTTP: true},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		s := New(c, t.TempDir())
 		ctx := context.Background()
-		for op, call := range map[string]func() error{
-			"delete":        func() error { return s.Delete(ctx, "k") },
-			"create empty":  func() error { _, err := s.Create(ctx, "k", strings.NewReader("")); return err },
-			"create":        func() error { _, err := s.Create(ctx, "k", strings.NewReader("x")); return err },
-			"replace empty": func() error { _, err := s.Replace(ctx, "k", `"v"`, strings.NewReader("")); return err },
+		for op, call := range map[string]func(*Store) error{
+			"delete":        func(s *Store) error { return s.Delete(ctx, "k") },
+			"create empty":  func(s *Store) error { _, err := s.Create(ctx, "k", strings.NewReader("")); return err },
+			"create":        func(s *Store) error { _, err := s.Create(ctx, "k", strings.NewReader("x")); return err },
+			"replace empty": func(s *Store) error { _, err := s.Replace(ctx, "k", `"v"`, strings.NewReader("")); return err },
 		} {
-			if err := call(); err == nil || errors.Is(err, storage.ErrOutcomeUnknown) {
-				t.Errorf("%s, %s: %v, want a definite error", name, op, err)
+			// A client per call: the client caches the token, and only a
+			// call that asks for one has the credential's connection.
+			c, err := container.NewClient(tc.blob+"/c", tc.cred, &container.ClientOptions{
+				ClientOptions: azcore.ClientOptions{InsecureAllowCredentialWithHTTP: true},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = call(New(c, t.TempDir()))
+			// A body the transport never read stays definite.
+			unknown := tc.unknown && op != "create"
+			if err == nil || errors.Is(err, storage.ErrOutcomeUnknown) != unknown {
+				t.Errorf("%s, %s: %v, want an error, wrapping ErrOutcomeUnknown: %v", name, op, err, unknown)
 			}
 		}
 	}
@@ -190,6 +202,177 @@ func TestAnsweredBehindCredential(t *testing.T) {
 		if err := call(); !errors.Is(err, storage.ErrOutcomeUnknown) {
 			t.Errorf("%s: %v, want an error wrapping ErrOutcomeUnknown", op, err)
 		}
+	}
+}
+
+// mutations calls Create, Replace and Delete on s, with a body and without,
+// and returns their errors by name.
+func mutations(s *Store) map[string]error {
+	ctx := context.Background()
+	errs := map[string]error{}
+	_, errs["create"] = s.Create(ctx, "k", strings.NewReader("x"))
+	_, errs["create empty"] = s.Create(ctx, "k", strings.NewReader(""))
+	_, errs["replace"] = s.Replace(ctx, "k", `"v"`, strings.NewReader("x"))
+	_, errs["replace empty"] = s.Replace(ctx, "k", `"v"`, strings.NewReader(""))
+	errs["delete"] = s.Delete(ctx, "k")
+	return errs
+}
+
+// stripTrace sends a request through tr with a context that carries no
+// client trace, as a RoundTripper that is not net/http's may.
+func stripTrace(tr http.RoundTripper) http.RoundTripper {
+	return rtFunc(func(r *http.Request) (*http.Response, error) { return tr.RoundTrip(r.Clone(context.Background())) })
+}
+
+// TestRefused: a refused connection to the container is net/http's dial
+// error, so nothing was sent and every mutation's error is definite, with or
+// without the client trace reaching net/http.
+func TestRefused(t *testing.T) {
+	tr := &http.Transport{}
+	defer tr.CloseIdleConnections()
+	for name, rt := range map[string]http.RoundTripper{"plain": tr, "trace stripped": stripTrace(tr)} {
+		c, err := container.NewClientWithNoCredential(closedURL(t)+"/c", &container.ClientOptions{
+			ClientOptions: azcore.ClientOptions{Transport: &http.Client{Transport: rt}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for op, err := range mutations(New(c, t.TempDir())) {
+			if err == nil || errors.Is(err, storage.ErrOutcomeUnknown) {
+				t.Errorf("%s, %s: %v, want a definite error", name, op, err)
+			}
+		}
+	}
+}
+
+// TestResent: net/http re-sends a request on its own, for example over
+// HTTP/2 after the server reset its stream with PROTOCOL_ERROR, so after a
+// second attempt the answer may be to a re-send of a first attempt that took
+// effect. A transport that reads the body, reports a second attempt in the
+// request's trace and then fails a dial, or answers a precondition failure,
+// must leave every mutation unknown.
+func TestResent(t *testing.T) {
+	dialFails := func(*http.Request) (*http.Response, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	}
+	conflict := func(r *http.Request) (*http.Response, error) {
+		h := http.Header{}
+		h.Set("x-ms-error-code", "BlobAlreadyExists")
+		if r.Method == http.MethodPut && r.Header.Get("If-Match") != "" {
+			h.Set("x-ms-error-code", "ConditionNotMet")
+			return &http.Response{StatusCode: http.StatusPreconditionFailed, Header: h, Body: http.NoBody, Request: r}, nil
+		}
+		if r.Method == http.MethodDelete {
+			h.Set("x-ms-error-code", "LeaseIdMissing")
+		}
+		return &http.Response{StatusCode: http.StatusConflict, Header: h, Body: http.NoBody, Request: r}, nil
+	}
+	twoGot := func(tr *httptrace.ClientTrace) {
+		tr.GotConn(httptrace.GotConnInfo{})
+		tr.GotConn(httptrace.GotConnInfo{})
+	}
+	gotGet := func(tr *httptrace.ClientTrace) {
+		tr.GotConn(httptrace.GotConnInfo{})
+		tr.GetConn("blob.example.test:80")
+	}
+	for name, tc := range map[string]struct {
+		attempts func(*httptrace.ClientTrace)
+		answer   func(*http.Request) (*http.Response, error)
+	}{
+		"two GotConn, dial fails":           {twoGot, dialFails},
+		"GetConn after GotConn, dial fails": {gotGet, dialFails},
+		"two GotConn, refused":              {twoGot, conflict},
+	} {
+		rt := rtFunc(func(r *http.Request) (*http.Response, error) {
+			if r.Body != nil {
+				_, _ = io.Copy(io.Discard, r.Body)
+			}
+			tc.attempts(httptrace.ContextClientTrace(r.Context()))
+			return tc.answer(r)
+		})
+		c, err := container.NewClientWithNoCredential("http://blob.example.test/c", &container.ClientOptions{
+			ClientOptions: azcore.ClientOptions{Transport: &http.Client{Transport: rt}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for op, err := range mutations(New(c, t.TempDir())) {
+			if !errors.Is(err, storage.ErrOutcomeUnknown) {
+				t.Errorf("%s, %s: %v, want an error wrapping ErrOutcomeUnknown", name, op, err)
+			}
+		}
+	}
+}
+
+// proxyCredential asks its token endpoint through a proxy, as a credential
+// does when HTTP_PROXY names one (http.ProxyFromEnvironment reads the
+// environment once per process, so the proxy is named here), and falls back
+// to its cached, still valid token when that fails, as azcore does when an
+// early refresh fails.
+type proxyCredential struct {
+	proxy *url.URL
+	calls *atomic.Int64
+}
+
+func (c proxyCredential) GetToken(ctx context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	c.calls.Add(1)
+	tr := &http.Transport{Proxy: http.ProxyURL(c.proxy)}
+	defer tr.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://login.example.test/token", nil)
+	if err != nil {
+		return azcore.AccessToken{}, err
+	}
+	if resp, err := tr.RoundTrip(req); err == nil {
+		_ = resp.Body.Close()
+	}
+	return azcore.AccessToken{Token: "t", ExpiresOn: time.Now().Add(time.Hour)}, nil
+}
+
+// TestLostBehindProxyCredential: a credential's failed connection to a
+// closed proxy leaves a connection attempt without a connection in the
+// call's trace; the container's transport drops the trace, and the server
+// applies the request and closes the connection without an answer. The
+// error (EOF) proves nothing, so every mutation is unknown.
+func TestLostBehindProxyCredential(t *testing.T) {
+	var applied atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		applied.Add(1)
+		panic(http.ErrAbortHandler) // close the connection without an answer
+	}))
+	defer srv.Close()
+	t.Setenv("HTTP_PROXY", closedURL(t))
+	proxy, err := url.Parse(os.Getenv("HTTP_PROXY"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	tr := &http.Transport{}
+	defer tr.CloseIdleConnections()
+	c, err := container.NewClient(srv.URL+"/c", proxyCredential{proxy, &calls}, &container.ClientOptions{ClientOptions: azcore.ClientOptions{
+		InsecureAllowCredentialWithHTTP: true,
+		Transport:                       &http.Client{Transport: stripTrace(tr)},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(c, t.TempDir())
+	ctx := context.Background()
+	for op, call := range map[string]func() error{
+		"create":  func() error { _, err := s.Create(ctx, "k", strings.NewReader("x")); return err },
+		"replace": func() error { _, err := s.Replace(ctx, "k", `"v"`, strings.NewReader("x")); return err },
+		"delete":  func() error { return s.Delete(ctx, "k") },
+	} {
+		before := applied.Load()
+		if err := call(); !errors.Is(err, storage.ErrOutcomeUnknown) {
+			t.Errorf("%s: %v, want an error wrapping ErrOutcomeUnknown", op, err)
+		}
+		if applied.Load() == before {
+			t.Errorf("%s: the server did not get the request", op)
+		}
+	}
+	if calls.Load() == 0 {
+		t.Fatal("the credential was never asked")
 	}
 }
 
