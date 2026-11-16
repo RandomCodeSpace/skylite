@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ncruces/go-sqlite3"
 
@@ -486,6 +487,74 @@ func TestLocalWALFailures(t *testing.T) {
 				t.Fatalf("rows after reopening: %s", got)
 			}
 			_ = o
+		})
+	}
+}
+
+// TestFailureAfterUploadOtherConnection: a VACUUM fails after its upload and
+// SQLite rolls it back without the rollback hook. Before the Run ends,
+// another connection starts the WAL again from its header (after a TRUNCATE
+// checkpoint, or a PASSIVE one in the window) and commits. That commit must
+// not be acknowledged on top of the rolled-back image: the leader stops, and
+// the other commit is not committed.
+func TestFailureAfterUploadOtherConnection(t *testing.T) {
+	for _, pre := range []string{"TRUNCATE before", "PASSIVE in the window"} {
+		t.Run(pre, func(t *testing.T) {
+			st, keys, o := newDatabase(t, 4096)
+			l := lead(t, st, keys, o, testConfig())
+			l.psow = false
+			w, other := open(t, l), open(t, l)
+			mustRun(t, w, "BEGIN; CREATE TABLE junk(b); CREATE TABLE t(x); INSERT INTO t VALUES (0); COMMIT")
+			mustRun(t, w, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 60) INSERT INTO junk SELECT randomblob(3000) FROM n")
+			mustRun(t, w, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 400) INSERT INTO t SELECT i FROM n")
+			mustRun(t, w, "DROP TABLE junk")
+			queryConn(t, other, "SELECT count(*) FROM t")
+			if pre == "TRUNCATE before" {
+				checkpoint(t, w, sqlite3.CHECKPOINT_TRUNCATE)
+			}
+			before := l.Head()
+			armed := false
+			l.afterUpload = func() { armed = true }
+			l.fault = func(file, op string, off int64, n int) error {
+				if armed && file == "wal" && op == "write" {
+					armed = false
+					return errInjected
+				}
+				return nil
+			}
+			type res struct {
+				txn uint64
+				err error
+			}
+			done := make(chan res, 1)
+			txn, err := w.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
+				verr := db.Exec("VACUUM")
+				l.afterUpload = nil
+				go func() {
+					if pre != "TRUNCATE before" {
+						_, _ = other.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+							_, _, err := db.WALCheckpoint("main", sqlite3.CHECKPOINT_PASSIVE)
+							return err
+						})
+					}
+					txn, err := exec(other, "INSERT INTO t VALUES (888)")
+					done <- res{txn, err}
+				}()
+				time.Sleep(300 * time.Millisecond)
+				return verr
+			})
+			r := <-done
+			d := mustQuery(t, durable(t, st.Store, keys, 0), "SELECT count(*), (SELECT count(*) FROM t WHERE x = 888) FROM t")
+			t.Logf("Run: txn=%d (head before %d) %v; other: txn=%d %v; durable %v", txn, before, err, r.txn, r.err, d)
+			if l.Err() == nil {
+				t.Errorf("leader serves")
+			}
+			if r.txn != 0 && d[0] != "402|1" {
+				t.Errorf("commit %d was acknowledged and is not in the durable image: %v", r.txn, d)
+			}
+			if r.txn == 0 && !errors.Is(r.err, ErrNotCommitted) {
+				t.Errorf("other connection: %v, want an error matching ErrNotCommitted", r.err)
+			}
 		})
 	}
 }

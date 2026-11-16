@@ -456,6 +456,15 @@ func (l *Leader) walWrite(w *walFile, p []byte, off int64) error {
 		if len(p) != walHeaderSize {
 			return fmt.Errorf("engine: WAL write of %d bytes at 0", len(p))
 		}
+		// A WAL that starts again while a commit is uploaded and not yet
+		// completed: wait for SQLite to complete it, or for the leader to
+		// stop if SQLite rolled it back without the rollback hook.
+		for l.uploading && l.stopped == nil {
+			l.cond.Wait()
+		}
+		if l.stopped != nil {
+			return l.stopped
+		}
 		t.start, t.end = -1, walHeaderSize
 	case off < t.end:
 		return l.stopLocked(fmt.Errorf("engine: WAL write at %d over committed frames ending at %d", off, t.end))
