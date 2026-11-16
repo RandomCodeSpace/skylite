@@ -124,19 +124,17 @@ type FrameKind uint8
 const (
 	FrameColumns FrameKind = iota + 1
 	FrameRow
-	FrameResults
 	FrameParams
 	FrameDone  // terminal
 	FrameError // terminal
 )
 
 // Frame is one frame of a response. Only the member of its Kind is set.
-// Columns, Row, Results and Params are valid until the next call to Next.
+// Columns, Row and Params are valid until the next call to Next.
 type Frame struct {
 	Kind    FrameKind
 	Columns []Column
 	Row     []any
-	Results []Result // this frame's entries
 	Params  []string // this frame's names; "" for a parameter without one
 	Done    *Done
 	Error   *Error
@@ -167,12 +165,16 @@ var doneRequired = map[DoneKind]int{
 	DoneDescribe: dTxn | dParamCount,
 }
 
+// terminalFrameBytes bounds a terminal frame, newline included: ADR 0005
+// reserves 4 KiB for it, and no configuration makes one larger.
+const terminalFrameBytes = 4 << 10
+
 // Reader reads a response body one frame at a time, as it arrives, and keeps
 // at most one frame in memory. It checks the order of ADR 0005's grammar,
-// the row widths, the continuity of results and params entries, the members
-// of the terminal frame the request's kind expects, and that nothing follows
-// the terminal frame. It skips keepalives, frames whose only member is
-// unknown, and unknown members of known objects.
+// the row widths, the continuity of params entries, the members of the
+// terminal frame the request's kind expects, the terminal frame's size, and
+// that nothing follows the terminal frame. It skips keepalives, frames whose
+// only member is unknown, and unknown members of known objects.
 type Reader struct {
 	br       *bufio.Reader
 	kind     DoneKind
@@ -181,7 +183,6 @@ type Reader struct {
 	p        parser
 	state    int // the Writer's states
 	columns  int
-	results  int64 // entries read
 	params   int64 // names read
 	f        Frame
 }
@@ -288,22 +289,23 @@ func (r *Reader) frame(first byte) (skip bool, err error) {
 		}
 		r.f.Kind, err = FrameColumns, r.columnsFrame()
 		r.state, r.columns = stateRows, len(r.f.Columns)
-	case "results":
-		if r.kind != DoneBatch || r.state == stateParams {
-			return false, malformed("a results frame in this response")
-		}
-		r.f.Kind, err = FrameResults, r.entries(&r.results, "entries", r.result)
-		r.state = stateResults
+	case "results": // only in a batch answer, which no Reader reads yet
+		return false, malformed("a results frame in this response")
 	case "params":
-		if r.kind != DoneDescribe && r.kind != DoneChannelDescribe || r.state != stateRows && r.state != stateParams {
+		if r.kind != DoneDescribe || r.state != stateRows && r.state != stateParams {
 			return false, malformed("a params frame in this response or before its columns")
 		}
 		r.f.Kind, err = FrameParams, r.entries(&r.params, "names", r.param)
 		r.state = stateParams
-	case "done":
-		r.f.Kind, err = FrameDone, r.done()
-	case "error":
-		r.f.Kind, err = FrameError, r.errorObject()
+	case "done", "error":
+		if len(r.line) > terminalFrameBytes { // r.line still holds the newline
+			return false, malformed("a terminal frame exceeds %d bytes", terminalFrameBytes)
+		}
+		if string(name) == "done" {
+			r.f.Kind, err = FrameDone, r.done()
+		} else {
+			r.f.Kind, err = FrameError, r.errorObject()
+		}
 	default:
 		skip, err = true, d.SkipValue()
 	}
@@ -323,6 +325,9 @@ func (r *Reader) row() error {
 	}
 	vals := make([]any, 0, r.columns)
 	for d.PeekKind() != ']' {
+		if len(vals) == r.columns { // before decoding a value it would drop
+			return malformed("a row has more values than its %d columns", r.columns)
+		}
 		v, err := readValue(d, &r.p.scratch, true)
 		if err != nil {
 			return malformed("a row value: %v", err)
@@ -470,29 +475,6 @@ func (r *Reader) entries(next *int64, key string, entry func() error) error {
 	return nil
 }
 
-func (r *Reader) result() error {
-	var e Result
-	seen := 0
-	err := r.members("a results entry", func(n string) (ok bool, err error) {
-		switch n {
-		case "rows_affected":
-			e.RowsAffected, ok, err = r.p.integer(0, math.MaxInt64)
-			seen |= 1
-		case "last_insert_rowid":
-			e.LastInsertRowID, ok, err = r.p.integer(math.MinInt64, math.MaxInt64)
-			seen |= 2
-		default:
-			return r.skip()
-		}
-		return ok, err
-	})
-	if err == nil && seen != 3 {
-		err = malformed("a results entry lacks rows_affected or last_insert_rowid")
-	}
-	r.f.Results = append(r.f.Results, e)
-	return err
-}
-
 func (r *Reader) param() error {
 	s, ok, err := r.nullStr()
 	if err == nil && !ok {
@@ -532,7 +514,7 @@ func (r *Reader) done() error {
 		return err
 	case seen&need != need:
 		return malformed("the done frame lacks a member its request's answer carries")
-	case (r.kind == DoneDescribe || r.kind == DoneChannelDescribe) && r.params != d.ParamCount:
+	case r.kind == DoneDescribe && r.params != d.ParamCount:
 		return malformed("%d parameter names for param_count %d", r.params, d.ParamCount)
 	case r.kind == DoneDescribe && r.state == stateStart:
 		return malformed("a describe answer without its columns frame")

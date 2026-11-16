@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -279,5 +280,49 @@ func TestNewReaderRefuses(t *testing.T) {
 	}
 	if _, err := NewReader(strings.NewReader(""), DoneQuery, 1); err == nil {
 		t.Error("NewReader accepted a frame size of 1")
+	}
+}
+
+// TestReaderRefusesAWideRowEarly checks that a row wider than its columns is
+// refused at the first extra value, not after the whole row is decoded.
+func TestReaderRefusesAWideRowEarly(t *testing.T) {
+	body := `{"columns":[{"name":"a"}]}` + "\n[" + strings.Repeat("1000,", 400_000) + "1000]\n"
+	r, err := NewReader(strings.NewReader(body), DoneQuery, len(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Next(); err != nil {
+		t.Fatal(err)
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err = r.Next()
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a row of 400,001 values for 1 column: %v; want ErrMalformed", err)
+	}
+	// Buffering, checking and decoding the frame take about 5 times its size;
+	// decoding every value of the row took 24 times.
+	if got, limit := after.TotalAlloc-before.TotalAlloc, 8*uint64(len(body)); got > limit {
+		t.Fatalf("reading the row allocated %d bytes; want at most %d", got, limit)
+	}
+}
+
+func TestReaderBoundsTheTerminalFrame(t *testing.T) {
+	const cols = `{"columns":[{"name":"a"}]}` + "\n"
+	done := func(size int) string { // a done frame of size bytes, newline included
+		head, tail := `{"done":{"txn":1,"read_only":true,"rows_affected":0,"last_insert_rowid":0,"x":"`, `"}}`+"\n"
+		return head + strings.Repeat("y", size-len(head)-len(tail)) + tail
+	}
+	if _, err := readAll(cols+done(4096), DoneQuery, 1<<20); err != nil {
+		t.Fatalf("a done frame of 4,096 bytes: %v", err)
+	}
+	if _, err := readAll(cols+done(4097), DoneQuery, 1<<20); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a done frame of 4,097 bytes: %v; want ErrMalformed", err)
+	}
+	e := `{"error":{"code":"busy","not_executed":true,"final":true,"message":"` + strings.Repeat("m", 5000) + `","request_id":"r"}}` + "\n"
+	if _, err := readAll(e, DoneQuery, 1<<20); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("an error frame of %d bytes: %v; want ErrMalformed", len(e), err)
 	}
 }
