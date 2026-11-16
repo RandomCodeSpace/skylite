@@ -1473,6 +1473,13 @@ func TestHTTP2ResendOnAnotherConnection(t *testing.T) {
 					},
 				}
 				t.Cleanup(tr.CloseIdleConnections)
+				tr.CloseIdleConnections() // installs net/http's HTTP/2 in TLSNextProto
+				pooled, h2 := make(chan struct{}, 2), tr.TLSNextProto["h2"]
+				tr.TLSNextProto["h2"] = func(authority string, c *tls.Conn) http.RoundTripper {
+					rt := h2(authority, c) // returns once c is in the HTTP/2 pool
+					pooled <- struct{}{}
+					return rt
+				}
 				s := openStore(t, Config{Bucket: "b", Endpoint: "https://" + ln.Addr().String() + "/storage/v1/"}, tr)
 				held := make(chan struct{})
 				go func() { _, _ = s.Head(bg, "hold"); close(srv.resume); close(held) }()
@@ -1486,7 +1493,8 @@ func TestHTTP2ResendOnAnotherConnection(t *testing.T) {
 				<-head
 				close(dial) // the dial goes on for no request; its connection joins the pool
 				<-srv.acks
-				time.Sleep(100 * time.Millisecond) // the client adds it to the pool right after it sent its preface
+				<-pooled
+				<-pooled // both connections are in the pool; the ack alone can come first
 				if reverse {
 					close(srv.release) // the held Head ends: the first connection is free again
 					<-held
