@@ -14,6 +14,7 @@ The project is pre-alpha. The repository contains project scaffolding and a bina
 
 - [Getting started](/docs/getting-started/) installs the binary and shows the only commands that work today.
 - [Architecture](/docs/architecture/) sets out the design direction and the questions that are still open.
+- [Storage backends](/docs/storage-backends/) describes the storage interface's backends, which are library packages the server does not use yet.
 - [Roadmap and status](/docs/roadmap/) lists the planned milestones in order.
 - [Decisions](/docs/decisions/) is where architecture decision records will live.
 - [Reference](/docs/reference/) holds pages generated from the source, starting with the CLI.

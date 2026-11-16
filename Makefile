@@ -11,7 +11,12 @@ AZURITE_IMAGE := mcr.microsoft.com/azure-storage/azurite:3.37.0@sha256:830430c1d
 # and the Azurite log before the runner cancels the job.
 INTEGRATION_TIMEOUT ?= 6m
 
-.PHONY: build test vet lint vuln check integration
+# RustFS 1.0.5, pinned by the digest of its multi-architecture index.
+RUSTFS_IMAGE := rustfs/rustfs:1.0.5@sha256:b81d16a90ee25bd9511280127ca1471788c6e874cf0f0da759645f46b2dc1d74
+# Shorter than the CI job's limit, for the same reason as INTEGRATION_TIMEOUT.
+INTEGRATION_S3_TIMEOUT ?= 15m
+
+.PHONY: build test vet lint vuln check integration integration-s3
 
 build:
 	CGO_ENABLED=0 go build -o bin/skylite ./cmd/skylite
@@ -50,6 +55,29 @@ integration:
 	curl -s -o /dev/null "$$endpoint" || { echo "integration: Azurite did not start" >&2; exit 1; }; \
 	rc=0; SKYLITE_TEST_AZURITE_BLOB_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_TIMEOUT) -tags integration ./... || rc=$$?; \
 	if [ $$rc -ne 0 ]; then echo "integration: last Azurite log lines:" >&2; docker logs --tail 50 "$$name" >&2 || true; fi; \
+	exit $$rc
+
+# Starts a uniquely named RustFS container on a free local port, with its data
+# in memory, runs the S3 backend's tests (the conformance suite included)
+# against it with the race detector, and removes it. RustFS's documented
+# default credentials are public and only work against the emulator. RustFS
+# does not reclaim the space under /data/.rustfs.sys during the run (5.3 GB at
+# its peak, in one measured run), so a 4 GB tmpfs filled up and RustFS
+# answered 503. The conformance suite's ValidKeys subtest is skipped: RustFS
+# rejects its key of one 1,024-byte segment (any segment over 255 bytes), which
+# S3 accepts; the backend's TestValidKeys makes the same checks with that key
+# split into segments of at most 255 bytes.
+integration-s3:
+	@set -e; name="skylite-s3-rustfs-$$$$"; \
+	docker run -d --rm --name "$$name" -p 127.0.0.1::9000 --tmpfs /data:rw,size=10g,mode=1777 \
+	  -e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin $(RUSTFS_IMAGE) /data >/dev/null; \
+	trap 'docker stop "$$name" >/dev/null 2>&1' EXIT; \
+	port=$$(docker port "$$name" 9000/tcp | head -n 1 | sed 's/.*://'); \
+	endpoint="http://127.0.0.1:$$port"; \
+	for i in $$(seq 60); do curl -s -o /dev/null "$$endpoint" && break; sleep 1; done; \
+	curl -s -o /dev/null "$$endpoint" || { echo "integration-s3: RustFS did not start" >&2; exit 1; }; \
+	rc=0; SKYLITE_TEST_S3_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_S3_TIMEOUT) -tags integration -skip '^TestConformance$$/^ValidKeys$$' ./internal/storage/s3/ || rc=$$?; \
+	if [ $$rc -ne 0 ]; then echo "integration-s3: last RustFS log lines:" >&2; docker logs --tail 50 "$$name" >&2 || true; fi; \
 	exit $$rc
 
 # Documentation site (Hugo). Run from the repository root.
