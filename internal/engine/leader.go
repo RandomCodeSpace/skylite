@@ -13,11 +13,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/ncruces/go-sqlite3"
 	"github.com/ncruces/go-sqlite3/vfs"
@@ -49,6 +51,16 @@ var (
 	// version has none, so a retry does not help: reads and writes stay
 	// refused for the life of the leader.
 	ErrTailBound = errors.New("engine: the log tail is at its bound, and this version has no compaction to clear it")
+	// ErrBroken means the Run panicked outside the commit path, as on a
+	// stack overflow in SQLite, or its function reported the connection
+	// broken by returning an error that wraps ErrBroken. The engine has
+	// discarded the connection without SQLite's cooperation and released its
+	// locks; nothing of the Run's open transaction is visible. With
+	// ErrNotCommitted the Run committed nothing; with a nonzero txn its
+	// commit stands and the connection broke after it. The break does not
+	// stop the leader (record 0004, decision 6); a connection that could not
+	// be discarded stops it instead, and its Run does not report ErrBroken.
+	ErrBroken = errors.New("engine: connection broken and discarded")
 	// ErrFenced means another candidacy's epoch bump holds the leader's next
 	// transaction number. The leader has stopped.
 	ErrFenced = errors.New("engine: fenced by another leader's epoch bump")
@@ -409,7 +421,8 @@ func (l *Leader) err() error {
 
 // Open opens a new SQLite connection to the database. ctx bounds the Open:
 // its storage reads and SQLite's set-up statements end when ctx is done, and
-// a panic in them discards the connection (record 0007, requirement 5). An
+// a panic in them discards the connection if SQLite then closes it, and
+// otherwise stops the leader (record 0007, requirement 5). An
 // Open that fails without a panic after maintenance has cancelled its
 // storage reads fails with an error that matches ErrNotCommitted and
 // ErrRetry, whatever ended it: SQLite reports a failed read as an I/O error
@@ -488,6 +501,37 @@ func closeQuietly(db *sqlite3.Conn) (ok bool) {
 	return db.Close() == nil
 }
 
+// release frees db without running SQLite, whose state a panic may have
+// left half-updated; after a stack overflow the instance's stack pointer is
+// past the end of its stack, so no call into it returns. It closes every
+// file the instance holds through the VFS, which releases the main file's
+// lock and closes the WAL, the shared-memory index and temporary files, and
+// then unmaps the instance's memory. The index is mapped into that memory,
+// and the mapping keeps the index's open file description, and the locks on
+// it, alive until it goes. It reports whether it freed db; db must not be
+// used again.
+//
+// shortcut: ncruces v0.37.0 has no API to drop an instance, so release
+// reaches the connection's unexported wrapper by reflection and calls its
+// Close; the broken-connection tests fail if an upgrade changes that, and
+// release then reports false, which stops the leader as before.
+func release(db *sqlite3.Conn) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	f := reflect.ValueOf(db).Elem().FieldByName("wrp")
+	if f.Kind() != reflect.Pointer || f.IsNil() {
+		return false
+	}
+	w, ok := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface().(io.Closer) //nolint:gosec // see the shortcut above
+	if ok {
+		_ = w.Close()
+	}
+	return ok
+}
+
 // Conn is one SQLite connection to the leader's database. It is safe for
 // concurrent use, one Run at a time.
 type Conn struct {
@@ -549,9 +593,10 @@ func (c *Conn) setup() error {
 		return err
 	}
 	// Exceeding the memory ceiling panics in ncruces, and a panic costs the
-	// connection, or the database when the connection cannot be closed (see
-	// finish). Capping values and statements well below the ceiling turns
-	// the commonest way there, one huge value, into an SQLITE_TOOBIG error.
+	// connection (see finish), or, in Open, the database when SQLite cannot
+	// close the connection. Capping values and statements well below the
+	// ceiling turns the commonest way there, one huge value, into an
+	// SQLITE_TOOBIG error.
 	limit := int(min(1e9, c.l.cfg.MaxMemory/4))
 	c.db.Limit(sqlite3.LIMIT_LENGTH, limit)
 	c.db.Limit(sqlite3.LIMIT_SQL_LENGTH, limit)
@@ -601,12 +646,14 @@ func (c *Conn) pragma(name string) (string, error) {
 //   - txn is nonzero: f's commit is in the durable history. A non-nil error
 //     then means committed-then-failed: it reports what failed later in the
 //     Run and matches neither ErrNotCommitted nor ErrUnknown, so a caller
-//     must look at txn before err.
+//     must look at txn before err. It matches ErrBroken if the connection
+//     broke after the commit.
 //   - txn is 0 and err is nil: f succeeded and committed nothing.
 //   - err matches ErrNotCommitted: the Run committed nothing, and nothing
 //     of it can enter the history. It also matches ErrStopped if the leader
-//     stopped, ErrRetry if a retry can succeed, ErrTooLarge or ErrTailBound
-//     if it cannot, and wraps f's own error, if any. A transaction f left
+//     stopped, ErrBroken if the connection broke and was discarded, ErrRetry
+//     if a retry can succeed, ErrTooLarge or ErrTailBound if it cannot, and
+//     wraps f's own error, if any. A transaction f left
 //     open stays open for the next Run unless maintenance rolled it back,
 //     which the error says, or SQLite did, which it does not: SQLite can
 //     roll the whole transaction back after SQLITE_FULL (the temporary-file
@@ -662,13 +709,10 @@ func (c *Conn) Run(ctx context.Context, id []byte, f func(db *sqlite3.Conn) erro
 // commit path and reports the Run's class.
 //
 // A panic in the commit path stops the database on this node (decision 6).
-// A panic outside it discards just the connection if the connection closes
-// cleanly, and otherwise stops the database too: a panic that unwinds
-// through sqlite3_exec leaves a statement ncruces does not track, so the
-// connection cannot be closed and keeps its shared-memory locks
-// (TestExperimentPanickedConnectionKeepsLocks), while ncruces's
-// out-of-memory panic, and a VFS panic inside a prepared statement's step or
-// a checkpoint, leave it closable (TestPanicOutsideTheCommitPath).
+// A panic outside it, or an error of f's that wraps ErrBroken, breaks the
+// connection: release discards it without running SQLite, and the Run
+// fails with ErrBroken. Only the leader's own connection, and a connection
+// release cannot free, stop the database instead.
 func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	l := c.l
 	if p == nil {
@@ -678,8 +722,13 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	inCommit := c.inCommit
 	c.interrupt, c.id, c.ctx = nil, nil, nil
 	l.cmu.Unlock()
+	broken := p != nil || errors.Is(ferr, ErrBroken)
 	// The leader's own connection is never discarded: maintenance needs it.
-	discarded := p != nil && !inCommit && c != l.mconn && c.discard()
+	discarded := broken && !inCommit && c != l.mconn && c.discard(true)
+	if !discarded && errors.Is(ferr, ErrBroken) {
+		// ErrBroken says the connection was discarded; this one was not.
+		ferr = errors.New(ferr.Error())
+	}
 	l.cmu.Lock()
 	uploaded, done, outcome, maint := c.uploaded, c.done, c.outcome, c.maint
 	unsent := "nothing of this Run was sent to storage"
@@ -691,21 +740,25 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	unknown := errors.Is(outcome, ErrUnknown)
 	switch {
 	case discarded:
-		note := fmt.Errorf("%w: %s; the connection was closed and discarded (panic: %v)", ErrNotCommitted, unsent, p)
+		why := "its function reported it broken"
+		if p != nil {
+			why = fmt.Sprintf("panic: %v", p)
+		}
+		note := fmt.Errorf("%w: %w: %s; the connection was closed and discarded (%s)", ErrNotCommitted, ErrBroken, unsent, why)
 		if unknown {
-			note = fmt.Errorf("the connection was closed and discarded (panic: %v)", p)
+			note = fmt.Errorf("%w: the connection was closed and discarded (%s)", ErrBroken, why)
 		}
 		outcome = errors.Join(outcome, note)
-	case p != nil || inCommit:
-		// The Run ended in a panic that left the connection unclosable, or
-		// the commit path ended without SQLite completing a commit whose
-		// create may have taken effect.
+	case broken || inCommit:
+		// The Run broke a connection that could not be discarded, or the
+		// commit path ended without SQLite completing a commit whose create
+		// may have taken effect.
 		cause := fmt.Errorf("%w: a commit's create may have taken effect", ErrUnknown)
 		switch {
 		case !inCommit && unknown:
-			cause = errors.New("the connection could not be closed")
+			cause = errors.New("the connection could not be discarded")
 		case !inCommit:
-			cause = fmt.Errorf("%w: %s, but the connection could not be closed", ErrNotCommitted, unsent)
+			cause = fmt.Errorf("%w: %s, but the connection could not be discarded", ErrNotCommitted, unsent)
 		}
 		if uploaded != 0 {
 			cause = fmt.Errorf("transaction %d is committed in storage but SQLite did not complete it", uploaded)
@@ -749,8 +802,13 @@ func classify(done uint64, err, stopped error) (uint64, error) {
 	case done != 0:
 		if errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrUnknown) {
 			// The Run's commit stands: what failed after it must not read
-			// as its outcome.
-			err = fmt.Errorf("transaction %d committed, then: %s", done, err) //nolint:errorlint // must not match either class
+			// as its outcome. A broken connection is still reported broken:
+			// finish reports ErrBroken only for a discarded one.
+			if errors.Is(err, ErrBroken) {
+				err = fmt.Errorf("transaction %d committed, then: %w: %s", done, ErrBroken, err) //nolint:errorlint // must not match either class
+			} else {
+				err = fmt.Errorf("transaction %d committed, then: %s", done, err) //nolint:errorlint // must not match either class
+			}
 		}
 	case errors.Is(err, ErrUnknown):
 		if errors.Is(err, ErrNotCommitted) {
@@ -768,22 +826,24 @@ func classify(done uint64, err, stopped error) (uint64, error) {
 	return done, err
 }
 
-// discard closes the connection, at Close or after a panic outside the
-// commit path, each statement and then the connection under recover, and
-// reports whether the connection closed cleanly. Then SQLite has finalized
-// every statement and released the connection's locks, and the connection
-// leaves the leader. A
-// statement whose Close panics counts as closed: ncruces finalizes it first
-// and then re-reports its out-of-memory error that way; a statement it does
-// not track makes the connection's close fail.
-func (c *Conn) discard() bool {
-	for _, s := range slices.Collect(c.db.Stmts()) {
-		func() {
-			defer func() { _ = recover() }()
-			_ = s.Close()
-		}()
+// discard ends the connection, at Close or once it is broken, and reports
+// whether its locks and memory are released; the connection then leaves the
+// leader. A connection that is not broken is closed through SQLite, each
+// statement and then the connection under recover; a statement whose Close
+// panics counts as closed, since ncruces finalizes it first and then
+// re-reports its out-of-memory error that way. A broken connection, or one
+// whose close fails, is released instead.
+func (c *Conn) discard(broken bool) bool {
+	if !broken {
+		for _, s := range slices.Collect(c.db.Stmts()) {
+			func() {
+				defer func() { _ = recover() }()
+				_ = s.Close()
+			}()
+		}
+		broken = !closeQuietly(c.db)
 	}
-	if !closeQuietly(c.db) {
+	if broken && !release(c.db) {
 		return false
 	}
 	c.db = nil
@@ -848,7 +908,7 @@ func (c *Conn) Close() error {
 	if c.db == nil {
 		return nil
 	}
-	if !c.discard() {
+	if !c.discard(false) {
 		// The connection may still hold locks that the others wait for.
 		c.db = nil
 		return l.stop(errors.New("engine: a connection could not be closed"))

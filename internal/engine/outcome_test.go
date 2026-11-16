@@ -504,7 +504,7 @@ func TestNoChangeCommitsNothing(t *testing.T) {
 	})
 	// The first commits; the second is refused, and the error says so
 	// without reading as the Run's outcome.
-	if txn != head+1 || err == nil || errors.Is(err, ErrNotCommitted) || !strings.Contains(err.Error(), "a second commit") {
+	if txn != head+1 || err == nil || errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrBroken) || !strings.Contains(err.Error(), "a second commit") {
 		t.Fatalf("two commits with one identifier: %d, %v", txn, err)
 	}
 	if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,2" {

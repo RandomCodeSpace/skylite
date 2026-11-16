@@ -441,7 +441,7 @@ func TestRunClasses(t *testing.T) {
 		{"panic, connection discarded", func(t *testing.T) (uint64, error) {
 			_, _, _, _, c := setup(t)
 			return c.Run(ctx, nil, func(*sqlite3.Conn) error { panic("injected") })
-		}, "not committed", nil},
+		}, "not committed", []error{ErrBroken}},
 		{"unknown outcome", func(t *testing.T) (uint64, error) {
 			st, _, _, _, c := setup(t)
 			st.setRule(commitRules(fault{unknownNone: true}))
@@ -465,7 +465,7 @@ func TestRunClasses(t *testing.T) {
 			}
 			return txn, err
 		}, "unknown", []error{ErrStopped}},
-		{"unknown outcome, then a panic that leaves the connection unclosable", func(t *testing.T) (uint64, error) {
+		{"unknown outcome, then a panic inside sqlite3_exec, which SQLite cannot close after", func(t *testing.T) (uint64, error) {
 			st, _, _, _, c := setup(t)
 			st.setRule(commitRules(fault{unknownNone: true}))
 			txn, err := c.Run(ctx, newID(), func(db *sqlite3.Conn) error {
@@ -475,8 +475,8 @@ func TestRunClasses(t *testing.T) {
 				}
 				return errors.Join(e, db.Exec("SELECT boom()"))
 			})
-			if !strings.Contains(err.Error(), "could not be closed") || strings.Contains(err.Error(), "nothing of this Run") {
-				t.Fatalf("not unclosable, or said to have sent nothing: %v", err)
+			if !errors.Is(err, ErrBroken) || strings.Contains(err.Error(), "nothing of this Run") {
+				t.Fatalf("not discarded, or said to have sent nothing: %v", err)
 			}
 			return txn, err
 		}, "unknown", []error{ErrStopped}},
@@ -804,18 +804,28 @@ func TestCloseFinalizesLeakedStatements(t *testing.T) {
 	}
 }
 
-// Covers: decision 6 for a panic outside Run, in Close: the connection may
-// keep its locks, so the leader stops. The panic is in a rollback hook f
-// set, which SQLite calls when it closes a connection in a transaction.
-func TestClosePanicStops(t *testing.T) {
+// Covers: decision 6 as amended, for a panic outside Run, in Close: SQLite
+// did not close the connection, so the engine releases it, and the leader
+// serves on. The panic is in a rollback hook f set, which SQLite calls when it
+// closes a connection in a transaction; the transaction holds a WAL read
+// lock, which a TRUNCATE checkpoint needs.
+func TestClosePanicReleases(t *testing.T) {
 	_, _, _, l, c := setup(t)
+	w := open(t, l)
 	if _, err := c.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 		db.RollbackHook(func() { panic("injected") })
 		return db.Exec("BEGIN; SELECT * FROM t")
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Close(); !errors.Is(err, ErrStopped) || !errors.Is(l.Err(), ErrStopped) {
+	mustRun(t, w, "INSERT INTO t VALUES (1)")
+	if err := c.Close(); err != nil || l.Err() != nil {
 		t.Fatalf("Close: %v; leader: %v", err, l.Err())
+	}
+	if _, err := w.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+		_, _, err := db.WALCheckpoint("main", sqlite3.CHECKPOINT_TRUNCATE)
+		return err
+	}); err != nil {
+		t.Fatalf("TRUNCATE checkpoint after the release: %v", err)
 	}
 }
