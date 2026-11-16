@@ -6,7 +6,7 @@ weight: 30
 status: current
 ---
 
-skylite is pre-alpha. The binary's server authenticates requests and creates databases, and runs no SQL yet. The milestones below are in planned order. Only the first is done.
+skylite is pre-alpha. The binary's server authenticates requests and creates databases, and runs no SQL yet. The milestones below are in planned order. Only the first is done. Parts of the storage milestone exist as library packages, described in [Storage backends](/docs/storage-backends/).
 
 {{< roadmap >}}
 

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,6 +109,9 @@ type Leader struct {
 	// afterUpload, if set, runs after a commit resolved as committed and
 	// before SQLite is told. Tests use it to pause or kill there.
 	afterUpload func()
+	// beforePhaseTwo, if set, runs when SQLite sends a connection's phase
+	// two, before the engine handles it. Tests use it to pause there.
+	beforePhaseTwo func(*Conn)
 	// fault, if set, runs before each write, sync and truncate of a local
 	// file ("wal" or "main"), the engine's own WAL truncation included; an
 	// error it returns fails the call. Tests use it for disk failures.
@@ -138,7 +143,13 @@ type Leader struct {
 	tailPages   int    // page entries in the log above the manifest
 	pending     []*commit
 	wal         walState
-	uploading   bool // a commit is between its first create and its local completion
+	uploading   bool // a commit is between its first create and its local completion; one at a time
+	snapshots   int  // Snapshot calls whose start runs; no create begins meanwhile
+	// ids and bumps index the headers of the log above the manifest, which
+	// this version keeps whole (record 0005, requirement 11): each commit
+	// identifier's transaction, and the epoch bumps in order.
+	ids         map[string]uint64
+	bumps       []uint64
 	conns       map[int64]*Conn
 	nextConn    int64
 	admitClosed bool // client writes refused (decision 10, step 1)
@@ -189,6 +200,10 @@ func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, o
 		head: office.Head, headSize: tmpl.Size(), manifestTxn: m.Txn, tailPages: entryCount(tmpl.commits),
 		wal:   walState{start: -1},
 		conns: map[int64]*Conn{},
+		ids:   map[string]uint64{},
+	}
+	for _, c := range tmpl.commits {
+		l.indexLocked(c.h)
 	}
 	// A tail already at its bound refuses reads and writes from the start;
 	// only a compaction, later work, would clear it.
@@ -212,7 +227,7 @@ func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, o
 	l.vfs = "skylite-" + hex.EncodeToString(name[:])
 	l.ctx, l.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	vfs.Register(l.vfs, (*leaderVFS)(l))
-	if l.mconn, err = l.Open(); err != nil {
+	if l.mconn, err = l.Open(ctx); err != nil {
 		_ = l.Close()
 		return nil, err
 	}
@@ -248,6 +263,89 @@ func (l *Leader) Head() uint64 {
 	l.cmu.Lock()
 	defer l.cmu.Unlock()
 	return l.head
+}
+
+// Snapshot runs start, which must begin a read transaction on one of the
+// leader's connections, and returns the transaction number of the snapshot
+// that read holds (record 0005, requirement 12). The number is exact:
+// Snapshot first waits until no commit is between its create and SQLite's
+// completion of it, so the head is the newest commit SQLite has published,
+// and while start runs no create begins, so neither changes before the read
+// has taken its snapshot. That wait lasts for each commit it meets, a
+// create of up to createAttempts attempts and SQLite's completion; a writer
+// queued behind that commit can begin its create first, so the wait can
+// span several commits. It ends with ctx's error when ctx is done. Commits wait while start runs, so start should only begin the read,
+// with a statement that reads little, such as PRAGMA schema_version inside
+// BEGIN; its storage reads end with its Run's context. start must not wait
+// for SQLite's write lock: a writer holding it may be waiting for start to
+// end before its create, so a BEGIN IMMEDIATE would wait out the busy
+// timeout. A write transaction's number is Head() once BEGIN IMMEDIATE has
+// returned: no commit lands while it holds the lock, and SQLite publishes a
+// commit before it releases it.
+func (l *Leader) Snapshot(ctx context.Context, start func() error) (uint64, error) {
+	defer context.AfterFunc(ctx, func() {
+		l.cmu.Lock()
+		defer l.cmu.Unlock()
+		l.cond.Broadcast()
+	})()
+	l.cmu.Lock()
+	for l.uploading && l.stopped == nil && ctx.Err() == nil {
+		l.cond.Wait()
+	}
+	if err := cmp.Or(l.stopped, ctx.Err()); err != nil {
+		l.cmu.Unlock()
+		return 0, err
+	}
+	l.snapshots++
+	l.cmu.Unlock()
+	defer func() {
+		l.cmu.Lock()
+		defer l.cmu.Unlock()
+		if l.snapshots--; l.snapshots == 0 {
+			l.cond.Broadcast()
+		}
+	}()
+	if err := start(); err != nil {
+		return 0, err
+	}
+	l.cmu.Lock()
+	defer l.cmu.Unlock()
+	return l.head, nil
+}
+
+// Lookup answers a resolve (record 0005, decision 4) from the leader's
+// headers, in one observation ordered against every head advance: txn is
+// the transaction above `above` that carries commit identifier id, and
+// firstBump the first epoch bump above `above`, each 0 if there is none,
+// and head is the leader's head. Every value of above is valid. ok is false
+// if the headers held do not cover every transaction from above+1 to head.
+// This version holds every header above the manifest, at most the reader's
+// walk bound of 65,536 (the tail bound stops commits before more), so ok is
+// false only for `above` below the manifest's transaction number. Lookup
+// answers from memory on a stopped leader too: the caller does decision
+// 4's step 1 itself, with Err. A caller that also reads a table of its own
+// channels reads it before Lookup: a channel it found absent can then send
+// no commit above head.
+func (l *Leader) Lookup(id []byte, above uint64) (txn, firstBump, head uint64, ok bool) {
+	l.cmu.Lock()
+	defer l.cmu.Unlock()
+	if t := l.ids[string(id)]; t > above {
+		txn = t
+	}
+	if i := sort.Search(len(l.bumps), func(i int) bool { return l.bumps[i] > above }); i < len(l.bumps) {
+		firstBump = l.bumps[i]
+	}
+	return txn, firstBump, l.head, above >= l.manifestTxn
+}
+
+// indexLocked adds a commit's header to the lookup index, with l.cmu held.
+func (l *Leader) indexLocked(h format.CommitHeader) {
+	switch {
+	case h.EpochBump:
+		l.bumps = append(l.bumps, h.Txn)
+	case len(h.CommitID) > 0:
+		l.ids[string(h.CommitID)] = h.Txn
+	}
 }
 
 // Err is nil while the leader serves, and otherwise wraps ErrStopped and
@@ -296,6 +394,9 @@ func (l *Leader) stopLocked(cause error) error {
 	if l.stopped == nil {
 		l.stopped = fmt.Errorf("%w: %v", ErrStopped, cause) //nolint:errorlint // see above
 		l.cond.Broadcast()
+		for _, c := range l.conns {
+			c.endLocked()
+		}
 	}
 	return l.stopped
 }
@@ -306,26 +407,33 @@ func (l *Leader) err() error {
 	return l.stopped
 }
 
-// Open opens a new SQLite connection to the database. An Open that fails
-// without a panic after maintenance has cancelled its storage reads fails
-// with an error that matches ErrNotCommitted and ErrRetry, whatever ended
-// it: SQLite reports a failed read as an I/O error without its cause, so a
-// storage error during maintenance is told to retry too.
-func (l *Leader) Open() (_ *Conn, err error) {
+// Open opens a new SQLite connection to the database. ctx bounds the Open:
+// its storage reads and SQLite's set-up statements end when ctx is done, and
+// a panic in them discards the connection (record 0007, requirement 5). An
+// Open that fails without a panic after maintenance has cancelled its
+// storage reads fails with an error that matches ErrNotCommitted and
+// ErrRetry, whatever ended it: SQLite reports a failed read as an I/O error
+// without its cause, so a storage error during maintenance is told to retry
+// too.
+func (l *Leader) Open(ctx context.Context) (_ *Conn, err error) {
 	l.cmu.Lock()
 	if l.stopped != nil {
 		defer l.cmu.Unlock()
 		return nil, l.stopped
 	}
 	l.nextConn++
-	c := &Conn{l: l, n: l.nextConn}
+	c := &Conn{l: l, n: l.nextConn, abort: make(chan struct{})}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	l.conns[c.n] = c
-	// Open's storage reads use this context, so maintenance can end them.
-	ctx, cancel := context.WithCancel(l.ctx)
+	// ictx ends Open's set-up statements when ctx ends or at Close; octx
+	// ends its storage reads then and at maintenance too.
+	ictx, icancel := context.WithCancel(ctx)
+	defer icancel()
+	defer context.AfterFunc(l.ctx, icancel)()
+	octx, cancel := context.WithCancel(ictx)
 	defer cancel()
-	c.ctx, c.interrupt = ctx, cancel
+	c.ctx, c.interrupt = octx, cancel
 	if l.maintaining {
 		// Maintenance may have listed the connections already, and a read in
 		// setup holds a WAL read lock its checkpoint waits on.
@@ -343,7 +451,7 @@ func (l *Leader) Open() (_ *Conn, err error) {
 		if err == nil {
 			return
 		}
-		if p == nil && ctx.Err() != nil && l.ctx.Err() == nil {
+		if p == nil && octx.Err() != nil && ictx.Err() == nil {
 			err = fmt.Errorf("%w: %w: maintenance interrupted the Open: %w", ErrNotCommitted, ErrRetry, err)
 		}
 		// A connection that panicked inside sqlite3.Open cannot be closed.
@@ -358,12 +466,14 @@ func (l *Leader) Open() (_ *Conn, err error) {
 	}()
 
 	u := url.URL{Scheme: "file", Path: l.path, RawQuery: url.Values{"vfs": {l.vfs}, "conn": {fmt.Sprint(c.n)}}.Encode()}
-	if c.db, err = sqlite3.OpenContext(sqlite3.WithMaxMemory(context.Background(), l.cfg.MaxMemory), u.String()); err != nil {
+	if c.db, err = sqlite3.OpenContext(sqlite3.WithMaxMemory(ictx, l.cfg.MaxMemory), u.String()); err != nil {
 		return nil, err
 	}
+	c.db.SetInterrupt(ictx)
 	if err := c.setup(); err != nil {
 		return nil, err
 	}
+	c.db.SetInterrupt(context.Background())
 	return c, nil
 }
 
@@ -399,8 +509,30 @@ type Conn struct {
 	outcome   error  // why a commit during this Run failed
 	retired   bool   // the uploaded commit was found retired: the leader is deposed
 	interrupt context.CancelFunc
-	maint     bool  // maintenance asked this connection to give up its transaction
-	aborted   error // maintenance rolled this connection's transaction back
+	maint     bool          // maintenance asked this connection to give up its transaction
+	aborted   error         // maintenance rolled this connection's transaction back
+	abort     chan struct{} // closed by endLocked
+}
+
+// Aborted returns a channel that is closed once the engine has ended the
+// connection's transaction, or will refuse it, without its client asking:
+// maintenance rolled it back (record 0004 decision 10, steps 4 and 5), or
+// the leader stopped. The connection's next Run fails and says why. Close,
+// and a discard after a panic, close it too. A server that holds its own
+// write lock for the transaction waits on it to release that lock and
+// report the failure (record 0005, requirement 15). SQLite itself rolls an
+// explicit transaction back when it interrupts a write statement in it, as
+// at the end of a Run's context: the channel stays open then, the Run's
+// error is the signal, and the connection's transaction state is NONE.
+func (c *Conn) Aborted() <-chan struct{} { return c.abort }
+
+// endLocked closes the Aborted channel, once, with l.cmu held.
+func (c *Conn) endLocked() {
+	select {
+	case <-c.abort:
+	default:
+		close(c.abort)
+	}
 }
 
 func (c *Conn) setup() error {
@@ -657,6 +789,7 @@ func (c *Conn) discard() bool {
 	c.db = nil
 	c.l.cmu.Lock()
 	delete(c.l.conns, c.n)
+	c.endLocked()
 	c.l.cmu.Unlock()
 	return true
 }
@@ -710,6 +843,7 @@ func (c *Conn) Close() error {
 	l := c.l
 	l.cmu.Lock()
 	delete(l.conns, c.n)
+	c.endLocked()
 	l.cmu.Unlock()
 	if c.db == nil {
 		return nil
@@ -737,6 +871,7 @@ func (c *Conn) rollbackForMaintenance() error {
 	err := c.db.Exec("ROLLBACK")
 	l.cmu.Lock()
 	c.aborted = fmt.Errorf("%w: transaction rolled back for maintenance", l.maintRefusalLocked())
+	c.endLocked()
 	aborted := c.aborted
 	l.cmu.Unlock()
 	return errors.Join(aborted, err)

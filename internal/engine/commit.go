@@ -200,6 +200,13 @@ const (
 func (l *Leader) commit(w *walFile, cp *capture) error {
 	c := w.c
 	l.cmu.Lock()
+	// One commit at a time from its create to SQLite's completion of it:
+	// SQLite releases the write lock before it sends phase two, so a second
+	// writer can get here first. The checks below then see what maintenance
+	// changed meanwhile (decision 10, steps 2 and 3).
+	for l.uploading && l.stopped == nil {
+		l.cond.Wait()
+	}
 	var refuse error
 	switch {
 	case l.head >= maxTxn:
@@ -224,12 +231,33 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 	if refuse == nil {
 		c.idUsed = true
 		l.uploading = true
+		// New Snapshots wait from here; one whose read is taking its
+		// snapshot finishes before the create (record 0005, requirement 12).
+		for l.snapshots > 0 && l.stopped == nil {
+			l.cond.Wait()
+		}
+		if l.stopped != nil {
+			refuse = fmt.Errorf("%w: %w", ErrNotCommitted, l.stopped)
+		}
 	}
 	l.cmu.Unlock()
 	if refuse != nil {
 		return l.fail(w, cp.start, refuse)
 	}
+	// A panic in build creates nothing and leaves no phase two to clear the
+	// flag. The connection's discard or the leader's stop clears it today;
+	// this does not depend on that.
+	building := true
+	defer func() {
+		if building {
+			l.cmu.Lock()
+			l.uploading = false
+			l.cond.Broadcast()
+			l.cmu.Unlock()
+		}
+	}()
 	b, err := l.build(w, cp, h)
+	building = false
 	if err != nil {
 		return l.fail(w, cp.start, fmt.Errorf("%w: building the commit object: %w", ErrNotCommitted, err))
 	}
@@ -250,6 +278,7 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 			pc.entries = nil
 		}
 		l.pending = append(l.pending, pc)
+		l.indexLocked(b.h)
 		c.uploaded, c.retired = h.Txn, retired
 		l.wal.start, l.wal.end = -1, cp.end
 		if l.tailFullLocked() {

@@ -7,9 +7,9 @@ GOVULNCHECK_VERSION := v1.9.0
 
 # Azurite 3.37.0, pinned by the digest of its multi-architecture index.
 AZURITE_IMAGE := mcr.microsoft.com/azure-storage/azurite:3.37.0@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5
-# Shorter than the CI job's 10-minute limit, so a hang prints its goroutine dump
+# Shorter than the CI job's 15-minute limit, so a hang prints its goroutine dump
 # and the Azurite log before the runner cancels the job.
-INTEGRATION_TIMEOUT ?= 6m
+INTEGRATION_TIMEOUT ?= 9m
 
 # RustFS 1.0.5, pinned by the digest of its multi-architecture index.
 RUSTFS_IMAGE := rustfs/rustfs:1.0.5@sha256:b81d16a90ee25bd9511280127ca1471788c6e874cf0f0da759645f46b2dc1d74
@@ -43,10 +43,16 @@ check: build vet lint test vuln
 # Starts a uniquely named Azurite blob container on a free local port, runs
 # the integration tests against it with the race detector, and removes it.
 # SKYLITE_SPIKE_KILL_ROUNDS in the environment sets the kill-test round count.
+# Azurite keeps its data on the container's disk, not in memory: it frees the
+# data of deleted blobs only in a garbage collection every 10 minutes, and the
+# azureblob tests write about 7.5 GiB in 4. Its in-memory store is limited to
+# half the machine's RAM (about 8 GiB on a 16 GB CI runner), and with a 6 GiB
+# limit the conformance suite failed with MemoryExtentStoreAtSizeLimit. On
+# disk, a full run peaked at 7.5 GiB of data and 0.8 GiB of memory.
 integration:
 	@set -e; name="skylite-azurite-$$$$"; \
 	docker run -d --rm --name "$$name" -p 127.0.0.1::10000 $(AZURITE_IMAGE) \
-	  azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --inMemoryPersistence >/dev/null; \
+	  azurite-blob --blobHost 0.0.0.0 --blobPort 10000 >/dev/null; \
 	trap 'docker stop "$$name" >/dev/null 2>&1' EXIT; \
 	port=$$(docker port "$$name" 10000/tcp | head -n 1 | sed 's/.*://'); \
 	endpoint="http://127.0.0.1:$$port/devstoreaccount1"; \

@@ -367,6 +367,14 @@ func TestFrameSplit(t *testing.T) {
 	if n := len(lines(buf)); n != 1 {
 		t.Fatalf("%d frames; want 1", n)
 	}
+	// One byte less and the second name starts a frame of its own.
+	w, buf = newTestWriter(len(`{"params":{"from":0,"names":[":a",":b"]}}`+"\n")-1, DefaultLimits())
+	must(t, w.Columns(nil))
+	buf.Reset()
+	must(t, w.Params([]string{":a", ":b"}))
+	if n := len(lines(buf)); n != 2 {
+		t.Fatalf("%d frames; want 2", n)
+	}
 }
 
 func counts(fs [][]*string) []int {

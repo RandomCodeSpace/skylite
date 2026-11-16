@@ -303,7 +303,7 @@ Every limit is server configuration unless marked as driver configuration. The [
 | Header block read deadline, from the connection's or stream's first byte of the request | 10 s |
 | Body read deadline, from the end of the header block | 30 s |
 | Entries in one batch | 10,000, a maximum: a server may configure it lower, never higher |
-| Entries in one `results` or `params` frame | 1,024 |
+| Entries in one `results` or `params` frame | 1,024, a maximum: a server may configure it lower, never higher |
 | Result size: bytes of all frames of one response before its terminal frame | 64 MiB |
 | Held result: rows and `results` frames of an autocommit write held until its commit has an outcome, one request (`result_too_large`) | 1 MiB |
 | Held results, per pod (`result_too_large`) | 64 MiB |
@@ -600,7 +600,7 @@ The first line is an open answer, with its `limits` shortened; the second and th
 
 ### The `limits` object
 
-Every member is always present, and every value is an integer from 1 to 2^63 − 1, or to 2^31 − 1 for members in milliseconds; `error_message_bytes` is at most 1,024, `batch_entries` at most 10,000 and `frame_entries` at most 1,024. A driver ignores a member it does not know. The values are those in force when the answer was produced. A configuration change applies to channels opened after it; an open channel keeps, for its life, the limits its open answer reported.
+Every member is always present, and every value is an integer from 1 to 2^63 − 1, or to 2^31 − 1 for members in milliseconds; `error_message_bytes` is from 2 (the empty message) to 1,024, `batch_entries` at most 10,000 and `frame_entries` at most 1,024. A driver ignores a member it does not know. The values are those in force when the answer was produced. A configuration change applies to channels opened after it; an open channel keeps, for its life, the limits its open answer reported.
 
 | Member | Limit in [decision 9](#9-limits-and-defaults) |
 |---|---|

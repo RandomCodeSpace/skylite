@@ -211,7 +211,7 @@ func TestFencedByEpochBump(t *testing.T) {
 	if !errors.Is(l.Err(), ErrStopped) {
 		t.Fatalf("leader still serving after being fenced: %v", l.Err())
 	}
-	if _, err := l.Open(); !errors.Is(err, ErrStopped) {
+	if _, err := l.Open(context.Background()); !errors.Is(err, ErrStopped) {
 		t.Fatalf("open after fencing: %v", err)
 	}
 	if got := rows(t, durable(t, st.Store, keys, 0)); got != "0" {
