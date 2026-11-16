@@ -306,7 +306,9 @@ func (l *Leader) err() error {
 	return l.stopped
 }
 
-// Open opens a new SQLite connection to the database.
+// Open opens a new SQLite connection to the database. An Open whose storage
+// read maintenance ends fails with an error that matches ErrNotCommitted and
+// ErrRetry.
 func (l *Leader) Open() (_ *Conn, err error) {
 	l.cmu.Lock()
 	if l.stopped != nil {
@@ -322,6 +324,11 @@ func (l *Leader) Open() (_ *Conn, err error) {
 	ctx, cancel := context.WithCancel(l.ctx)
 	defer cancel()
 	c.ctx, c.interrupt = ctx, cancel
+	if l.maintaining {
+		// Maintenance may have listed the connections already, and a read in
+		// setup holds a WAL read lock its checkpoint waits on.
+		cancel()
+	}
 	l.cmu.Unlock()
 	defer func() {
 		l.cmu.Lock()
@@ -333,6 +340,9 @@ func (l *Leader) Open() (_ *Conn, err error) {
 		}
 		if err == nil {
 			return
+		}
+		if p == nil && ctx.Err() != nil && l.ctx.Err() == nil {
+			err = fmt.Errorf("%w: %w: maintenance ended the Open: %w", ErrNotCommitted, ErrRetry, err)
 		}
 		// A connection that panicked inside sqlite3.Open cannot be closed.
 		// One that is not closed may hold locks the others wait for.
@@ -447,7 +457,10 @@ func (c *Conn) pragma(name string) (string, error) {
 // identifier, at most format.MaxCommitIDLen bytes, of the one transaction f
 // may commit; a commit without one, or a second commit in one Run, is
 // refused as not committed. A transaction that changes no page commits
-// nothing and needs none.
+// nothing and needs none. f may close a writing statement before stepping
+// it to its end, as with an INSERT ... RETURNING whose rows it does not all
+// read: SQLite then commits it at the close, and the Run reports that commit
+// as any other.
 //
 // Every Run ends in exactly one of these classes:
 //   - txn is nonzero: f's commit is in the durable history. A non-nil error
@@ -523,10 +536,18 @@ func (c *Conn) Run(ctx context.Context, id []byte, f func(db *sqlite3.Conn) erro
 // a checkpoint, leave it closable (TestPanicOutsideTheCommitPath).
 func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	l := c.l
+	idle := false
 	if p == nil {
 		c.db.SetInterrupt(context.Background())
+		idle = c.db.TxnState("main") == sqlite3.TXN_NONE
 	}
 	l.cmu.Lock()
+	if idle && c.uploaded != 0 && l.stopped == nil && c.completeLocked() {
+		// SQLite committed a statement closed before its end inside
+		// sqlite3_finalize, which calls no WAL hook; a failure there would
+		// have panicked or rolled back, and a rollback stops the leader.
+		_ = l.stopLocked(fmt.Errorf("%w: own commit %d already retired", ErrFenced, c.done))
+	}
 	inCommit := c.inCommit
 	c.interrupt, c.id, c.ctx = nil, nil, nil
 	l.cmu.Unlock()
@@ -649,13 +670,7 @@ func (c *Conn) discard() bool {
 func (c *Conn) walHook(db *sqlite3.Conn, schema string, pages int) error {
 	l := c.l
 	l.cmu.Lock()
-	var deposed bool
-	if schema == "main" && c.uploaded != 0 {
-		c.done, c.uploaded, c.inCommit = c.uploaded, 0, false
-		deposed = c.retired
-		l.uploading = false
-		l.cond.Broadcast()
-	}
+	deposed := schema == "main" && c.uploaded != 0 && c.completeLocked()
 	l.cmu.Unlock()
 	if deposed {
 		// Only a later leader's compaction retires a commit the leader had
@@ -667,6 +682,16 @@ func (c *Conn) walHook(db *sqlite3.Conn, schema string, pages int) error {
 		_, _, _ = db.WALCheckpoint("main", sqlite3.CHECKPOINT_PASSIVE)
 	}
 	return nil
+}
+
+// completeLocked records, with l.cmu held, that SQLite completed the
+// connection's uploaded commit, and reports whether that commit was found
+// retired, which means the leader is deposed.
+func (c *Conn) completeLocked() bool {
+	c.done, c.uploaded, c.inCommit = c.uploaded, 0, false
+	c.l.uploading = false
+	c.l.cond.Broadcast()
+	return c.retired
 }
 
 // rollbackHook runs when SQLite rolls a transaction back on this

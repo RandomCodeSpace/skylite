@@ -367,6 +367,9 @@ func TestTailBoundCountsBumps(t *testing.T) {
 		if err := db.Exec("CREATE TABLE u(x)"); err != nil {
 			return err
 		}
+		// The maintenance the first commit started must not interrupt the
+		// second statement before it reaches the commit point.
+		db.SetInterrupt(context.Background())
 		return db.Exec("INSERT INTO u VALUES (1)")
 	})
 	if txn == 0 || err == nil || !strings.Contains(err.Error(), "tail is at its bound") || strings.Contains(err.Error(), "maintenance") {

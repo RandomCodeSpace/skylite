@@ -284,6 +284,44 @@ func runClass(txn uint64, err error) string {
 	return fmt.Sprintf("unclassified (%d, %v)", txn, err)
 }
 
+// Covers: decision 6's commit path for a writing statement closed before
+// its end: SQLite commits an INSERT ... RETURNING closed after one step
+// inside sqlite3_finalize, where it calls no WAL hook, and the Run reports
+// that commit as any other, with the leader serving on.
+func TestReturningClosedEarly(t *testing.T) {
+	for _, steps := range []string{"one step", "to its end"} {
+		t.Run(steps, func(t *testing.T) {
+			st, keys, _, l, c := setup(t)
+			other := open(t, l)
+			want := l.Head() + 1
+			txn, err := c.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
+				s, _, err := db.Prepare("INSERT INTO t VALUES (5), (6) RETURNING x")
+				if err != nil {
+					return err
+				}
+				if !s.Step() {
+					return errors.Join(errors.New("no row returned"), s.Close())
+				}
+				for steps == "to its end" && s.Step() {
+				}
+				return s.Close()
+			})
+			if txn != want || err != nil || l.Err() != nil {
+				t.Fatalf("Run: %d, %v; leader: %v; want %d and serving", txn, err, l.Err(), want)
+			}
+			if got := rows(t, durable(t, st.Store, keys, 0)); got != "0,5,6" {
+				t.Fatalf("durable rows %s, want 0,5,6", got)
+			}
+			if got := queryConn(t, other, "SELECT count(*) FROM t"); got[0] != "3" {
+				t.Fatalf("another connection reads %v rows, want 3", got)
+			}
+			if _, err := exec(c, "INSERT INTO t VALUES (7)"); err != nil {
+				t.Fatalf("a later commit on the same connection: %v", err)
+			}
+		})
+	}
+}
+
 // Covers: Commit outcomes, "A client is told exactly one of committed, not
 // committed or unknown", for every exit of Run: each returns exactly one of
 // the classes Run documents, with the reason it names.
@@ -498,10 +536,80 @@ func TestMaintenanceEndsHungOpen(t *testing.T) {
 	}()
 	reached(t, hs)
 	startMaintenance(l)
-	t.Logf("Open: %v", within(t, hs, opened, "the Open parked in a storage read"))
+	if err := within(t, hs, opened, "the Open parked in a storage read"); !errors.Is(err, ErrRetry) || !errors.Is(err, ErrNotCommitted) {
+		t.Fatalf("Open ended by maintenance: %v, want ErrRetry and ErrNotCommitted", err)
+	}
 	armed.Store(false)
 	waitMaintenance(t, l)
 	if got := queryConn(t, w, "SELECT count(*) FROM t"); got[0] != "50" || l.Err() != nil {
+		t.Fatalf("after maintenance: %v; leader: %v", got, l.Err())
+	}
+}
+
+// Covers: decision 10's steps 4 to 6 for an Open that begins after
+// maintenance listed the connections: its setup reads from storage inside a
+// read transaction, whose WAL read lock the TRUNCATE checkpoint waits on, so
+// maintenance ends it too, and the Open is told to retry.
+func TestMaintenanceEndsOpenAfterListing(t *testing.T) {
+	var armed atomic.Bool
+	var n atomic.Int64
+	// Open's first storage read is inside sqlite3.Open; the second, in
+	// setup, holds a WAL read lock.
+	hs, l, w := hungReadSetup(t, func(_ context.Context, op string) bool {
+		return op == "getrange" && armed.Load() && n.Add(1) >= 2
+	})
+	mustRun(t, w, "INSERT INTO t VALUES (1000, 'x')") // frames the checkpoint must backfill
+	b := open(t, l)
+	entered, hold, ran := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		_, err := b.Run(context.Background(), nil, func(*sqlite3.Conn) error {
+			close(entered)
+			<-hold
+			return nil
+		})
+		ran <- err
+	}()
+	<-entered
+	startMaintenance(l)
+	for end := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		l.cmu.Lock()
+		listed := b.maint
+		l.cmu.Unlock()
+		if listed {
+			break
+		}
+		if time.Now().After(end) {
+			close(hold)
+			t.Fatal("maintenance did not list the running connection within 5s")
+		}
+	}
+	armed.Store(true)
+	opened := make(chan error, 1)
+	go func() {
+		c, err := l.Open()
+		if err == nil {
+			err = c.Close()
+		}
+		opened <- err
+	}()
+	// The Open parks in its setup read, or maintenance has ended it already.
+	select {
+	case <-hs.reached:
+	case err := <-opened:
+		opened <- err
+	case <-time.After(5 * time.Second):
+		t.Log("the Open reached neither the store nor its end within 5s")
+	}
+	close(hold)
+	if err := <-ran; err != nil {
+		t.Fatalf("the running connection's Run: %v", err)
+	}
+	if err := within(t, hs, opened, "an Open that began after the listing"); !errors.Is(err, ErrRetry) || !errors.Is(err, ErrNotCommitted) {
+		t.Fatalf("Open ended by maintenance: %v, want ErrRetry and ErrNotCommitted", err)
+	}
+	armed.Store(false)
+	waitMaintenance(t, l)
+	if got := queryConn(t, w, "SELECT count(*) FROM t"); got[0] != "51" || l.Err() != nil {
 		t.Fatalf("after maintenance: %v; leader: %v", got, l.Err())
 	}
 }
