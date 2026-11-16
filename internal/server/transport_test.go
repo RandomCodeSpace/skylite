@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -249,6 +250,73 @@ func TestBodyDeadline(t *testing.T) {
 	defer func() { _ = resp3.Body.Close() }()
 	if resp3.StatusCode != http.StatusUnauthorized || !closedWithin(c, br, 3*time.Second) {
 		t.Errorf("unauthenticated, body never sent: %s, and the connection stayed open", resp3.Status)
+	}
+}
+
+// TestHTTP2ClientThatNeverReads sends unauthenticated requests over HTTP/2
+// and never reads, until the server's frame writes block in TCP. The
+// connection must still close, freeing its slot, and shutdown stay clean.
+func TestHTTP2ClientThatNeverReads(t *testing.T) {
+	e := newEnv(t, nil)
+	e.s.idleTimeout = 200 * time.Millisecond
+	e.s.responseDeadline = 200 * time.Millisecond
+	e.s.shutdownTimeout = 2 * time.Second
+	e.s.maxConns = 1
+	stop := e.start(t)
+	d := net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) { _ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 1024) })
+	}}
+	c, err := d.Dial("tcp", e.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	fr := http2.NewFramer(c, c)
+	if _, err := c.Write([]byte(http2.ClientPreface)); err != nil {
+		t.Fatal(err)
+	}
+	_ = fr.WriteSettings()
+	_ = fr.WriteSettingsAck()
+	_ = fr.WriteWindowUpdate(0, 1<<30)
+	answered := func() int { return strings.Count(e.logs.String(), `"msg":"authentication refused"`) }
+	pad := strings.Repeat("x", 3000)
+	stalls, sent, id := 0, 0, uint32(1)
+	for stalls < 2 && sent < 200000 {
+		before := answered()
+		for range 8 {
+			_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block(h2Put("p", "", "x-pad", pad)...), EndHeaders: true, EndStream: true}); err != nil {
+				break // the server closed the connection
+			}
+			id += 2
+			sent++
+		}
+		for dl := time.Now().Add(500 * time.Millisecond); answered() == before && time.Now().Before(dl); {
+			time.Sleep(time.Millisecond)
+		}
+		if answered() == before {
+			stalls++
+		} else {
+			stalls = 0
+		}
+	}
+	if stalls < 2 {
+		t.Fatalf("the server's writes never blocked after %d requests", sent)
+	}
+	time.Sleep(time.Second)
+	// With one connection allowed, a second is served only once the first closed.
+	c2, err := net.Dial("tcp", e.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c2.Close() }()
+	_, _ = c2.Write([]byte("GET /x HTTP/1.1\r\nHost: s\r\n\r\n"))
+	_ = c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, _ := c2.Read(make([]byte, 1)); n == 0 {
+		t.Error("the connection that stopped reading still holds the only slot")
+	}
+	if err := stop(); err != nil {
+		t.Errorf("shutdown: %v", err)
 	}
 }
 

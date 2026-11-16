@@ -33,7 +33,7 @@ The 30-second body read deadline starts when the server has read the header bloc
 
 ### Connections
 
-An answer must be written within 10 seconds (0005's response deadline), refusals included; a client that does not read it loses it. A connection with no request running is closed after 90 seconds, on HTTP/1.1 and HTTP/2. 0005 gives no value for this idle timeout; 90 seconds is this server's. On HTTP/2 it also bounds a header block that never ends. An HTTP/2 connection carries at most 16 concurrent streams.
+An answer must be written within 10 seconds (0005's response deadline), refusals included; a client that does not read it loses it, and on HTTP/2, where one stalled write holds the whole connection, loses the connection. A connection with no request running is closed after 90 seconds, on HTTP/1.1 and HTTP/2. 0005 gives no value for this idle timeout; 90 seconds is this server's. On HTTP/2 it also bounds a header block that never ends. An HTTP/2 connection carries at most 16 concurrent streams.
 
 ## Configuration
 

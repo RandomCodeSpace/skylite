@@ -153,9 +153,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		ReadHeaderTimeout: s.headerDeadline,
 		IdleTimeout:       s.idleTimeout,
 		MaxHeaderBytes:    int(s.limits.HeaderBlockBytes),
-		HTTP2:             &http.HTTP2Config{MaxConcurrentStreams: maxStreams},
-		Protocols:         &p,
-		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
+		// WriteByteTimeout closes an HTTP/2 connection whose client stops
+		// reading: a frame write blocked in TCP ends no other way.
+		HTTP2:     &http.HTTP2Config{MaxConcurrentStreams: maxStreams, WriteByteTimeout: s.responseDeadline},
+		Protocols: &p,
+		ErrorLog:  slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
 	}
 	ln = netutil.LimitListener(ln, s.maxConns)
 	serve := func() error { return srv.Serve(ln) }
