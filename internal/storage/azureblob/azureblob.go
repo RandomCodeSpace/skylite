@@ -9,12 +9,14 @@
 // and any azcore.TokenCredential; with a shared key or a SAS, use the other
 // constructors of package container. The container must exist, and nothing
 // else may write to it. Any transport works, with two limits (see
-// "Outcomes"): a refused connection is a definite error only if the
-// transport returns net/http's dial error, and through a transport that hides
-// it the failure is reported as unknown; and the transport must not send a
-// request again on its own, except for net/http's own re-sends, which the
-// backend detects only if the transport passes the request's context, with
-// its client trace, on to net/http. The transport must also close an idle
+// "Outcomes"): the backend proves that a request was sent once from
+// net/http's client trace, so a transport that does not pass the request's
+// context on to net/http gets "outcome unknown" for every failed mutation
+// except a body it did not read to its end and a non-retriable SDK error
+// raised before it; and the transport must not send a request again on its
+// own, except for net/http's own re-sends, which the trace shows. A refused
+// connection is a definite error only if the transport returns net/http's
+// dial error. The transport must also close an idle
 // connection before the service, or anything between (a load balancer, a
 // proxy), does: set http.Transport.IdleConnTimeout below
 // the shortest idle timeout on the path (the SDK's default transport keeps
@@ -72,53 +74,67 @@
 // The SDK never retries a mutation: Create, Replace and Delete run with
 // azcore retries disabled for that call, so the outcome of the call is the
 // outcome of its one request, and a lost response is never turned into a
-// precondition failure by a retry that meets the write's own effect. (net/http
-// itself can send a request again: over HTTP/2 it re-sends a request whose
-// stream the server reset with PROTOCOL_ERROR, which does not say whether the
-// server processed it.) A failed mutation is definite, with no effect, only
-// when the error itself proves it:
+// precondition failure by a retry that meets the write's own effect. net/http
+// itself can send a request again, and an answer or a failed dial may belong
+// to that second attempt, after a first that took effect: over HTTP/2 it
+// re-sends a request whose stream the server reset with PROTOCOL_ERROR, which
+// does not say whether the server processed it, and it retries on a new
+// connection a request that it wrote nothing of on a reused one. The backend
+// proves a single attempt from net/http's client trace of the call's context:
+// the connections net/http hands the request (GotConn) and the connections it
+// asks for (GetConn). A failed mutation is definite, with no effect, only
+// when the error and that trace prove it:
 //
 //   - if the transport did not read a write's body to its end, no request
 //     with the whole body was completed, so the service cannot have applied
-//     it;
-//   - the service answered with a status that refuses the request: 409
-//     BlobAlreadyExists or 412 (Create or Replace), or 404 BlobNotFound
-//     (Replace), is storage.ErrPreconditionFailed, and any other 4xx except
-//     408 is a definite error (the status comes from the *azcore.ResponseError
-//     in the error);
+//     it (a 409 or 412 that answers a re-send whose body was not read to its
+//     end is therefore a definite error, but not
+//     storage.ErrPreconditionFailed);
 //   - the SDK failed before its transport with an error azcore marks
 //     non-retriable: its bearer token policy marks so a credential that got
 //     no token and its refusal to send a token over plain HTTP (after the
 //     transport it marks only a failed 401 challenge, a response with no
 //     effect);
-//   - the error holds net/http's *net.OpError for a dial ("dial", or
+//   - the trace saw exactly one connection handed to the request and none
+//     asked for after it, and the service answered with a status that
+//     refuses the request: 409 BlobAlreadyExists or 412 (Create or Replace),
+//     or 404 BlobNotFound (Replace), is storage.ErrPreconditionFailed, and
+//     any other 4xx except 408 is a definite error (the status comes from the
+//     *azcore.ResponseError in the error). The backend assumes that a 4xx
+//     other than 408 comes from the service, or from an intermediary that
+//     refused the request itself, never from one that forwarded the request
+//     and replaced the answer;
+//   - the trace saw a connection asked for and none handed to the request,
+//     and the error holds net/http's *net.OpError for a dial ("dial", or
 //     "proxyconnect" through a proxy): no connection was made, so nothing of
 //     the request was sent.
 //
-// The answer, or the failed dial, may belong to a second attempt by net/http
-// at the request, after a first that took effect. The backend counts the
-// attempts in the client trace of the call's context: after more than one
-// connection handed to the request, or a connection asked for after one was
-// handed to it, every error except the body rule wraps
-// storage.ErrOutcomeUnknown. A credential that calls its token endpoint with
-// the call's context shares that trace, so its connections count too; they
-// can only turn an answer into unknown.
+// A transport that does not pass the request's context on to net/http leaves
+// the trace empty, so through it every failed mutation wraps
+// storage.ErrOutcomeUnknown except under the first two rules. A credential
+// that calls its token endpoint with the call's context shares the trace, so
+// its connections count too; they can only turn an answer into unknown.
 //
 // Everything else wraps storage.ErrOutcomeUnknown: a lost response, a reset
 // connection, EOF, a body that fails after a response arrived, a header that
 // does not parse, the context ending, any other transport error, a 5xx, 408,
 // and a 2xx or 3xx other than the one the request expects (from a
 // non-conforming proxy). Some of these come from requests that were never
-// sent, which the contract allows when the backend cannot tell: for Delete
-// and a write with an empty body when the context ends while a credential
-// waits for a token, or before the transport dials (the SDK then returns the
-// context's error alone); when a credential fails with an error azcore does
-// not mark non-retriable, or the SDK fails before its transport with such an
-// error, for example a shared key that cannot sign the request; when a
-// connection fails with an error other than net/http's dial error, such as a
-// TLS handshake failure or any failure of a transport that hides net/http's
-// errors; and when a credential's own connection in the call's trace makes a
-// refused connection look like a re-send.
+// sent, or that had no effect, which the contract allows when the backend
+// cannot tell: for Delete and a write with an empty body when the context
+// ends while a credential waits for a token, or before the transport dials
+// (the SDK then returns the context's error alone); when a credential fails
+// with an error azcore does not mark non-retriable, or the SDK fails before
+// its transport with such an error, for example a shared key that cannot sign
+// the request; when a connection fails with an error other than net/http's
+// dial error, such as a TLS handshake failure or any failure of a transport
+// that hides net/http's errors; when a credential's own connection in the
+// call's trace makes a refused connection look like a re-send; when net/http
+// retries, on a new connection, a request it wrote nothing of on a reused one
+// (an HTTP/2 connection found unusable, or one the server closed with
+// GOAWAY), and the new dial is refused; and, through a transport that does
+// not pass the request's context on, for a refused connection and for any
+// 4xx answer.
 //
 // Once a mutation call returns, its request body refuses further reads, so a
 // request that net/http is still sending when the call returns can never be
@@ -162,8 +178,10 @@
 // fails without a request, some that call a local token endpoint, and one
 // that gets a token for a server whose answers' bodies fail, and transports
 // that refuse a connection, report a re-send in the trace, or drop the trace
-// while a credential fails to reach a closed proxy. The real service, working
-// Entra ID credentials, real latency, HTTP/2 and a real proxy are not tested.
+// while a credential fails to reach a closed proxy, and a local HTTP/2 server
+// that resets a request's stream with PROTOCOL_ERROR after applying it. The
+// real service, working Entra ID credentials, real latency, HTTP/2 against
+// the service and a real proxy are not tested.
 package azureblob
 
 import (
@@ -264,12 +282,12 @@ func (s *Store) put(ctx context.Context, key, ifMatch string, body io.Reader) (s
 	bodySent := up.finish()
 	if err != nil {
 		var re *azcore.ResponseError
-		if !tries.resent() && errors.As(err, &re) && (re.StatusCode == http.StatusPreconditionFailed ||
+		if tries.single() && errors.As(err, &re) && (re.StatusCode == http.StatusPreconditionFailed ||
 			re.StatusCode == http.StatusConflict && re.ErrorCode == string(bloberror.BlobAlreadyExists) ||
 			ifMatch != "" && re.StatusCode == http.StatusNotFound && re.ErrorCode == string(bloberror.BlobNotFound)) {
 			return "", storage.ErrPreconditionFailed
 		}
-		return "", mutationError(ctx, err, !bodySent, tries.resent())
+		return "", mutationError(ctx, err, !bodySent, tries)
 	}
 	if resp.ETag == nil || *resp.ETag == "" {
 		return "", fmt.Errorf("%w: azure: Put Blob succeeded without an ETag", storage.ErrOutcomeUnknown)
@@ -441,7 +459,7 @@ func (s *Store) delete(ctx context.Context, key string) error {
 	if err == nil || bloberror.HasCode(err, bloberror.BlobNotFound) {
 		return nil
 	}
-	return mutationError(ctx, err, false, tries.resent())
+	return mutationError(ctx, err, false, tries)
 }
 
 func check(ctx context.Context, key string) error {
@@ -465,68 +483,75 @@ func isETag(v string) bool {
 	return true
 }
 
-// attempts counts net/http's attempts at one mutation request, from the
-// client trace of the call's context.
+// attempts records net/http's attempts at one mutation request, from the
+// client trace of the call's context. A transport that does not pass the
+// request's context on to net/http leaves it empty.
 type attempts struct {
-	got   atomic.Int32 // connections handed to the request
-	again atomic.Bool  // a second attempt has started
+	asked atomic.Bool  // a connection was asked for (GetConn)
+	got   atomic.Int32 // connections handed to the request (GotConn)
+	after atomic.Bool  // a connection was asked for after one was handed over
 }
 
-// resent reports whether net/http may have sent the request more than once.
-func (a *attempts) resent() bool { return a.again.Load() }
+// single reports whether the trace saw exactly one attempt: one connection
+// handed to the request and none asked for after it. GetConn runs before a
+// dial, but HTTP/2 skips it for the first request on a new pooled connection,
+// which may not be the request that dialled it, so a single attempt may lack
+// it; a second GotConn, or a GetConn after a GotConn, is a re-send.
+func (a *attempts) single() bool { return a.got.Load() == 1 && !a.after.Load() }
+
+// unconnected reports whether the trace saw a connection asked for and none
+// handed to the request.
+func (a *attempts) unconnected() bool { return a.asked.Load() && a.got.Load() == 0 }
 
 // mutation returns a context for one mutation request, with SDK retries off
-// and a client trace that counts net/http's attempts at the request.
+// and a client trace that records net/http's attempts at the request.
 func mutation(ctx context.Context) (context.Context, *attempts) {
 	a := &attempts{}
-	// GotConn runs once per attempt that has a connection. GetConn runs
-	// before a dial, but HTTP/2 skips it for the first request on a new
-	// pooled connection, which may not be the request that dialled it. So a
-	// second GotConn, or a GetConn after a GotConn, is a re-send.
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		GetConn: func(string) {
+			a.asked.Store(true)
 			if a.got.Load() > 0 {
-				a.again.Store(true)
+				a.after.Store(true)
 			}
 		},
-		GotConn: func(httptrace.GotConnInfo) {
-			if a.got.Add(1) > 1 {
-				a.again.Store(true)
-			}
-		},
+		GotConn: func(httptrace.GotConnInfo) { a.got.Add(1) },
 	})
 	return policy.WithRetryOptions(ctx, policy.RetryOptions{MaxRetries: -1}), a
 }
 
 // mutationError classifies the error of a mutation request that got no
 // precondition answer. unsent reports that the transport did not read the
-// body to its end, resent that net/http may have sent the request twice.
-func mutationError(ctx context.Context, err error, unsent, resent bool) error {
+// body to its end; tries holds the attempts the trace saw.
+func mutationError(ctx context.Context, err error, unsent bool, tries *attempts) error {
 	var re *azcore.ResponseError
 	answered := errors.As(err, &re)
 	cause := redact(err)
 	if !answered && ctx.Err() != nil {
 		cause = ctx.Err()
 	}
-	if unsent || !resent && noEffect(err) {
+	if unsent || noEffect(err, tries) {
 		return cause
 	}
 	return fmt.Errorf("%w: %w", storage.ErrOutcomeUnknown, cause)
 }
 
-// noEffect reports whether err itself proves that its request had no effect:
-// a 4xx answer other than 408 (a 2xx or 3xx other than the one the SDK
-// expects comes from a peer that may have applied it), an error azcore marks
-// non-retriable, which it raises before the transport or for a failed 401
-// challenge, or net/http's error for a connection that was never made.
-func noEffect(err error) bool {
+// noEffect reports whether err, with the attempts the trace saw, proves that
+// its request had no effect: a 4xx answer other than 408 to a single attempt
+// (a 2xx or 3xx other than the one the SDK expects comes from a peer that may
+// have applied it), an error azcore marks non-retriable, which it raises
+// before the transport or for a failed 401 challenge, or net/http's error for
+// a dial when no connection was handed to the request.
+func noEffect(err error, tries *attempts) bool {
 	var re *azcore.ResponseError
 	if errors.As(err, &re) {
-		return re.StatusCode >= 400 && re.StatusCode < 500 && re.StatusCode != http.StatusRequestTimeout
+		return tries.single() && re.StatusCode >= 400 && re.StatusCode < 500 && re.StatusCode != http.StatusRequestTimeout
 	}
 	var nr interface{ NonRetriable() }
+	if errors.As(err, &nr) {
+		return true
+	}
 	var oe *net.OpError
-	return errors.As(err, &nr) || errors.As(err, &oe) && (oe.Op == "dial" || oe.Op == "proxyconnect")
+	return tries.unconnected() && errors.As(err, &oe) && (oe.Op == "dial" || oe.Op == "proxyconnect")
 }
 
 // readError maps the error of a read request.

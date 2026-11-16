@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -226,7 +227,9 @@ func response(req *http.Request, status int, code string) *http.Response {
 	}
 }
 
-var errInjected = errors.New("connection reset by peer (injected)")
+// errInjected is a transport error that is not a dial error, so it proves
+// nothing about the request whatever the trace shows.
+var errInjected error = &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer (injected)")}
 
 // lostResponse sends the request and drops the service's answer.
 func lostResponse(req *http.Request, next http.RoundTripper) (*http.Response, error) {
@@ -250,9 +253,13 @@ func statusAfter(status int, code string) faultFunc {
 }
 
 // statusBefore reads the whole request, as a server does, and answers status
-// without passing it on.
+// without passing it on, reporting in the request's trace the one connection
+// that a server's answer arrives on.
 func statusBefore(status int, code string) faultFunc {
 	return func(req *http.Request, _ http.RoundTripper) (*http.Response, error) {
+		if tr := httptrace.ContextClientTrace(req.Context()); tr != nil && tr.GotConn != nil {
+			tr.GotConn(httptrace.GotConnInfo{})
+		}
 		if req.Body != nil {
 			_, _ = io.Copy(io.Discard, req.Body)
 			_ = req.Body.Close()

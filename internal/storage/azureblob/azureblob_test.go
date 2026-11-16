@@ -1,7 +1,9 @@
 package azureblob
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -18,6 +20,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 
 	"github.com/RandomCodeSpace/skylite/internal/storage"
 )
@@ -225,8 +229,12 @@ func stripTrace(tr http.RoundTripper) http.RoundTripper {
 }
 
 // TestRefused: a refused connection to the container is net/http's dial
-// error, so nothing was sent and every mutation's error is definite, with or
-// without the client trace reaching net/http.
+// error, and with the client trace reaching net/http the trace shows a
+// connection asked for and none handed over, so nothing was sent and every
+// mutation's error is definite. Through a transport that strips the trace the
+// same dial error is unknown: without the trace the backend cannot tell it
+// from a re-send, by net/http, of a first attempt that took effect. A write
+// whose body the transport never read stays definite by the body rule.
 func TestRefused(t *testing.T) {
 	tr := &http.Transport{}
 	defer tr.CloseIdleConnections()
@@ -238,8 +246,117 @@ func TestRefused(t *testing.T) {
 			t.Fatal(err)
 		}
 		for op, err := range mutations(New(c, t.TempDir())) {
-			if err == nil || errors.Is(err, storage.ErrOutcomeUnknown) {
-				t.Errorf("%s, %s: %v, want a definite error", name, op, err)
+			wantUnknown := name == "trace stripped" && op != "create" && op != "replace"
+			if err == nil || errors.Is(err, storage.ErrOutcomeUnknown) != wantUnknown {
+				t.Errorf("%s, %s: %v, want an error, wrapping ErrOutcomeUnknown: %v", name, op, err, wantUnknown)
+			}
+		}
+	}
+}
+
+// outcome names the kind of a mutation's result.
+func outcome(err error) string {
+	switch {
+	case err == nil:
+		return "success"
+	case errors.Is(err, storage.ErrOutcomeUnknown):
+		return "unknown"
+	case errors.Is(err, storage.ErrPreconditionFailed):
+		return "precondition"
+	default:
+		return "definite"
+	}
+}
+
+// traced returns a Store whose transport reads the request's body, reports
+// attempts in the request's trace and then answers.
+func traced(t *testing.T, attempts func(*httptrace.ClientTrace), answer func(*http.Request) (*http.Response, error)) *Store {
+	t.Helper()
+	rt := rtFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Body != nil {
+			_, _ = io.Copy(io.Discard, r.Body)
+		}
+		attempts(httptrace.ContextClientTrace(r.Context()))
+		return answer(r)
+	})
+	c, err := container.NewClientWithNoCredential("http://blob.example.test/c", &container.ClientOptions{
+		ClientOptions: azcore.ClientOptions{Transport: &http.Client{Transport: rt}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(c, t.TempDir())
+}
+
+// answer returns a transport answer with status and the Azure error code.
+func answer(status int, code string) func(*http.Request) (*http.Response, error) {
+	return func(r *http.Request) (*http.Response, error) {
+		h := http.Header{}
+		h.Set("x-ms-error-code", code)
+		return &http.Response{StatusCode: status, Header: h, Body: http.NoBody, Request: r}, nil
+	}
+}
+
+// opError returns a transport that fails with net/http's error for op.
+func opError(op string) func(*http.Request) (*http.Response, error) {
+	return func(*http.Request) (*http.Response, error) {
+		return nil, &net.OpError{Op: op, Net: "tcp", Err: errors.New("connection refused")}
+	}
+}
+
+// conflict answers as the service does when a precondition fails: 412 to a
+// Replace, 409 BlobAlreadyExists to a Create, and 409 LeaseIdMissing to a
+// Delete.
+func conflict(r *http.Request) (*http.Response, error) {
+	switch {
+	case r.Method == http.MethodPut && r.Header.Get("If-Match") != "":
+		return answer(http.StatusPreconditionFailed, "ConditionNotMet")(r)
+	case r.Method == http.MethodDelete:
+		return answer(http.StatusConflict, "LeaseIdMissing")(r)
+	}
+	return answer(http.StatusConflict, "BlobAlreadyExists")(r)
+}
+
+func noAttempt(*httptrace.ClientTrace) {}
+
+func oneGot(tr *httptrace.ClientTrace) { tr.GotConn(httptrace.GotConnInfo{}) }
+
+func getOnly(tr *httptrace.ClientTrace) { tr.GetConn("blob.example.test:80") }
+
+// all returns the same outcome for every mutation of mutations.
+func all(o string) map[string]string {
+	return map[string]string{"create": o, "create empty": o, "replace": o, "replace empty": o, "delete": o}
+}
+
+// TestTraceRules: an answer that proves no effect counts only when the trace
+// saw exactly one connection handed to the request and none asked for after
+// it, and net/http's dial error only when the trace saw a connection asked
+// for and none handed over; any other transport error is unknown.
+func TestTraceRules(t *testing.T) {
+	refusedOne := map[string]string{"create": "precondition", "create empty": "precondition", "replace": "precondition", "replace empty": "precondition", "delete": "definite"}
+	notFound := map[string]string{"create": "definite", "create empty": "definite", "replace": "precondition", "replace empty": "precondition", "delete": "success"}
+	for name, tc := range map[string]struct {
+		attempts func(*httptrace.ClientTrace)
+		answer   func(*http.Request) (*http.Response, error)
+		want     map[string]string
+	}{
+		"one GotConn, refused":          {oneGot, conflict, refusedOne},
+		"one GotConn, 404 BlobNotFound": {oneGot, answer(http.StatusNotFound, "BlobNotFound"), notFound},
+		"one GotConn, read fails":       {oneGot, opError("read"), all("unknown")},
+		"one GotConn, dial fails":       {oneGot, opError("dial"), all("unknown")},
+		"GetConn only, dial fails":      {getOnly, opError("dial"), all("definite")},
+		"GetConn only, proxyconnect":    {getOnly, opError("proxyconnect"), all("definite")},
+		"GetConn only, read fails":      {getOnly, opError("read"), all("unknown")},
+		"GetConn only, write fails":     {getOnly, opError("write"), all("unknown")},
+		"GetConn only, refused":         {getOnly, conflict, all("unknown")},
+		"no trace, refused":             {noAttempt, conflict, all("unknown")},
+		"no trace, 400":                 {noAttempt, answer(http.StatusBadRequest, "InvalidHeaderValue"), all("unknown")},
+		"no trace, dial fails":          {noAttempt, opError("dial"), all("unknown")},
+		"no trace, 404 BlobNotFound":    {noAttempt, answer(http.StatusNotFound, "BlobNotFound"), map[string]string{"create": "unknown", "create empty": "unknown", "replace": "unknown", "replace empty": "unknown", "delete": "success"}},
+	} {
+		for op, err := range mutations(traced(t, tc.attempts, tc.answer)) {
+			if got := outcome(err); got != tc.want[op] {
+				t.Errorf("%s, %s: %v, a %s outcome, want %s", name, op, err, got, tc.want[op])
 			}
 		}
 	}
@@ -252,21 +369,7 @@ func TestRefused(t *testing.T) {
 // request's trace and then fails a dial, or answers a precondition failure,
 // must leave every mutation unknown.
 func TestResent(t *testing.T) {
-	dialFails := func(*http.Request) (*http.Response, error) {
-		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
-	}
-	conflict := func(r *http.Request) (*http.Response, error) {
-		h := http.Header{}
-		h.Set("x-ms-error-code", "BlobAlreadyExists")
-		if r.Method == http.MethodPut && r.Header.Get("If-Match") != "" {
-			h.Set("x-ms-error-code", "ConditionNotMet")
-			return &http.Response{StatusCode: http.StatusPreconditionFailed, Header: h, Body: http.NoBody, Request: r}, nil
-		}
-		if r.Method == http.MethodDelete {
-			h.Set("x-ms-error-code", "LeaseIdMissing")
-		}
-		return &http.Response{StatusCode: http.StatusConflict, Header: h, Body: http.NoBody, Request: r}, nil
-	}
+	dialFails := opError("dial")
 	twoGot := func(tr *httptrace.ClientTrace) {
 		tr.GotConn(httptrace.GotConnInfo{})
 		tr.GotConn(httptrace.GotConnInfo{})
@@ -282,23 +385,17 @@ func TestResent(t *testing.T) {
 		"two GotConn, dial fails":           {twoGot, dialFails},
 		"GetConn after GotConn, dial fails": {gotGet, dialFails},
 		"two GotConn, refused":              {twoGot, conflict},
+		"GetConn after GotConn, refused":    {gotGet, conflict},
+		// A missing blob is a Delete's effect, also after a re-send.
+		"two GotConn, 404 BlobNotFound": {twoGot, answer(http.StatusNotFound, "BlobNotFound")},
 	} {
-		rt := rtFunc(func(r *http.Request) (*http.Response, error) {
-			if r.Body != nil {
-				_, _ = io.Copy(io.Discard, r.Body)
+		for op, err := range mutations(traced(t, tc.attempts, tc.answer)) {
+			want := "unknown"
+			if op == "delete" && name == "two GotConn, 404 BlobNotFound" {
+				want = "success"
 			}
-			tc.attempts(httptrace.ContextClientTrace(r.Context()))
-			return tc.answer(r)
-		})
-		c, err := container.NewClientWithNoCredential("http://blob.example.test/c", &container.ClientOptions{
-			ClientOptions: azcore.ClientOptions{Transport: &http.Client{Transport: rt}},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for op, err := range mutations(New(c, t.TempDir())) {
-			if !errors.Is(err, storage.ErrOutcomeUnknown) {
-				t.Errorf("%s, %s: %v, want an error wrapping ErrOutcomeUnknown", name, op, err)
+			if got := outcome(err); got != want {
+				t.Errorf("%s, %s: %v, a %s outcome, want %s", name, op, err, got, want)
 			}
 		}
 	}
@@ -441,5 +538,120 @@ func TestUploadEnd(t *testing.T) {
 	}
 	if u.finish() {
 		t.Fatal("finish reports the whole body read after 2 of 3 bytes")
+	}
+}
+
+// h2Reset serves HTTP/2 by hand. Of each two complete requests it takes the
+// first as applied, runs onApply if set, and resets its stream with
+// PROTOCOL_ERROR, after which net/http re-sends the request; it answers the
+// second, the re-send, 409 BlobAlreadyExists, as the service answers a
+// request that meets its own first attempt's effect.
+func h2Reset(applied, answered *atomic.Int64, onApply func()) func(*http.Server, *tls.Conn, http.Handler) {
+	return func(_ *http.Server, c *tls.Conn, _ http.Handler) {
+		defer c.Close()
+		if _, err := io.ReadFull(c, make([]byte, len(http2.ClientPreface))); err != nil {
+			return
+		}
+		fr := http2.NewFramer(c, c)
+		_ = fr.WriteSettings()
+		handle := func(id uint32) {
+			if (applied.Load()+answered.Load())%2 == 0 {
+				applied.Add(1)
+				if onApply != nil {
+					onApply()
+				}
+				_ = fr.WriteRSTStream(id, http2.ErrCodeProtocol)
+				return
+			}
+			answered.Add(1)
+			var b bytes.Buffer
+			enc := hpack.NewEncoder(&b)
+			_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "409"})
+			_ = enc.WriteField(hpack.HeaderField{Name: "x-ms-error-code", Value: "BlobAlreadyExists"})
+			_ = enc.WriteField(hpack.HeaderField{Name: "content-length", Value: "0"})
+			_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: b.Bytes(), EndStream: true, EndHeaders: true})
+		}
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				return
+			}
+			switch f := f.(type) {
+			case *http2.SettingsFrame:
+				if !f.IsAck() {
+					_ = fr.WriteSettingsAck()
+				}
+			case *http2.HeadersFrame:
+				if f.StreamEnded() {
+					handle(f.StreamID)
+				}
+			case *http2.DataFrame:
+				if f.StreamEnded() {
+					handle(f.StreamID)
+				}
+			}
+		}
+	}
+}
+
+// TestH2Resend: over HTTP/2 net/http re-sends, on its own, a request whose
+// stream the server reset with PROTOCOL_ERROR, which the server may have
+// applied. The re-send's 409, or its refused dial once the server has stopped
+// listening, belongs to the second attempt, so every mutation must be
+// unknown: with the trace intact because the trace shows the second attempt,
+// and through a transport that strips the trace because nothing then proves a
+// single attempt.
+func TestH2Resend(t *testing.T) {
+	for _, strip := range []bool{false, true} {
+		for _, closeListener := range []bool{false, true} {
+			var applied, answered atomic.Int64
+			srv := httptest.NewUnstartedServer(http.NotFoundHandler())
+			var onApply func()
+			if closeListener {
+				onApply = func() { _ = srv.Listener.Close() }
+			}
+			srv.TLS = &tls.Config{NextProtos: []string{"h2"}}
+			srv.Config.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){"h2": h2Reset(&applied, &answered, onApply)}
+			srv.StartTLS()
+			tr := srv.Client().Transport.(*http.Transport).Clone()
+			tr.ForceAttemptHTTP2 = true
+			var rt http.RoundTripper = tr
+			if strip {
+				rt = stripTrace(tr)
+			}
+			c, err := container.NewClientWithNoCredential(srv.URL+"/c", &container.ClientOptions{
+				ClientOptions: azcore.ClientOptions{Transport: &http.Client{Transport: rt}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := New(c, t.TempDir())
+			ctx := context.Background()
+			ops := map[string]func() error{
+				"create":       func() error { _, err := s.Create(ctx, "k", strings.NewReader("x")); return err },
+				"create empty": func() error { _, err := s.Create(ctx, "k", strings.NewReader("")); return err },
+				"replace":      func() error { _, err := s.Replace(ctx, "k", `"v"`, strings.NewReader("x")); return err },
+				"delete":       func() error { return s.Delete(ctx, "k") },
+			}
+			if closeListener {
+				ops = map[string]func() error{"create": ops["create"]} // the listener closes on the first
+			}
+			for op, call := range ops {
+				a0, r0 := applied.Load(), answered.Load()
+				err := call()
+				wantAnswered := int64(1)
+				if closeListener {
+					wantAnswered = 0
+				}
+				if a, r := applied.Load()-a0, answered.Load()-r0; a != 1 || r != wantAnswered {
+					t.Fatalf("strip %v, close %v, %s: %d applied, %d re-sends answered, want 1 and %d", strip, closeListener, op, a, r, wantAnswered)
+				}
+				if !errors.Is(err, storage.ErrOutcomeUnknown) {
+					t.Errorf("strip %v, close %v, %s: %v, want an error wrapping ErrOutcomeUnknown", strip, closeListener, op, err)
+				}
+			}
+			tr.CloseIdleConnections()
+			srv.Close()
+		}
 	}
 }
