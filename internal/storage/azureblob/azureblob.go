@@ -126,7 +126,8 @@
 // cannot tell: for Delete and a write with an empty body when the context
 // ends while a credential waits for a token, or before the transport dials
 // (the SDK then returns the context's error alone); when a credential fails
-// with an error azcore does not mark non-retriable, or the SDK fails before
+// with an error azcore does not mark non-retriable, or with one it does mark
+// after its own connections put more than one in the trace, or the SDK fails before
 // its transport with such an error, for example a shared key that cannot sign
 // the request; when a connection fails with an error other than net/http's
 // dial error, such as a TLS handshake failure or any failure of a transport
@@ -541,7 +542,8 @@ func mutationError(ctx context.Context, err error, unsent bool, tries *attempts)
 // its request had no effect: a 4xx answer other than 408 to a single attempt
 // (a 2xx or 3xx other than the one the SDK expects comes from a peer that may
 // have applied it), an error azcore marks non-retriable, which it raises
-// before the transport or for a failed 401 challenge, or net/http's error for
+// before the transport or for a failed 401 challenge, to at most one attempt,
+// or net/http's error for
 // a dial when no connection was handed to the request.
 func noEffect(err error, tries *attempts) bool {
 	var re *azcore.ResponseError
