@@ -273,6 +273,37 @@ func TestMaintenanceRefusesWaitingWriter(t *testing.T) {
 	}
 }
 
+// Covers: a writer waiting for an earlier commit's phase two is refused when
+// the leader stops meanwhile, and the earlier commit still completes.
+func TestStopReleasesWaitingWriter(t *testing.T) {
+	_, _, o, l, w1 := setup(t)
+	w2 := open(t, l)
+	p2 := parkPhaseTwo(l, w1)
+	d1, d2 := make(chan error, 1), make(chan error, 1)
+	var t1 uint64
+	go func() { var err error; t1, err = exec(w1, "INSERT INTO t VALUES (1)"); d1 <- err }()
+	<-p2.reached
+	go func() { _, err := exec(w2, "INSERT INTO t VALUES (2)"); d2 <- err }()
+	time.Sleep(300 * time.Millisecond)
+	_ = l.stop(errors.New("test stop"))
+	select {
+	case err := <-d2:
+		if !errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrUnknown) {
+			t.Fatalf("the waiting writer after a stop: %v, want not committed", err)
+		}
+	case <-time.After(5 * time.Second):
+		p2.open()
+		t.Fatal("a stop did not release the waiting writer")
+	}
+	p2.open()
+	if err := <-d1; err != nil {
+		t.Fatalf("the earlier commit after a stop: %v", err)
+	}
+	if t1 != o.Head+2 || l.Head() != o.Head+2 {
+		t.Fatalf("first writer's txn %d, head %d, want %d", t1, l.Head(), o.Head+2)
+	}
+}
+
 // Covers: a commit waiting for a Snapshot's start is refused if the leader
 // stops meanwhile, and creates nothing.
 func TestCommitWaitingForSnapshotStops(t *testing.T) {

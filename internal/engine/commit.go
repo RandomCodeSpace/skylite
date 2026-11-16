@@ -244,7 +244,19 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 	if refuse != nil {
 		return l.fail(w, cp.start, refuse)
 	}
+	// A panic in build creates nothing and leaves no phase two to clear the
+	// flag; clear it here, or every later writer would wait on it.
+	building := true
+	defer func() {
+		if building {
+			l.cmu.Lock()
+			l.uploading = false
+			l.cond.Broadcast()
+			l.cmu.Unlock()
+		}
+	}()
 	b, err := l.build(w, cp, h)
+	building = false
 	if err != nil {
 		return l.fail(w, cp.start, fmt.Errorf("%w: building the commit object: %w", ErrNotCommitted, err))
 	}
