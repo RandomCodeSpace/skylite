@@ -25,7 +25,7 @@ func (cn *conn) CheckNamedValue(nv *driver.NamedValue) error {
 		}
 	case time.Time:
 		x = x.UTC()
-		if x.Year() < 1 || x.Year() > 9999 {
+		if !validYear(x.Year()) {
 			return errors.New("skylite: a time must be in the years 0001 to 9999")
 		}
 		v = x.Format(instantLayout)
@@ -37,15 +37,26 @@ func (cn *conn) CheckNamedValue(nv *driver.NamedValue) error {
 // instantLayout is the canonical form of an instant, in UTC.
 const instantLayout = "2006-01-02 15:04:05.000000000"
 
+// validYear reports whether y is in ADR 0005's range of years, 0001 to 9999.
+func validYear(y int) bool { return y >= 1 && y <= 9999 }
+
+// typeName returns the name of a declared type as SQLite reads it: without
+// the arguments in parentheses that SQLite ignores, trimmed, in upper case.
+// "datetime(6)" is DATETIME.
+func typeName(decl string) string {
+	t, _, _ := strings.Cut(decl, "(")
+	return strings.ToUpper(strings.TrimSpace(t))
+}
+
 // columnValue returns a value read from a column declared decl: a time.Time,
-// in UTC, for TEXT in a date or timestamp form in a column declared DATE,
-// DATETIME or TIMESTAMP, and the value unchanged otherwise.
+// in UTC, for TEXT in a date or timestamp form in a column whose type name
+// is DATE, DATETIME or TIMESTAMP, and the value unchanged otherwise.
 func columnValue(decl string, v any) any {
 	s, ok := v.(string)
 	if !ok {
 		return v
 	}
-	switch strings.ToUpper(strings.TrimSpace(decl)) {
+	switch typeName(decl) {
 	case "DATE", "DATETIME", "TIMESTAMP":
 		if t, ok := parseTime(s); ok {
 			return t
@@ -57,7 +68,8 @@ func columnValue(decl string, v any) any {
 // parseTime reads the date and timestamp forms of ADR 0005 decision 8:
 // YYYY-MM-DD, then optionally a space or T and HH:MM, HH:MM:SS or HH:MM:SS
 // with 1 to 9 fraction digits, then, after a time, optionally Z or an offset
-// +HH:MM or -HH:MM. Text without an offset is UTC.
+// +HH:MM or -HH:MM. Text without an offset is UTC. A time whose year in UTC
+// is outside 0001 to 9999 is refused.
 func parseTime(s string) (time.Time, bool) {
 	i := 0
 	num := func(n int) int { // n digits at i, or -1
@@ -145,5 +157,6 @@ func parseTime(s string) (time.Time, bool) {
 	if t.Day() != d { // 31 April and the like
 		return time.Time{}, false
 	}
-	return t.UTC(), true
+	t = t.UTC()
+	return t, validYear(t.Year())
 }

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
+	"net/url"
 
 	"github.com/RandomCodeSpace/skylite/internal/wire"
 )
@@ -78,6 +78,9 @@ func (cn *conn) send(ctx context.Context, kind wire.Kind, call *wire.Call) (*res
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := cn.c.client.Do(req)
 	if err != nil {
+		if ue, ok := errors.AsType[*url.Error](err); ok {
+			err = ue.Err // its text holds the request URL
+		}
 		return nil, fmt.Errorf("skylite: %w", err)
 	}
 	if resp.Header.Get("Skylite-Protocol") != "1" {
@@ -291,9 +294,6 @@ func (r *rows) Next(dest []driver.Value) error {
 	return fmt.Errorf("skylite: reading the response: unexpected frame kind %d", f.Kind)
 }
 
-// ColumnTypeDatabaseTypeName returns the column's declared type in upper
-// case without its length, or "" for an expression.
-func (r *rows) ColumnTypeDatabaseTypeName(i int) string {
-	t, _, _ := strings.Cut(r.cols[i].DeclType, "(")
-	return strings.ToUpper(strings.TrimSpace(t))
-}
+// ColumnTypeDatabaseTypeName returns the column's declared type name, as
+// typeName reads it, or "" for an expression.
+func (r *rows) ColumnTypeDatabaseTypeName(i int) string { return typeName(r.cols[i].DeclType) }

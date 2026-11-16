@@ -9,7 +9,12 @@
 //
 // Open a database with a Connector, which carries the token source:
 //
-//	db := sql.OpenDB(skylite.NewConnector(skylite.Config{...}))
+//	c, err := skylite.NewConnector(skylite.Config{...})
+//	if err != nil { ... }
+//	db := sql.OpenDB(c)
+//
+// db.Close closes the Connector, which releases the idle connections of
+// the driver's own HTTP client.
 //
 // The driver is also registered as "skylite", but a DSN cannot carry a
 // token source, so sql.Open("skylite", dsn) fails on first use.
@@ -51,8 +56,8 @@ func (f TokenFunc) Token(ctx context.Context) (string, error) { return f(ctx) }
 // Config configures a Connector.
 type Config struct {
 	// Endpoint is the server's base URL: https://host[:port][/path]. It may
-	// not carry user information, a query, a fragment, or a "." or ".."
-	// path segment.
+	// not carry user information, a query, a fragment, an empty host, or a
+	// "." or ".." path segment.
 	Endpoint string
 	// Database is the database name: 1 to 63 characters from a-z, 0-9 and
 	// -, starting with a letter or digit.
@@ -69,10 +74,18 @@ type Config struct {
 	// for each query: from 1 ms to 2^31-1 ms. Zero leaves the server's
 	// limit. The caller's context bounds the request on the client side.
 	StatementTimeout time.Duration
+	// ResponseHeaderTimeout bounds the wait for a response's headers on the
+	// driver's own HTTP client; zero means 60 s, above the server's default
+	// statement time limit of 30 s. It cannot be combined with HTTPClient.
+	ResponseHeaderTimeout time.Duration
 	// HTTPClient replaces the driver's HTTP client. The driver uses a copy
-	// whose redirect policy refuses every redirect.
+	// whose redirect policy refuses every redirect, and never closes its
+	// connections.
 	HTTPClient *http.Client
 }
+
+// defaultResponseHeaderTimeout is Config.ResponseHeaderTimeout's default.
+const defaultResponseHeaderTimeout = 60 * time.Second
 
 // maxFrame is the largest frame the driver reads: a row can be as large as
 // the result limit, plus its newline.
@@ -92,6 +105,7 @@ type Connector struct {
 	token           TokenSource
 	client          *http.Client
 	timeoutMS       int64
+	own             bool         // client is the driver's own, not Config.HTTPClient
 	watermark       atomic.Int64 // the highest txn seen
 }
 
@@ -100,7 +114,7 @@ type Connector struct {
 func NewConnector(cfg Config) (*Connector, error) {
 	u, err := url.Parse(cfg.Endpoint)
 	switch {
-	case err != nil || u.Host == "" || u.Opaque != "":
+	case err != nil || u.Hostname() == "" || u.Opaque != "":
 		return nil, errors.New("skylite: Endpoint must be an absolute URL with a host")
 	case u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(cfg.Endpoint, "#"):
 		return nil, errors.New("skylite: Endpoint may not carry user information, a query or a fragment")
@@ -112,8 +126,10 @@ func NewConnector(cfg Config) (*Connector, error) {
 		return nil, errors.New("skylite: Database must be 1 to 63 characters from a-z, 0-9 and -, starting with a letter or digit")
 	case cfg.Token == nil:
 		return nil, errors.New("skylite: Token is required")
-	case cfg.TLSConfig != nil && cfg.HTTPClient != nil:
-		return nil, errors.New("skylite: set TLSConfig or HTTPClient, not both")
+	case (cfg.TLSConfig != nil || cfg.ResponseHeaderTimeout != 0) && cfg.HTTPClient != nil:
+		return nil, errors.New("skylite: TLSConfig and ResponseHeaderTimeout configure the driver's own HTTP client; set them or HTTPClient, not both")
+	case cfg.ResponseHeaderTimeout < 0:
+		return nil, errors.New("skylite: ResponseHeaderTimeout is negative")
 	case cfg.StatementTimeout != 0 && (cfg.StatementTimeout < time.Millisecond || cfg.StatementTimeout > math.MaxInt32*time.Millisecond):
 		return nil, errors.New("skylite: StatementTimeout must be 0 or from 1 ms to 2^31-1 ms")
 	}
@@ -126,8 +142,17 @@ func NewConnector(cfg Config) (*Connector, error) {
 	if cfg.HTTPClient != nil {
 		client = *cfg.HTTPClient
 	} else {
-		t := http.DefaultTransport.(*http.Transport).Clone() // keeps ForceAttemptHTTP2
+		t, ok := http.DefaultTransport.(*http.Transport)
+		if ok {
+			t = t.Clone() // keeps ForceAttemptHTTP2
+		} else { // replaced, for example by instrumentation
+			t = &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true}
+		}
 		t.TLSClientConfig = cfg.TLSConfig.Clone()
+		t.ResponseHeaderTimeout = cfg.ResponseHeaderTimeout
+		if t.ResponseHeaderTimeout == 0 {
+			t.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+		}
 		client.Transport = t
 	}
 	client.CheckRedirect = refuseRedirect
@@ -138,7 +163,17 @@ func NewConnector(cfg Config) (*Connector, error) {
 		token:     cfg.Token,
 		client:    &client,
 		timeoutMS: cfg.StatementTimeout.Milliseconds(),
+		own:       cfg.HTTPClient == nil,
 	}, nil
+}
+
+// Close closes the idle connections of the driver's own HTTP client, never
+// those of a Config.HTTPClient. sql.DB.Close calls it.
+func (c *Connector) Close() error {
+	if c.own {
+		c.client.CloseIdleConnections()
+	}
+	return nil
 }
 
 // Connect returns a connection. It sends nothing: every request is a
@@ -163,7 +198,7 @@ func (c *Connector) raise(txn int64) {
 type Driver struct{}
 
 // ErrNoDSN is Driver.Open's error.
-var ErrNoDSN = errors.New("skylite: a DSN cannot carry a token source; use sql.OpenDB(skylite.NewConnector(cfg))")
+var ErrNoDSN = errors.New("skylite: a DSN cannot carry a token source; use NewConnector and sql.OpenDB")
 
 // Open returns ErrNoDSN. It never echoes the DSN.
 func (Driver) Open(string) (driver.Conn, error) { return nil, ErrNoDSN }

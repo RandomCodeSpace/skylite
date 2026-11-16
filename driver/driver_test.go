@@ -14,10 +14,12 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -182,6 +184,9 @@ func TestPing(t *testing.T) {
 	if err := db.Ping(); !errors.As(err, &se) || se.Code != CodeDatabaseNotFound {
 		t.Fatalf("ping of a missing database: %v", err)
 	}
+	if c := f.lastCalls(); c[1].req.MinTxn != 2 {
+		t.Fatalf("second describe min_txn %d; want 2, the first describe's txn", c[1].req.MinTxn)
+	}
 }
 
 func TestWritesAndTransactionsUnsupported(t *testing.T) {
@@ -316,6 +321,9 @@ func TestBadConnOnlyBeforeSend(t *testing.T) {
 		case 3: // an answer without the protocol marker
 			w.Header().Del("Skylite-Protocol")
 			w.WriteHeader(http.StatusBadGateway)
+		case 4: // an answer with another protocol version's marker
+			w.Header().Set("Skylite-Protocol", "2")
+			answerRows(bookColumns[:1], nil, 0, 1)(w, ww, c, r)
 		default:
 			answerRows(bookColumns[:1], nil, 0, 1)(w, ww, c, r)
 		}
@@ -338,7 +346,7 @@ func TestBadConnOnlyBeforeSend(t *testing.T) {
 
 	db := sql.OpenDB(c)
 	defer func() { _ = db.Close() }()
-	for m, name := range []string{1: "dropped before the answer", 2: "dropped mid-stream", 3: "no marker"} {
+	for m, name := range []string{1: "dropped before the answer", 2: "dropped mid-stream", 3: "no marker", 4: "marker 2"} {
 		if m == 0 {
 			continue
 		}
@@ -354,7 +362,7 @@ func TestBadConnOnlyBeforeSend(t *testing.T) {
 		if err == nil || errors.Is(err, driver.ErrBadConn) || f.hits.Load()-before != 1 {
 			t.Errorf("%s: err %v after %d requests; want one request and an error that is not ErrBadConn", name, err, f.hits.Load()-before)
 		}
-		if m == 3 && !strings.Contains(fmt.Sprint(err), "Skylite-Protocol") {
+		if m >= 3 && !strings.Contains(fmt.Sprint(err), "Skylite-Protocol") {
 			t.Errorf("no marker: %v", err)
 		}
 	}
@@ -471,10 +479,11 @@ func TestBindConversions(t *testing.T) {
 	f := newFake(t, true, answerRows(bookColumns[:1], nil, 0, 1))
 	db := openDB(t, f.config())
 	at := time.Date(2024, 2, 29, 23, 30, 0, 5, time.FixedZone("", -3600))
-	if _, err := db.Exec("SELECT ?, ?, ?, ?, ?", true, false, at, int8(-3), float32(0.5)); err != nil {
+	first, last := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
+	if _, err := db.Exec("SELECT ?, ?, ?, ?, ?, ?, ?", true, false, at, int8(-3), float32(0.5), first, last); err != nil {
 		t.Fatal(err)
 	}
-	if want := `"params":[1,0,"2024-03-01 00:30:00.000000005",-3,5e-1]`; !strings.Contains(f.lastCalls()[0].body, want) {
+	if want := `"params":[1,0,"2024-03-01 00:30:00.000000005",-3,5e-1,"0001-01-01 00:00:00.000000000","9999-12-31 23:59:59.999999999"]`; !strings.Contains(f.lastCalls()[0].body, want) {
 		t.Fatalf("body %s; want %s", f.lastCalls()[0].body, want)
 	}
 	refused := []struct {
@@ -514,21 +523,37 @@ func TestBindConversionsInAnotherZone(t *testing.T) {
 }
 
 func TestDateColumns(t *testing.T) {
-	cols := []wire.Column{{Name: "d", DeclType: "DATE"}, {Name: "dt", DeclType: "datetime"}, {Name: "ts", DeclType: " Timestamp "}, {Name: "t", DeclType: "TEXT"}, {Name: "n", DeclType: "DATE"}}
+	cols := []wire.Column{
+		{Name: "d", DeclType: "DATE"},
+		{Name: "dt", DeclType: "datetime"},
+		{Name: "ts", DeclType: " Timestamp "},
+		{Name: "t", DeclType: "TEXT"},
+		{Name: "n", DeclType: "DATE"},
+		{Name: "p", DeclType: "DATETIME (6)"},
+		{Name: "x", DeclType: "DATETIMEX"},
+	}
 	f := newFake(t, true, answerRows(cols, [][]any{
-		{"2024-01-02", "2024-01-02T03:04:05.5+01:00", "2024-01-02 03:04Z", "2024-01-02", int64(5)},
-		{"tomorrow", "2024-02-30", "2024-01-02 03:04:05.1234567890", "x", 1.5},
+		{"2024-01-02", "2024-01-02T03:04:05.5+01:00", "2024-01-02 03:04Z", "2024-01-02", int64(5), "2024-01-02 03:04:05.123456", "2024-01-02"},
+		{"tomorrow", "2024-02-30", "2024-01-02 03:04:05.1234567890", "x", 1.5, "x", "x"},
 	}, 0, 1))
 	db := openDB(t, f.config())
-	rs, err := db.Query("SELECT d, dt, ts, t, n FROM x")
+	rs, err := db.Query("SELECT d, dt, ts, t, n, p, x FROM x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = rs.Close() }()
+	types, _ := rs.ColumnTypes()
+	var names []string
+	for _, ct := range types {
+		names = append(names, ct.DatabaseTypeName())
+	}
+	if got, want := strings.Join(names, ","), "DATE,DATETIME,TIMESTAMP,TEXT,DATE,DATETIME,DATETIMEX"; got != want {
+		t.Fatalf("type names %s; want %s", got, want)
+	}
 	var got []string
 	for rs.Next() {
-		v := make([]any, 5)
-		p := make([]any, 5)
+		v := make([]any, len(cols))
+		p := make([]any, len(cols))
 		for i := range v {
 			p[i] = &v[i]
 		}
@@ -540,7 +565,8 @@ func TestDateColumns(t *testing.T) {
 		}
 	}
 	want := "time.Time:2024-01-02 00:00:00 +0000 UTC time.Time:2024-01-02 02:04:05.5 +0000 UTC time.Time:2024-01-02 03:04:00 +0000 UTC string:2024-01-02 int64:5 " +
-		"string:tomorrow string:2024-02-30 string:2024-01-02 03:04:05.1234567890 string:x float64:1.5"
+		"time.Time:2024-01-02 03:04:05.123456 +0000 UTC string:2024-01-02 " +
+		"string:tomorrow string:2024-02-30 string:2024-01-02 03:04:05.1234567890 string:x float64:1.5 string:x string:x"
 	if strings.Join(got, " ") != want {
 		t.Fatalf("values\n%s\nwant\n%s", strings.Join(got, " "), want)
 	}
@@ -566,7 +592,8 @@ func TestParseTime(t *testing.T) {
 		"2024/01/01", "2024-01-01Z", "2024-01-01 ", "2024-01-01x10:00", "2024-01-01 24:00", "2024-01-01 10:60",
 		"2024-01-01 10:00:60", "2024-01-01 10", "2024-01-01 10:00:", "2024-01-01 10:00:00.", "2024-01-01 10:00:00.1234567890",
 		"2024-01-01 10:00+01", "2024-01-01 10:00+24:00", "2024-01-01 10:00+01:60", "2024-01-01 10:00Z ", "+2024-01-01",
-		"2024-01-01 1a:00", "2024-01-01 10:00:0a",
+		"2024-01-01 1a:00", "2024-01-01 10:00:0a", "2024-01-01t10:00", "2024-01-01 10:00z",
+		"9999-12-31 23:30-01:00", "0001-01-01 00:30+01:00",
 	} {
 		if got, ok := parseTime(s); ok {
 			t.Errorf("parseTime(%q) = %v; want refused", s, got)
@@ -589,6 +616,10 @@ func TestNewConnectorRefuses(t *testing.T) {
 		{"plaintext without opt-in", func(c *Config) { c.Endpoint = "http://db.example/" }},
 		{"other scheme", func(c *Config) { c.Endpoint = "ftp://db.example/" }},
 		{"no host", func(c *Config) { c.Endpoint = "https:///x" }},
+		{"empty host with a port", func(c *Config) { c.Endpoint = "https://:443" }},
+		{"empty host with a port and path", func(c *Config) { c.Endpoint = "https://:443/x" }},
+		{"header timeout and client", func(c *Config) { c.ResponseHeaderTimeout, c.HTTPClient = time.Second, &http.Client{} }},
+		{"header timeout negative", func(c *Config) { c.ResponseHeaderTimeout = -time.Second }},
 		{"relative", func(c *Config) { c.Endpoint = "db.example/x" }},
 		{"opaque", func(c *Config) { c.Endpoint = "https:db.example" }},
 		{"unparsable", func(c *Config) { c.Endpoint = "https://hunter2\x7f/" }},
@@ -816,5 +847,218 @@ func TestConformanceVectors(t *testing.T) {
 				t.Fatalf("encoded body %.200s; want %.200s", body, w)
 			}
 		})
+	}
+}
+
+// wrapped stands for instrumentation that replaces http.DefaultTransport.
+type wrapped struct{ http.RoundTripper }
+
+func TestDefaultTransportWrapped(t *testing.T) {
+	f := newFake(t, true, answerRows(bookColumns[:1], [][]any{{int64(1)}}, 0, 1))
+	saved := http.DefaultTransport
+	http.DefaultTransport = wrapped{saved}
+	defer func() { http.DefaultTransport = saved }()
+	var id int64
+	if err := openDB(t, f.config()).QueryRow("SELECT id FROM books").Scan(&id); err != nil || id != 1 {
+		t.Fatalf("query: %d, %v", id, err)
+	}
+	if c := f.lastCalls(); c[0].proto != 2 {
+		t.Fatalf("HTTP/%d; want HTTP/2", c[0].proto)
+	}
+}
+
+func TestResponseHeaderTimeout(t *testing.T) {
+	f := newFake(t, true, func(_ http.ResponseWriter, _ *wire.Writer, _ call, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	})
+	cfg := f.config()
+	cfg.ResponseHeaderTimeout = 50 * time.Millisecond
+	_, err := openDB(t, cfg).Query("SELECT 1")
+	if err == nil || errors.Is(err, driver.ErrBadConn) || !strings.Contains(err.Error(), "timeout awaiting response headers") {
+		t.Fatalf("%v; want the header timeout, not ErrBadConn", err)
+	}
+	c, err := NewConnector(f.config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.client.Transport.(*http.Transport).ResponseHeaderTimeout; got != 60*time.Second {
+		t.Fatalf("default ResponseHeaderTimeout %v; want 60s", got)
+	}
+}
+
+// TestTransportErrorsHideTheURL checks that an error from the HTTP client
+// keeps its cause for errors.As but not the request URL.
+func TestTransportErrorsHideTheURL(t *testing.T) {
+	f := newFake(t, true, answerRows(bookColumns[:1], nil, 0, 1))
+	cfg := f.config()
+	cfg.Endpoint += "/hunter2"
+	cfg.TLSConfig = nil // the fake's certificate is not trusted
+	_, err := openDB(t, cfg).Query("SELECT 1")
+	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); !ok || errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("untrusted certificate: %v; want a CertificateVerificationError", err)
+	}
+	if _, ok := errors.AsType[*url.Error](err); ok || strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "/v1/") {
+		t.Fatalf("error %q holds the request URL", err)
+	}
+}
+
+func TestCloseReleasesOnlyItsOwnConnections(t *testing.T) {
+	f := newFake(t, true, answerRows(bookColumns[:1], [][]any{{int64(1)}}, 0, 1))
+	query := func(db *sql.DB) {
+		t.Helper()
+		var id int64
+		if err := db.QueryRow("SELECT id FROM books").Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	own := openDB(t, f.config())
+	query(own)
+	if err := own.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); f.closed.Load() != f.conns.Load(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d connections closed after DB.Close; want all", f.closed.Load(), f.conns.Load())
+		}
+	}
+
+	cfg := f.config()
+	client := f.srv.Client()
+	cfg.TLSConfig, cfg.HTTPClient = nil, client
+	theirs := openDB(t, cfg)
+	query(theirs)
+	before := f.conns.Load()
+	if err := theirs.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Get(f.srv.URL) //nolint:noctx // the test's own request
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if f.conns.Load() != before {
+		t.Fatal("DB.Close closed the idle connection of the caller's HTTP client")
+	}
+}
+
+func TestPingDuringMaintenance(t *testing.T) {
+	f := newFake(t, true, func(w http.ResponseWriter, ww *wire.Writer, _ call, _ *http.Request) {
+		refuse(w, ww, wire.NewError(wire.CodeMaintenance, "maintenance"))
+	})
+	var se *Error
+	if err := openDB(t, f.config()).Ping(); !errors.As(err, &se) || se.Code != CodeMaintenance || errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("ping during maintenance: %v; want maintenance, not ErrBadConn", err)
+	}
+}
+
+// counting counts the response bodies its transport returned and that have
+// not been closed.
+type counting struct {
+	rt   http.RoundTripper
+	open atomic.Int32
+}
+
+func (c *counting) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := c.rt.RoundTrip(r)
+	if err == nil {
+		c.open.Add(1)
+		resp.Body = &countedBody{ReadCloser: resp.Body, open: &c.open}
+	}
+	return resp, err
+}
+
+type countedBody struct {
+	io.ReadCloser
+	open *atomic.Int32
+	once sync.Once
+}
+
+func (b *countedBody) Close() error {
+	b.once.Do(func() { b.open.Add(-1) })
+	return b.ReadCloser.Close()
+}
+
+func TestFailedAnswersReleaseTheirBody(t *testing.T) {
+	var mode atomic.Int32
+	f := newFake(t, true, func(w http.ResponseWriter, ww *wire.Writer, _ call, _ *http.Request) {
+		switch mode.Load() {
+		case 0: // the first frame is an error
+			refuse(w, ww, wire.NewError(wire.CodeBusy, "busy"))
+		case 1: // the first frame breaks the protocol
+			_, _ = io.WriteString(w, "[1]\n")
+		case 2: // no protocol marker
+			w.Header().Del("Skylite-Protocol")
+		}
+	})
+	ct := &counting{rt: f.srv.Client().Transport}
+	cfg := f.config()
+	cfg.TLSConfig, cfg.HTTPClient = nil, &http.Client{Transport: ct}
+	db := openDB(t, cfg)
+	for m, name := range []string{"error frame", "malformed frame", "no marker"} {
+		mode.Store(int32(m)) //nolint:gosec // small
+		if _, err := db.Query("SELECT 1"); err == nil {
+			t.Fatalf("%s: query succeeded", name)
+		}
+		if _, err := db.Prepare("SELECT 1"); err == nil {
+			t.Fatalf("%s: prepare succeeded", name)
+		}
+		if n := ct.open.Load(); n != 0 {
+			t.Fatalf("%s: %d response bodies left open", name, n)
+		}
+	}
+}
+
+// TestFrameBound checks the driver's frame bound: the result limit plus a
+// newline, enforced on every frame it reads.
+func TestFrameBound(t *testing.T) {
+	if maxFrame != 64<<20+1 {
+		t.Fatalf("maxFrame %d; want 64 MiB + 1", maxFrame)
+	}
+	saved := maxFrame
+	maxFrame = 128
+	defer func() { maxFrame = saved }()
+	cols := []wire.Column{{Name: "a"}}
+	for size, ok := range map[int]bool{128: true, 129: false} {
+		row := []any{strings.Repeat("x", size-len(`[""]`+"\n"))}
+		f := newFake(t, true, answerRows(cols, [][]any{row}, 0, 1))
+		var s string
+		err := openDB(t, f.config()).QueryRow("SELECT a").Scan(&s)
+		if ok && err != nil || !ok && !errors.Is(err, wire.ErrMalformed) {
+			t.Errorf("a row frame of %d bytes under a bound of 128: %v", size, err)
+		}
+	}
+}
+
+func TestFakeChecksRequestHeaders(t *testing.T) {
+	f := newFake(t, true, answerRows(bookColumns[:1], nil, 0, 1))
+	post := func(edit func(*http.Request)) (int, http.Header) {
+		t.Helper()
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, f.srv.URL+"/v1/databases/library/query", strings.NewReader(`{"sql":"SELECT 1"}`))
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		req.Header.Set("Content-Type", "application/json")
+		edit(req)
+		resp, err := f.srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode, resp.Header
+	}
+	for name, edit := range map[string]func(*http.Request){
+		"no Content-Type":  func(r *http.Request) { r.Header.Del("Content-Type") },
+		"chunked":          func(r *http.Request) { r.ContentLength = -1 },
+		"other media type": func(r *http.Request) { r.Header.Set("Content-Type", "text/plain") },
+	} {
+		if status, _ := post(edit); status != http.StatusBadRequest {
+			t.Errorf("%s: status %d; want 400", name, status)
+		}
+	}
+	status, h := post(func(r *http.Request) { r.Header.Set("Authorization", "Bearer x") })
+	if status != http.StatusUnauthorized || h.Get("WWW-Authenticate") != "Bearer" || h.Get("Cache-Control") != "no-store" || h.Get("Skylite-Request-Id") == "" {
+		t.Fatalf("unauthenticated: %d %v", status, h)
 	}
 }
