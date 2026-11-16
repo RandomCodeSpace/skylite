@@ -20,7 +20,9 @@ A ruleset on `main` enforces the following, with no bypass for anyone:
 
 - Required status checks, on the pull request and again on the merge queue's
   combined commit: `build`, `vet`, `lint`, `test`, `govulncheck`, `actionlint`,
-  `docs`, `integration` and `java-acceptance`.
+  `docs`, `integration`, `integration-s3` and `java-acceptance`.
+  `integration-s3` becomes required once the pull request that adds it has
+  merged; until the ruleset lists it, it runs without blocking.
 - CodeQL code scanning must report no new alert of severity error, or security
   severity high or above, before a pull request can enter the queue. Merge
   queue groups are not scanned again; GitHub does not apply this rule to them,
@@ -50,6 +52,7 @@ targets select Go 1.26.11 unless `GOTOOLCHAIN` is already set.
 | `make vuln`             | `govulncheck ./...` at the pinned version                                               |
 | `make check`            | all of the above                                                                        |
 | `make integration`      | Azurite in Docker, then `go test -race -tags integration ./...`                         |
+| `make integration-s3`   | RustFS in Docker, then the S3 backend's tests and the conformance suite against it      |
 | `make java-acceptance`  | JPA acceptance suite against sqlite-jdbc (needs a JDK and Maven)                        |
 | `make java-fault-check` | checks that the acceptance suite catches injected driver faults (needs a JDK and Maven) |
 
