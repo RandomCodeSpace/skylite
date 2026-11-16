@@ -45,6 +45,7 @@ type recStore struct {
 type leaseWrite struct {
 	lease     format.Lease
 	afterStop bool
+	at        time.Time
 }
 
 func (s *recStore) setRule(r func(op, key string) error) {
@@ -92,7 +93,7 @@ func (s *recStore) before(op, key string, body io.Reader) (io.Reader, error) {
 		return nil, err
 	}
 	s.mu.Lock()
-	s.writes = append(s.writes, leaseWrite{lease: l, afterStop: stopped != nil && stopped()})
+	s.writes = append(s.writes, leaseWrite{lease: l, afterStop: stopped != nil && stopped(), at: time.Now()})
 	s.mu.Unlock()
 	return bytes.NewReader(b), nil
 }
@@ -258,7 +259,7 @@ func epoch(t *testing.T, st storage.Store, keys format.Keys) uint64 {
 }
 
 func commit(ctx context.Context, l *engine.Leader) (uint64, error) {
-	c, err := l.Open()
+	c, err := l.Open(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -777,7 +778,7 @@ func TestLeadFailureBacksOff(t *testing.T) {
 	e := epoch(t, st, keys)
 	// The renewal period lets the backoff double from 1 s to 2 s.
 	a, _ := start(t, office.Config{
-		Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 4 * time.Second, Renew: 2 * time.Second,
+		Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 6 * time.Second, Renew: 2 * time.Second,
 		Engine: engine.Config{WALBound: -1},
 	})
 	s := waitFor(t, a, 5*time.Second, "failed", func(s office.State) bool { return s.Reason != nil })
@@ -962,11 +963,24 @@ func TestCancelledCandidacyReleases(t *testing.T) {
 }
 
 // A leader that fail-stops leaves State within about a second however long
-// the renewal period, and the next candidacy waits a backoff.
+// the renewal period, and the next candidacy waits the first backoff, the
+// backoff having started again when the loop took office.
 func TestFailStopNoticedWithinASecond(t *testing.T) {
 	st, keys := newDatabase(t, t.TempDir())
+	// The first candidacy fails, which doubles the backoff to 2 s.
+	var failed atomic.Bool
+	st.setRule(func(op, key string) error {
+		if op == "get" && key == keys.Manifest() && failed.CompareAndSwap(false, true) {
+			return errors.New("injected")
+		}
+		return nil
+	})
+	t0 := time.Now()
 	a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 9 * time.Second})
 	s := waitFor(t, a, 5*time.Second, "leading", leading)
+	if d := time.Since(t0); !failed.Load() || d < 900*time.Millisecond {
+		t.Fatalf("took office %v after starting, failed candidacy %v; want a failed candidacy and a backoff", d, failed.Load())
+	}
 	st.setRule(func(op, key string) error {
 		if isCommit(op, key) {
 			return fmt.Errorf("injected: %w", storage.ErrOutcomeUnknown)
@@ -983,7 +997,7 @@ func TestFailStopNoticedWithinASecond(t *testing.T) {
 	}
 	left := time.Now()
 	waitFor(t, a, 5*time.Second, "leading again", leading)
-	if d := time.Since(left); d < 700*time.Millisecond {
+	if d := time.Since(left); d < 700*time.Millisecond || d > 1700*time.Millisecond {
 		t.Fatalf("took office again %v after leaving it, want a backoff of 1 s", d)
 	}
 }
@@ -1044,8 +1058,8 @@ func TestNewChecksConfig(t *testing.T) {
 		ttl, renew, drain time.Duration
 		ok                bool
 	}{
-		{time.Second, 500 * time.Millisecond, 0, true},
-		{time.Second, 501 * time.Millisecond, 0, false},
+		{time.Second, 333 * time.Millisecond, 0, true},
+		{time.Second, 334 * time.Millisecond, 0, false},
 		{time.Second, 0, -time.Second, false},
 		{-time.Second, time.Millisecond, 0, false},
 	} {
@@ -1053,5 +1067,249 @@ func TestNewChecksConfig(t *testing.T) {
 		if (err == nil) != tc.ok {
 			t.Errorf("TTL %v, renewal %v, drain timeout %v: %v", tc.ttl, tc.renew, tc.drain, err)
 		}
+	}
+}
+
+// hangN makes the next n reads of key wait for their context to end.
+type hangN struct {
+	*recStore
+	key string
+	n   atomic.Int64
+}
+
+func (s *hangN) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	if key == s.key && s.n.Add(-1) >= 0 {
+		<-ctx.Done()
+		return nil, storage.Info{}, ctx.Err()
+	}
+	return s.recStore.Get(ctx, key)
+}
+
+// A leader at the longest renewal period whose manifest read hangs once
+// keeps office: its lease outlives the hung renewal.
+func TestOneHungRenewalKeepsOffice(t *testing.T) {
+	rec, keys := newDatabase(t, t.TempDir())
+	st := &hangN{recStore: rec, key: keys.Manifest()}
+	const ttl = 1500 * time.Millisecond
+	a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: ttl, Renew: ttl / 3})
+	s := waitFor(t, a, 5*time.Second, "leading", leading)
+	e := epoch(t, rec, keys)
+	other := &recStore{Store: rec.Store, keys: keys}
+	b, _ := start(t, office.Config{Store: other, Keys: keys, Holder: holder(t, "b"), TTL: ttl, Renew: ttl / 3})
+	st.n.Store(1)
+	select {
+	case <-s.Changed:
+		t.Fatalf("left office after one hung renewal: reason %v", a.State().Reason)
+	case <-time.After(2 * ttl):
+	}
+	if st.n.Load() > 0 {
+		t.Fatal("no renewal hung")
+	}
+	if got := epoch(t, rec, keys); got != e || b.State().Leader != nil {
+		t.Fatalf("epoch moved from %d to %d; standby leads: %v", e, got, b.State().Leader != nil)
+	}
+}
+
+// The first renewal after Lead returns is due a renewal period after the
+// last one while Lead ran, not a period after Lead returned.
+func TestRenewalCadenceAcrossLead(t *testing.T) {
+	st, keys := newDatabase(t, t.TempDir())
+	const renew = 500 * time.Millisecond
+	office.SetLead(t, func(ctx context.Context, s storage.Store, k format.Keys, dir string, o engine.Office, cfg engine.Config) (*engine.Leader, error) {
+		n := len(st.leaseWrites())
+		l, err := engine.Lead(ctx, s, k, dir, o, cfg)
+		// Return just before the next tick: after a renewal and most of a
+		// period.
+		for err == nil && ctx.Err() == nil && len(st.leaseWrites()) == n {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(renew * 9 / 10)
+		return l, err
+	})
+	a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 3 * renew, Renew: renew})
+	waitFor(t, a, 5*time.Second, "leading", leading)
+	time.Sleep(2 * renew)
+	w := st.leaseWrites()
+	var gap time.Duration
+	for i := 1; i < len(w); i++ {
+		gap = max(gap, w[i].at.Sub(w[i-1].at))
+	}
+	if len(w) < 4 || gap > renew*3/2 {
+		t.Fatalf("%d lease writes, at most %v apart; want renewals a period of %v apart", len(w), gap, renew)
+	}
+}
+
+// A leader deposed while Lead runs cancels Lead, closes the leader Lead
+// returns, and leaves office without another lease write.
+func TestDeposedDuringLead(t *testing.T) {
+	st, keys := newDatabase(t, t.TempDir())
+	var cancelled atomic.Bool
+	led := make(chan *engine.Leader, 1)
+	office.SetLead(t, func(ctx context.Context, s storage.Store, k format.Keys, dir string, o engine.Office, cfg engine.Config) (*engine.Leader, error) {
+		l, err := engine.Lead(ctx, s, k, dir, o, cfg)
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case led <- l:
+		default:
+		}
+		// Return the leader once Lead is cancelled, as a Lead that finished
+		// as the office was lost would.
+		select {
+		case <-ctx.Done():
+			cancelled.Store(true)
+		case <-time.After(5 * time.Second):
+		}
+		return l, nil
+	})
+	a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 3 * time.Second, Renew: 100 * time.Millisecond})
+	var leader *engine.Leader
+	select {
+	case leader = <-led:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Lead did not run")
+	}
+	n := len(st.leaseWrites())
+	// A candidate whose time to live of 1 ms finds the live lease expired,
+	// and which stamps it by the true clock.
+	if _, _, err := engine.Takeover(context.Background(), st.Store, keys, engine.Candidate{Holder: "usurper", TTL: time.Millisecond, Now: time.Now}); err != nil {
+		t.Fatalf("usurper: %v", err)
+	}
+	s := waitFor(t, a, 10*time.Second, "out of office", func(s office.State) bool { return s.Reason != nil })
+	if s.Leader != nil || !errors.Is(s.Reason, office.ErrDeposed) {
+		t.Fatalf("leader %v, reason %v; want none, deposed", s.Leader != nil, s.Reason)
+	}
+	if !cancelled.Load() {
+		t.Error("Lead's context was not cancelled")
+	}
+	if !errors.Is(leader.Err(), engine.ErrStopped) {
+		t.Errorf("the leader Lead returned is not closed: %v", leader.Err())
+	}
+	left := len(st.leaseWrites())
+	time.Sleep(500 * time.Millisecond)
+	w := st.leaseWrites()
+	for _, w := range w[n:] {
+		if w.lease.Renewed == 0 {
+			t.Errorf("released %+v after being deposed", w.lease)
+		}
+	}
+	if len(w) != left || a.State().Leader != nil {
+		t.Errorf("%d lease writes after leaving office; leading %v", len(w)-left, a.State().Leader != nil)
+	}
+}
+
+// A manifest read that fails once, more than a time to live into office,
+// deposes nobody: the time since the last good read counts.
+func TestReadFailureLateInOfficeKeepsOffice(t *testing.T) {
+	st, keys := newDatabase(t, t.TempDir())
+	const ttl = 600 * time.Millisecond
+	a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: ttl, Renew: ttl / 3})
+	s := waitFor(t, a, 5*time.Second, "leading", leading)
+	time.Sleep(ttl + ttl/2)
+	var failed atomic.Bool
+	st.setRule(func(op, key string) error {
+		if op == "get" && key == keys.Manifest() && failed.CompareAndSwap(false, true) {
+			return errors.New("injected")
+		}
+		return nil
+	})
+	select {
+	case <-s.Changed:
+		t.Fatalf("left office: reason %v", a.State().Reason)
+	case <-time.After(ttl):
+	}
+	if !failed.Load() {
+		t.Fatal("no manifest read failed")
+	}
+}
+
+// A standby takes office within a poll of finding the lease stamped more
+// than a time to live ahead, which engine.Lease judges free.
+func TestStandbyTakesFutureStampedLease(t *testing.T) {
+	st, keys := newDatabase(t, t.TempDir())
+	const ttl = 3 * time.Second
+	if _, _, err := engine.Takeover(context.Background(), st.Store, keys, engine.Candidate{Holder: "live", TTL: ttl, Now: time.Now}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "b"), TTL: ttl, Renew: 300 * time.Millisecond})
+	time.Sleep(500 * time.Millisecond)
+	if b.State().Leader != nil {
+		t.Fatal("took office from a live lease")
+	}
+	// A holder whose clock is an hour ahead takes office and is never heard
+	// from again.
+	far := func() time.Time { return time.Now().Add(time.Hour) }
+	if _, _, err := engine.Takeover(context.Background(), st.Store, keys, engine.Candidate{Holder: "skewed", TTL: ttl, Now: far}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, b, 2*time.Second, "leading", leading)
+}
+
+// sigHang makes every manifest read wait for its context to end once armed,
+// and signals each.
+type sigHang struct {
+	*recStore
+	arm atomic.Bool
+	in  chan struct{}
+}
+
+func (s *sigHang) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	if s.arm.Load() && key == s.keys.Manifest() {
+		select {
+		case s.in <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return nil, storage.Info{}, ctx.Err()
+	}
+	return s.recStore.Get(ctx, key)
+}
+
+// A leader that fail-stops while a renewal's manifest read hangs leaves
+// State within about a second, not when the read times out.
+func TestFailStopNoticedDuringHungRenewal(t *testing.T) {
+	rec, keys := newDatabase(t, t.TempDir())
+	st := &sigHang{recStore: rec, in: make(chan struct{}, 1)}
+	a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 9 * time.Second})
+	s := waitFor(t, a, 5*time.Second, "leading", leading)
+	st.arm.Store(true)
+	select {
+	case <-st.in:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no renewal")
+	}
+	rec.setRule(func(op, key string) error {
+		if isCommit(op, key) {
+			return fmt.Errorf("injected: %w", storage.ErrOutcomeUnknown)
+		}
+		return nil
+	})
+	if _, err := commit(context.Background(), s.Leader); !errors.Is(err, engine.ErrUnknown) {
+		t.Fatalf("commit: %v, want %v", err, engine.ErrUnknown)
+	}
+	down := waitFor(t, a, 1500*time.Millisecond, "stopped", func(s office.State) bool { return s.Leader == nil })
+	if !errors.Is(down.Reason, engine.ErrStopped) {
+		t.Fatalf("reason %v, want %v", down.Reason, engine.ErrStopped)
+	}
+}
+
+// A standby whose lease read hangs gives it up after a renewal period, and
+// takes office once the leader releases.
+func TestStandbyLeaseReadTimesOut(t *testing.T) {
+	st, keys := newDatabase(t, t.TempDir())
+	const ttl, renew = 3 * time.Second, 300 * time.Millisecond
+	a, stop := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: ttl, Renew: renew})
+	waitFor(t, a, 5*time.Second, "leading", leading)
+	other := &hangN{recStore: &recStore{Store: st.Store, keys: keys}, key: keys.Lease()}
+	b, _ := start(t, office.Config{Store: other, Keys: keys, Holder: holder(t, "b"), TTL: ttl, Renew: renew})
+	time.Sleep(renew)
+	other.n.Store(1)
+	if err := stop(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	waitFor(t, b, 2*time.Second, "leading after the release", leading)
+	if other.n.Load() > 0 {
+		t.Fatal("no lease read hung")
 	}
 }

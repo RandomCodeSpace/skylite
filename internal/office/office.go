@@ -59,8 +59,9 @@ type Config struct {
 	Engine engine.Config
 
 	TTL time.Duration // lease time to live; DefaultTTL if 0
-	// Renew is the renewal period, TTL/3 if 0. It is at most TTL/2, so that
-	// a lease outlives one failed renewal.
+	// Renew is the renewal period, TTL/3 if 0. It is at most TTL/3, so that
+	// a lease outlives one renewal that hangs: that renewal costs two
+	// periods, its timeout and the wait for the next tick.
 	Renew time.Duration
 	// Drain, if set, runs when the loop's context ends while it leads,
 	// after State reports it not leading and before the leader closes. It
@@ -146,8 +147,8 @@ func New(cfg Config) (*Loop, error) {
 	switch {
 	case cfg.Store == nil || cfg.Dir == "":
 		return nil, errors.New("office: Config needs a store and a directory")
-	case cfg.TTL < 0 || cfg.Renew <= 0 || cfg.Renew > cfg.TTL/2:
-		return nil, errors.New("office: Config needs a positive renewal period of at most half the lease's time to live")
+	case cfg.TTL < 0 || cfg.Renew <= 0 || cfg.Renew > cfg.TTL/3:
+		return nil, errors.New("office: Config needs a positive renewal period of at most a third of the lease's time to live")
 	case cfg.DrainTimeout < 0:
 		return nil, errors.New("office: Config needs a drain timeout of 0 or more")
 	}
@@ -185,9 +186,11 @@ func (l *Loop) set(leader *engine.Leader, reason error) {
 // again whenever it leaves office, until ctx ends. After a failed attempt,
 // and after leaving office, it waits a backoff that doubles from a second,
 // or the renewal period if that is shorter, up to the renewal period, and
-// starts from there again once a leader is in office. A standby never takes over a live lease: it reads the lease, and
-// only the lease, at most min(renewal period, 5 s) apart, and runs a
-// candidacy once the lease reads as released or expired.
+// starts from there again once a leader is in office. A standby never
+// takes over a live lease: it reads the lease, and only the lease, at most
+// min(renewal period, 5 s) apart and under a timeout of one renewal period,
+// and runs a candidacy once the lease reads as released or expired, or
+// cannot be read.
 //
 // A node in office starts its leader with engine.Lead, which walks the log
 // tail and can take longer than a time to live, and keeps renewing while it
@@ -201,14 +204,16 @@ func (l *Loop) set(leader *engine.Leader, reason error) {
 //     lease is never a fence, and the write is no write of data;
 //   - leaves office, without releasing the lease, if the manifest no longer
 //     carries its office, or if it has not read the manifest for a time to
-//     live (ErrUnchecked);
+//     live (ErrUnchecked). A lease it retook as it was deposed is left to
+//     expire, as a crashed leader's would: only the log and the manifest
+//     decide who leads;
 //   - renews the lease, and calls Retake if another holder holds it, which
 //     takes it back only if it reads as released or expired.
 //
-// It also checks every second whether its leader has stopped. If Lead
-// fails, or the office is lost while it runs, the loop leaves office,
-// closing any leader Lead returns; it releases the lease after a failed
-// Lead.
+// It also checks every second whether its leader has stopped, and ends a
+// renewal whose read or write hangs once it has. If Lead fails, or the
+// office is lost while it runs, the loop leaves office, closing any leader
+// Lead returns; it releases the lease after a failed Lead.
 //
 // When ctx ends, a leader stops reporting itself in State, runs Drain, closes
 // the leader and then releases the lease, unless the leader had stopped.
@@ -241,8 +246,12 @@ func (l *Loop) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		leader, err := l.start(ctx, t)
+		// One ticker for the whole term, so that a renewal is due a period
+		// after the last one wherever Lead's end falls between them.
+		renewal := time.NewTicker(l.cfg.Renew)
+		leader, err := l.start(ctx, t, renewal.C)
 		if err != nil {
+			renewal.Stop()
 			var rerr error
 			if !errors.Is(err, ErrDeposed) && !errors.Is(err, ErrUnchecked) {
 				rerr = l.release(ctx, t.lease)
@@ -259,7 +268,9 @@ func (l *Loop) Run(ctx context.Context) error {
 		backoff = first
 		l.log.Info("office: leading", "epoch", t.office.Epoch, "head", t.office.Head)
 		l.set(leader, nil)
-		if done, err := l.lead(ctx, t, leader); done {
+		done, err := l.lead(ctx, t, leader, renewal.C)
+		renewal.Stop()
+		if done {
 			return err
 		}
 		if !pause() {
@@ -300,7 +311,9 @@ func (l *Loop) standby(ctx context.Context, expires time.Time) bool {
 		if !now.Before(expires) {
 			return true
 		}
-		b, err := l.read(ctx, l.cfg.Keys.Lease(), format.MaxLeaseSize+1)
+		rctx, cancel := context.WithTimeout(ctx, l.cfg.Renew)
+		b, err := l.read(rctx, l.cfg.Keys.Lease(), format.MaxLeaseSize+1)
+		cancel()
 		if err != nil {
 			return true // the candidacy reports it
 		}
@@ -315,10 +328,14 @@ func (l *Loop) standby(ctx context.Context, expires time.Time) bool {
 	}
 }
 
-// start runs engine.Lead for t's office and keeps renewing while it runs.
-// It returns the leader, or why there is none: Lead's error, or the reason a
-// renewal found to leave office, after closing any leader Lead returned.
-func (l *Loop) start(ctx context.Context, t *term) (*engine.Leader, error) {
+// lead is engine.Lead; tests replace it.
+var lead = engine.Lead
+
+// start runs engine.Lead for t's office and renews on each tick of renewal
+// while it runs. It returns the leader, or why there is none: Lead's error,
+// or the reason a renewal found to leave office, after closing any leader
+// Lead returned.
+func (l *Loop) start(ctx context.Context, t *term, renewal <-chan time.Time) (*engine.Leader, error) {
 	lctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	type result struct {
@@ -327,15 +344,13 @@ func (l *Loop) start(ctx context.Context, t *term) (*engine.Leader, error) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		leader, err := engine.Lead(lctx, l.cfg.Store, l.cfg.Keys, l.cfg.Dir, t.office, l.cfg.Engine)
+		leader, err := lead(lctx, l.cfg.Store, l.cfg.Keys, l.cfg.Dir, t.office, l.cfg.Engine)
 		done <- result{leader, err}
 	}()
-	renewal := time.NewTicker(l.cfg.Renew)
-	defer renewal.Stop()
 	var lost error
 	for {
 		select {
-		case <-renewal.C:
+		case <-renewal:
 			if lost == nil {
 				if lost = l.renew(ctx, t, nil); lost != nil {
 					cancel()
@@ -364,10 +379,9 @@ func (l *Loop) start(ctx context.Context, t *term) (*engine.Leader, error) {
 }
 
 // lead keeps office until the leader stops, the node is deposed or ctx
-// ends. It reports done when ctx ended, with the release's error.
-func (l *Loop) lead(ctx context.Context, t *term, leader *engine.Leader) (bool, error) {
-	renewal := time.NewTicker(l.cfg.Renew)
-	defer renewal.Stop()
+// ends, renewing on each tick of renewal. It reports done when ctx ended,
+// with the release's error.
+func (l *Loop) lead(ctx context.Context, t *term, leader *engine.Leader, renewal <-chan time.Time) (bool, error) {
 	check := time.NewTicker(stopCheck)
 	defer check.Stop()
 	for {
@@ -377,7 +391,7 @@ func (l *Loop) lead(ctx context.Context, t *term, leader *engine.Leader) (bool, 
 			return true, l.shutdown(ctx, t.lease, leader)
 		case <-check.C:
 			reason = leader.Err()
-		case <-renewal.C:
+		case <-renewal:
 			reason = l.renew(ctx, t, leader)
 		}
 		if reason != nil {
@@ -393,6 +407,25 @@ func (l *Loop) lead(ctx context.Context, t *term, leader *engine.Leader) (bool, 
 func (l *Loop) renew(ctx context.Context, t *term, leader *engine.Leader) error {
 	rctx, cancel := context.WithTimeout(ctx, l.cfg.Renew)
 	defer cancel()
+	if leader != nil {
+		// A leader that stops ends a renewal that hangs, so that it leaves
+		// State within about a second.
+		go func() {
+			check := time.NewTicker(stopCheck)
+			defer check.Stop()
+			for {
+				select {
+				case <-rctx.Done():
+					return
+				case <-check.C:
+					if leader.Err() != nil {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
 	// shortcut: reads the whole manifest every renewal; read it only when its version changed once the store can tell.
 	m, err := l.manifest(rctx)
 	// Checked after the read, which takes time, and right before the
