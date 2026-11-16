@@ -270,7 +270,7 @@ func outcome(err error) string {
 
 // traced returns a Store whose transport reads the request's body, reports
 // attempts in the request's trace and then answers.
-func traced(t *testing.T, attempts func(*httptrace.ClientTrace), answer func(*http.Request) (*http.Response, error)) *Store {
+func traced(t *testing.T, attempts func(*httptrace.ClientTrace), answer rtFunc) *Store {
 	t.Helper()
 	rt := rtFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Body != nil {
@@ -289,7 +289,7 @@ func traced(t *testing.T, attempts func(*httptrace.ClientTrace), answer func(*ht
 }
 
 // answer returns a transport answer with status and the Azure error code.
-func answer(status int, code string) func(*http.Request) (*http.Response, error) {
+func answer(status int, code string) rtFunc {
 	return func(r *http.Request) (*http.Response, error) {
 		h := http.Header{}
 		h.Set("x-ms-error-code", code)
@@ -298,7 +298,7 @@ func answer(status int, code string) func(*http.Request) (*http.Response, error)
 }
 
 // opError returns a transport that fails with net/http's error for op.
-func opError(op string) func(*http.Request) (*http.Response, error) {
+func opError(op string) rtFunc {
 	return func(*http.Request) (*http.Response, error) {
 		return nil, &net.OpError{Op: op, Net: "tcp", Err: errors.New("connection refused")}
 	}
@@ -337,7 +337,7 @@ func TestTraceRules(t *testing.T) {
 	notFound := map[string]string{"create": "definite", "create empty": "definite", "replace": "precondition", "replace empty": "precondition", "delete": "success"}
 	for name, tc := range map[string]struct {
 		attempts func(*httptrace.ClientTrace)
-		answer   func(*http.Request) (*http.Response, error)
+		answer   rtFunc
 		want     map[string]string
 	}{
 		"one GotConn, refused":          {oneGot, conflict, refusedOne},
@@ -380,7 +380,7 @@ func TestResent(t *testing.T) {
 	}
 	for name, tc := range map[string]struct {
 		attempts func(*httptrace.ClientTrace)
-		answer   func(*http.Request) (*http.Response, error)
+		answer   rtFunc
 	}{
 		"two GotConn, dial fails":           {twoGot, dialFails},
 		"GetConn after GotConn, dial fails": {gotGet, dialFails},
@@ -548,7 +548,7 @@ func TestUploadEnd(t *testing.T) {
 // request that meets its own first attempt's effect.
 func h2Reset(applied, answered *atomic.Int64, onApply func()) func(*http.Server, *tls.Conn, http.Handler) {
 	return func(_ *http.Server, c *tls.Conn, _ http.Handler) {
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		if _, err := io.ReadFull(c, make([]byte, len(http2.ClientPreface))); err != nil {
 			return
 		}
