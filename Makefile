@@ -16,7 +16,12 @@ RUSTFS_IMAGE := rustfs/rustfs:1.0.5@sha256:b81d16a90ee25bd9511280127ca1471788c6e
 # Shorter than the CI job's limit, for the same reason as INTEGRATION_TIMEOUT.
 INTEGRATION_S3_TIMEOUT ?= 15m
 
-.PHONY: build test vet lint vuln check integration integration-s3
+# fake-gcs-server 1.56.1, pinned by the digest of its multi-architecture index.
+FAKE_GCS_IMAGE := fsouza/fake-gcs-server:1.56.1@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef
+# Shorter than the CI job's 15-minute limit, for the same reason.
+INTEGRATION_GCS_TIMEOUT ?= 12m
+
+.PHONY: build test vet lint vuln check integration integration-s3 integration-gcs
 
 build:
 	CGO_ENABLED=0 go build -o bin/skylite ./cmd/skylite
@@ -78,6 +83,24 @@ integration-s3:
 	curl -s -o /dev/null "$$endpoint" || { echo "integration-s3: RustFS did not start" >&2; exit 1; }; \
 	rc=0; SKYLITE_TEST_S3_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_S3_TIMEOUT) -tags integration -skip '^TestConformance$$/^ValidKeys$$' ./internal/storage/s3/ || rc=$$?; \
 	if [ $$rc -ne 0 ]; then echo "integration-s3: last RustFS log lines:" >&2; docker logs --tail 50 "$$name" >&2 || true; fi; \
+	exit $$rc
+
+# Starts a uniquely named in-memory fake-gcs-server on a free local port, runs
+# the gcs backend's tests (fault tests and conformance suite) against it with
+# the race detector, and removes it. The emulator puts its own URL into
+# resumable upload session URLs, so it must be told the published port: the
+# port is chosen before the container starts.
+integration-gcs:
+	@set -e; name="skylite-fake-gcs-$$$$"; \
+	port=$$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'); \
+	docker run -d --rm --name "$$name" -p "127.0.0.1:$$port:$$port" $(FAKE_GCS_IMAGE) \
+	  -scheme http -port "$$port" -backend memory -external-url "http://127.0.0.1:$$port" -public-host "127.0.0.1:$$port" >/dev/null; \
+	trap 'docker stop "$$name" >/dev/null 2>&1' EXIT; \
+	endpoint="http://127.0.0.1:$$port/storage/v1/"; \
+	for i in $$(seq 60); do curl -sf -o /dev/null "$${endpoint}b" && break; sleep 1; done; \
+	curl -sf -o /dev/null "$${endpoint}b" || { echo "integration-gcs: fake-gcs-server did not start" >&2; exit 1; }; \
+	rc=0; SKYLITE_TEST_GCS_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_GCS_TIMEOUT) -tags integration ./internal/storage/gcs/ || rc=$$?; \
+	if [ $$rc -ne 0 ]; then echo "integration-gcs: last fake-gcs-server log lines:" >&2; docker logs --tail 50 "$$name" >&2 || true; fi; \
 	exit $$rc
 
 # Documentation site (Hugo). Run from the repository root.
