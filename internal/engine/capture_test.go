@@ -415,7 +415,7 @@ func TestReadsThroughCheckpoints(t *testing.T) {
 	if err := os.Truncate(l.path, 0); err != nil {
 		t.Fatal(err)
 	}
-	if lost, err := l.Open(); err == nil {
+	if lost, err := l.Open(context.Background()); err == nil {
 		if _, err := lost.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
 			_, err := dump(db)
 			return err

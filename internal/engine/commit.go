@@ -224,6 +224,14 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 	if refuse == nil {
 		c.idUsed = true
 		l.uploading = true
+		// New Snapshots wait from here; one whose read is taking its
+		// snapshot finishes before the create (record 0005, requirement 12).
+		for l.snapshots > 0 && l.stopped == nil {
+			l.cond.Wait()
+		}
+		if l.stopped != nil {
+			refuse = fmt.Errorf("%w: %w", ErrNotCommitted, l.stopped)
+		}
 	}
 	l.cmu.Unlock()
 	if refuse != nil {
@@ -250,6 +258,7 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 			pc.entries = nil
 		}
 		l.pending = append(l.pending, pc)
+		l.indexLocked(b.h)
 		c.uploaded, c.retired = h.Txn, retired
 		l.wal.start, l.wal.end = -1, cp.end
 		if l.tailFullLocked() {

@@ -105,7 +105,7 @@ func TestCrashChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := l.Open()
+	c, err := l.Open(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
