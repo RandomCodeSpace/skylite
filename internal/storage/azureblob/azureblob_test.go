@@ -397,8 +397,8 @@ func TestResent(t *testing.T) {
 		"GetConn after GotConn, dial fails": {gotGet, dialFails},
 		"two GotConn, refused":              {twoGot, conflict},
 		// A failed 401 challenge after a re-send: azcore marks it non-retriable.
-		"two GotConn, non-retriable": {twoGot, nonRetriable},
-		"GetConn after GotConn, refused":    {gotGet, conflict},
+		"two GotConn, non-retriable":     {twoGot, nonRetriable},
+		"GetConn after GotConn, refused": {gotGet, conflict},
 		// A missing blob is a Delete's effect, also after a re-send.
 		"two GotConn, 404 BlobNotFound": {twoGot, answer(http.StatusNotFound, "BlobNotFound")},
 	} {
