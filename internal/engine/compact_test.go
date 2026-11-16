@@ -664,3 +664,27 @@ func TestCompactionOverlappingAttempts(t *testing.T) {
 		})
 	}
 }
+
+// Covers: Invariants, "A read transaction that meets ... a changed version
+// token on a log object it indexed ... fails or restarts", for the
+// compactor: a commit it indexed and then finds retired, which only a newer
+// manifest explains, ends the attempt as stale, and nothing is published.
+func TestCompactionMeetsRetiredCommit(t *testing.T) {
+	ctx := context.Background()
+	st, keys, h := faultHistory(t)
+	r, err := Open(ctx, st, keys, nil, h.head())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, mv := h.manifest()
+	h.compact(h.head()) // another actor's compaction, then its retirement
+	h.retireAll()
+	k := &compaction{st: st, keys: keys, a: r.a, r: r}
+	var stale *staleError
+	if _, err := k.run(ctx); !errors.As(err, &stale) {
+		t.Fatalf("an attempt over a retired commit: %v", err)
+	}
+	if now, v := h.manifest(); v == mv || now.Txn == m.Txn {
+		t.Fatal("the other compaction did not publish")
+	}
+}

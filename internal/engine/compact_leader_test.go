@@ -449,8 +449,20 @@ func TestGraceKeepsOlderReaders(t *testing.T) {
 			t.Fatalf("page %d within the grace period: %v", p+1, err)
 		}
 	}
+	// Retirement and collection that run within the grace period leave
+	// both alone.
+	l.cmpMu.Lock()
+	l.retireLocked()
+	l.collectLocked()
+	l.collectLocked()
+	l.cmpMu.Unlock()
 	if h, _, err := readHeader(ctx, st.Store, keys, o.DB, m2.Txn); err != nil || h.Retired {
 		t.Fatalf("commit %d within the grace period: retired %v, %v", m2.Txn, h.Retired, err)
+	}
+	for _, k := range dropped {
+		if _, err := st.Store.Head(ctx, k); err != nil {
+			t.Fatalf("base object %s within the grace period: %v", k, err)
+		}
 	}
 	eventually(t, "retirement and collection after the grace period", func() bool {
 		h, _, err := readHeader(ctx, st.Store, keys, o.DB, m2.Txn)

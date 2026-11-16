@@ -380,7 +380,9 @@ func TestTailBoundCountsBumps(t *testing.T) {
 	}
 	atBound("a read after it", read())
 
-	// Once a compaction can publish, the leader serves again.
+	// Once a compaction can publish, the leader serves again: the
+	// background compaction readmits, after maintenance has ended.
+	waitMaintenance(t, l)
 	st.setRule(nil)
 	eventually(t, "a read once compaction can publish", func() bool { return read() == nil })
 	mustRun(t, c, "INSERT INTO u VALUES (2)")
