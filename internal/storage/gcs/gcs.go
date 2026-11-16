@@ -54,8 +54,9 @@
 // as storage.ErrOutcomeUnknown. net/http can still send a request twice on its
 // own, below the store's transport: over HTTP/2 it re-sends a request whose
 // stream the server reset with PROTOCOL_ERROR, which does not say whether the
-// server processed it. The store counts the connections net/http asks for to
-// send a commit request; after more than one, every error of the call, a 412,
+// server processed it. The store counts the attempts net/http makes at a
+// commit request (each connection it hands the request, and each connection
+// it asks for after one); after more than one, every error of the call, a 412,
 // another 4xx or a refused connection included, wraps
 // storage.ErrOutcomeUnknown, because the answer may be to the re-send of an
 // attempt that took effect. The client does not retry a chunk of a resumable
@@ -182,14 +183,15 @@ func (s *Store) Close() error { return s.client.Close() }
 type progress struct {
 	data   atomic.Bool  // a request carrying the body, or the commit request, has started
 	commit atomic.Bool  // the commit request has started
-	conns  atomic.Int32 // connections net/http has asked for to send the commit request
+	got    atomic.Int32 // connections net/http has handed the commit request
+	again  atomic.Bool  // net/http has started a second attempt at the commit request
 }
 
 // resent reports whether net/http may have sent the commit request more than
 // once. It re-sends a request on its own, below this store's transport, for
 // example when an HTTP/2 server resets the stream with PROTOCOL_ERROR, which
 // does not say whether the server processed it.
-func (p *progress) resent() bool { return p.conns.Load() > 1 }
+func (p *progress) resent() bool { return p.again.Load() }
 
 type progressKey struct{}
 
@@ -205,9 +207,21 @@ func (m markCommits) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 		if c {
 			p.commit.Store(true)
-			// GetConn runs once per attempt, before any dial.
+			// GotConn runs once per attempt that has a connection. GetConn runs
+			// before a dial, but HTTP/2 skips it for the first request on a new
+			// pooled connection, which may not be the request that dialled it.
+			// So a second GotConn, or a GetConn after a GotConn, is a re-send.
 			r = r.WithContext(httptrace.WithClientTrace(r.Context(), &httptrace.ClientTrace{
-				GetConn: func(string) { p.conns.Add(1) },
+				GetConn: func(string) {
+					if p.got.Load() > 0 {
+						p.again.Store(true)
+					}
+				},
+				GotConn: func(httptrace.GotConnInfo) {
+					if p.got.Add(1) > 1 {
+						p.again.Store(true)
+					}
+				},
 			}))
 		}
 	}

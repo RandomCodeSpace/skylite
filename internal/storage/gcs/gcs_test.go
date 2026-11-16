@@ -603,7 +603,11 @@ func TestCommitFaults(t *testing.T) {
 				if fc.name != "slow response past the deadline" {
 					ctx = bg
 				}
+				start := time.Now()
 				err := run(ctx)
+				if took := time.Since(start); fc.name == "slow response past the deadline" && took > 5*time.Second {
+					t.Fatalf("the call past its 3 s deadline returned after %v: it ignored its context", took)
+				}
 				if n := f.count(commitKinds...); n != 1 {
 					t.Fatalf("%d commit requests, want 1: the client must not retry a commit request", n)
 				}
@@ -1199,12 +1203,22 @@ func TestBodyDataWithEOF(t *testing.T) {
 // tell the client whether the server processed the stream, and net/http
 // re-sends the request on its own, below the store's transport. The server
 // answers the re-sent commit request with second, or, if redial is set,
-// sends GOAWAY with the reset, closes the connection and stops listening, so
-// that the re-send has to dial and is refused.
+// stops listening before the reset: net/http does not reuse a connection
+// after a PROTOCOL_ERROR reset, so the re-send has to dial and is refused.
+//
+// If hold is set, the server allows one stream per connection, closes hold
+// when the request for object "hold" arrives and answers it 404 only once the
+// first commit request has arrived, closing release; it resets that commit
+// once resume is closed. acks, if set, receives a value for each SETTINGS
+// ACK of the client.
 type h2Server struct {
 	ln      net.Listener
 	second  int
 	redial  bool
+	hold    chan struct{}
+	release chan struct{}
+	resume  chan struct{}
+	acks    chan struct{}
 	mu      sync.Mutex
 	commits int
 }
@@ -1232,7 +1246,11 @@ func (s *h2Server) serve(c net.Conn) {
 	}
 	fr := http2.NewFramer(c, c)
 	dec := hpack.NewDecoder(4096, nil)
-	_ = fr.WriteSettings()
+	if s.hold != nil {
+		_ = fr.WriteSettings(http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1})
+	} else {
+		_ = fr.WriteSettings()
+	}
 	respond := func(id uint32, status int, body string, header ...string) {
 		var hb bytes.Buffer
 		enc := hpack.NewEncoder(&hb)
@@ -1260,6 +1278,19 @@ func (s *h2Server) serve(c net.Conn) {
 			respond(id, 200, "", "x-http-status-code-override", "308", "range", "bytes=0-"+cr[strings.IndexByte(cr, '-')+1:])
 			return true
 		case "single", "final", "delete":
+		case "meta":
+			if s.hold != nil && strings.HasSuffix(r.URL.Path, "/o/hold") {
+				close(s.hold)
+				// Its own framer, so the loop goes on reading; a tls.Conn writes each frame whole.
+				go func() {
+					<-s.release
+					var hb bytes.Buffer
+					_ = hpack.NewEncoder(&hb).WriteField(hpack.HeaderField{Name: ":status", Value: "404"})
+					_ = http2.NewFramer(c, nil).WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: hb.Bytes(), EndHeaders: true, EndStream: true})
+				}()
+				return true
+			}
+			fallthrough
 		default:
 			respond(id, 404, `{"error":{"code":404,"message":"not found"}}`, "content-type", "application/json")
 			return true
@@ -1272,14 +1303,14 @@ func (s *h2Server) serve(c net.Conn) {
 			respond(id, s.second, fmt.Sprintf(`{"error":{"code":%d,"message":"second","errors":[{"reason":"conditionNotMet"}]}}`, s.second), "content-type", "application/json")
 			return true
 		}
-		if s.redial {
-			_ = fr.WriteGoAway(id, http2.ErrCodeNo, nil)
+		if s.release != nil {
+			close(s.release)
+			<-s.resume
 		}
-		_ = fr.WriteRSTStream(id, http2.ErrCodeProtocol)
 		if s.redial {
 			_ = s.ln.Close()
-			return false
 		}
+		_ = fr.WriteRSTStream(id, http2.ErrCodeProtocol)
 		return true
 	}
 	for {
@@ -1292,6 +1323,8 @@ func (s *h2Server) serve(c net.Conn) {
 		case *http2.SettingsFrame:
 			if !f.IsAck() {
 				_ = fr.WriteSettingsAck()
+			} else if s.acks != nil {
+				s.acks <- struct{}{}
 			}
 		case *http2.PingFrame:
 			if !f.IsAck() {
@@ -1382,6 +1415,68 @@ func TestHTTP2Resend(t *testing.T) {
 			err = tc.run(s)
 			if n, d := srv.commitCount(), dials.Load(); tc.redial && (n != 1 || d != 2) || !tc.redial && n != 2 {
 				t.Fatalf("the server saw %d commit requests over %d connections; net/http did not re-send as expected", n, d)
+			}
+			expectUnknown(t, err, tc.op, "k")
+		})
+	}
+}
+
+// TestHTTP2ResendOnAnotherConnection re-sends the commit request on a second
+// HTTP/2 connection. The first attempt goes out on a connection dialled for a
+// Head that gave up during the dial, for which net/http does not call GetConn;
+// the re-send goes out on the first connection, now free.
+func TestHTTP2ResendOnAnotherConnection(t *testing.T) {
+	ts := httptest.NewUnstartedServer(nil)
+	ts.StartTLS()
+	cert, roots := ts.TLS.Certificates[0], ts.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	ts.Close()
+	for _, tc := range []struct {
+		op     string
+		second int
+		run    func(s *Store) error
+	}{
+		{"create", 412, func(s *Store) error { _, err := s.Create(bg, "k", strings.NewReader("hello world")); return err }},
+		{"replace", 412, func(s *Store) error { _, err := s.Replace(bg, "k", "7", strings.NewReader("hello world")); return err }},
+		{"delete", 403, func(s *Store) error { return s.Delete(bg, "k") }},
+	} {
+		t.Run(tc.op, func(t *testing.T) {
+			ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = ln.Close() })
+			srv := &h2Server{ln: ln, second: tc.second, hold: make(chan struct{}), release: make(chan struct{}), resume: make(chan struct{}), acks: make(chan struct{}, 4)}
+			go srv.accept()
+			var dials atomic.Int64
+			dialling, dial := make(chan struct{}), make(chan struct{})
+			tr := &http.Transport{
+				TLSClientConfig:   &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
+				ForceAttemptHTTP2: true,
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					if dials.Add(1) == 2 {
+						close(dialling)
+						<-dial
+					}
+					return (&net.Dialer{}).DialContext(ctx, network, addr)
+				},
+			}
+			t.Cleanup(tr.CloseIdleConnections)
+			s := openStore(t, Config{Bucket: "b", Endpoint: "https://" + ln.Addr().String() + "/storage/v1/"}, tr)
+			go func() { _, _ = s.Head(bg, "hold"); close(srv.resume) }()
+			<-srv.hold
+			<-srv.acks // the first connection takes one stream, now busy
+			ctx, cancel := context.WithCancel(bg)
+			head := make(chan struct{})
+			go func() { _, _ = s.Head(ctx, "k"); close(head) }()
+			<-dialling
+			cancel()
+			<-head
+			close(dial) // the dial goes on for no request; its connection joins the pool
+			<-srv.acks
+			time.Sleep(100 * time.Millisecond) // the client adds it to the pool right after it sent its preface
+			err = tc.run(s)
+			if n, d := srv.commitCount(), dials.Load(); n != 2 || d != 2 {
+				t.Fatalf("the server saw %d commit requests over %d connections, want 2 over 2", n, d)
 			}
 			expectUnknown(t, err, tc.op, "k")
 		})
