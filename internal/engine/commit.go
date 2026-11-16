@@ -200,6 +200,13 @@ const (
 func (l *Leader) commit(w *walFile, cp *capture) error {
 	c := w.c
 	l.cmu.Lock()
+	// One commit at a time from its create to SQLite's completion of it:
+	// SQLite releases the write lock before it sends phase two, so a second
+	// writer can get here first. The checks below then see what maintenance
+	// changed meanwhile (decision 10, steps 2 and 3).
+	for l.uploading && l.stopped == nil {
+		l.cond.Wait()
+	}
 	var refuse error
 	switch {
 	case l.head >= maxTxn:

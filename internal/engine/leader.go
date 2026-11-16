@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,6 +109,9 @@ type Leader struct {
 	// afterUpload, if set, runs after a commit resolved as committed and
 	// before SQLite is told. Tests use it to pause or kill there.
 	afterUpload func()
+	// beforePhaseTwo, if set, runs when SQLite sends a connection's phase
+	// two, before the engine handles it. Tests use it to pause there.
+	beforePhaseTwo func(*Conn)
 	// fault, if set, runs before each write, sync and truncate of a local
 	// file ("wal" or "main"), the engine's own WAL truncation included; an
 	// error it returns fails the call. Tests use it for disk failures.
@@ -138,7 +143,7 @@ type Leader struct {
 	tailPages   int    // page entries in the log above the manifest
 	pending     []*commit
 	wal         walState
-	uploading   bool // a commit is between its first create and its local completion
+	uploading   bool // a commit is between its first create and its local completion; one at a time
 	snapshots   int  // Snapshot calls whose start runs; no create begins meanwhile
 	// ids and bumps index the headers of the log above the manifest, which
 	// this version keeps whole (record 0005, requirement 11): each commit
@@ -266,34 +271,45 @@ func (l *Leader) Head() uint64 {
 // Snapshot first waits until no commit is between its create and SQLite's
 // completion of it, so the head is the newest commit SQLite has published,
 // and while start runs no create begins, so neither changes before the read
-// has taken its snapshot. Commits wait while start runs, so start should
-// only begin the read, with a statement that reads little, such as
-// PRAGMA schema_version inside BEGIN; its storage reads end with its Run's
-// context. start must not wait for SQLite's write lock: a
-// writer holding it may be waiting for start to end before its create, so
-// a BEGIN IMMEDIATE would wait out the busy timeout. A write transaction's
-// number is Head() once BEGIN IMMEDIATE has returned: no commit lands while
-// it holds the lock, and SQLite publishes a commit before it releases it.
-func (l *Leader) Snapshot(start func() error) (uint64, error) {
+// has taken its snapshot. That wait lasts for each commit it meets, a
+// create of up to createAttempts attempts and SQLite's completion; a writer
+// queued behind that commit can begin its create first, so the wait can
+// span several commits. It ends with ctx's error when ctx is done. Commits wait while start runs, so start should only begin the read,
+// with a statement that reads little, such as PRAGMA schema_version inside
+// BEGIN; its storage reads end with its Run's context. start must not wait
+// for SQLite's write lock: a writer holding it may be waiting for start to
+// end before its create, so a BEGIN IMMEDIATE would wait out the busy
+// timeout. A write transaction's number is Head() once BEGIN IMMEDIATE has
+// returned: no commit lands while it holds the lock, and SQLite publishes a
+// commit before it releases it.
+func (l *Leader) Snapshot(ctx context.Context, start func() error) (uint64, error) {
+	defer context.AfterFunc(ctx, func() {
+		l.cmu.Lock()
+		defer l.cmu.Unlock()
+		l.cond.Broadcast()
+	})()
 	l.cmu.Lock()
-	for l.uploading && l.stopped == nil {
+	for l.uploading && l.stopped == nil && ctx.Err() == nil {
 		l.cond.Wait()
 	}
-	if l.stopped != nil {
-		defer l.cmu.Unlock()
-		return 0, l.stopped
+	if err := cmp.Or(l.stopped, ctx.Err()); err != nil {
+		l.cmu.Unlock()
+		return 0, err
 	}
 	l.snapshots++
 	l.cmu.Unlock()
-	err := start()
-	l.cmu.Lock()
-	defer l.cmu.Unlock()
-	if l.snapshots--; l.snapshots == 0 {
-		l.cond.Broadcast()
-	}
-	if err != nil {
+	defer func() {
+		l.cmu.Lock()
+		defer l.cmu.Unlock()
+		if l.snapshots--; l.snapshots == 0 {
+			l.cond.Broadcast()
+		}
+	}()
+	if err := start(); err != nil {
 		return 0, err
 	}
+	l.cmu.Lock()
+	defer l.cmu.Unlock()
 	return l.head, nil
 }
 
@@ -301,20 +317,22 @@ func (l *Leader) Snapshot(start func() error) (uint64, error) {
 // headers, in one observation ordered against every head advance: txn is
 // the transaction above `above` that carries commit identifier id, and
 // firstBump the first epoch bump above `above`, each 0 if there is none,
-// and head is the leader's head. ok is false if the headers held do not
-// cover every transaction from above+1 to head. This version holds every
-// header above the manifest, at most the reader's walk bound of 65,536
-// (the tail bound stops commits before more), so ok is false only for
-// `above` below the manifest's transaction number. A caller that also reads
-// a table of its own channels reads it before Lookup: a channel it found
-// absent can then send no commit above head.
+// and head is the leader's head. Every value of above is valid. ok is false
+// if the headers held do not cover every transaction from above+1 to head.
+// This version holds every header above the manifest, at most the reader's
+// walk bound of 65,536 (the tail bound stops commits before more), so ok is
+// false only for `above` below the manifest's transaction number. Lookup
+// answers from memory on a stopped leader too: the caller does decision
+// 4's step 1 itself, with Err. A caller that also reads a table of its own
+// channels reads it before Lookup: a channel it found absent can then send
+// no commit above head.
 func (l *Leader) Lookup(id []byte, above uint64) (txn, firstBump, head uint64, ok bool) {
 	l.cmu.Lock()
 	defer l.cmu.Unlock()
 	if t := l.ids[string(id)]; t > above {
 		txn = t
 	}
-	if i, _ := slices.BinarySearch(l.bumps, above+1); i < len(l.bumps) {
+	if i := sort.Search(len(l.bumps), func(i int) bool { return l.bumps[i] > above }); i < len(l.bumps) {
 		firstBump = l.bumps[i]
 	}
 	return txn, firstBump, l.head, above >= l.manifestTxn
@@ -499,9 +517,13 @@ type Conn struct {
 // Aborted returns a channel that is closed once the engine has ended the
 // connection's transaction, or will refuse it, without its client asking:
 // maintenance rolled it back (record 0004 decision 10, steps 4 and 5), or
-// the leader stopped. The connection's next Run fails and says why. A
-// server that holds its own write lock for the transaction waits on it to
-// release that lock and report the failure (record 0005, requirement 15).
+// the leader stopped. The connection's next Run fails and says why. Close,
+// and a discard after a panic, close it too. A server that holds its own
+// write lock for the transaction waits on it to release that lock and
+// report the failure (record 0005, requirement 15). SQLite itself rolls an
+// explicit transaction back when it interrupts a write statement in it, as
+// at the end of a Run's context: the channel stays open then, the Run's
+// error is the signal, and the connection's transaction state is NONE.
 func (c *Conn) Aborted() <-chan struct{} { return c.abort }
 
 // endLocked closes the Aborted channel, once, with l.cmu held.
@@ -767,6 +789,7 @@ func (c *Conn) discard() bool {
 	c.db = nil
 	c.l.cmu.Lock()
 	delete(c.l.conns, c.n)
+	c.endLocked()
 	c.l.cmu.Unlock()
 	return true
 }
@@ -820,6 +843,7 @@ func (c *Conn) Close() error {
 	l := c.l
 	l.cmu.Lock()
 	delete(l.conns, c.n)
+	c.endLocked()
 	l.cmu.Unlock()
 	if c.db == nil {
 		return nil
