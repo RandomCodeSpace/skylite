@@ -1208,8 +1208,8 @@ func TestBodyDataWithEOF(t *testing.T) {
 //
 // If hold is set, the server allows one stream per connection, closes hold
 // when the request for object "hold" arrives and answers it 404 only once the
-// first commit request has arrived, closing release; it resets that commit
-// once resume is closed. acks, if set, receives a value for each SETTINGS
+// first commit request has arrived, closing release unless the test closed it
+// first; it resets that commit once resume is closed. acks, if set, receives a value for each SETTINGS
 // ACK of the client.
 type h2Server struct {
 	ln      net.Listener
@@ -1304,7 +1304,11 @@ func (s *h2Server) serve(c net.Conn) {
 			return true
 		}
 		if s.release != nil {
-			close(s.release)
+			select {
+			case <-s.release:
+			default:
+				close(s.release)
+			}
 			<-s.resume
 		}
 		if s.redial {
@@ -1422,9 +1426,12 @@ func TestHTTP2Resend(t *testing.T) {
 }
 
 // TestHTTP2ResendOnAnotherConnection re-sends the commit request on a second
-// HTTP/2 connection. The first attempt goes out on a connection dialled for a
-// Head that gave up during the dial, for which net/http does not call GetConn;
-// the re-send goes out on the first connection, now free.
+// HTTP/2 connection, one dialled for a Head that gave up during the dial, for
+// which net/http does not call GetConn. In the first order the first attempt
+// goes out on that connection and the re-send on the first connection, now
+// free. In the reverse order the held Head ends before the mutation, so the
+// first attempt takes the first connection and the re-send the dialled one,
+// with no GetConn between the two attempts.
 func TestHTTP2ResendOnAnotherConnection(t *testing.T) {
 	ts := httptest.NewUnstartedServer(nil)
 	ts.StartTLS()
@@ -1439,47 +1446,59 @@ func TestHTTP2ResendOnAnotherConnection(t *testing.T) {
 		{"replace", 412, func(s *Store) error { _, err := s.Replace(bg, "k", "7", strings.NewReader("hello world")); return err }},
 		{"delete", 403, func(s *Store) error { return s.Delete(bg, "k") }},
 	} {
-		t.Run(tc.op, func(t *testing.T) {
-			ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
-			if err != nil {
-				t.Fatal(err)
+		for _, reverse := range []bool{false, true} {
+			name := tc.op
+			if reverse {
+				name += " in reverse order"
 			}
-			t.Cleanup(func() { _ = ln.Close() })
-			srv := &h2Server{ln: ln, second: tc.second, hold: make(chan struct{}), release: make(chan struct{}), resume: make(chan struct{}), acks: make(chan struct{}, 4)}
-			go srv.accept()
-			var dials atomic.Int64
-			dialling, dial := make(chan struct{}), make(chan struct{})
-			tr := &http.Transport{
-				TLSClientConfig:   &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
-				ForceAttemptHTTP2: true,
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					if dials.Add(1) == 2 {
-						close(dialling)
-						<-dial
-					}
-					return (&net.Dialer{}).DialContext(ctx, network, addr)
-				},
-			}
-			t.Cleanup(tr.CloseIdleConnections)
-			s := openStore(t, Config{Bucket: "b", Endpoint: "https://" + ln.Addr().String() + "/storage/v1/"}, tr)
-			go func() { _, _ = s.Head(bg, "hold"); close(srv.resume) }()
-			<-srv.hold
-			<-srv.acks // the first connection takes one stream, now busy
-			ctx, cancel := context.WithCancel(bg)
-			head := make(chan struct{})
-			go func() { _, _ = s.Head(ctx, "k"); close(head) }()
-			<-dialling
-			cancel()
-			<-head
-			close(dial) // the dial goes on for no request; its connection joins the pool
-			<-srv.acks
-			time.Sleep(100 * time.Millisecond) // the client adds it to the pool right after it sent its preface
-			err = tc.run(s)
-			if n, d := srv.commitCount(), dials.Load(); n != 2 || d != 2 {
-				t.Fatalf("the server saw %d commit requests over %d connections, want 2 over 2", n, d)
-			}
-			expectUnknown(t, err, tc.op, "k")
-		})
+			t.Run(name, func(t *testing.T) {
+				ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = ln.Close() })
+				srv := &h2Server{ln: ln, second: tc.second, hold: make(chan struct{}), release: make(chan struct{}), resume: make(chan struct{}), acks: make(chan struct{}, 4)}
+				go srv.accept()
+				var dials atomic.Int64
+				dialling, dial := make(chan struct{}), make(chan struct{})
+				tr := &http.Transport{
+					TLSClientConfig:   &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
+					ForceAttemptHTTP2: true,
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						if dials.Add(1) == 2 {
+							close(dialling)
+							<-dial
+						}
+						return (&net.Dialer{}).DialContext(ctx, network, addr)
+					},
+				}
+				t.Cleanup(tr.CloseIdleConnections)
+				s := openStore(t, Config{Bucket: "b", Endpoint: "https://" + ln.Addr().String() + "/storage/v1/"}, tr)
+				held := make(chan struct{})
+				go func() { _, _ = s.Head(bg, "hold"); close(srv.resume); close(held) }()
+				<-srv.hold
+				<-srv.acks // the first connection takes one stream, now busy
+				ctx, cancel := context.WithCancel(bg)
+				head := make(chan struct{})
+				go func() { _, _ = s.Head(ctx, "k"); close(head) }()
+				<-dialling
+				cancel()
+				<-head
+				close(dial) // the dial goes on for no request; its connection joins the pool
+				<-srv.acks
+				time.Sleep(100 * time.Millisecond) // the client adds it to the pool right after it sent its preface
+				if reverse {
+					close(srv.release) // the held Head ends: the first connection is free again
+					<-held
+					time.Sleep(100 * time.Millisecond) // the client returns the stream before the Head's caller sees it end
+				}
+				err = tc.run(s)
+				if n, d := srv.commitCount(), dials.Load(); n != 2 || d != 2 {
+					t.Fatalf("the server saw %d commit requests over %d connections, want 2 over 2", n, d)
+				}
+				expectUnknown(t, err, tc.op, "k")
+			})
+		}
 	}
 }
 
