@@ -1596,3 +1596,132 @@ func TestRetakeRefusesDeposed(t *testing.T) {
 		t.Fatalf("lease %+v; want b's released %+v", ls, lb.l)
 	}
 }
+
+// A Retake whose lease write fails keeps the version of this holder's own
+// last write: a later Renew or Release must not replace the lease Retake
+// read, whether that lease is released, expired or (with clocks apart by
+// more than the time to live) live again.
+func TestRetakeFailedWriteKeepsOwnVersion(t *testing.T) {
+	boom := errors.New("injected")
+	failReplace := func(keys format.Keys) func(context.Context, string, string) (bool, error) {
+		return func(_ context.Context, op, key string) (bool, error) {
+			if op == "replace" && key == keys.Lease() {
+				return false, boom // definitely no effect
+			}
+			return false, nil
+		}
+	}
+	for _, release := range []bool{false, true} {
+		ts, keys, _, _, la, lb := retakeSetup(t, 40)
+		if err := lb.Release(bg); err != nil {
+			t.Fatal(err)
+		}
+		ts.setInject(failReplace(keys))
+		if err := la.Retake(bg); !errors.Is(err, boom) {
+			t.Fatalf("Retake: %v, want the injected error", err)
+		}
+		ts.setInject(nil)
+		op := la.Renew
+		if release {
+			op = la.Release
+		}
+		if err := op(bg); !errors.Is(err, ErrLeaseHeld) {
+			t.Errorf("release=%v: after a failed Retake: %v, want ErrLeaseHeld", release, err)
+		}
+		if got := storedLease(t, ts, keys); got != lb.l {
+			t.Errorf("release=%v: stored lease %+v, want b's %+v", release, got, lb.l)
+		}
+	}
+
+	ts, keys := newStore(t)
+	newHistory(t, ts, keys, 41, 512, 4)
+	clk := newClock(0)
+	_, la, err := Takeover(bg, ts, keys, Candidate{Holder: "a", TTL: time.Minute, Now: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ahead := newClock(0)
+	ahead.advance(2*time.Minute + time.Second)
+	lb, err := acquireLease(bg, ts, keys, Candidate{Holder: "b", TTL: time.Minute, Now: ahead.now}, 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts.setInject(failReplace(keys))
+	if err := la.Retake(bg); !errors.Is(err, boom) {
+		t.Fatalf("Retake: %v, want the injected error", err)
+	}
+	ts.setInject(nil)
+	clk.advance(90 * time.Second) // b's lease is now live by a's clock
+	if err := la.Renew(bg); !errors.Is(err, ErrLeaseHeld) {
+		t.Errorf("Renew over a lease live by this clock: %v, want ErrLeaseHeld", err)
+	}
+	if got := storedLease(t, ts, keys); got != lb.l {
+		t.Errorf("stored lease %+v, want b's %+v", got, lb.l)
+	}
+}
+
+// The window Retake's doc comment describes: another node takes over between
+// Retake's manifest read and its lease write. The deposed leader then holds
+// the lease and Renew keeps it, refusing the leader in office, until the
+// deposed leader reads the manifest; Retake then reports ErrLost.
+func TestRetakeDeposedInWindow(t *testing.T) {
+	ts, keys := newStore(t)
+	newHistory(t, ts, keys, 42, 512, 4)
+	clk := newClock(0)
+	oa, la, err := Takeover(bg, ts, keys, Candidate{Holder: "a", TTL: time.Minute, Now: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(time.Minute)
+	var ob Office
+	var lb *Lease
+	var berr error
+	armed := true
+	ts.setInject(func(_ context.Context, op, key string) (bool, error) {
+		if armed && op == "get" && key == keys.Lease() {
+			armed = false
+			// b takes over after a's manifest read, then its lease expires.
+			ob, lb, berr = Takeover(bg, ts, keys, Candidate{Holder: "b", TTL: time.Minute, Now: clk.now})
+			clk.advance(time.Minute)
+		}
+		return false, nil
+	})
+	rerr := la.Retake(bg)
+	ts.setInject(nil)
+	if armed || berr != nil {
+		t.Fatalf("b's takeover did not run in the window: %v", berr)
+	}
+	if rerr != nil || ob.Epoch <= oa.Epoch {
+		t.Fatalf("Retake in the window: %v, epochs a %d b %d; want success, b newer", rerr, oa.Epoch, ob.Epoch)
+	}
+	clk.advance(20 * time.Second)
+	if err := la.Renew(bg); err != nil {
+		t.Fatalf("Renew by the deposed holder: %v", err)
+	}
+	if err := lb.Retake(bg); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("Retake by the leader in office: %v, want ErrLeaseHeld", err)
+	}
+	if err := la.Retake(bg); !errors.Is(err, ErrLost) {
+		t.Fatalf("Retake by the deposed holder, now reading the manifest: %v, want ErrLost", err)
+	}
+}
+
+// Retake of a lease this holder still holds, with the clock behind its last
+// renewal, writes a renewal time above the last one.
+func TestRetakeOwnLeaseClockBehind(t *testing.T) {
+	ts, keys := newStore(t)
+	newHistory(t, ts, keys, 43, 512, 4)
+	clk := newClock(0)
+	_, la, err := Takeover(bg, ts, keys, Candidate{Holder: "a", TTL: time.Minute, Now: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := la.l.Renewed
+	clk.advance(-10 * time.Second)
+	if err := la.Retake(bg); err != nil {
+		t.Fatal(err)
+	}
+	if got := storedLease(t, ts, keys); got.Holder != "a" || got.Renewed <= before {
+		t.Errorf("stored lease %+v, want holder a renewed after %d", got, before)
+	}
+}

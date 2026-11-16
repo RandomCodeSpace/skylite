@@ -66,7 +66,6 @@ func (e *LeaseHeldError) Is(target error) bool { return target == ErrLeaseHeld }
 type Lease struct {
 	st   storage.Store
 	keys format.Keys
-	key  string
 	ttl  time.Duration
 	now  func() time.Time
 
@@ -81,7 +80,7 @@ func acquireLease(ctx context.Context, st storage.Store, keys format.Keys, c Can
 	if c.TTL <= 0 || c.Now == nil {
 		return nil, errors.New("engine: a candidate needs a positive lease time to live and a clock")
 	}
-	l := &Lease{st: st, keys: keys, key: keys.Lease(), ttl: c.TTL, now: c.Now}
+	l := &Lease{st: st, keys: keys, ttl: c.TTL, now: c.Now}
 	if err := l.take(ctx, c.Holder, epoch); err != nil {
 		return nil, err
 	}
@@ -92,9 +91,12 @@ func acquireLease(ctx context.Context, st storage.Store, keys format.Keys, c Can
 // otherwise replaces a lease of the same holder, an expired one or one that
 // does not decode, conditioned on the version it read. An unexpired lease of
 // another holder gives ErrLeaseHeld, and a lease of a newer format version
-// an error; neither is overwritten.
+// an error; neither is overwritten. If the write fails, the handle keeps the
+// version of this holder's own last write, so that a later Renew or Release
+// can never replace the lease it read here.
 func (l *Lease) take(ctx context.Context, holder string, epoch uint64) error {
-	b, info, err := readObject(ctx, l.st, l.key, format.MaxLeaseSize+1)
+	prev := l.version
+	b, info, err := readObject(ctx, l.st, l.keys.Lease(), format.MaxLeaseSize+1)
 	create := errors.Is(err, storage.ErrNotFound)
 	if err != nil && !create {
 		return err
@@ -111,7 +113,11 @@ func (l *Lease) take(ctx context.Context, holder string, epoch uint64) error {
 		}
 		l.version = info.Version
 	}
-	return l.put(ctx, format.Lease{Holder: holder, Epoch: epoch, Renewed: l.stamp(l.l.Renewed)}, create)
+	if err := l.put(ctx, format.Lease{Holder: holder, Epoch: epoch, Renewed: l.stamp(l.l.Renewed)}, create); err != nil {
+		l.version = prev
+		return err
+	}
+	return nil
 }
 
 // Renew refreshes the lease's renewal time. ErrLeaseHeld means another
@@ -136,7 +142,11 @@ func (l *Lease) Renew(ctx context.Context) error {
 // hold back the next takeover. That check is not a fence. The manifest can
 // move between the read and the lease write, so a deposed leader may still
 // take the lease once; it remains deposed, because only the log and the
-// manifest decide who leads. Retake gives no right to write.
+// manifest decide who leads. Retake gives no right to write. Renew does not
+// read the manifest, so a lease retaken in that window is kept by Renew,
+// and every other holder and candidate is refused it, until the holder reads
+// the manifest: a leader checks the manifest on its renewal cadence, not
+// only when Renew fails.
 func (l *Lease) Retake(ctx context.Context) error {
 	a, err := (&Reader{st: l.st, keys: l.keys}).readManifest(ctx, anchor{}, nil)
 	if err != nil {
@@ -212,14 +222,14 @@ func (l *Lease) put(ctx context.Context, next format.Lease, create bool) error {
 		own, err := settle(ctx, nil,
 			func() (err error) {
 				if create {
-					version, err = l.st.Create(ctx, l.key, bytes.NewReader(body))
+					version, err = l.st.Create(ctx, l.keys.Lease(), bytes.NewReader(body))
 				} else {
-					version, err = l.st.Replace(ctx, l.key, l.version, bytes.NewReader(body))
+					version, err = l.st.Replace(ctx, l.keys.Lease(), l.version, bytes.NewReader(body))
 				}
 				return err
 			},
 			func() (bool, error) {
-				b, info, err := readObject(ctx, l.st, l.key, format.MaxLeaseSize+1)
+				b, info, err := readObject(ctx, l.st, l.keys.Lease(), format.MaxLeaseSize+1)
 				version = info.Version
 				found, ferr = format.DecodeLease(b)
 				return bytes.Equal(b, body), err
