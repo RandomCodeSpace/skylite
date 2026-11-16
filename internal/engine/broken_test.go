@@ -301,6 +301,18 @@ func TestFailedReleaseStops(t *testing.T) {
 	if _, err := exec(d.w, "SELECT 1"); !errors.Is(err, ErrStopped) {
 		t.Fatalf("another connection served after a failed release: %v", err)
 	}
+	// The same when the function reports the connection broken.
+	d = brokenSetup(t)
+	v = open(t, d.l)
+	db2 := v.db
+	t.Cleanup(func() { _ = db2.Close() })
+	txn, err = v.Run(context.Background(), newID(), func(*sqlite3.Conn) error {
+		v.db = new(sqlite3.Conn)
+		return fmt.Errorf("the policy found the connection broken: %w", ErrBroken)
+	})
+	if txn != 0 || !errors.Is(err, ErrStopped) || !errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrBroken) || d.l.Err() == nil {
+		t.Fatalf("Run reporting broken: %d, %v, leader %v; want not committed, not broken, and the leader stopped", txn, err, d.l.Err())
+	}
 }
 
 // Covers: a Run that commits and then breaks, whose connection release

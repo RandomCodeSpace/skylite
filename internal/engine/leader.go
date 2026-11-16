@@ -57,8 +57,9 @@ var (
 	// discarded the connection without SQLite's cooperation and released its
 	// locks; nothing of the Run's open transaction is visible. With
 	// ErrNotCommitted the Run committed nothing; with a nonzero txn its
-	// commit stands and the connection broke after it. The leader serves on
-	// (record 0004, decision 6).
+	// commit stands and the connection broke after it. The break does not
+	// stop the leader (record 0004, decision 6); a connection that could not
+	// be discarded stops it instead, and its Run does not report ErrBroken.
 	ErrBroken = errors.New("engine: connection broken and discarded")
 	// ErrFenced means another candidacy's epoch bump holds the leader's next
 	// transaction number. The leader has stopped.
@@ -724,6 +725,10 @@ func (c *Conn) finish(p any, ferr error) (uint64, error) {
 	broken := p != nil || errors.Is(ferr, ErrBroken)
 	// The leader's own connection is never discarded: maintenance needs it.
 	discarded := broken && !inCommit && c != l.mconn && c.discard(true)
+	if !discarded && errors.Is(ferr, ErrBroken) {
+		// ErrBroken says the connection was discarded; this one was not.
+		ferr = errors.New(ferr.Error())
+	}
 	l.cmu.Lock()
 	uploaded, done, outcome, maint := c.uploaded, c.done, c.outcome, c.maint
 	unsent := "nothing of this Run was sent to storage"
@@ -797,9 +802,9 @@ func classify(done uint64, err, stopped error) (uint64, error) {
 	case done != 0:
 		if errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrUnknown) {
 			// The Run's commit stands: what failed after it must not read
-			// as its outcome. A broken connection is still reported broken
-			// if it was discarded, which a stopped leader did not do.
-			if errors.Is(err, ErrBroken) && stopped == nil {
+			// as its outcome. A broken connection is still reported broken:
+			// finish reports ErrBroken only for a discarded one.
+			if errors.Is(err, ErrBroken) {
 				err = fmt.Errorf("transaction %d committed, then: %w: %s", done, ErrBroken, err) //nolint:errorlint // must not match either class
 			} else {
 				err = fmt.Errorf("transaction %d committed, then: %s", done, err) //nolint:errorlint // must not match either class
