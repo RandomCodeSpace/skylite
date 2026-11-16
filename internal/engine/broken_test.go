@@ -303,6 +303,27 @@ func TestFailedReleaseStops(t *testing.T) {
 	}
 }
 
+// Covers: a Run that commits and then breaks, whose connection release
+// cannot free, reports its commit and not a broken connection: the leader
+// stopped instead of discarding it.
+func TestFailedReleaseAfterACommit(t *testing.T) {
+	d := brokenSetup(t)
+	l := d.l
+	v := open(t, l)
+	db := v.db
+	t.Cleanup(func() { _ = db.Close() })
+	txn, err := v.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
+		if err := db.Exec("INSERT INTO t VALUES (1000, 'committed')"); err != nil {
+			return err
+		}
+		v.db = new(sqlite3.Conn) // release cannot free this one
+		return fmt.Errorf("the policy found the connection broken: %w", ErrBroken)
+	})
+	if txn == 0 || errors.Is(err, ErrBroken) || errors.Is(err, ErrNotCommitted) || l.Err() == nil {
+		t.Fatalf("Run: %d, %v, leader %v; want committed, not broken, and the leader stopped", txn, err, l.Err())
+	}
+}
+
 // Covers: release closes the broken connection's files at once, not at a
 // later garbage collection: its main file, WAL, shared-memory index and
 // temporary files, whose bytes leave the temporary-file budget.

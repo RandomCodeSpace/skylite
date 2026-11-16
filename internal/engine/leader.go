@@ -797,8 +797,9 @@ func classify(done uint64, err, stopped error) (uint64, error) {
 	case done != 0:
 		if errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrUnknown) {
 			// The Run's commit stands: what failed after it must not read
-			// as its outcome. A broken connection is still reported broken.
-			if errors.Is(err, ErrBroken) {
+			// as its outcome. A broken connection is still reported broken
+			// if it was discarded, which a stopped leader did not do.
+			if errors.Is(err, ErrBroken) && stopped == nil {
 				err = fmt.Errorf("transaction %d committed, then: %w: %s", done, ErrBroken, err) //nolint:errorlint // must not match either class
 			} else {
 				err = fmt.Errorf("transaction %d committed, then: %s", done, err) //nolint:errorlint // must not match either class
