@@ -143,6 +143,26 @@ func (s *keySource) refresh(ctx context.Context) {
 	s.mu.Unlock()
 }
 
+// LoadKeyFiles reads the key set of every issuer configured with a JWKS
+// file, as a first refresh, and fails if one cannot be read or holds no
+// usable key. Later refreshes follow the cache policy.
+func (g *Guard) LoadKeyFiles() error {
+	for _, s := range g.sources {
+		if s.issuer.JWKSFile == "" {
+			continue
+		}
+		keys, err := s.fetch(context.Background())
+		if err != nil {
+			return fmt.Errorf("auth: issuer %s: %w", clip(s.issuer.Issuer), err)
+		}
+		now := s.now()
+		s.mu.Lock()
+		s.keys, s.fetched, s.attempted = keys, now, now
+		s.mu.Unlock()
+	}
+	return nil
+}
+
 func (s *keySource) fetch(ctx context.Context) (map[string]jose.JSONWebKey, error) {
 	if s.issuer.JWKSFile != "" {
 		raw, err := readFile(s.issuer.JWKSFile)

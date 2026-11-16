@@ -8,6 +8,8 @@ weight: 6
 
 **Date:** 2026-11-15
 
+**Amended by [ADR 0005](/docs/decisions/0005-client-protocol/#paths)** in one point: a database name has no `_`. The server's pull request aligned `internal/auth` with it.
+
 ## Context
 
 The [architecture page](/docs/architecture/#client-authentication) requires authentication and authorisation on the query endpoint and left open how clients authenticate. The owner decided: clients present OIDC JWT bearer tokens, and nothing else. No static API tokens, no mTLS client identity, and no trust in identity headers injected by a mesh or an ingress.
@@ -78,13 +80,15 @@ The request must carry one `Authorization` header with the `Bearer` scheme, then
 | The token fails any check, or the header appears more than once | 401 | `Bearer error="invalid_token"` | `invalid_token` |
 | Authenticated, but without the role | 403 | `Bearer error="insufficient_scope"` | `forbidden` |
 
+*Superseded for the client protocol:* this table describes `internal/auth`'s `Require` middleware. The server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) answers with that record's responses instead: an NDJSON error frame with the code `unauthenticated` (401, `WWW-Authenticate: Bearer`) or `forbidden` (403, no `WWW-Authenticate`), not these text bodies and not `insufficient_scope`.
+
 The log records the specific reason: `token_too_large`, `malformed_token`, `unsupported_algorithm`, `untrusted_issuer`, `unknown_key`, `keys_unavailable`, `invalid_signature`, `missing_claim`, `invalid_audience`, `token_expired`, `token_not_yet_valid` or `issued_in_future`.
 
 ### Authorisation
 
 Access is denied by default. Server configuration holds rules, and each rule grants one role on a database name or a pattern to principals of one issuer. A rule matches principals either by subject or by a claim: a top-level claim that equals the rule's value or, if it is an array, contains it, for example a `groups` or `roles` entry. A request is allowed if any rule grants the required role or a higher one. Configuration that names an unconfigured issuer, sets both or neither of subject and claim, has a database that is not a valid name or pattern, or names an unknown role is rejected at start-up.
 
-A database name is 1 to 63 characters of lower-case ASCII letters, digits, `-` and `_`, and starts with a letter or a digit. This is a requirement on the server, which must refuse any other name, and on storage naming, which must not map two names to one database. `internal/auth` denies any name outside that set before it reads a rule. A pattern is a name in which `*` may also appear, matching zero or more characters, and `?`, matching exactly one. It is 1 to 63 characters long and starts with a letter, a digit, `*` or `?`, so every pattern matches some valid name. Character classes, escapes and every other character are configuration errors, so a malformed pattern is never a rule that silently matches nothing or everything. Subjects, claim values, names and patterns are compared exactly, byte for byte, with no case or Unicode folding.
+A database name is 1 to 63 characters of lower-case ASCII letters, digits and `-`, and starts with a letter or a digit, the rule of [0005](/docs/decisions/0005-client-protocol/#paths). This is a requirement on the server, which must refuse any other name, and on storage naming, which must not map two names to one database. `internal/auth` denies any name outside that set before it reads a rule. A pattern is a name in which `*` may also appear, matching zero or more characters, and `?`, matching exactly one. It is 1 to 63 characters long and starts with a letter, a digit, `*` or `?`, so every pattern matches some valid name. Character classes, escapes and every other character are configuration errors, so a malformed pattern is never a rule that silently matches nothing or everything. Subjects, claim values, names and patterns are compared exactly, byte for byte, with no case or Unicode folding.
 
 There are three roles, in increasing order: `read`, then `write`, which includes read, then `admin`, which includes write and is reserved for schema changes and administrative endpoints. Which role each endpoint and statement requires is decided with the query API.
 

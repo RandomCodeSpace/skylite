@@ -7,7 +7,7 @@ status: current
 
 Every durable byte in skylite is to go through one interface, the `storage.Store` of package `internal/storage`. Its package documentation is the contract: create-if-absent and compare-and-swap as the only writes, version tokens that never repeat for a key, strongly consistent reads and listings, and a rule for writes whose outcome is unknown. Package `internal/storage/storagetest` is the conformance suite every backend must pass.
 
-The backends below are library packages, each tested against an emulator only (RustFS, fake-gcs-server, Azurite). The server cannot be configured to use any of them yet.
+Each cloud backend is tested against an emulator only (RustFS, fake-gcs-server, Azurite). The [server](/docs/server/) can be configured to use `localfs`, `s3` or `gcs`; the Azure Blob backend is a library package the server cannot use yet.
 
 | Package | Service | Status |
 |---|---|---|
@@ -78,7 +78,7 @@ Package `internal/storage/gcs` stores each key as an object in one existing buck
 | Create | Upload with `ifGenerationMatch=0`. The service answers 412 with reason `conditionNotMet` if the object exists. |
 | Replace | Upload with `ifGenerationMatch=<generation>`. A token that is not a generation the store could have returned fails without a request. |
 | Delete | Unconditional `DELETE`; 404 counts as success. |
-| Concurrent writers | Exactly one of concurrent Creates of a key, or of Replaces from one version, succeeds across every process and host that shares the bucket, if the service evaluates each condition when it commits the object. For a single-request upload that is the request itself. For a resumable upload, used from 16 MiB on, it is an assumption: fake-gcs-server evaluates the condition at the last request of the session, and Google does not document when the service does. If the service evaluated it only when the session opens, two writers could both succeed. This must be checked against the real service before the server uses this backend. |
+| Concurrent writers | Exactly one of concurrent Creates of a key, or of Replaces from one version, succeeds across every process and host that shares the bucket, if the service evaluates each condition when it commits the object. For a single-request upload that is the request itself. For a resumable upload, used from 16 MiB on, it is an assumption: fake-gcs-server evaluates the condition at the last request of the session, and Google does not document when the service does. If the service evaluated it only when the session opens, two writers could both succeed. The [server](/docs/server/) uses this backend, and this condition has not been checked against the real service. |
 | Range reads | A `Range` request. A zero-length range is answered from the object's metadata, and a range that starts at or past the end (416) is answered with an empty body once the metadata confirms the object still ends there. A download that the client resumes after a broken connection is pinned to the generation it started at. |
 | Listing | `objects.list` with `prefix` and `startOffset`. The client keeps requesting pages until the listing has `limit` entries or ends, so short pages from the service are filled. |
 
