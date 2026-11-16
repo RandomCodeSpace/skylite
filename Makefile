@@ -57,7 +57,10 @@ integration:
 # default credentials are public and only work against the emulator. RustFS
 # does not reclaim the space under /data/.rustfs.sys during the run (5.3 GB at
 # its peak, in one measured run), so a 4 GB tmpfs filled up and RustFS
-# answered 503.
+# answered 503. The conformance suite's ValidKeys subtest is skipped: RustFS
+# rejects its key of one 1,024-byte segment (any segment over 255 bytes), which
+# S3 accepts; the backend's TestValidKeys makes the same checks with that key
+# split into segments of at most 255 bytes.
 integration-s3:
 	@set -e; name="skylite-s3-rustfs-$$$$"; \
 	docker run -d --rm --name "$$name" -p 127.0.0.1::9000 --tmpfs /data:rw,size=10g,mode=1777 \
@@ -67,7 +70,7 @@ integration-s3:
 	endpoint="http://127.0.0.1:$$port"; \
 	for i in $$(seq 60); do curl -s -o /dev/null "$$endpoint" && break; sleep 1; done; \
 	curl -s -o /dev/null "$$endpoint" || { echo "integration-s3: RustFS did not start" >&2; exit 1; }; \
-	rc=0; SKYLITE_TEST_S3_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_S3_TIMEOUT) -tags integration ./internal/storage/s3/ || rc=$$?; \
+	rc=0; SKYLITE_TEST_S3_ENDPOINT="$$endpoint" go test -race -count=1 -v -timeout $(INTEGRATION_S3_TIMEOUT) -tags integration -skip '^TestConformance$$/^ValidKeys$$' ./internal/storage/s3/ || rc=$$?; \
 	if [ $$rc -ne 0 ]; then echo "integration-s3: last RustFS log lines:" >&2; docker logs --tail 50 "$$name" >&2 || true; fi; \
 	exit $$rc
 

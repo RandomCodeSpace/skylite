@@ -1021,3 +1021,219 @@ func TestWriteMemoryBound(t *testing.T) {
 type zeroReader struct{}
 
 func (zeroReader) Read(p []byte) (int, error) { clear(p); return len(p), nil }
+
+// The tests below need no service: rt answers every request.
+func offline(t *testing.T, rt roundTripFunc) *Store {
+	t.Helper()
+	s, err := newStore(Config{Bucket: "b", Region: testRegion, Credentials: devCredentials(), Endpoint: "http://127.0.0.1:1", UsePathStyle: true, SpoolDir: t.TempDir()}, &http.Client{Transport: rt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// fakeID is the identity of the objects the fake answers describe.
+var fakeID = strings.Repeat("ab", idLen)
+
+// fakeRange answers a ranged GET with a 206 carrying body as range cr, at
+// version "e", of an object this backend wrote if ours is set; closed records
+// whether the body was closed.
+func fakeRange(r *http.Request, cr, body string, ours bool, closed *bool) *http.Response {
+	h := http.Header{"Content-Range": {cr}, "Etag": {`"e"`}}
+	if ours {
+		h.Set("X-Amz-Meta-Skylite-Id", fakeID)
+	}
+	return &http.Response{StatusCode: http.StatusPartialContent, Header: h, Body: closeRecorder{strings.NewReader(body), closed}, ContentLength: int64(len(body)), Request: r}
+}
+
+type closeRecorder struct {
+	io.Reader
+	closed *bool
+}
+
+func (c closeRecorder) Close() error { *c.closed = true; return nil }
+
+// fakeHead answers a HEAD for an object of stored bytes, at version "h",
+// written by the write with identity id.
+func fakeHead(r *http.Request, stored int64, id string) *http.Response {
+	h := http.Header{"Etag": {`"h"`}, "Content-Length": {fmt.Sprint(stored)}, "X-Amz-Meta-Skylite-Id": {id}}
+	return &http.Response{StatusCode: http.StatusOK, Header: h, Body: http.NoBody, ContentLength: stored, Request: r}
+}
+
+// TestReadErrorsAreNotMissing answers every read with an error that does not
+// say the key is missing: access denied, a server error (on every attempt) and,
+// for a GET, a missing bucket. The contract: ErrNotFound means the key is
+// missing, so each of these is an error that wraps no storage sentinel.
+func TestReadErrorsAreNotMissing(t *testing.T) {
+	for _, c := range []struct {
+		code   int
+		s3Code string
+	}{{403, "AccessDenied"}, {500, "InternalError"}, {404, "NoSuchBucket"}} {
+		t.Run(fmt.Sprint(c.code, " ", c.s3Code), func(t *testing.T) {
+			s := offline(t, func(r *http.Request) (*http.Response, error) { return status(c.code, c.s3Code, false)(nil, r) })
+			if c.code != http.StatusNotFound { // HeadObject cannot tell a missing bucket from a missing key
+				_, err := s.Head(ctx, "k")
+				expectDefinite(t, err, nil)
+			}
+			_, _, err := s.Get(ctx, "k")
+			expectDefinite(t, err, nil)
+			_, _, err = s.GetRange(ctx, "k", 1, 2)
+			expectDefinite(t, err, nil)
+		})
+	}
+}
+
+// TestRangeAfter416 answers GetRange's GET with 416, as S3 does for a range
+// that starts past the object, and the HEAD that follows with an object that
+// has grown past the offset, with an error, or with growth on every attempt.
+func TestRangeAfter416(t *testing.T) {
+	answer := func(gets *int, head func(*http.Request) *http.Response, second func(*http.Request) *http.Response) roundTripFunc {
+		return func(r *http.Request) (*http.Response, error) {
+			if r.Method == http.MethodHead {
+				return head(r), nil
+			}
+			if *gets++; *gets == 1 || second == nil {
+				return status(http.StatusRequestedRangeNotSatisfiable, "InvalidRange", false)(nil, r)
+			}
+			return second(r), nil
+		}
+	}
+	grown := func(r *http.Request) *http.Response { return fakeHead(r, 100+int64(trailerLen), fakeID) }
+	t.Run("grown", func(t *testing.T) {
+		var gets int
+		var closed bool
+		s := offline(t, answer(&gets, grown, func(r *http.Request) *http.Response {
+			return fakeRange(r, fmt.Sprintf("bytes 50-50/%d", 100+trailerLen), "z", true, &closed)
+		}))
+		body, info, err := s.GetRange(ctx, "k", 50, 1)
+		if err != nil {
+			t.Fatalf("GetRange of an object that grew after the 416: %v after %d GETs, want the second GET's byte", err, gets)
+		}
+		got, err := io.ReadAll(body)
+		_ = body.Close()
+		if err != nil || string(got) != "z" || info != (storage.Info{Size: 100, Version: `"e"`}) || gets != 2 {
+			t.Fatalf("GetRange = %q, %+v, %v after %d GETs; want \"z\" of 100 bytes at \"e\" after 2", got, info, err, gets)
+		}
+	})
+	t.Run("HEAD fails", func(t *testing.T) {
+		var gets int
+		s := offline(t, answer(&gets, func(r *http.Request) *http.Response {
+			resp, _ := status(http.StatusForbidden, "AccessDenied", false)(nil, r)
+			return resp
+		}, nil))
+		_, _, err := s.GetRange(ctx, "k", 50, 1)
+		expectDefinite(t, err, nil)
+	})
+	t.Run("keeps growing", func(t *testing.T) {
+		var gets int
+		s := offline(t, answer(&gets, grown, nil))
+		_, _, err := s.GetRange(ctx, "k", 50, 1)
+		expectDefinite(t, err, nil)
+		if gets != 3 {
+			t.Fatalf("%d GETs, want 3 before giving up", gets)
+		}
+	})
+}
+
+// TestRangeAnswersNotReturned answers ranged GETs with a 206 whose body the
+// backend must not return, and checks that it closes that body: an object it
+// did not write, an offset at the end of the object (an empty read), and a
+// range that starts elsewhere than asked (an error).
+func TestRangeAnswersNotReturned(t *testing.T) {
+	for name, c := range map[string]struct {
+		cr     string
+		ours   bool
+		offset int64
+	}{
+		"foreign object":    {"bytes 0-1/100", false, 0},
+		"offset at the end": {fmt.Sprintf("bytes 5-%d/%d", 4+trailerLen, 5+trailerLen), true, 5},
+		"other start":       {"bytes 0-1/100", true, 3},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var closed bool
+			s := offline(t, func(r *http.Request) (*http.Response, error) { return fakeRange(r, c.cr, "zz", c.ours, &closed), nil })
+			body, info, err := s.GetRange(ctx, "k", c.offset, 1)
+			if name == "offset at the end" {
+				if err != nil || body != http.NoBody || info != (storage.Info{Size: 5, Version: `"e"`}) {
+					t.Fatalf("GetRange at the end = %v, %+v, %v; want an empty body of 5 bytes at \"e\"", body, info, err)
+				}
+			} else {
+				expectDefinite(t, err, nil)
+			}
+			if !closed {
+				t.Fatal("the response body was not closed")
+			}
+		})
+	}
+}
+
+// TestNoETag answers a Create with a 200 that carries no ETag. The write was
+// applied, so the outcome is unknown unless the identity check finds the
+// object, whose token the write then returns.
+func TestNoETag(t *testing.T) {
+	for _, found := range []bool{false, true} {
+		var id string
+		s := offline(t, func(r *http.Request) (*http.Response, error) {
+			if r.Method == http.MethodPut {
+				id = r.Header.Get("X-Amz-Meta-Skylite-Id")
+				closeBody(r)
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: r}, nil
+			}
+			if !found {
+				return status(http.StatusNotFound, "NotFound", false)(nil, r)
+			}
+			return fakeHead(r, int64(1+trailerLen), id), nil
+		})
+		v, err := s.Create(ctx, "k", strings.NewReader("x"))
+		if !found {
+			expectUnknown(t, err)
+		} else if err != nil || v != `"h"` {
+			t.Fatalf("Create answered without an ETag, identity found: %q, %v; want the HEAD's token", v, err)
+		}
+	}
+}
+
+// TestCancelInBody cancels the context while the body is read, from a body
+// that never ends. The contract: the context's error and no effect; the
+// backend stops reading at the cancel, not at the size limit.
+func TestCancelInBody(t *testing.T) {
+	s := offline(t, func(r *http.Request) (*http.Response, error) {
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		closeBody(r)
+		return nil, errors.New("no request expected")
+	})
+	old := maxBody
+	maxBody = 64 << 20
+	defer func() { maxBody = old }()
+	c, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var read int64
+	_, err := s.Create(c, "k", readerFunc(func(p []byte) (int, error) {
+		if read > 0 {
+			cancel()
+		}
+		clear(p)
+		read += int64(len(p))
+		return len(p), nil
+	}))
+	expectDefinite(t, err, context.Canceled)
+	if read > 1<<20 {
+		t.Fatalf("read %d bytes of the body, want the reads to stop at the cancel", read)
+	}
+}
+
+// TestListPrefixOfMaxLen lists with a prefix of exactly storage.MaxKeyLen
+// bytes, which the key of that length matches, so List must ask the service.
+func TestListPrefixOfMaxLen(t *testing.T) {
+	key := strings.Repeat("a", storage.MaxKeyLen)
+	requests := 0
+	s := offline(t, func(r *http.Request) (*http.Response, error) {
+		requests++
+		body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>b</Name><IsTruncated>false</IsTruncated><Contents><Key>%s</Key><Size>%d</Size></Contents></ListBucketResult>`, key, 3+trailerLen)
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/xml"}}, Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: r}, nil
+	})
+	entries, err := s.List(ctx, key, "", 10)
+	if err != nil || len(entries) != 1 || entries[0] != (storage.Entry{Key: key, Size: 3}) || requests != 1 {
+		t.Fatalf("List with a prefix of MaxKeyLen bytes = %+v, %v after %d requests; want the key after one", entries, err, requests)
+	}
+}

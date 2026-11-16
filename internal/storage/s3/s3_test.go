@@ -479,3 +479,60 @@ func TestEmulatorConditionsUnderConcurrency(t *testing.T) {
 		check("r", w, v)
 	}
 }
+
+// TestValidKeys makes the checks of the conformance suite's ValidKeys
+// subtest, which `make integration-s3` skips: RustFS rejects that subtest's
+// key of one 1,024-byte segment, as it rejects every segment longer than 255
+// bytes, and S3 does not. Here that key is 1,024 bytes in segments of at most
+// 255; the other keys are the suite's.
+func TestValidKeys(t *testing.T) {
+	keys := []string{
+		"a", "a/b", "a.b", "a/b/c", "a0", "a-b", "a_b", "b", "Z", "z", "A",
+		"..a", ".a/b", "...a", "a/..b/c", "-", "_", "Ab", "aB", "AB", "ab", "x.y.z",
+		strings.Repeat(strings.Repeat("k", 255)+"/", 3) + strings.Repeat("k", 252) + "/kkk",
+		strings.Repeat("s/", storage.MaxKeySegments-1) + "s",
+		strings.Repeat(strings.Repeat("m", 31)+"/", storage.MaxKeySegments-1) + strings.Repeat("m", 32),
+	}
+	s := newBucket(t).store(t)
+	list := func() []string {
+		t.Helper()
+		entries, err := s.List(ctx, "", "", storage.MaxListLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]string, len(entries))
+		for i, e := range entries {
+			got[i] = e.Key
+		}
+		return got
+	}
+	versions := make([]string, len(keys))
+	for i, k := range keys {
+		if err := storage.ValidateKey(k); err != nil {
+			t.Fatalf("ValidateKey(%.40q): %v", k, err)
+		}
+		var err error
+		if versions[i], err = s.Create(ctx, k, strings.NewReader(k)); err != nil {
+			t.Fatalf("Create(%.40q): %v", k, err)
+		}
+	}
+	want := slices.Sorted(slices.Values(keys))
+	if got := list(); !slices.Equal(got, want) {
+		t.Fatalf("List = %q, want %q", got, want)
+	}
+	for i, k := range keys {
+		expectHolds(t, s, k, k, versions[i])
+		v, err := s.Replace(ctx, k, versions[i], strings.NewReader(k+" replaced"))
+		if err != nil {
+			t.Fatalf("Replace(%.40q): %v", k, err)
+		}
+		expectHolds(t, s, k, k+" replaced", v)
+		if err := s.Delete(ctx, k); err != nil {
+			t.Fatalf("Delete(%.40q): %v", k, err)
+		}
+		expectMissing(t, s, k)
+	}
+	if got := list(); len(got) != 0 {
+		t.Fatalf("List after every Delete = %q, want nothing", got)
+	}
+}
