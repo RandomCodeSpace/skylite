@@ -193,7 +193,7 @@ type mainFile struct {
 	ckptDone bool // a checkpoint finished; it may now truncate the file
 }
 
-// fetch reads page pgno from s, as readPage does after locate. It uses only
+// fetch reads page pgno from s, the source locate names for it. It uses only
 // the reader's store, keys and cache, which never change, so it is safe while
 // the index changes; the leader reads that way outside its lock.
 func (r *Reader) fetch(ctx context.Context, s source, pgno uint32) ([]byte, error) {
@@ -363,7 +363,9 @@ func (f *mainFile) DeviceCharacteristics() vfs.DeviceCharacteristic {
 // CommitPhaseTwo runs when SQLite has completed a commit on the connection,
 // in sqlite3_step or, for a statement closed before its end, in
 // sqlite3_finalize, which calls no WAL hook. SQLite sends it for no commit
-// that fails.
+// that fails, but for every commit that ends a write transaction, an empty
+// one included; the commit hook stops the leader before any commit other
+// than the uploaded one gets here.
 func (f *mainFile) CommitPhaseTwo() error {
 	l, c := f.l, f.c
 	l.cmu.Lock()
@@ -386,7 +388,7 @@ func (f *mainFile) CheckpointStart() { f.inCkpt, f.ckptDone = true, false }
 func (f *mainFile) CheckpointDone()  { f.inCkpt, f.ckptDone = false, true }
 
 // Pragma refuses the settings that would route a write around capture or
-// take away the hook that completes a commit. The SQL policy refuses more;
+// replace the WAL hook, which checkpoints. The SQL policy refuses more;
 // this holds whatever it allows.
 func (f *mainFile) Pragma(name, value string) (string, error) {
 	v := strings.ToLower(strings.Trim(value, `'"`))

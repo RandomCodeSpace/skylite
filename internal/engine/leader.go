@@ -306,9 +306,11 @@ func (l *Leader) err() error {
 	return l.stopped
 }
 
-// Open opens a new SQLite connection to the database. An Open whose storage
-// read maintenance ends fails with an error that matches ErrNotCommitted and
-// ErrRetry.
+// Open opens a new SQLite connection to the database. An Open that fails
+// without a panic after maintenance has cancelled its storage reads fails
+// with an error that matches ErrNotCommitted and ErrRetry, whatever ended
+// it: SQLite reports a failed read as an I/O error without its cause, so a
+// storage error during maintenance is told to retry too.
 func (l *Leader) Open() (_ *Conn, err error) {
 	l.cmu.Lock()
 	if l.stopped != nil {
@@ -342,7 +344,7 @@ func (l *Leader) Open() (_ *Conn, err error) {
 			return
 		}
 		if p == nil && ctx.Err() != nil && l.ctx.Err() == nil {
-			err = fmt.Errorf("%w: %w: maintenance ended the Open: %w", ErrNotCommitted, ErrRetry, err)
+			err = fmt.Errorf("%w: %w: maintenance interrupted the Open: %w", ErrNotCommitted, ErrRetry, err)
 		}
 		// A connection that panicked inside sqlite3.Open cannot be closed.
 		// One that is not closed may hold locks the others wait for.
@@ -423,6 +425,7 @@ func (c *Conn) setup() error {
 	c.db.Limit(sqlite3.LIMIT_SQL_LENGTH, limit)
 	c.db.WALHook(c.walHook)
 	c.db.RollbackHook(c.rollbackHook)
+	c.db.CommitHook(c.commitHook)
 	return nil
 }
 
@@ -664,6 +667,23 @@ func (c *Conn) walHook(db *sqlite3.Conn, schema string, pages int) error {
 		_, _, _ = db.WALCheckpoint("main", sqlite3.CHECKPOINT_PASSIVE)
 	}
 	return nil
+}
+
+// commitHook runs when SQLite begins a commit of a write transaction on
+// this connection, an empty one included, and never between a commit's
+// upload and its completion. An uploaded commit still pending here was
+// rolled back without the rollback hook, as a failed VACUUM is, and the
+// commit-phase-two file control of this commit must not complete it:
+// fail-stop, and refuse this commit.
+func (c *Conn) commitHook() bool {
+	l := c.l
+	l.cmu.Lock()
+	defer l.cmu.Unlock()
+	if c.uploaded != 0 {
+		c.outcome = l.stopLocked(fmt.Errorf("SQLite began another commit before completing transaction %d", c.uploaded))
+		return false
+	}
+	return true
 }
 
 // rollbackHook runs when SQLite rolls a transaction back on this

@@ -34,11 +34,16 @@ import (
 // connection unclosable; the cases "in a step" panic inside a prepared
 // statement's step, which leaves it closable, as ncruces's out-of-memory
 // panic does. SQLite rolls a failed VACUUM back without calling the
-// rollback hook.
+// rollback hook; the cases "then" go on in the same Run with a commit of an
+// empty write transaction, which must not complete the uploaded one.
 func TestFailureAfterUpload(t *testing.T) {
-	for _, tc := range []string{"panic after upload", "panic in create", "SQLite error after upload", "panic after upload, in a step", "panic in create, in a step", "SQLite error after upload, in VACUUM"} {
+	for _, tc := range []string{
+		"panic after upload", "panic in create", "SQLite error after upload", "panic after upload, in a step", "panic in create, in a step", "SQLite error after upload, in VACUUM",
+		"SQLite error after upload, in VACUUM, then BEGIN IMMEDIATE; COMMIT", "SQLite error after upload, in VACUUM, then UPDATE t SET x = x WHERE 0",
+	} {
 		t.Run(tc, func(t *testing.T) {
-			how, step := strings.CutSuffix(tc, ", in a step")
+			how, then, _ := strings.Cut(tc, ", then ")
+			how, step := strings.CutSuffix(how, ", in a step")
 			how, vacuum := strings.CutSuffix(how, ", in VACUUM")
 			st, keys, o := newDatabase(t, 4096)
 			l := lead(t, st, keys, o, testConfig())
@@ -85,6 +90,11 @@ func TestFailureAfterUpload(t *testing.T) {
 				switch {
 				case vacuum:
 					err = db.Exec("VACUUM")
+					l.afterUpload = nil
+					if then != "" {
+						// f ignores the VACUUM's error.
+						err = db.Exec(then)
+					}
 				case step:
 					_, err = query(db, "INSERT INTO t VALUES (1)")
 				default:

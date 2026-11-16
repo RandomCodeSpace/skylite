@@ -25,10 +25,12 @@ import (
 type hangKey struct{}
 
 // hangStore wraps a store. Each call that hang selects waits, as a hung
-// backend does, until its context ends or the test releases it.
+// backend does, until its context ends or the test releases it; with
+// panics set, a call whose context ends panics instead.
 type hangStore struct {
 	storage.Store
 	hang    func(ctx context.Context, op string) bool
+	panics  bool
 	reached chan struct{}
 	release chan struct{}
 	once    sync.Once
@@ -48,6 +50,9 @@ func (s *hangStore) wait(ctx context.Context, op, key string) error {
 	s.once.Do(func() { close(s.reached) })
 	select {
 	case <-ctx.Done():
+		if s.panics {
+			panic("injected: a storage call ended by its context")
+		}
 		return &storage.Error{Op: op, Key: key, Err: ctx.Err()}
 	case <-s.release:
 		return nil
@@ -120,30 +125,45 @@ func within[T any](t *testing.T, hs *hangStore, done <-chan T, what string) T {
 }
 
 // Covers: Reads, the statement deadline on page reads: cancelling a Run's
-// context ends its read parked in storage, the Run is not committed, and
-// the leader serves on.
+// context ends its read parked in storage, of a commit object or of a base
+// object, the Run is not committed, and the leader serves on.
 func TestRunContextEndsStorageRead(t *testing.T) {
-	hs, l, _ := hungReadSetup(t, readsHang)
-	r := open(t, l)
-	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), hangKey{}, true))
-	done := make(chan error, 1)
-	go func() {
-		_, err := r.Run(ctx, nil, func(db *sqlite3.Conn) error {
-			_, err := query(db, "SELECT count(*) FROM t")
-			return err
+	for _, objects := range []string{"commit objects", "base objects"} {
+		t.Run(objects, func(t *testing.T) {
+			var hs *hangStore
+			var l *Leader
+			if objects == "commit objects" {
+				hs, l, _ = hungReadSetup(t, readsHang)
+			} else {
+				ts, keys, o, _ := importDatabase(t, 50)
+				hs = newHangStore(ts, readsHang)
+				t.Cleanup(hs.open)
+				cfg := testConfig()
+				cfg.Cache = NewCache(0)
+				l = lead(t, hs, keys, o, cfg)
+			}
+			r := open(t, l)
+			ctx, cancel := context.WithCancel(context.WithValue(context.Background(), hangKey{}, true))
+			done := make(chan error, 1)
+			go func() {
+				_, err := r.Run(ctx, nil, func(db *sqlite3.Conn) error {
+					_, err := query(db, "SELECT count(*) FROM t")
+					return err
+				})
+				done <- err
+			}()
+			reached(t, hs)
+			cancel()
+			if err := within(t, hs, done, "the cancelled Run"); !errors.Is(err, ErrNotCommitted) {
+				t.Fatalf("the cancelled Run: %v", err)
+			}
+			if err := l.Err(); err != nil {
+				t.Fatalf("leader: %v", err)
+			}
+			if got := queryConn(t, r, "SELECT count(*) FROM t"); got[0] != "50" {
+				t.Fatalf("rows %v", got)
+			}
 		})
-		done <- err
-	}()
-	reached(t, hs)
-	cancel()
-	if err := within(t, hs, done, "the cancelled Run"); !errors.Is(err, ErrNotCommitted) {
-		t.Fatalf("the cancelled Run: %v", err)
-	}
-	if err := l.Err(); err != nil {
-		t.Fatalf("leader: %v", err)
-	}
-	if got := queryConn(t, r, "SELECT count(*) FROM t"); got[0] != "50" {
-		t.Fatalf("rows %v", got)
 	}
 }
 
@@ -289,11 +309,11 @@ func runClass(txn uint64, err error) string {
 // inside sqlite3_finalize, where it calls no WAL hook, and the Run reports
 // that commit as any other, with the leader serving on, whatever f does
 // next in the Run: a second write is refused as a second commit, a
-// rollback or an open read touches nothing committed, and a panic
-// discards just the connection.
+// rollback or an open read touches nothing committed, an empty write
+// transaction commits nothing, and a panic discards just the connection.
 func TestReturningClosedEarly(t *testing.T) {
 	for _, steps := range []string{"one step", "to its end"} {
-		for _, then := range []string{"nothing", "a second write", "a rollback", "a read left open", "a panic"} {
+		for _, then := range []string{"nothing", "a second write", "a rollback", "a read left open", "an empty write transaction", "a panic"} {
 			t.Run(steps+", then "+then, func(t *testing.T) {
 				st, keys, _, l, c := setup(t)
 				other := open(t, l)
@@ -316,6 +336,8 @@ func TestReturningClosedEarly(t *testing.T) {
 						return db.Exec("INSERT INTO t VALUES (9)")
 					case "a rollback":
 						return db.Exec("BEGIN; ROLLBACK")
+					case "an empty write transaction":
+						return db.Exec("BEGIN IMMEDIATE; COMMIT")
 					case "a read left open":
 						if err := db.Exec("BEGIN"); err != nil {
 							return err
@@ -563,8 +585,9 @@ func TestMaintenanceEndsHungOpen(t *testing.T) {
 	}()
 	reached(t, hs)
 	startMaintenance(l)
-	if err := within(t, hs, opened, "the Open parked in a storage read"); !errors.Is(err, ErrRetry) || !errors.Is(err, ErrNotCommitted) {
-		t.Fatalf("Open ended by maintenance: %v, want ErrRetry and ErrNotCommitted", err)
+	// SQLite reports the cancelled read as an I/O error, without its cause.
+	if err := within(t, hs, opened, "the Open parked in a storage read"); !errors.Is(err, ErrRetry) || !errors.Is(err, ErrNotCommitted) || !errors.Is(err, sqlite3.IOERR) {
+		t.Fatalf("Open ended by maintenance: %v, want ErrRetry and ErrNotCommitted wrapping SQLite's I/O error", err)
 	}
 	armed.Store(false)
 	waitMaintenance(t, l)
@@ -573,9 +596,12 @@ func TestMaintenanceEndsHungOpen(t *testing.T) {
 	}
 }
 
-// Covers: Open's retry class belongs only to an Open that maintenance
-// ended: one whose storage read fails with no maintenance running, and one
-// that Close ends, are not told to retry.
+// Covers: Open's retry class belongs only to an Open that fails after
+// maintenance has cancelled its storage reads: one whose storage read fails
+// with no maintenance running, and one that Close ends, are not told to
+// retry, nor is one that panics after maintenance has cancelled it. An Open
+// whose read fails for another reason during maintenance is told to retry
+// too, as Open documents.
 func TestOpenFailureNotRetry(t *testing.T) {
 	t.Run("storage error", func(t *testing.T) {
 		st, keys, o := newDatabase(t, 4096)
@@ -603,9 +629,25 @@ func TestOpenFailureNotRetry(t *testing.T) {
 			opened <- err
 		}()
 		reached(t, hs)
-		_ = l.Close()
+		go func() { _ = l.Close() }() // Close waits for the Open
 		if err := within(t, hs, opened, "the Open parked in a storage read"); err == nil || errors.Is(err, ErrRetry) {
 			t.Fatalf("Open ended by Close: %v, want an error that does not match ErrRetry", err)
+		}
+	})
+	t.Run("panic during maintenance", func(t *testing.T) {
+		var armed atomic.Bool
+		hs, l, _ := hungReadSetup(t, func(_ context.Context, op string) bool { return op == "getrange" && armed.Load() })
+		hs.panics = true
+		armed.Store(true)
+		opened := make(chan error, 1)
+		go func() {
+			_, err := l.Open()
+			opened <- err
+		}()
+		reached(t, hs)
+		startMaintenance(l)
+		if err := within(t, hs, opened, "the Open parked in a storage read"); err == nil || errors.Is(err, ErrRetry) || !strings.Contains(err.Error(), "panicked") {
+			t.Fatalf("Open that panicked during maintenance: %v, want a panic that does not match ErrRetry", err)
 		}
 	})
 }

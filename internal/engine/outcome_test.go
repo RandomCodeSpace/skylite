@@ -178,8 +178,8 @@ func TestLostResponseRetiredByLaterLeader(t *testing.T) {
 			}
 			// Reading its own commit already retired, A knows it is deposed
 			// and stops at once, before any later write meets the bump.
-			if when == "before" && !errors.Is(l.Err(), ErrStopped) {
-				t.Fatalf("a leader that read its commit retired still serves: %v", l.Err())
+			if when == "before" && (!errors.Is(l.Err(), ErrStopped) || !strings.Contains(l.Err().Error(), ErrFenced.Error())) {
+				t.Fatalf("a leader that read its commit retired: %v, want stopped as fenced", l.Err())
 			}
 			if when == "after" {
 				retire(t, st.Store, keys, o.DB, txn)
