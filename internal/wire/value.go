@@ -23,6 +23,20 @@ type badValue string
 
 func (e badValue) Error() string { return string(e) }
 
+// The bad values readTagged finds, as errors, so that returning one does
+// not allocate.
+var (
+	errNoMember    error = badValue("a tagged value needs one member")
+	errNotString   error = badValue("a tagged value's member must be a string")
+	errTwoMembers  error = badValue("a tagged value has exactly one member")
+	errRealTag     error = badValue(`"real" must be "Infinity" or "-Infinity"`)
+	errBase64      error = badValue("invalid base64")
+	errUnknownTag  error = badValue("unknown value tag")
+	errValueKind   error = badValue("a value must be null, a number, a string or a tagged object")
+	errRealRange   error = badValue("a REAL must be a finite double")
+	errIntegerSize error = badValue("an INTEGER must be in the signed 64-bit range")
+)
+
 // DecodeValue decodes data, which must be exactly one value with nothing
 // before or after it.
 func DecodeValue(data []byte) (any, error) {
@@ -56,13 +70,13 @@ func readValue(d *jsontext.Decoder, scratch *[]byte, decode bool) (any, error) {
 		if bytes.ContainsAny(raw, ".eE") {
 			f, err := strconv.ParseFloat(string(raw), 64)
 			if err != nil { // the syntax is valid, so only overflow is left
-				return nil, badValue("a REAL must be a finite double")
+				return nil, errRealRange
 			}
 			return f, nil
 		}
 		n, ok := parseInt(raw)
 		if !ok {
-			return nil, badValue("an INTEGER must be in the signed 64-bit range")
+			return nil, errIntegerSize
 		}
 		return n, nil
 	case '"':
@@ -78,7 +92,7 @@ func readValue(d *jsontext.Decoder, scratch *[]byte, decode bool) (any, error) {
 		if err := d.SkipValue(); err != nil {
 			return nil, err
 		}
-		return nil, badValue("a value must be null, a number, a string or a tagged object")
+		return nil, errValueKind
 	}
 	_, err := d.ReadValue() // reports the syntax error
 	if err == nil {
@@ -93,8 +107,10 @@ func readTagged(d *jsontext.Decoder, scratch *[]byte, decode bool) (any, error) 
 		return nil, err
 	}
 	if d.PeekKind() == '}' {
-		_, err := d.ReadToken()
-		return nil, errOr(err, "a tagged value needs one member")
+		if _, err := d.ReadToken(); err != nil {
+			return nil, err
+		}
+		return nil, errNoMember
 	}
 	raw, err := d.ReadValue()
 	if err != nil {
@@ -109,7 +125,7 @@ func readTagged(d *jsontext.Decoder, scratch *[]byte, decode bool) (any, error) 
 		if err := skipRest(d); err != nil {
 			return nil, err
 		}
-		return nil, badValue("a tagged value's member must be a string")
+		return nil, errNotString
 	}
 	if raw, err = d.ReadValue(); err != nil {
 		return nil, err
@@ -119,7 +135,7 @@ func readTagged(d *jsontext.Decoder, scratch *[]byte, decode bool) (any, error) 
 		return nil, err
 	}
 	var v any
-	var bad badValue
+	var bad error
 	switch tag {
 	case "real":
 		switch string(s) {
@@ -128,13 +144,13 @@ func readTagged(d *jsontext.Decoder, scratch *[]byte, decode bool) (any, error) 
 		case "-Infinity":
 			v = math.Inf(-1)
 		default:
-			bad = `"real" must be "Infinity" or "-Infinity"`
+			bad = errRealTag
 		}
 	case "text_bytes", "blob":
 		b, ok := decodeBase64(s)
 		switch {
 		case !ok:
-			bad = "invalid base64"
+			bad = errBase64
 		case !decode:
 		case tag == "blob":
 			v = b
@@ -142,18 +158,18 @@ func readTagged(d *jsontext.Decoder, scratch *[]byte, decode bool) (any, error) 
 			v = string(b)
 		}
 	default:
-		bad = "unknown value tag"
+		bad = errUnknownTag
 	}
 	if d.PeekKind() != '}' {
 		if err := skipRest(d); err != nil {
 			return nil, err
 		}
-		return nil, badValue("a tagged value has exactly one member")
+		return nil, errTwoMembers
 	}
 	if _, err := d.ReadToken(); err != nil {
 		return nil, err
 	}
-	if bad != "" {
+	if bad != nil {
 		return nil, bad
 	}
 	return v, nil
@@ -243,7 +259,7 @@ func AppendValue(dst []byte, v any) ([]byte, error) {
 		return appendReal(dst, v), nil
 	case string:
 		if utf8.ValidString(v) {
-			return jsontext.AppendQuote(dst, v)
+			return appendQuoted(dst, v), nil
 		}
 		return appendBase64(append(dst, `{"text_bytes":"`...), []byte(v)), nil
 	case []byte:
@@ -256,9 +272,17 @@ func appendBase64(dst, b []byte) []byte {
 	return append(base64.StdEncoding.AppendEncode(dst, b), `"}`...)
 }
 
-// FormatReal returns the canonical form of a finite double: the shortest
-// digits that parse back to f, as [-]d[.ddd]e[-]N.
-func FormatReal(f float64) string { return string(appendReal(nil, f)) }
+// FormatReal returns f as AppendValue writes it: for a finite double, the
+// canonical REAL form, the shortest digits that parse back to f, as
+// [-]d[.ddd]e[-]N; for an infinity, its tagged value. NaN has no encoding,
+// and FormatReal panics on it; callers must not pass it.
+func FormatReal(f float64) string {
+	b, err := AppendValue(nil, f)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
 
 func appendReal(dst []byte, f float64) []byte {
 	var tmp [32]byte
@@ -273,4 +297,61 @@ func appendReal(dst []byte, f float64) []byte {
 		return append(dst, '0')
 	}
 	return append(dst, exp...)
+}
+
+// appendQuoted appends s as a JSON string, escaped by ADR 0005's rule: '"'
+// and '\\' as \" and \\; U+0008, U+0009, U+000A, U+000C and U+000D as
+// \b, \t, \n, \f and \r; every other code point below U+0020 as \u00XX
+// with lowercase hexadecimal digits; and nothing else. It is the codec's
+// own rule, whatever a JSON library would write. An invalid byte in s is
+// written as U+FFFD.
+func appendQuoted(dst []byte, s string) []byte {
+	const hex = "0123456789abcdef"
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= utf8.RuneSelf {
+			r, n := utf8.DecodeRuneInString(s[i:])
+			if r == utf8.RuneError && n == 1 {
+				dst = utf8.AppendRune(append(dst, s[start:i]...), utf8.RuneError)
+				i++
+				start = i
+				continue
+			}
+			i += n
+			continue
+		}
+		var esc string
+		switch c {
+		case '"':
+			esc = `\"`
+		case '\\':
+			esc = `\\`
+		case '\b':
+			esc = `\b`
+		case '\t':
+			esc = `\t`
+		case '\n':
+			esc = `\n`
+		case '\f':
+			esc = `\f`
+		case '\r':
+			esc = `\r`
+		default:
+			if c >= 0x20 {
+				i++
+				continue
+			}
+		}
+		dst = append(dst, s[start:i]...)
+		if esc != "" {
+			dst = append(dst, esc...)
+		} else {
+			dst = append(dst, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xf])
+		}
+		i++
+		start = i
+	}
+	return append(append(dst, s[start:]...), '"')
 }

@@ -2,9 +2,9 @@ package wire
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"strings"
 
 	"github.com/go-json-experiment/json/jsontext"
@@ -262,7 +262,7 @@ func (p *parser) object() error {
 		}
 		f := fieldBit(name)
 		p.seen |= f
-		if err := p.field(f, string(name)); err != nil {
+		if err := p.field(f, name); err != nil {
 			return err
 		}
 	}
@@ -279,8 +279,10 @@ func (p *parser) name() ([]byte, error) {
 	return unquote(raw, &p.scratch)
 }
 
-// field reads the value of top-level field f.
-func (p *parser) field(f int, name string) error {
+// field reads the value of top-level field f, whose name is valid only until
+// the value is read. It formats a message for an unknown field only if it is
+// the first problem, so that many unknown fields allocate nothing each.
+func (p *parser) field(f int, name []byte) error {
 	r := &p.r
 	var ok bool
 	var err error
@@ -348,7 +350,9 @@ func (p *parser) field(f int, name string) error {
 			return ok, err
 		})
 	default:
-		p.fail("unknown field %q", name)
+		if p.bad == nil {
+			p.fail("unknown field %q", name)
+		}
 		return p.d.SkipValue()
 	}
 	if err != nil {
@@ -356,7 +360,7 @@ func (p *parser) field(f int, name string) error {
 	}
 	if !ok {
 		p.badBits |= f
-		p.fail("field %q has a bad value", name)
+		p.fail("field %q has a bad value", fieldNames[bits.TrailingZeros(uint(f))]) // at most once per known field
 	}
 	return nil
 }
@@ -415,12 +419,14 @@ func (p *parser) args(open jsontext.Kind) (Args, bool, error) {
 			}
 		}
 		if _, err := readValue(p.d, &p.scratch, false); err != nil {
-			var bad badValue
-			if !errors.As(err, &bad) {
+			bad, isBad := err.(badValue) //nolint:errorlint // readValue returns badValue unwrapped
+			if !isBad {
 				return a, false, err
 			}
 			ok = false
-			p.fail("bad parameter value: %s", bad)
+			if p.bad == nil { // fail's arguments are boxed even when it records nothing
+				p.fail("bad parameter value: %s", string(bad))
+			}
 		}
 	}
 	_, err := p.d.ReadToken()
@@ -569,53 +575,65 @@ func validToken(s string) bool {
 }
 
 // Bind passes a statement's argument values to set, by parameter index from
-// 1, after checking that they bind every parameter exactly once. names holds
-// the statement's parameter names by index from 1, names[0] being that of
-// parameter 1, with their prefix as sqlite3_bind_parameter_name reports
-// them, or "" for a parameter without a name. A binding mismatch is an
-// invalid_request *Error with the flags of an answer before acceptance; an
-// error from set is returned unchanged. Bind decodes one value at a time and
-// keeps none.
+// 1, after checking that they bind every parameter exactly once: set is not
+// called unless they do. names holds the statement's parameter names by
+// index from 1, names[0] being that of parameter 1, with their prefix as
+// sqlite3_bind_parameter_name reports them, or "" for a parameter without a
+// name. A channel request that Validate finds invalid returns Validate's
+// error before anything else. A binding mismatch is an invalid_request
+// *Error with the flags of an answer before acceptance; an error from set is
+// returned unchanged. Bind decodes one value at a time and keeps none.
 func (r *Request) Bind(a Args, names []string, set func(index int, v any) error) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
 	if a.off == 0 {
 		if len(names) > 0 {
 			return NewError(CodeInvalidRequest, "parameter 1 is not bound")
 		}
 		return nil
 	}
-	if !a.named {
-		return r.bindValues(a, len(names), nil, set)
+	var index map[string]int
+	if a.named {
+		index = make(map[string]int, len(names))
+		for i, n := range names {
+			if n == "" || strings.IndexByte(":@$", n[0]) < 0 {
+				continue
+			}
+			if _, dup := index[n[1:]]; dup {
+				return NewError(CodeInvalidRequest, "parameters "+n+" and another differ only in their prefix; bind them with params")
+			}
+			index[n[1:]] = i + 1
+		}
 	}
-	index := make(map[string]int, len(names))
-	for i, n := range names {
-		if n == "" || strings.IndexByte(":@$", n[0]) < 0 {
-			continue
-		}
-		if _, dup := index[n[1:]]; dup {
-			return NewError(CodeInvalidRequest, "parameters "+n+" and another differ only in their prefix; bind them with params")
-		}
-		index[n[1:]] = i + 1
+	if err := r.bindValues(a, len(names), index, nil); err != nil {
+		return err
 	}
 	return r.bindValues(a, len(names), index, set)
 }
 
+// bindValues reads a's values in order. Without set it checks that they
+// bind every one of n parameters exactly once; with set it passes them on.
 func (r *Request) bindValues(a Args, n int, index map[string]int, set func(int, any) error) error {
 	d := newDecoder(r.body[a.off:])
 	if _, err := d.ReadToken(); err != nil {
-		return err
+		return NewError(CodeInvalidRequest, err.Error())
 	}
 	var scratch []byte
-	bound := make([]bool, n+1)
+	var bound []bool
+	if set == nil {
+		bound = make([]bool, n+1)
+	}
 	for i := 1; d.PeekKind() != ']' && d.PeekKind() != '}'; i++ {
 		at := i
 		if index != nil {
 			raw, err := d.ReadValue()
 			if err != nil {
-				return err
+				return NewError(CodeInvalidRequest, err.Error())
 			}
 			key, err := unquote(raw, &scratch)
 			if err != nil {
-				return err
+				return NewError(CodeInvalidRequest, err.Error())
 			}
 			var ok bool
 			if at, ok = index[string(key)]; !ok {
@@ -624,16 +642,19 @@ func (r *Request) bindValues(a Args, n int, index map[string]int, set func(int, 
 		} else if at > n {
 			return NewError(CodeInvalidRequest, fmt.Sprintf("the statement has %d parameters and params has more values", n))
 		}
-		v, err := readValue(d, &scratch, true)
+		v, err := readValue(d, &scratch, set != nil)
 		if err != nil {
-			return err
+			return NewError(CodeInvalidRequest, err.Error())
 		}
-		bound[at] = true
+		if set == nil {
+			bound[at] = true
+			continue
+		}
 		if err := set(at, v); err != nil {
 			return err
 		}
 	}
-	for i := 1; i <= n; i++ {
+	for i := 1; i < len(bound); i++ {
 		if !bound[i] {
 			return NewError(CodeInvalidRequest, fmt.Sprintf("parameter %d is not bound", i))
 		}

@@ -16,19 +16,45 @@ import (
 	"testing"
 )
 
+// vector is one line of clients/conformance/values.ndjson, whose format
+// clients/conformance/README.md describes.
 type vector struct {
-	Name       string `json:"name"`
-	Wire       string `json:"wire"`
-	WireHex    string `json:"wire_hex"`
-	Class      string `json:"class"`
-	Value      string `json:"value"`
-	DecodeOnly bool   `json:"decode_only"`
-	Error      string `json:"error"`
+	Name       string  `json:"name"`
+	Wire       string  `json:"wire"`
+	WireHex    string  `json:"wire_hex"`
+	Class      string  `json:"class"`
+	Value      *string `json:"value"`
+	DecodeOnly bool    `json:"decode_only"`
+	Error      string  `json:"error"`
+	Repeat     int     `json:"repeat"`
+}
+
+// expand applies a vector's repeat rule: the contents of its wire string,
+// and its value, repeated that many times.
+func (v *vector) expand() error {
+	if v.Repeat == 0 {
+		return nil
+	}
+	if len(v.Wire) < 2 || v.Wire[0] != '"' || v.Wire[len(v.Wire)-1] != '"' || v.Value == nil {
+		return fmt.Errorf("repeat on a vector whose wire is not a string: %q", v.Wire)
+	}
+	v.Wire = `"` + strings.Repeat(v.Wire[1:len(v.Wire)-1], v.Repeat) + `"`
+	value := strings.Repeat(*v.Value, v.Repeat)
+	v.Value = &value
+	return nil
 }
 
 // describe returns a value's storage class and its value as the vectors
-// write it.
-func describe(v any) (string, string) {
+// write it, nil for NULL.
+func describe(v any) (string, *string) {
+	class, value := describeText(v)
+	if v == nil {
+		return class, nil
+	}
+	return class, &value
+}
+
+func describeText(v any) (string, string) {
 	switch v := v.(type) {
 	case nil:
 		return "null", ""
@@ -59,6 +85,9 @@ func TestConformanceVectors(t *testing.T) {
 			t.Fatalf("line %d: %v", n+1, err)
 		}
 		n++
+		if err := v.expand(); err != nil {
+			t.Fatalf("%s: %v", v.Name, err)
+		}
 		wire := []byte(v.Wire)
 		if v.WireHex != "" {
 			if wire, err = hex.DecodeString(v.WireHex); err != nil {
@@ -95,8 +124,8 @@ func checkVector(t *testing.T, v vector, wire []byte) {
 	if err != nil {
 		t.Fatalf("DecodeValue: %v", err)
 	}
-	if class, value := describe(got); class != v.Class || value != v.Value {
-		t.Fatalf("DecodeValue = %s %s; want %s %s", class, value, v.Class, v.Value)
+	if class, value := describe(got); class != v.Class || !sameValue(value, v.Value) {
+		t.Fatalf("DecodeValue = %s %s; want %s %s", class, show(value), v.Class, show(v.Value))
 	}
 	if perr != nil {
 		t.Fatalf("Parse: %v", perr)
@@ -105,8 +134,8 @@ func checkVector(t *testing.T, v vector, wire []byte) {
 	if err := r.Bind(r.Args, []string{""}, func(_ int, v any) error { bound = v; return nil }); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	if class, value := describe(bound); class != v.Class || value != v.Value {
-		t.Fatalf("Bind = %s %s; want %s %s", class, value, v.Class, v.Value)
+	if class, value := describe(bound); class != v.Class || !sameValue(value, v.Value) {
+		t.Fatalf("Bind = %s %s; want %s %s", class, show(value), v.Class, show(v.Value))
 	}
 	if v.DecodeOnly {
 		return
@@ -116,8 +145,7 @@ func checkVector(t *testing.T, v vector, wire []byte) {
 		t.Fatalf("AppendValue = %q, %v; want %q", enc, err, wire)
 	}
 	if v.Name == "text at the frame size" {
-		var buf bytes.Buffer
-		w := NewWriter(&buf, DefaultFrameBytes, DefaultLimits())
+		w, buf := newTestWriter(DefaultFrameBytes, DefaultLimits())
 		if err := w.Columns([]Column{{Name: "t"}}); err != nil {
 			t.Fatal(err)
 		}
@@ -128,12 +156,41 @@ func checkVector(t *testing.T, v vector, wire []byte) {
 	}
 }
 
+func sameValue(a, b *string) bool { return (a == nil) == (b == nil) && (a == nil || *a == *b) }
+
+func show(s *string) string {
+	if s == nil {
+		return "null"
+	}
+	return *s
+}
+
 func TestAppendValueRefuses(t *testing.T) {
 	for _, v := range []any{math.NaN(), true, 1, float32(1), []any{}} {
 		if b, err := AppendValue(nil, v); err == nil {
 			t.Errorf("AppendValue(%#v) = %q; want an error", v, b)
 		}
 	}
+}
+
+// TestFormatRealNonFinite checks that FormatReal writes what AppendValue
+// writes for an infinity and panics on NaN, which AppendValue refuses.
+func TestFormatRealNonFinite(t *testing.T) {
+	if got := FormatReal(math.Inf(1)); got != `{"real":"Infinity"}` {
+		t.Errorf("+Inf: %s", got)
+	}
+	if got := FormatReal(math.Inf(-1)); got != `{"real":"-Infinity"}` {
+		t.Errorf("-Inf: %s", got)
+	}
+	if got := FormatReal(math.Copysign(0, -1)); got != "-0e0" {
+		t.Errorf("-0: %s", got)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Error("FormatReal(NaN) did not panic")
+		}
+	}()
+	_ = FormatReal(math.NaN())
 }
 
 var realForm = regexp.MustCompile(`^-?[0-9](\.[0-9]*[1-9])?e(0|-?[1-9][0-9]*)$`)

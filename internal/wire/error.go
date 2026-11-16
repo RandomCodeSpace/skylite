@@ -44,6 +44,16 @@ const (
 	CodeInternal             Code = "internal"
 )
 
+// codes lists every code, in the order of ADR 0005's errors table.
+var codes = []Code{
+	CodeInvalidRequest, CodeUnauthenticated, CodeForbidden, CodeStatementForbidden, CodeDatabaseNotFound,
+	CodeDatabaseExists, CodeNeedsChannel, CodeChannelBusy, CodeInFlight, CodeStaleSequence, CodeSequenceGap,
+	CodeSequenceConflict, CodeChannelLost, CodeRequestTooLarge, CodeTooManyChannels, CodeOverloaded,
+	CodeInvalidState, CodeTransactionAborted, CodeBusy, CodeTimeout, CodeCancelled, CodeResultTooLarge,
+	CodeSQLError, CodeCommitFailed, CodeCommitOutcomeUnknown, CodeNoLeader, CodeNotServing,
+	CodeOwnerUnreachable, CodeBehind, CodeMaintenance, CodeInternal,
+}
+
 // Status is the HTTP status of a response whose whole body is an error with
 // this code. A code that only ever ends the response of an accepted request
 // returns 200, the status of that response. An unknown code returns 500.
@@ -162,8 +172,8 @@ func CutMessage(msg string, limit int) string {
 	return strings.ToValidUTF8(msg, "�")
 }
 
-// quotedLen is the length of r inside a JSON string as jsontext.AppendQuote
-// writes it. An invalid byte counts as U+FFFD.
+// quotedLen is the length of r inside a JSON string as appendQuoted writes
+// it. An invalid byte counts as U+FFFD.
 func quotedLen(r rune) int {
 	switch {
 	case r == '"', r == '\\', r == '\b', r == '\f', r == '\n', r == '\r', r == '\t':
