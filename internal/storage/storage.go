@@ -125,22 +125,28 @@
 // Publication begins when a write has read its body to its end, or when a
 // Delete sends the request or makes the system call that removes the object.
 // Before publication begins a backend can always undo its work, so it never
-// returns [ErrOutcomeUnknown]. After it has begun, a backend returns
-// [ErrOutcomeUnknown] for any error unless it knows the mutation had no
-// effect. Examples: the context ended, or the connection failed, after the
-// request that commits the write was sent and before its response arrived; a
-// local link, rename or unlink succeeded and the following directory fsync
-// failed.
+// returns [ErrOutcomeUnknown]. The one exception is a backend that cannot tell
+// whether publication had begun when the error arose, because what it observes
+// does not separate a request that was never sent from one that was sent and
+// lost. It then answers as if publication had begun. That is always safe: an
+// unknown outcome claims nothing, and a definite error is safe only when it is
+// true. A backend's package documentation lists the cases where it does this.
+// After publication has begun, a backend returns [ErrOutcomeUnknown] for any
+// error unless it knows the mutation had no effect. Examples: the context
+// ended, or the connection failed, after the request that commits the write
+// was sent and before its response arrived; a local link, rename or unlink
+// succeeded and the following directory fsync failed.
 //
 // Cancellation is a case of this rule, not an exception to it. A context that
 // is done when a call starts fails the call. A context that ends before
 // publication begins fails the mutation with the context's error and no
-// effect. A context that ends after publication has begun gives success, an
-// error with no effect, or an error wrapping both [ErrOutcomeUnknown] and the
-// context's error. Cancellation cannot interrupt a call that is blocked
-// inside the caller's own body Read: a backend sees the context end only when
-// that Read returns, so a caller that needs a bounded write gives it a reader
-// that returns.
+// effect, except as above, where the error also wraps [ErrOutcomeUnknown]. A
+// context that ends after publication has begun gives success, an error with
+// no effect, or an error wrapping both [ErrOutcomeUnknown] and the context's
+// error. Cancellation cannot interrupt a call that is blocked inside the
+// caller's own body Read: a backend sees the context end only when that Read
+// returns, so a caller that needs a bounded write gives it a reader that
+// returns.
 //
 // A backend whose SDK retries a request decides the outcome of the whole call,
 // not of its last attempt. A precondition failure returned after a retry of an
@@ -199,10 +205,11 @@
 //
 // Implementation note for Azure Blob Storage: the service documents that a
 // blob's ETag changes on every write, but not that an ETag never recurs for a
-// blob name across a delete and a re-create. An Azure backend that uses the
-// ETag as the token must justify that it never repeats for a key, or use
-// another mechanism, such as a per-write identity stored with the blob and
-// compared under a blob lease.
+// blob name across a delete and a re-create. Package azureblob uses the ETag
+// as the token on the assumption, not a documented guarantee, that the service
+// never issues the same ETag twice for one blob name. That has not been
+// verified against the service. If it proves false, the backend must change to
+// a per-write identity stored with the blob and compared under a blob lease.
 //
 // # Reads
 //

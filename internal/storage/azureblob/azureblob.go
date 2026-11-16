@@ -10,10 +10,11 @@
 // constructors of package container. The container must exist, and nothing
 // else may write to it. The client's transport must be net/http's (the SDK's
 // default or an *http.Client): the backend learns whether a request reached a
-// connection from net/http's client trace (see "Outcomes"). The trace names
-// a request's first hop, so a proxy, if the transport uses one, must be the
-// one the environment names (http.ProxyFromEnvironment, as in the SDK's
-// default transport). The transport
+// connection from the response the SDK's pipeline returns and from net/http's
+// client trace (see "Outcomes"). The trace names a request's first hop, so
+// only a proxy that the environment names (http.ProxyFromEnvironment, as in
+// the SDK's default transport) is recognised in it; through another proxy the
+// backend classifies as if the transport reported no trace. The transport
 // must also close an idle connection before the service, or anything between
 // (a load balancer, a proxy), does: set http.Transport.IdleConnTimeout below
 // the shortest idle timeout on the path (the SDK's default transport keeps
@@ -57,10 +58,12 @@
 //
 // The service documents that a blob's ETag changes on every write. The
 // storage contract also needs an ETag never to recur for a key, also across a
-// Delete and a later Create of the same name. The engine relies on that
-// assumption, and Azure does not document it: it holds for the ETags observed
-// so far, which encode a modification time, but it is an assumption, not a
-// documented guarantee. Azurite derives its ETags from the time in
+// Delete and a later Create of the same name. The backend uses the ETag as the
+// token on the assumption, not a documented guarantee, that the service never
+// issues the same ETag twice for one blob name. That has not been verified
+// against the service. If it proves false, the backend must change to a
+// per-write identity stored with the blob and compared under a blob lease.
+// Azurite derives its ETags from the time in
 // milliseconds multiplied by a random factor, so on the emulator a repeat is
 // possible, though unlikely, for two writes in the same millisecond.
 //
@@ -76,21 +79,35 @@
 //   - a response with status 409 BlobAlreadyExists or 412 (Create or Replace),
 //     or 404 BlobNotFound (Replace), is storage.ErrPreconditionFailed;
 //   - any other 4xx status except 408 is a definite error with no effect;
-//   - if the request never reached a connection to the container (net/http's
-//     trace reports none obtained to its endpoint or the proxy for it, or the
-//     SDK failed before calling its transport, as when a credential gets no
-//     token), or the transport did not read the body to its end, the service
+//   - if the transport did not read a write's body to its end, the service
 //     cannot have applied it, and the error is definite;
-//   - anything else, such as a 5xx status, 408, a 2xx or 3xx status other than
-//     the one the request expects (from a non-conforming proxy), a lost
-//     response, a reset connection or the context ending while the request is
-//     in flight, wraps storage.ErrOutcomeUnknown.
+//   - if the SDK's pipeline returned no response and either net/http's trace
+//     reports a connection attempt to the container's endpoint, or the proxy
+//     for it, that obtained no connection, or there was no such attempt and
+//     the error is one azcore marks non-retriable (as its bearer token policy
+//     marks a credential that got no token, and its refusal to send a token
+//     over plain HTTP), the request never reached the container, and the
+//     error is definite;
+//   - anything else wraps storage.ErrOutcomeUnknown: a 5xx status, 408, a
+//     2xx or 3xx status other than the one the request expects (from a
+//     non-conforming proxy), any failure after a response arrived (a body
+//     that fails, a header that does not parse), a lost response, a reset
+//     connection, the context ending while the request is in flight, and any
+//     other error for which the backend cannot rule out that the request was
+//     sent.
 //
 // A credential that calls its token endpoint with the call's context shares
 // its client trace, so only connections to the container's endpoint, or the
-// proxy for it, count. A credential's failure is still reported as unknown
-// when the context ends while it waits for a token, or when it reaches its
-// token endpoint through that same proxy.
+// proxy for it, count. azcore does not pass the response capture on to a
+// credential, so a response always is the container's. Without a connection
+// in the trace, the backend cannot always tell a request that was never sent
+// from one that was sent and lost, and then reports unknown although nothing
+// was sent: for Delete and an empty Create when the context ends while a
+// credential waits for a token (azcore then returns the context's error
+// alone); when a credential reaches its token endpoint through the
+// container's proxy; and when the SDK fails before its transport with an
+// error azcore does not mark non-retriable, for example a shared key that
+// cannot sign the request.
 //
 // Once a mutation call returns, its request body refuses further reads, so a
 // request that net/http is still sending when the call returns can never be
@@ -131,7 +148,8 @@
 //
 // Only against Azurite 3.37.0, with its well-known development account and a
 // container SAS, and token credentials against local HTTP servers: one that
-// fails without a request, and some that call a local token endpoint.
+// fails without a request, some that call a local token endpoint, and one
+// that gets a token for a server whose answers' bodies fail.
 // The real service, working Entra ID credentials, real latency and a proxy
 // are not tested.
 package azureblob
@@ -456,41 +474,45 @@ func hostPort(u *url.URL) string {
 	return net.JoinHostPort(u.Hostname(), port)
 }
 
-// connTrace records what net/http's client trace reports for one call about
+// connTrace records what one call's pipeline and net/http's client trace
+// report about its request: the response the pipeline returned, if any, and
 // connections to hops, the container's first hops. A credential shares the
-// call's trace, so connections to other hosts, such as its token endpoint,
-// are left out.
+// call's client trace, so connections to other hosts, such as its token
+// endpoint, are left out; azcore does not pass the response capture on to a
+// credential, so a captured response is always the container's.
 type connTrace struct {
 	hops             []string
+	resp             *http.Response
 	getConn, gotConn atomic.Bool
 }
 
 // reached reports whether the request that failed with err may have reached a
-// connection to the container. With net/http's trace, that is whether it
-// obtained one. Without one (a transport that is not net/http's reports none),
-// the request may have been handed to the transport if err holds a response, a
-// *url.Error for the container, in which http.Client wraps every transport
-// error, or the context's error, which the SDK returns in place of the
-// transport's once the context has ended; any other error came from the SDK
-// before its transport, such as a credential that got no token.
+// connection to the container. A response returned by the pipeline means it
+// did, whatever failed after it (reading the body, parsing a header). Else,
+// with net/http's trace, it did if it obtained a connection. Without either,
+// only an error that azcore marks non-retriable is known to come from before
+// the transport: its bearer token policy marks so a credential's failure and
+// the refusal to send a token over plain HTTP. Any other error may come from
+// after it: http.Client wraps every transport error in a *url.Error, the
+// bearer token policy drops a response whose body fails and returns the
+// body's error alone, and the SDK returns the context's error in place of the
+// transport's once the context has ended.
 func (c *connTrace) reached(err error) bool {
+	if c.resp != nil {
+		return true
+	}
 	if c.getConn.Load() {
 		return c.gotConn.Load()
 	}
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		if u, perr := url.Parse(ue.URL); perr != nil || slices.Contains(c.hops, hostPort(u)) {
-			return true
-		}
-	}
-	var re *azcore.ResponseError
-	return errors.As(err, &re) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	var nr interface{ NonRetriable() }
+	return !errors.As(err, &nr)
 }
 
 // mutation returns a context for one mutation request: SDK retries are off,
 // and the returned trace records whether the request reached a connection.
 func (s *Store) mutation(ctx context.Context) (context.Context, *connTrace) {
 	c := &connTrace{hops: s.hops}
+	ctx = policy.WithCaptureResponse(ctx, &c.resp)
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		GetConn: func(hp string) {
 			if slices.Contains(c.hops, hp) {

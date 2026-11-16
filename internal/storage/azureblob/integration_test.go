@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -291,6 +292,26 @@ func noTrace(req *http.Request, next http.RoundTripper) (*http.Response, error) 
 	return nil, req.Context().Err()
 }
 
+// noTraceAnswer sends the request with a context that carries no client
+// trace, as noTrace does, and passes the service's answer on, changed by alter.
+func noTraceAnswer(alter func(*http.Response)) faultFunc {
+	return func(req *http.Request, next http.RoundTripper) (*http.Response, error) {
+		resp, err := next.RoundTrip(req.Clone(context.Background()))
+		if err == nil {
+			alter(resp)
+		}
+		return resp, err
+	}
+}
+
+// failBody replaces the answer's body with one that fails, as when the
+// connection breaks while the body is read.
+func failBody(resp *http.Response) {
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(iotest.ErrReader(io.ErrUnexpectedEOF))
+}
+
 // unsent fails the request without reading its body or sending it.
 func unsent(*http.Request, http.RoundTripper) (*http.Response, error) { return nil, errInjected }
 
@@ -409,6 +430,15 @@ func TestMutationFaults(t *testing.T) {
 		{"NoTraceDeadline", func(*testing.T) faultFunc {
 			return noTrace
 		}, [3]outcome{unknownDone, unknownDone, unknownDone}, true},
+		// The service applied the request and answered it, through a transport
+		// that reports no connection trace, and then the answer's body fails
+		// or a header of its success does not parse: unknown.
+		{"NoTraceBodyFails", func(*testing.T) faultFunc {
+			return noTraceAnswer(failBody)
+		}, [3]outcome{unknownDone, unknownDone, unknownDone}, false},
+		{"NoTraceBadDate", func(*testing.T) faultFunc {
+			return noTraceAnswer(func(resp *http.Response) { resp.Header.Set("Date", "not a date") })
+		}, [3]outcome{unknownDone, unknownDone, unknownDone}, false},
 		// The connection was refused, so nothing was sent: a definite error.
 		{"Refused", refused, [3]outcome{noEffect, noEffect, noEffect}, false},
 		// The request failed before its body was read: nothing reached the

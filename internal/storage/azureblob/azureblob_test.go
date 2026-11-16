@@ -140,6 +140,59 @@ func TestCredentialFailure(t *testing.T) {
 	}
 }
 
+// rtFunc is an http.RoundTripper made of a function.
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// tokenCredential returns a token without a request.
+type tokenCredential struct{}
+
+func (tokenCredential) GetToken(context.Context, policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	return azcore.AccessToken{Token: "t", ExpiresOn: time.Now().Add(time.Hour)}, nil
+}
+
+// TestAnsweredBehindCredential: azcore's bearer token policy drops a response
+// whose body fails and returns the body's error alone, so with a token
+// credential and a transport that reports no connection trace nothing but
+// that error is left. The server answered the request, which it may have
+// applied, so every mutation's outcome must be unknown.
+func TestAnsweredBehindCredential(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("ETag", `"e"`)
+		w.Header().Set("Content-Length", "10") // and no body, so reading it fails
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusAccepted)
+		} else {
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer srv.Close()
+	tr := &http.Transport{}
+	defer tr.CloseIdleConnections()
+	noTrace := rtFunc(func(r *http.Request) (*http.Response, error) { return tr.RoundTrip(r.Clone(context.Background())) })
+	c, err := container.NewClient(srv.URL+"/c", tokenCredential{}, &container.ClientOptions{ClientOptions: azcore.ClientOptions{
+		InsecureAllowCredentialWithHTTP: true,
+		Transport:                       &http.Client{Transport: noTrace},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(c, t.TempDir())
+	ctx := context.Background()
+	for op, call := range map[string]func() error{
+		"create":       func() error { _, err := s.Create(ctx, "k", strings.NewReader("x")); return err },
+		"create empty": func() error { _, err := s.Create(ctx, "k", strings.NewReader("")); return err },
+		"replace":      func() error { _, err := s.Replace(ctx, "k", `"v"`, strings.NewReader("x")); return err },
+		"delete":       func() error { return s.Delete(ctx, "k") },
+	} {
+		if err := call(); !errors.Is(err, storage.ErrOutcomeUnknown) {
+			t.Errorf("%s: %v, want an error wrapping ErrOutcomeUnknown", op, err)
+		}
+	}
+}
+
 // TestSpoolMemory: a body of at most memLimit bytes stays in memory, and
 // needs no spool directory.
 func TestSpoolMemory(t *testing.T) {
