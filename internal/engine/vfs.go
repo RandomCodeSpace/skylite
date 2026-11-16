@@ -221,8 +221,16 @@ func (f *mainFile) ReadAt(p []byte, off int64) (int, error) {
 			page, err := l.tmpl.fetch(ctx, *src, pgno)
 			var stale *staleError
 			if errors.As(err, &stale) {
-				// Only a later leader's compaction retires a commit or
-				// deletes a base object: this leader is deposed.
+				l.mu.RLock()
+				ours := stale.explainedBy(l.tmpl.a)
+				l.mu.RUnlock()
+				if ours {
+					// The leader's own compaction moved the base past the
+					// object after this read located it: locate again.
+					continue
+				}
+				// Otherwise only a later leader's compaction retires a
+				// commit or deletes a base object: this leader is deposed.
 				err = l.stop(fmt.Errorf("%w: %w", ErrFenced, stale))
 			}
 			if err != nil {

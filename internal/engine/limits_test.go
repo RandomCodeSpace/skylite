@@ -1,7 +1,7 @@
 package engine
 
 // Tests for "Limits and size" in record 0004, and the maintenance of
-// decision 10 up to the point where compaction would begin.
+// decision 10.
 
 import (
 	"context"
@@ -301,12 +301,15 @@ func TestMaintenanceRollsBackWriters(t *testing.T) {
 	})
 }
 
-// Covers: Limits and size, "The tail bound counts epoch bumps": a log tail
-// filled by takeovers refuses writes and starts maintenance. Clearing it
-// needs a compaction, which is later work, so reads and writes stay
-// refused, with an error that says a retry does not help.
+// Covers: Limits and size, "The tail bound counts epoch bumps. A tail filled
+// by failed takeovers is cleared by one completed takeover and one
+// compaction": a log tail filled by takeovers refuses reads and writes and
+// starts maintenance, with an error that says a retry can help; while no
+// compaction can publish, they stay refused; once one can, service returns.
 func TestTailBoundCountsBumps(t *testing.T) {
+	fastCompaction(t)
 	st, keys, _ := newDatabase(t, 4096)
+	blockCompaction(st, keys)
 	takeOffice(t, st.Store, keys)
 	o := takeOffice(t, st.Store, keys) // bumps at 2, 3 and 4: a tail of 4 above manifest 0
 	cfg := testConfig()
@@ -315,7 +318,7 @@ func TestTailBoundCountsBumps(t *testing.T) {
 	c := open(t, l)
 	atBound := func(what string, err error) {
 		t.Helper()
-		if !errors.Is(err, ErrTailBound) || !errors.Is(err, ErrNotCommitted) || errors.Is(err, ErrRetry) || strings.Contains(err.Error(), "maintenance") {
+		if !errors.Is(err, ErrTailBound) || !errors.Is(err, ErrNotCommitted) || !errors.Is(err, ErrRetry) || strings.Contains(err.Error(), "maintenance") {
 			t.Fatalf("%s at the tail bound: %v", what, err)
 		}
 	}
@@ -376,15 +379,22 @@ func TestTailBoundCountsBumps(t *testing.T) {
 		t.Fatalf("a second commit in the Run that reached the bound: %d, %v", txn, err)
 	}
 	atBound("a read after it", read())
+
+	// Once a compaction can publish, the leader serves again.
+	st.setRule(nil)
+	eventually(t, "a read once compaction can publish", func() bool { return read() == nil })
+	mustRun(t, c, "INSERT INTO u VALUES (2)")
 }
 
-// Covers: Limits and size, at the tail bound a retry does not help: a Run
-// the bound's maintenance interrupted, with or without a transaction open,
-// a connection whose transaction it rolled back, and one whose transaction
-// an earlier maintenance rolled back are told ErrTailBound, not ErrRetry.
+// Covers: Limits and size, the refusal at the tail bound: a Run the bound's
+// maintenance interrupted, with or without a transaction open, a connection
+// whose transaction it rolled back, and one whose transaction an earlier
+// maintenance rolled back are told ErrTailBound, with ErrRetry, while no
+// compaction can publish.
 func TestTailBoundAfterMaintenanceEnds(t *testing.T) {
 	ctx := context.Background()
 	st, keys, o := newDatabase(t, 4096)
+	blockCompaction(st, keys)
 	cfg := testConfig()
 	cfg.TailBound = o.Head + 2
 	l := lead(t, st, keys, o, cfg)
@@ -425,7 +435,7 @@ func TestTailBoundAfterMaintenanceEnds(t *testing.T) {
 	mustRun(t, a, "INSERT INTO t VALUES (1)") // reaches the bound
 	tailBound := func(what string, err error) {
 		t.Helper()
-		if !errors.Is(err, ErrTailBound) || errors.Is(err, ErrRetry) {
+		if !errors.Is(err, ErrTailBound) || !errors.Is(err, ErrRetry) {
 			t.Fatalf("%s: %v", what, err)
 		}
 	}
@@ -443,7 +453,7 @@ func TestTailBoundAfterMaintenanceEnds(t *testing.T) {
 // tail bound is at most half of each": Lead refuses a larger TailBound, and
 // a leader inside its bounds, on commits or on page entries, never writes a
 // tail that a fresh Open refuses. The reader's limits are lowered so that
-// the leader reaches its own in a few commits.
+// the leader reaches its own in a few commits, and no compaction publishes.
 func TestLeaderTailWithinReaderLimits(t *testing.T) {
 	st, keys, o := newDatabase(t, 1024)
 	cfg := testConfig()
@@ -463,6 +473,7 @@ func TestLeaderTailWithinReaderLimits(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st, keys, o := newDatabase(t, 1024)
+			blockCompaction(st, keys)
 			cfg := testConfig()
 			cfg.TailBound = uint64(maxTail / 2) //nolint:gosec // lowered above
 			l := lead(t, st, keys, o, cfg)
@@ -488,12 +499,13 @@ func TestLeaderTailWithinReaderLimits(t *testing.T) {
 // Covers: Limits and size, "The leader's tail bound is at most half of
 // each", for page entries a takeover finds: a leader that takes office over
 // a tail at its entry bound refuses commits, so a fresh Open of the tail
-// still works.
+// still works. No compaction publishes.
 func TestTakeoverOverFullTail(t *testing.T) {
 	oldTail, oldPages := maxTail, maxTailPages
 	maxTail, maxTailPages = 64, 64
 	t.Cleanup(func() { maxTail, maxTailPages = oldTail, oldPages })
 	st, keys, o := newDatabase(t, 1024)
+	blockCompaction(st, keys)
 	cfg := testConfig()
 	cfg.TailBound = uint64(maxTail / 2) //nolint:gosec // lowered above
 	l := lead(t, st, keys, o, cfg)

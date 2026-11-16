@@ -47,10 +47,12 @@ var (
 	// in one commit object or in the local WAL bound.
 	ErrTooLarge = errors.New("engine: transaction too large")
 	// ErrTailBound, with ErrNotCommitted, means the log above the manifest
-	// is at the leader's tail bound. Only a compaction clears it, and this
-	// version has none, so a retry does not help: reads and writes stay
-	// refused for the life of the leader.
-	ErrTailBound = errors.New("engine: the log tail is at its bound, and this version has no compaction to clear it")
+	// is at the leader's tail bound. Reads and writes are refused until a
+	// compaction clears it, and the error also matches ErrRetry. If the
+	// leader cannot compact, because the new manifest would pass its
+	// maximum size, it does not match ErrRetry and says why: the refusal
+	// lasts for the life of the leader.
+	ErrTailBound = errors.New("engine: the log tail is at its bound until a compaction clears it")
 	// ErrBroken means the Run panicked outside the commit path, as on a
 	// stack overflow in SQLite, or its function reported the connection
 	// broken by returning an error that wraps ErrBroken. The engine has
@@ -84,9 +86,22 @@ type Config struct {
 	// TailBound is how many commits, epoch bumps included, the log may
 	// hold above the manifest's transaction number, at most 32,768. Once it
 	// holds that many, or 2,097,152 page entries, commits are refused and
-	// maintenance starts. Those are half of what a reader walks (record
-	// 0004 decision 10).
+	// maintenance starts, which compacts. Those are half of what a reader
+	// walks (record 0004 decision 10). Compaction starts in the background
+	// at half of either, or at CompactBytes.
 	TailBound uint64
+	// CompactBytes starts a compaction once the commit objects above the
+	// manifest hold this many bytes; 256 MiB if 0.
+	CompactBytes int64
+	// CompactInterval starts a compaction once this long has passed since
+	// the last one and the log above the manifest is not empty; a minute if
+	// 0.
+	CompactInterval time.Duration
+	// Grace is how long a manifest has been current before the commits it
+	// covers are retired, and how long base objects found to be garbage
+	// wait before they are deleted, so that readers on older manifests
+	// usually finish; five minutes if 0. Safety does not depend on it.
+	Grace time.Duration
 	// MaxMemory is each connection's SQLite memory ceiling in bytes.
 	MaxMemory int64
 	// TempBudget is the most bytes SQLite's temporary files (sorts,
@@ -169,6 +184,31 @@ type Leader struct {
 	maintaining bool
 	scratch     *os.File // the commit object being uploaded
 	mconn       *Conn    // the leader's own connection, for maintenance
+	// tailBytes is the size of the commit objects above the manifest.
+	tailBytes int64
+	// compactRefused is why the leader cannot compact: the new manifest
+	// would pass its maximum size.
+	compactRefused error
+	// indexFloor: ids and bumps cover every number above it to the head.
+	indexFloor uint64
+
+	// cctx ends at Close and at fail-stop: compaction, retirement and
+	// collection issue no write after the leader stops.
+	cctx  context.Context
+	cstop context.CancelFunc
+	wake  chan struct{} // wakes the compaction loop
+
+	// cmpMu is held by one compaction, retirement or collection at a time
+	// and guards what follows.
+	cmpMu          sync.Mutex
+	lastWrite      time.Time // the last manifest write attempt
+	failures       int       // compaction attempts that failed since the last success
+	lastCompact    time.Time
+	retiredThrough uint64     // every commit up to it was read as retired or as a bump
+	covered        []coverage // manifests known current, oldest first
+	garbage        []string   // base keys found garbage at garbageAt
+	garbageAt      time.Time
+	collectWanted  bool // a compaction published since the last collection looked
 }
 
 // walState follows the write transaction in the local WAL. Only the
@@ -187,8 +227,9 @@ type walState struct {
 // subdirectory held, and deletes it again at Close. Lead reads the manifest
 // and the log tail up to office.Head, never the database's pages.
 func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, office Office, cfg Config) (*Leader, error) {
-	if cfg.WALBound <= 0 || cfg.TailBound == 0 || cfg.TailBound > uint64(maxTail/2) || cfg.MaxMemory <= 0 || cfg.TempBudget <= 0 || cfg.Cache == nil { //nolint:gosec // maxTail is a small positive constant
-		return nil, fmt.Errorf("engine: Config needs a WAL bound, a tail bound from 1 to %d, a memory ceiling, a temporary-file budget and a cache", maxTail/2)
+	if cfg.WALBound <= 0 || cfg.TailBound == 0 || cfg.TailBound > uint64(maxTail/2) || cfg.MaxMemory <= 0 || cfg.TempBudget <= 0 || cfg.Cache == nil || //nolint:gosec // maxTail is a small positive constant
+		cfg.CompactBytes < 0 || cfg.CompactInterval < 0 || cfg.Grace < 0 {
+		return nil, fmt.Errorf("engine: Config needs a WAL bound, a tail bound from 1 to %d, a memory ceiling, a temporary-file budget and a cache, and no negative compaction setting", maxTail/2)
 	}
 	tmpl, err := Open(ctx, st, keys, cfg.Cache, office.Head)
 	if err != nil {
@@ -210,15 +251,19 @@ func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, o
 		base: office.Head, tmpl: tmpl,
 		overlay: map[uint32]bool{}, size: int64(tmpl.Size()) * int64(tmpl.PageSize()), baseLimit: tmpl.Size(),
 		head: office.Head, headSize: tmpl.Size(), manifestTxn: m.Txn, tailPages: entryCount(tmpl.commits),
-		wal:   walState{start: -1},
-		conns: map[int64]*Conn{},
-		ids:   map[string]uint64{},
+		wal:        walState{start: -1},
+		conns:      map[int64]*Conn{},
+		ids:        map[string]uint64{},
+		indexFloor: m.Txn, retiredThrough: m.RetiredThrough,
+		wake: make(chan struct{}, 1),
 	}
 	for _, c := range tmpl.commits {
 		l.indexLocked(c.h)
+		l.tailBytes += c.h.Size()
 	}
-	// A tail already at its bound refuses reads and writes from the start;
-	// only a compaction, later work, would clear it.
+	// A tail already at its bound refuses reads and writes from the start,
+	// until the compaction the loop starts at once clears it: the base
+	// version is the head.
 	l.admitClosed = l.tailFullLocked()
 	l.noCreates = l.admitClosed
 	l.cond = sync.NewCond(&l.cmu)
@@ -238,11 +283,20 @@ func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, o
 	}
 	l.vfs = "skylite-" + hex.EncodeToString(name[:])
 	l.ctx, l.cancel = context.WithCancel(context.WithoutCancel(ctx))
+	l.cctx, l.cstop = context.WithCancel(l.ctx)
 	vfs.Register(l.vfs, (*leaderVFS)(l))
 	if l.mconn, err = l.Open(ctx); err != nil {
 		_ = l.Close()
 		return nil, err
 	}
+	// The manifest Lead read covers the log up to it from now on.
+	l.covered = []coverage{{m.Txn, time.Now()}}
+	l.lastCompact = time.Now()
+	l.cmu.Lock()
+	l.wakeLocked()
+	l.cmu.Unlock()
+	l.wg.Add(1)
+	go l.compactLoop()
 	return l, nil
 }
 
@@ -331,9 +385,10 @@ func (l *Leader) Snapshot(ctx context.Context, start func() error) (uint64, erro
 // firstBump the first epoch bump above `above`, each 0 if there is none,
 // and head is the leader's head. Every value of above is valid. ok is false
 // if the headers held do not cover every transaction from above+1 to head.
-// This version holds every header above the manifest, at most the reader's
-// walk bound of 65,536 (the tail bound stops commits before more), so ok is
-// false only for `above` below the manifest's transaction number. Lookup
+// This version holds the headers above the manifest it took office on and
+// of each commit since, and once a compaction has passed them drops those
+// more than 65,536 numbers below the head, so ok is false for `above` below
+// that point. It reads no header from storage. Lookup
 // answers from memory on a stopped leader too: the caller does decision
 // 4's step 1 itself, with Err. A caller that also reads a table of its own
 // channels reads it before Lookup: a channel it found absent can then send
@@ -347,7 +402,7 @@ func (l *Leader) Lookup(id []byte, above uint64) (txn, firstBump, head uint64, o
 	if i := sort.Search(len(l.bumps), func(i int) bool { return l.bumps[i] > above }); i < len(l.bumps) {
 		firstBump = l.bumps[i]
 	}
-	return txn, firstBump, l.head, above >= l.manifestTxn
+	return txn, firstBump, l.head, above >= l.indexFloor
 }
 
 // indexLocked adds a commit's header to the lookup index, with l.cmu held.
@@ -405,6 +460,9 @@ func (l *Leader) stop(cause error) error {
 func (l *Leader) stopLocked(cause error) error {
 	if l.stopped == nil {
 		l.stopped = fmt.Errorf("%w: %v", ErrStopped, cause) //nolint:errorlint // see above
+		if l.cstop != nil {
+			l.cstop()
+		}
 		l.cond.Broadcast()
 		for _, c := range l.conns {
 			c.endLocked()
@@ -652,8 +710,8 @@ func (c *Conn) pragma(name string) (string, error) {
 //   - err matches ErrNotCommitted: the Run committed nothing, and nothing
 //     of it can enter the history. It also matches ErrStopped if the leader
 //     stopped, ErrBroken if the connection broke and was discarded, ErrRetry
-//     if a retry can succeed, ErrTooLarge or ErrTailBound if it cannot, and
-//     wraps f's own error, if any. A transaction f left
+//     if a retry can succeed, ErrTailBound at the tail bound, ErrTooLarge if
+//     no retry can, and wraps f's own error, if any. A transaction f left
 //     open stays open for the next Run unless maintenance rolled it back,
 //     which the error says, or SQLite did, which it does not: SQLite can
 //     roll the whole transaction back after SQLITE_FULL (the temporary-file
@@ -938,7 +996,7 @@ func (c *Conn) rollbackForMaintenance() error {
 }
 
 // maintRefusalLocked is the refusal of a transaction that maintenance
-// ended, with l.cmu held: at the tail bound a retry does not help.
+// ended, with l.cmu held: at the tail bound, the tail bound's.
 func (l *Leader) maintRefusalLocked() error {
 	if l.tailFullLocked() {
 		return l.tailErrLocked()
@@ -957,10 +1015,12 @@ func (l *Leader) startMaintenance() {
 	go l.maintain()
 }
 
-// maintain runs decision 10's steps 3 to 8. Compaction, retirement and
-// garbage collection, the second half of step 7, are not part of this
-// version: maintenance stops where compaction would begin, and writes are
-// readmitted only while the tail is under its bound.
+// maintain runs decision 10's steps 3 to 8. Step 7 compacts only at the
+// tail bound; after the WAL bound, the compaction loop folds the new base
+// version once writes are readmitted. Retirement follows on the loop's
+// schedule, after the grace period. Writes are readmitted only while the
+// tail is under its bound; if the compaction failed, the loop retries it and
+// readmits once the tail is clear.
 func (l *Leader) maintain() {
 	defer l.wg.Done()
 	// Step 3: a commit already in its upload completes or fails.
@@ -1014,8 +1074,16 @@ func (l *Leader) maintain() {
 		case <-time.After(maintenanceBackoff):
 		}
 	}
-	// Step 7 continues with compaction up to the new base version: later
-	// work. Step 8: readmit writes once both bounds are clear.
+	// Step 7 continues with compaction up to the new base version.
+	l.cmu.Lock()
+	full := l.tailFullLocked()
+	l.cmu.Unlock()
+	if full {
+		l.cmpMu.Lock()
+		_ = l.compactLocked()
+		l.cmpMu.Unlock()
+	}
+	// Step 8: readmit writes once both bounds are clear.
 	l.cmu.Lock()
 	defer l.cmu.Unlock()
 	l.maintaining = false
@@ -1034,8 +1102,12 @@ func (l *Leader) tailFullLocked() bool {
 
 // tailErrLocked is the refusal at the tail bound, with l.cmu held.
 func (l *Leader) tailErrLocked() error {
-	return fmt.Errorf("%w: %w: %d commits and %d page entries above the manifest at %d, bounds %d and %d",
-		ErrNotCommitted, ErrTailBound, l.head-l.manifestTxn, l.tailPages, l.manifestTxn, l.cfg.TailBound, maxTailPages/2)
+	if l.compactRefused != nil {
+		return fmt.Errorf("%w: %w: %d commits and %d page entries above the manifest at %d, bounds %d and %d, and the leader cannot compact: %w",
+			ErrNotCommitted, ErrTailBound, l.head-l.manifestTxn, l.tailPages, l.manifestTxn, l.cfg.TailBound, maxTailPages/2, l.compactRefused)
+	}
+	return fmt.Errorf("%w: %w: %w: %d commits and %d page entries above the manifest at %d, bounds %d and %d",
+		ErrNotCommitted, ErrTailBound, ErrRetry, l.head-l.manifestTxn, l.tailPages, l.manifestTxn, l.cfg.TailBound, maxTailPages/2)
 }
 
 // advanceBase moves the base version to the head when SQLite restarts the

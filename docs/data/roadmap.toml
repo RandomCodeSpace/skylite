@@ -20,7 +20,7 @@ detail = "One storage interface whose writes are create-if-absent, compare-and-s
 [[items]]
 title = "Storage engine: commit log, paged reads, compaction"
 status = "planned"
-detail = "A storage layer under SQLite (ncruces/go-sqlite3) that uploads each commit from the write-ahead log as one create-if-absent object before acknowledging it, reads pages on demand from a paged base with a bounded cache, and folds the commit log into the base behind a compare-and-swap manifest."
+detail = "A storage layer under SQLite (ncruces/go-sqlite3) that uploads each commit from the write-ahead log as one create-if-absent object before acknowledging it, reads pages on demand from a paged base with a bounded cache, and folds the commit log into the base behind a compare-and-swap manifest. So far database creation, paged reads, the leader's commit path, and compaction with retirement and garbage collection exist as a library package, tested against the local filesystem backend; the server does not use it yet."
 
 [[items]]
 title = "Leader lease and failover"
