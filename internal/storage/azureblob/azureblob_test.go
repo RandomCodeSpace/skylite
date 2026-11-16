@@ -5,11 +5,15 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 
 	"github.com/RandomCodeSpace/skylite/internal/storage"
 )
@@ -44,6 +48,45 @@ func TestRedact(t *testing.T) {
 	resp := &azcore.ResponseError{StatusCode: http.StatusForbidden, ErrorCode: "AuthenticationFailed", RawResponse: &http.Response{}}
 	if got := redact(resp).Error(); got != "azure: HTTP 403 AuthenticationFailed" {
 		t.Errorf("redact(response error) = %q", got)
+	}
+}
+
+type failingCredential struct{}
+
+func (failingCredential) GetToken(context.Context, policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	return azcore.AccessToken{}, errors.New("token endpoint unavailable")
+}
+
+// TestCredentialFailure: a credential that cannot get a token fails each
+// mutation in the SDK before any request is sent, so the error is definite,
+// for a Delete and an empty body too.
+func TestCredentialFailure(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	c, err := container.NewClient(srv.URL+"/c", failingCredential{}, &container.ClientOptions{
+		ClientOptions: azcore.ClientOptions{InsecureAllowCredentialWithHTTP: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(c, t.TempDir())
+	ctx := context.Background()
+	for op, call := range map[string]func() error{
+		"delete":        func() error { return s.Delete(ctx, "k") },
+		"create empty":  func() error { _, err := s.Create(ctx, "k", strings.NewReader("")); return err },
+		"create":        func() error { _, err := s.Create(ctx, "k", strings.NewReader("x")); return err },
+		"replace empty": func() error { _, err := s.Replace(ctx, "k", `"v"`, strings.NewReader("")); return err },
+	} {
+		if err := call(); err == nil || errors.Is(err, storage.ErrOutcomeUnknown) {
+			t.Errorf("%s: %v, want a definite error", op, err)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("%d requests reached the server", n)
 	}
 }
 

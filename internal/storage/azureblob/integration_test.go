@@ -85,6 +85,9 @@ func newContainer(t *testing.T) string {
 func newClient(t *testing.T, sasURL string, wrap func(http.RoundTripper) http.RoundTripper) (*container.Client, *http.Transport) {
 	t.Helper()
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// A mutation is never retried, so the transport must drop an idle
+	// connection before Azurite does, after 5 s (see TestIdleConnection).
+	tr.IdleConnTimeout = 2 * time.Second
 	var rt http.RoundTripper = tr
 	if wrap != nil {
 		rt = wrap(tr)
@@ -277,14 +280,23 @@ func refused(t *testing.T) faultFunc {
 // unsent fails the request without reading its body or sending it.
 func unsent(*http.Request, http.RoundTripper) (*http.Response, error) { return nil, errInjected }
 
-// slowResponse sends the request and then waits for its context to end.
+// slowBound is the longest slowResponse holds a request whose context does
+// not end: a call that takes that long has ignored its context.
+const slowBound = 5 * time.Second
+
+// slowResponse sends the request and then waits for its context to end, or
+// fails it after slowBound.
 func slowResponse(req *http.Request, next http.RoundTripper) (*http.Response, error) {
 	resp, err := next.RoundTrip(req)
 	if err == nil {
 		_ = resp.Body.Close()
 	}
-	<-req.Context().Done()
-	return nil, req.Context().Err()
+	select {
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	case <-time.After(slowBound):
+		return nil, errInjected
+	}
 }
 
 // cutBody sends the request with a body that fails after n bytes, as when the
@@ -349,6 +361,30 @@ func TestMutationFaults(t *testing.T) {
 		{"503BeforeEffect", func(*testing.T) faultFunc {
 			return statusBefore(503, "ServerBusy")
 		}, [3]outcome{unknownNoEff, unknownNoEff, unknownNoEff}, false},
+		// A 408 is a timeout, which says nothing definite either.
+		{"408AfterEffect", func(*testing.T) faultFunc {
+			return statusAfter(408, "OperationTimedOut")
+		}, [3]outcome{unknownDone, unknownDone, unknownDone}, false},
+		{"408BeforeEffect", func(*testing.T) faultFunc {
+			return statusBefore(408, "OperationTimedOut")
+		}, [3]outcome{unknownNoEff, unknownNoEff, unknownNoEff}, false},
+		// Any other 4xx is a refusal, a definite error; a 409 is a
+		// precondition failure only with the code BlobAlreadyExists.
+		{"400", func(*testing.T) faultFunc {
+			return statusBefore(400, "InvalidHeaderValue")
+		}, [3]outcome{noEffect, noEffect, noEffect}, false},
+		{"403", func(*testing.T) faultFunc {
+			return statusBefore(403, "AuthorizationFailure")
+		}, [3]outcome{noEffect, noEffect, noEffect}, false},
+		{"409LeaseIdMissing", func(*testing.T) faultFunc {
+			return statusBefore(409, "LeaseIdMissing")
+		}, [3]outcome{noEffect, noEffect, noEffect}, false},
+		// A success status other than the one the request expects (201 for
+		// Put Blob, 202 for Delete Blob), as a non-conforming proxy may send
+		// after the effect, is no definite error.
+		{"200AfterEffect", func(*testing.T) faultFunc {
+			return statusAfter(200, "")
+		}, [3]outcome{unknownDone, unknownDone, unknownDone}, false},
 		// The deadline passes after the request was sent: unknown, and the
 		// error wraps the context's error.
 		{"SlowResponse", func(*testing.T) faultFunc {
@@ -398,6 +434,7 @@ func TestMutationFaults(t *testing.T) {
 						ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
 					}
 					defer cancel()
+					start := time.Now()
 					var err error
 					switch op {
 					case "create":
@@ -420,6 +457,9 @@ func TestMutationFaults(t *testing.T) {
 					}
 					if tc.deadline && !errors.Is(err, context.DeadlineExceeded) {
 						t.Fatalf("error %v does not wrap context.DeadlineExceeded", err)
+					}
+					if d := time.Since(start); tc.deadline && d >= slowBound {
+						t.Fatalf("returned after %v: the call ignored its context's deadline", d)
 					}
 					if sent != 1 {
 						t.Fatalf("%d requests sent, want 1: the SDK must not retry a mutation", sent)
@@ -599,6 +639,7 @@ func TestReadDeadline(t *testing.T) {
 	in.set(slowResponse)
 	for _, op := range []string{"get", "head", "list"} {
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		start := time.Now()
 		var err error
 		key := "k"
 		switch op {
@@ -611,6 +652,9 @@ func TestReadDeadline(t *testing.T) {
 			key = ""
 		}
 		cancel()
+		if d := time.Since(start); d >= slowBound {
+			t.Fatalf("%s returned after %v: it ignored its context's deadline", op, d)
+		}
 		expectStorageError(t, err, op, key)
 		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, storage.ErrOutcomeUnknown) {
 			t.Fatalf("%s: error %v, want one wrapping context.DeadlineExceeded and not ErrOutcomeUnknown", op, err)
@@ -698,6 +742,19 @@ func TestShortPages(t *testing.T) {
 		if in.count("list") < 2 && len(want) > 2 {
 			t.Fatalf("List(%q, %q, %d) made %d requests: the pages were not short", tc.prefix, tc.startAfter, tc.limit, in.count("list"))
 		}
+	}
+
+	// A later page that keeps failing, after the read retries, fails the
+	// whole List: the entries of the pages before are not a listing.
+	var firstPage atomic.Bool
+	in.set(func(req *http.Request, next http.RoundTripper) (*http.Response, error) {
+		if kind(req) == "list" && firstPage.Swap(true) {
+			return response(req, http.StatusServiceUnavailable, "ServerBusy"), nil
+		}
+		return shortPages("2")(req, next)
+	})
+	if got, err := s.List(context.Background(), "", "", 5); err == nil || got != nil {
+		t.Fatalf("List with a failing second page = %q, %v; want no entries and an error", entryKeys(got), err)
 	}
 
 	// More keys than storage.MaxListLimit, in service pages of 400.
@@ -809,8 +866,16 @@ func TestRedaction(t *testing.T) {
 	errs := func(what string) {
 		_, err := s.Create(context.Background(), "k", strings.NewReader("x"))
 		check(what+" create", err)
+		_, err = s.Replace(context.Background(), "k", `"v"`, strings.NewReader("x"))
+		check(what+" replace", err)
 		_, _, err = s.Get(context.Background(), "k")
 		check(what+" get", err)
+		_, _, err = s.GetRange(context.Background(), "k", 0, 1)
+		check(what+" range", err)
+		_, _, err = s.GetRange(context.Background(), "k", 0, 0)
+		check(what+" empty range", err)
+		_, err = s.Head(context.Background(), "k")
+		check(what+" head", err)
 		_, err = s.List(context.Background(), "", "", 1)
 		check(what+" list", err)
 		check(what+" delete", s.Delete(context.Background(), "k"))
@@ -897,7 +962,17 @@ func TestSpool(t *testing.T) {
 	}
 	clean("a body error")
 	ctx, cancel := context.WithCancel(context.Background())
-	_, err = s.Replace(ctx, "k", v, io.MultiReader(strings.NewReader(big), readerFunc(func([]byte) (int, error) { cancel(); return 0, nil }), strings.NewReader("tail")))
+	// The body cancels the context and returns nothing; read again, it
+	// fails, so a write that ignores the context fails with a body error
+	// instead of reading forever.
+	var reads int
+	_, err = s.Replace(ctx, "k", v, io.MultiReader(strings.NewReader(big), readerFunc(func([]byte) (int, error) {
+		if reads++; reads == 1 {
+			cancel()
+			return 0, nil
+		}
+		return 0, errInjected
+	}), strings.NewReader("tail")))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Replace cancelled in its body: %v", err)
 	}
@@ -933,6 +1008,112 @@ func TestNotETag(t *testing.T) {
 	}
 	expectRequests(t, in, "put", 0)
 	expectContent(t, check, "k", "x")
+}
+
+// TestWriteToken: a successful Create or Replace sends one request, its Put
+// Blob, and returns the ETag of that response. A token read afterwards could
+// belong to a later writer's version.
+func TestWriteToken(t *testing.T) {
+	s, in, _, _ := faultStore(t)
+	var v string
+	for _, op := range []string{"create", "replace"} {
+		var putETag string
+		in.set(func(req *http.Request, next http.RoundTripper) (*http.Response, error) {
+			resp, err := next.RoundTrip(req)
+			if err == nil && kind(req) == "put" {
+				putETag = resp.Header.Get("ETag")
+			}
+			return resp, err
+		})
+		var err error
+		if op == "create" {
+			v, err = s.Create(context.Background(), "k", strings.NewReader("a"))
+		} else {
+			v, err = s.Replace(context.Background(), "k", v, strings.NewReader("b"))
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", op, err)
+		}
+		for _, k := range []string{"get", "head", "list"} {
+			expectRequests(t, in, k, 0)
+		}
+		expectRequests(t, in, "put", 1)
+		if v == "" || v != putETag {
+			t.Fatalf("%s returned token %q, want the Put Blob response's ETag %q", op, v, putETag)
+		}
+	}
+}
+
+// TestMissingContainer deletes the container. A 404 or 409 is the contract's
+// answer only with the blob's own error code, so every call then fails with a
+// definite error that is none of ErrNotFound, ErrPreconditionFailed and
+// ErrOutcomeUnknown.
+func TestMissingContainer(t *testing.T) {
+	s, _, _, u := faultStore(t)
+	v, err := s.Create(context.Background(), "k", strings.NewReader("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := container.NewSharedKeyCredential(azuriteAccount, azuriteKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, _, _ := strings.Cut(u, "?")
+	admin, err := container.NewClientWithSharedKeyCredential(base, cred, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Delete(context.Background(), nil); err != nil {
+		t.Fatal(redact(err))
+	}
+	ctx := context.Background()
+	for op, call := range map[string]func() error{
+		"create":  func() error { _, err := s.Create(ctx, "k2", strings.NewReader("y")); return err },
+		"replace": func() error { _, err := s.Replace(ctx, "k", v, strings.NewReader("y")); return err },
+		"delete":  func() error { return s.Delete(ctx, "k") },
+		"get":     func() error { _, _, err := s.Get(ctx, "k"); return err },
+		"range":   func() error { _, _, err := s.GetRange(ctx, "k", 0, 1); return err },
+		"head":    func() error { _, err := s.Head(ctx, "k"); return err },
+		"list":    func() error { _, err := s.List(ctx, "", "", 1); return err },
+	} {
+		err := call()
+		if err == nil || errors.Is(err, storage.ErrNotFound) || errors.Is(err, storage.ErrPreconditionFailed) || errors.Is(err, storage.ErrOutcomeUnknown) {
+			t.Errorf("%s without the container: %v, want a definite error of no contract kind", op, err)
+		}
+	}
+}
+
+// TestIdleConnection: Azurite closes a connection after 5 s idle, and a
+// mutation is never retried, so a write sent on a pooled connection while
+// Azurite closes it fails. newClient's transport drops idle connections
+// sooner. Many clients each write after about 6 s idle, around the time
+// Azurite closes their connections, and each Create of an existing key must
+// fail its precondition, as on a fresh connection.
+func TestIdleConnection(t *testing.T) {
+	u := newContainer(t)
+	if _, err := newStore(t, u, nil).Create(context.Background(), "k", strings.NewReader("old")); err != nil {
+		t.Fatal(err)
+	}
+	body := content("new", 1<<20)
+	const n = 48
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		s := newStore(t, u, nil)
+		wg.Go(func() {
+			if _, errs[i] = s.Head(context.Background(), "k"); errs[i] != nil {
+				return
+			}
+			time.Sleep(5960*time.Millisecond + time.Duration(i)*2*time.Millisecond)
+			_, errs[i] = s.Create(context.Background(), "k", strings.NewReader(body))
+		})
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if !errors.Is(err, storage.ErrPreconditionFailed) {
+			t.Errorf("client %d: %v, want ErrPreconditionFailed", i, err)
+		}
+	}
 }
 
 func expectStorageError(t *testing.T, err error, op, key string) {

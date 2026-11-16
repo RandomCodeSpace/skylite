@@ -10,7 +10,13 @@
 // constructors of package container. The container must exist, and nothing
 // else may write to it. The client's transport must be net/http's (the SDK's
 // default or an *http.Client): the backend learns whether a request reached a
-// connection from net/http's client trace (see "Outcomes").
+// connection from net/http's client trace (see "Outcomes"). The transport
+// must also close an idle connection before the service, or anything between
+// (a load balancer, a proxy), does: set http.Transport.IdleConnTimeout below
+// the shortest idle timeout on the path (the SDK's default transport keeps
+// idle connections 90 s; Azurite closes them after 5 s). A mutation is never
+// retried, so one sent on a pooled connection that the other end is closing
+// fails, often with an unknown outcome.
 //
 // # Writes
 //
@@ -66,14 +72,19 @@
 //
 //   - a response with status 409 BlobAlreadyExists or 412 (Create or Replace),
 //     or 404 BlobNotFound (Replace), is storage.ErrPreconditionFailed;
-//   - any other status below 500 except 408 is a definite error with no
-//     effect;
+//   - any other 4xx status except 408 is a definite error with no effect;
 //   - if the request never reached a connection (net/http's trace reports no
-//     connection obtained), or the transport did not read the body to its end,
-//     the service cannot have applied it, and the error is definite;
-//   - anything else, such as a 5xx status, 408, a lost response, a reset
-//     connection or the context ending while the request is in flight, wraps
-//     storage.ErrOutcomeUnknown.
+//     connection obtained, or the SDK failed before calling its transport, as
+//     when a credential gets no token), or the transport did not read the
+//     body to its end, the service cannot have applied it, and the error is
+//     definite;
+//   - anything else, such as a 5xx status, 408, a 2xx or 3xx status other than
+//     the one the request expects (from a non-conforming proxy), a lost
+//     response, a reset connection or the context ending while the request is
+//     in flight, wraps storage.ErrOutcomeUnknown.
+//
+// A credential that calls its token endpoint with the call's context shares
+// its client trace, so its failure there can be reported as unknown.
 //
 // Once a mutation call returns, its request body refuses further reads, so a
 // request that net/http is still sending when the call returns can never be
@@ -113,8 +124,9 @@
 // # Tested
 //
 // Only against Azurite 3.37.0, with its well-known development account and a
-// container SAS. The real service, Entra ID credentials and real latency are
-// not tested.
+// container SAS, and a failing token credential against a local HTTP server.
+// The real service, working Entra ID credentials and real latency are not
+// tested.
 package azureblob
 
 import (
@@ -126,6 +138,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -219,7 +232,7 @@ func (s *Store) put(ctx context.Context, key, ifMatch string, body io.Reader) (s
 			ifMatch != "" && re.StatusCode == http.StatusNotFound && re.ErrorCode == string(bloberror.BlobNotFound)) {
 			return "", storage.ErrPreconditionFailed
 		}
-		return "", mutationError(ctx, err, conn.reached() && bodySent)
+		return "", mutationError(ctx, err, conn.reached(err) && bodySent)
 	}
 	if resp.ETag == nil || *resp.ETag == "" {
 		return "", fmt.Errorf("%w: azure: Put Blob succeeded without an ETag", storage.ErrOutcomeUnknown)
@@ -390,7 +403,7 @@ func (s *Store) delete(ctx context.Context, key string) error {
 	if err == nil || bloberror.HasCode(err, bloberror.BlobNotFound) {
 		return nil
 	}
-	return mutationError(ctx, err, conn.reached())
+	return mutationError(ctx, err, conn.reached(err))
 }
 
 func check(ctx context.Context, key string) error {
@@ -417,10 +430,20 @@ func isETag(v string) bool {
 // connTrace records what net/http's client trace reports for one call.
 type connTrace struct{ getConn, gotConn atomic.Bool }
 
-// reached reports whether the request may have reached a connection: net/http
-// obtained one, or it never reported looking for one (a transport that is not
-// net/http's, which reports nothing).
-func (c *connTrace) reached() bool { return c.gotConn.Load() || !c.getConn.Load() }
+// reached reports whether the request that failed with err may have reached a
+// connection. With net/http's trace, that is whether it obtained one. Without
+// a trace (a transport that is not net/http's reports none), the request was
+// handed to the transport only if err holds a response or a *url.Error, in
+// which http.Client wraps every transport error; any other error came from
+// the SDK before its transport, such as a credential that got no token.
+func (c *connTrace) reached(err error) bool {
+	if c.getConn.Load() || c.gotConn.Load() {
+		return c.gotConn.Load()
+	}
+	var ue *url.Error
+	var re *azcore.ResponseError
+	return errors.As(err, &ue) || errors.As(err, &re)
+}
 
 // mutation returns a context for one mutation request: SDK retries are off,
 // and the returned trace records whether the request reached a connection.
@@ -443,7 +466,9 @@ func mutationError(ctx context.Context, err error, reached bool) error {
 	if !answered && ctx.Err() != nil {
 		cause = ctx.Err()
 	}
-	if !reached || answered && re.StatusCode < 500 && re.StatusCode != http.StatusRequestTimeout {
+	// Only a 4xx refuses the request; a 2xx or 3xx other than the one the
+	// SDK expects comes from a peer that may have applied it.
+	if !reached || answered && re.StatusCode >= 400 && re.StatusCode < 500 && re.StatusCode != http.StatusRequestTimeout {
 		return cause
 	}
 	return fmt.Errorf("%w: %w", storage.ErrOutcomeUnknown, cause)
