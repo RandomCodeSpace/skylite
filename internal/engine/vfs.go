@@ -458,7 +458,15 @@ func (l *Leader) walWrite(w *walFile, p []byte, off int64) error {
 		}
 		// A WAL that starts again while a commit is uploaded and not yet
 		// completed: wait for SQLite to complete it, or for the leader to
-		// stop if SQLite rolled it back without the rollback hook.
+		// stop if SQLite rolled it back without the rollback hook. A healthy
+		// commit never waits here: its connection keeps a WAL read mark
+		// below the new frames until phase two, so no checkpoint can reset
+		// the WAL first.
+		// shortcut: the wait ignores this connection's context and holds the
+		// WAL write lock until the failed Run returns or the leader closes;
+		// the database is already stopping, and the server bounds every Run
+		// with its statement time limit. Wake on the context if a caller
+		// without such a limit appears.
 		for l.uploading && l.stopped == nil {
 			l.cond.Wait()
 		}
