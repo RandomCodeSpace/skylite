@@ -317,6 +317,17 @@ func conflict(r *http.Request) (*http.Response, error) {
 	return answer(http.StatusConflict, "BlobAlreadyExists")(r)
 }
 
+// nonRetriable fails the way azcore's bearer token policy does after a 401
+// challenge it cannot satisfy.
+func nonRetriable(*http.Request) (*http.Response, error) {
+	return nil, nonRetriableError{}
+}
+
+type nonRetriableError struct{}
+
+func (nonRetriableError) Error() string { return "authentication challenge failed" }
+func (nonRetriableError) NonRetriable() {}
+
 func noAttempt(*httptrace.ClientTrace) {}
 
 func oneGot(tr *httptrace.ClientTrace) { tr.GotConn(httptrace.GotConnInfo{}) }
@@ -385,6 +396,8 @@ func TestResent(t *testing.T) {
 		"two GotConn, dial fails":           {twoGot, dialFails},
 		"GetConn after GotConn, dial fails": {gotGet, dialFails},
 		"two GotConn, refused":              {twoGot, conflict},
+		// A failed 401 challenge after a re-send: azcore marks it non-retriable.
+		"two GotConn, non-retriable": {twoGot, nonRetriable},
 		"GetConn after GotConn, refused":    {gotGet, conflict},
 		// A missing blob is a Delete's effect, also after a re-send.
 		"two GotConn, 404 BlobNotFound": {twoGot, answer(http.StatusNotFound, "BlobNotFound")},

@@ -7,9 +7,9 @@ GOVULNCHECK_VERSION := v1.9.0
 
 # Azurite 3.37.0, pinned by the digest of its multi-architecture index.
 AZURITE_IMAGE := mcr.microsoft.com/azure-storage/azurite:3.37.0@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5
-# Shorter than the CI job's 10-minute limit, so a hang prints its goroutine dump
+# Shorter than the CI job's 15-minute limit, so a hang prints its goroutine dump
 # and the Azurite log before the runner cancels the job.
-INTEGRATION_TIMEOUT ?= 6m
+INTEGRATION_TIMEOUT ?= 9m
 
 # RustFS 1.0.5, pinned by the digest of its multi-architecture index.
 RUSTFS_IMAGE := rustfs/rustfs:1.0.5@sha256:b81d16a90ee25bd9511280127ca1471788c6e874cf0f0da759645f46b2dc1d74

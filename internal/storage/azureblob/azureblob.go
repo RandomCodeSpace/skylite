@@ -8,13 +8,15 @@
 // including workload identity, build the client with [container.NewClient]
 // and any azcore.TokenCredential; with a shared key or a SAS, use the other
 // constructors of package container. The container must exist, and nothing
-// else may write to it. Any transport works, with two limits (see
-// "Outcomes"): the backend proves that a request was sent once from
-// net/http's client trace, so a transport that does not pass the request's
-// context on to net/http gets "outcome unknown" for every failed mutation
-// except a body it did not read to its end and a non-retriable SDK error
-// raised before it; and the transport must not send a request again on its
-// own, except for net/http's own re-sends, which the trace shows. A refused
+// else may write to it. The client's transport must pass the request's
+// context on to net/http, as the SDK's default transport, any
+// *http.Transport and any *http.Client do: the backend proves that a request
+// was sent once from net/http's client trace (see "Outcomes"). A transport
+// that drops the context is not supported. Through it, a credential that
+// fetches its token over HTTP with the call's context puts its own
+// connections in the trace, and a failed mutation that took effect can then
+// be reported as having none. The transport must also not send a request
+// again on its own; net/http's own re-sends show in the trace. A refused
 // connection is a definite error only if the transport returns net/http's
 // dial error. The transport must also close an idle
 // connection before the service, or anything between (a load balancer, a
@@ -71,9 +73,10 @@
 //
 // # Outcomes
 //
-// The SDK never retries a mutation: Create, Replace and Delete run with
-// azcore retries disabled for that call, so the outcome of the call is the
-// outcome of its one request, and a lost response is never turned into a
+// The SDK does not retry a mutation: Create, Replace and Delete run with
+// azcore retries disabled for that call (its bearer token policy still sends
+// the request again after a 401 challenge it handled, which shows in the
+// trace), so a lost response is never turned into a
 // precondition failure by a retry that meets the write's own effect. net/http
 // itself can send a request again, and an answer or a failed dial may belong
 // to that second attempt, after a first that took effect: over HTTP/2 it
@@ -91,10 +94,11 @@
 //     end is therefore a definite error, but not
 //     storage.ErrPreconditionFailed);
 //   - the SDK failed before its transport with an error azcore marks
-//     non-retriable: its bearer token policy marks so a credential that got
-//     no token and its refusal to send a token over plain HTTP (after the
-//     transport it marks only a failed 401 challenge, a response with no
-//     effect);
+//     non-retriable, and the trace saw at most one connection handed to the
+//     request and none asked for after it: its bearer token policy marks so,
+//     before the transport, a credential that got no token and its refusal
+//     to send a token over plain HTTP, and after it only a failed 401
+//     challenge, which has no effect unless it answers a re-send;
 //   - the trace saw exactly one connection handed to the request and none
 //     asked for after it, and the service answered with a status that
 //     refuses the request: 409 BlobAlreadyExists or 412 (Create or Replace),
@@ -109,11 +113,9 @@
 //     "proxyconnect" through a proxy): no connection was made, so nothing of
 //     the request was sent.
 //
-// A transport that does not pass the request's context on to net/http leaves
-// the trace empty, so through it every failed mutation wraps
-// storage.ErrOutcomeUnknown except under the first two rules. A credential
-// that calls its token endpoint with the call's context shares the trace, so
-// its connections count too; they can only turn an answer into unknown.
+// A credential that calls its token endpoint with the call's context shares
+// the trace, so its connections count too. With a transport that passes the
+// context on, they can only turn an answer into unknown.
 //
 // Everything else wraps storage.ErrOutcomeUnknown: a lost response, a reset
 // connection, EOF, a body that fails after a response arrived, a header that
@@ -548,7 +550,8 @@ func noEffect(err error, tries *attempts) bool {
 	}
 	var nr interface{ NonRetriable() }
 	if errors.As(err, &nr) {
-		return true
+		// A failed 401 challenge may answer a re-send of a request that took effect.
+		return tries.got.Load() <= 1 && !tries.after.Load()
 	}
 	var oe *net.OpError
 	return tries.unconnected() && errors.As(err, &oe) && (oe.Op == "dial" || oe.Op == "proxyconnect")

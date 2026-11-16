@@ -60,7 +60,7 @@ Run `make check` before opening a pull request. `make integration` needs
 Docker; it picks a free local port and removes its Azurite container when it
 finishes. `make integration-gcs` does the same with fake-gcs-server and also
 needs Python 3, which it uses to pick the port. The durability kill test runs 20 rounds by default; set
-`SKYLITE_SPIKE_KILL_ROUNDS` for a longer soak and raise the 6-minute
+`SKYLITE_SPIKE_KILL_ROUNDS` for a longer soak and raise the 9-minute
 `INTEGRATION_TIMEOUT` with it, for example
 `SKYLITE_SPIKE_KILL_ROUNDS=300 INTEGRATION_TIMEOUT=60m make integration`. CI runs the same checks plus
 `go mod tidy -diff` and workflow linting. CodeQL code scanning runs through
