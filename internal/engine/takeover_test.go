@@ -1725,3 +1725,53 @@ func TestRetakeOwnLeaseClockBehind(t *testing.T) {
 		t.Errorf("stored lease %+v, want holder a renewed after %d", got, before)
 	}
 }
+
+// A Retake whose write lands but whose outcome stays unknown leaves the
+// handle at this holder's previous version; the next Renew or Release finds
+// the holder's own write, adopts it and succeeds.
+func TestRetakeUnresolvedWriteLanded(t *testing.T) {
+	for _, mode := range []string{"renew", "renew-sameclock", "release"} {
+		ts, keys, clk, o, la, lb := retakeSetup(t, 50)
+		if err := lb.Release(bg); err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		ts.setInject(func(_ context.Context, op, key string) (bool, error) {
+			if key != keys.Lease() || (op != "replace" && n == 0) {
+				return false, nil
+			}
+			n++
+			e := &storage.Error{Op: op, Key: key, Err: storage.ErrOutcomeUnknown}
+			return n == 1, e // first replace lands; everything after fails without effect
+		})
+		err := la.Retake(bg)
+		ts.setInject(nil)
+		if !errors.Is(err, storage.ErrOutcomeUnknown) {
+			t.Fatalf("%s: Retake: %v", mode, err)
+		}
+		if got := storedLease(t, ts, keys); got.Holder != "a" || got.Epoch != o.Epoch {
+			t.Fatalf("%s: stored %+v, want a's landed write", mode, got)
+		}
+		if got := storedLease(t, ts, keys); got == la.l {
+			t.Fatalf("%s: handle already has the landed lease", mode)
+		}
+		switch mode {
+		case "renew":
+			clk.advance(5 * time.Second)
+			err = la.Renew(bg)
+		case "renew-sameclock":
+			err = la.Renew(bg)
+		case "release":
+			err = la.Release(bg)
+		}
+		if err != nil {
+			t.Fatalf("%s: after unresolved landed write: %v", mode, err)
+		}
+		if got := storedLease(t, ts, keys); got != la.l {
+			t.Fatalf("%s: stored %+v handle %+v", mode, got, la.l)
+		}
+		if err := la.Renew(bg); mode != "release" && err != nil {
+			t.Fatalf("%s: second renew: %v", mode, err)
+		}
+	}
+}

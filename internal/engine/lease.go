@@ -145,8 +145,8 @@ func (l *Lease) Renew(ctx context.Context) error {
 // manifest decide who leads. Retake gives no right to write. Renew does not
 // read the manifest, so a lease retaken in that window is kept by Renew,
 // and every other holder and candidate is refused it, until the holder reads
-// the manifest: a leader checks the manifest on its renewal cadence, not
-// only when Renew fails.
+// the manifest: the caller must check the manifest on its renewal cadence,
+// not only when Renew fails.
 func (l *Lease) Retake(ctx context.Context) error {
 	a, err := (&Reader{st: l.st, keys: l.keys}).readManifest(ctx, anchor{}, nil)
 	if err != nil {
