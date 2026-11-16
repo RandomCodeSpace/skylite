@@ -1037,7 +1037,7 @@ func TestTxnIsTheSnapshotRead(t *testing.T) {
 			}
 			if _, err := c.Run(context.Background(), fmt.Appendf(nil, "test-%d", commitIDs.Add(1)), func(db *sqlite3.Conn) error {
 				return db.Exec("INSERT INTO t VALUES (1)") // one row per commit
-			}); err != nil {
+			}); err != nil && !errors.Is(err, engine.ErrRetry) { // maintenance refuses commits for a while
 				wrote <- err
 				return
 			}
@@ -1046,8 +1046,15 @@ func TestTxnIsTheSnapshotRead(t *testing.T) {
 	// Each query reads the count, then runs long enough for commits to land
 	// before its done frame.
 	sql := q("SELECT count(*), (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 100000) SELECT count(*) FROM c) FROM t")
-	for range 20 {
+	for read, tries := 0, 0; read < 20; tries++ {
+		if tries == 200 {
+			t.Fatalf("%d reads in %d tries", read, tries)
+		}
 		a := e.post(t, "query", "reader", sql)
+		if a.code() == "maintenance" { // the writer's commits can start it; retry
+			continue
+		}
+		read++
 		var rows int64
 		if len(a.rows()) != 1 || a.done() == nil {
 			t.Fatalf("%d %v", a.status, a.frames)
