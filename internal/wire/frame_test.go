@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"math"
 	"strings"
 	"testing"
@@ -14,7 +16,11 @@ import (
 
 func newTestWriter(frameBytes int, l Limits) (*Writer, *bytes.Buffer) {
 	var buf bytes.Buffer
-	return NewWriter(&buf, frameBytes, l), &buf
+	w, err := NewWriter(&buf, frameBytes, l)
+	if err != nil {
+		panic(err)
+	}
+	return w, &buf
 }
 
 func lines(buf *bytes.Buffer) []string {
@@ -86,8 +92,9 @@ func TestFrameExamples(t *testing.T) {
 		}
 	}
 	// The open answer, whose limits the ADR shortens: every member is present.
-	var b bytes.Buffer
-	w = NewWriter(&b, DefaultFrameBytes, DefaultLimits())
+	w, bb := newTestWriter(DefaultFrameBytes, DefaultLimits())
+	b := *bb
+	w.w = &b
 	must(t, w.Done(&Done{Kind: DoneOpen, Txn: 1200, Channel: &Channel{Token: "w1.9QvX0aYk3H8...", ID: chID, Mode: ModeWrite, Epoch: 3, Limits: DefaultLimits()}})) //nolint:gosec // the ADR's shortened example token
 	if !strings.HasPrefix(b.String(), `{"done":{"txn":1200,"channel":{"token":"w1.9QvX0aYk3H8...","id":"7c1d2e3f40a1b2c37c1d2e3f40a1b2c3","mode":"write","epoch":3,"limits":{"request_body_bytes":16777216,`) {
 		t.Fatalf("open answer: %s", b.String())
@@ -148,7 +155,9 @@ func TestTerminalFrameBound(t *testing.T) {
 	var receipt int
 	{
 		w, _ := newTestWriter(DefaultFrameBytes, l)
-		receipt = len(w.appendReceipt(nil, &Receipt{Error: largestError()}))
+		b, err := w.appendReceipt(nil, &Receipt{Error: largestError()})
+		must(t, err)
+		receipt = len(b)
 	}
 	if errFrame != 1437 || receipt != 1473 || cancel != 1543 {
 		t.Fatalf("error frame %d, receipt %d, cancel answer %d; want 1437, 1473, 1543", errFrame, receipt, cancel)
@@ -210,28 +219,63 @@ func TestMessageCut(t *testing.T) {
 		}
 	}
 	// The cut applies in an error frame.
-	w, buf := newTestWriter(DefaultFrameBytes, DefaultLimits())
-	must(t, w.Error(NewError(CodeSQLError, strings.Repeat("x", 5000))))
-	var v struct {
-		Error struct {
-			Message jsontext.Value `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(buf.Bytes(), &v); err != nil || len(v.Error.Message) != 1024 {
-		t.Fatalf("message of %d bytes, %v", len(v.Error.Message), err)
+	for _, limit := range []int64{1024, 100, 2} {
+		l := DefaultLimits()
+		l.ErrorMessageBytes = limit
+		w, buf := newTestWriter(DefaultFrameBytes, l)
+		e := NewError(CodeSQLError, strings.Repeat("x", 5000))
+		e.RequestID = "r"
+		must(t, w.Error(e))
+		var v struct {
+			Error struct {
+				Message jsontext.Value `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &v); err != nil || int64(len(v.Error.Message)) != limit {
+			t.Fatalf("limit %d: message of %d bytes, %v", limit, len(v.Error.Message), err)
+		}
 	}
 }
 
-// TestQuotedLen checks quotedLen against the encoder for every character.
-func TestQuotedLen(t *testing.T) {
+// TestEscaping checks the encoder against ADR 0005's escaping rule for
+// every character, and quotedLen against the encoder.
+func TestEscaping(t *testing.T) {
+	short := map[rune]string{'"': `\"`, '\\': `\\`, '\b': `\b`, '\t': `\t`, '\n': `\n`, '\f': `\f`, '\r': `\r`}
 	for r := rune(0); r <= utf8.MaxRune; r++ {
 		if !utf8.ValidRune(r) {
 			continue
 		}
-		q, err := jsontext.AppendQuote(nil, string(r))
-		if err != nil || len(q)-2 != quotedLen(r) {
-			t.Fatalf("U+%04X: encoded in %d bytes, quotedLen %d", r, len(q)-2, quotedLen(r))
+		want, ok := short[r]
+		switch {
+		case ok:
+		case r < 0x20:
+			want = fmt.Sprintf(`\u%04x`, r)
+		default:
+			want = string(r)
 		}
+		q := string(appendQuoted(nil, string(r)))
+		if q != `"`+want+`"` {
+			t.Fatalf("U+%04X: encoded as %s; want %q", r, q, `"`+want+`"`)
+		}
+		if quotedLen(r) != len(want) {
+			t.Fatalf("U+%04X: quotedLen %d; want %d", r, quotedLen(r), len(want))
+		}
+	}
+	for in, want := range map[string]string{
+		"a\xffb":               "\"a\uFFFDb\"",
+		"\xed\xa0\x80":         "\"\uFFFD\uFFFD\uFFFD\"",
+		"\uFFFD":               "\"\uFFFD\"",
+		"/\u2028\u2029\x7f<>&": "\"/\u2028\u2029\x7f<>&\"",
+		"":                     `""`,
+	} {
+		if got := string(appendQuoted(nil, in)); got != want {
+			t.Errorf("appendQuoted(%q) = %q; want %q", in, got, want)
+		}
+	}
+	// The values and the diagnostic strings both follow the rule.
+	b, err := AppendValue(nil, "\x00\x1f\x7f\"\u00e9")
+	if err != nil || string(b) != `"\u0000\u001f`+"\x7f"+`\"é"` {
+		t.Fatalf("AppendValue = %s, %v", b, err)
 	}
 }
 
@@ -263,7 +307,8 @@ func decodeFrames(t *testing.T, buf *bytes.Buffer) []splitFrame {
 }
 
 func TestFrameSplit(t *testing.T) {
-	// By entries: 2,500 entries in two calls give frames of 1,024, 1,024 and 452.
+	// By entries: 1,500 then 1,000 entries give frames of 1,024, 476 and
+	// 1,000: a call does not fill the frame the previous call ended.
 	w, buf := newTestWriter(DefaultFrameBytes, DefaultLimits())
 	entries := make([]Result, 2500)
 	for i := range entries {
@@ -294,6 +339,8 @@ func TestFrameSplit(t *testing.T) {
 	// size, and a name too large for any frame goes alone.
 	const frameBytes = 100
 	w, buf = newTestWriter(frameBytes, DefaultLimits())
+	must(t, w.Columns(nil)) // a describe answer's params follow its columns
+	buf.Reset()
 	names := []string{":a", ":" + strings.Repeat("b", 40), ":" + strings.Repeat("c", 40), ":" + strings.Repeat("d", 200), "", ":e"}
 	must(t, w.Params(names))
 	var got [][]*string
@@ -314,6 +361,8 @@ func TestFrameSplit(t *testing.T) {
 	}
 	// A frame of exactly the frame size is kept whole.
 	w, buf = newTestWriter(len(`{"params":{"from":0,"names":[":a",":b"]}}`+"\n"), DefaultLimits())
+	must(t, w.Columns(nil))
+	buf.Reset()
 	must(t, w.Params([]string{":a", ":b"}))
 	if n := len(lines(buf)); n != 1 {
 		t.Fatalf("%d frames; want 1", n)
@@ -355,12 +404,38 @@ func TestResultLimit(t *testing.T) {
 	if w.Written() != l.ResultBytes {
 		t.Fatalf("written %d", w.Written())
 	}
+	we.RequestID = "r"
 	must(t, w.Error(we.Recorded(false)))
 	if got := lines(buf); len(got) != 3 || !strings.HasPrefix(got[2], `{"error":{"code":"result_too_large"`) {
 		t.Fatalf("body:\n%s", buf)
 	}
 	if err := w.Keepalive(); !errors.Is(err, errEnded) {
 		t.Fatalf("frame after the terminal frame: %v", err)
+	}
+	// Every frame before the terminal one counts: keepalives, columns and
+	// results frames as well as rows.
+	const keepalive = `{"keepalive":{}}` + "\n"
+	results := `{"results":{"from":0,"entries":[{"rows_affected":1,"last_insert_rowid":2}]}}` + "\n"
+	keep := func(w *Writer) error { return w.Keepalive() }
+	for _, tc := range []struct {
+		name        string
+		limit       int
+		first, then func(*Writer) error
+	}{
+		{"keepalives", len(keepalive), keep, keep},
+		{"results", len(results), func(w *Writer) error { return w.Results([]Result{{1, 2}}) }, func(w *Writer) error { return w.Results([]Result{{1, 2}}) }},
+		{"columns", len(cols), func(w *Writer) error { return w.Columns([]Column{{Name: "a"}}) }, keep},
+	} {
+		l := DefaultLimits()
+		l.ResultBytes = int64(tc.limit)
+		w, buf := newTestWriter(DefaultFrameBytes, l)
+		must(t, tc.first(w))
+		if w.Written() != int64(tc.limit) || buf.Len() != tc.limit {
+			t.Fatalf("%s: written %d", tc.name, w.Written())
+		}
+		if err := tc.then(w); !errors.As(err, &we) || we.Code != CodeResultTooLarge || buf.Len() != tc.limit {
+			t.Fatalf("%s past the result limit: %v, %d bytes", tc.name, err, buf.Len())
+		}
 	}
 }
 
@@ -390,9 +465,235 @@ func TestWriterOrder(t *testing.T) {
 	if err := w.Done(&Done{Kind: DoneBatch}); !errors.Is(err, errEnded) {
 		t.Fatalf("second terminal frame: %v", err)
 	}
-	// A columns frame above the frame size is refused.
-	w, buf := newTestWriter(64, DefaultLimits())
-	if err := w.Columns([]Column{{Name: strings.Repeat("n", 64)}}); err == nil || buf.Len() != 0 {
+	// A columns frame above the frame size is refused, and one of exactly
+	// the frame size is written.
+	frame := `{"columns":[{"name":"nn","decltype":null,"database":null,"table":null,"origin":null}]}` + "\n"
+	w, buf := newTestWriter(len(frame)-1, DefaultLimits())
+	var we *Error
+	if err := w.Columns([]Column{{Name: "nn"}}); !errors.As(err, &we) || we.Code != CodeResultTooLarge || buf.Len() != 0 {
 		t.Fatalf("oversized columns frame: %v, %d bytes written", err, buf.Len())
+	}
+	w, buf = newTestWriter(len(frame), DefaultLimits())
+	must(t, w.Columns([]Column{{Name: "nn"}}))
+	if buf.String() != frame {
+		t.Fatalf("columns frame %q", buf)
+	}
+	// Params only after columns, never after results; nothing after the end.
+	w, _ = newTestWriter(DefaultFrameBytes, DefaultLimits())
+	if err := w.Params([]string{":a"}); !errors.Is(err, errOrder) {
+		t.Fatalf("params before columns: %v", err)
+	}
+	must(t, w.Results([]Result{{}}))
+	if err := w.Params([]string{":a"}); !errors.Is(err, errOrder) {
+		t.Fatalf("params after results: %v", err)
+	}
+	w, _ = newTestWriter(DefaultFrameBytes, DefaultLimits())
+	must(t, w.Columns(nil))
+	must(t, w.Params([]string{":a"}))
+	must(t, w.Keepalive())
+	must(t, w.Params([]string{":b"}))
+	if err := w.Results([]Result{{}}); !errors.Is(err, errOrder) {
+		t.Fatalf("results after params: %v", err)
+	}
+	if err := w.Row(nil); !errors.Is(err, errOrder) {
+		t.Fatalf("row after params: %v", err)
+	}
+	must(t, w.Done(&Done{Kind: DoneDescribe}))
+	for name, write := range map[string]func() error{
+		"params":     func() error { return w.Params([]string{":c"}) },
+		"no params":  func() error { return w.Params(nil) },
+		"no results": func() error { return w.Results(nil) },
+		"columns":    func() error { return w.Columns(nil) },
+		"row":        func() error { return w.Row(nil) },
+		"keepalive":  w.Keepalive,
+		"error":      func() error { return w.Error(&Error{Code: CodeInternal, RequestID: "r"}) },
+		"done":       func() error { return w.Done(&Done{Kind: DonePut}) },
+	} {
+		if err := write(); !errors.Is(err, errEnded) {
+			t.Errorf("%s after the terminal frame: %v", name, err)
+		}
+	}
+}
+
+// testLimits has a distinct value in every member, so that the encoding
+// shows which field each comes from.
+var testLimits = Limits{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+
+const testLimitsJSON = `{"request_body_bytes":1,"header_block_bytes":2,"batch_entries":3,"frame_entries":4,` +
+	`"result_bytes":5,"held_result_bytes":6,"terminal_frame_bytes":7,"error_message_bytes":8,` +
+	`"retained_request_bytes":9,"resolve_bound":10,"statement_ms":11,"response_ms":12,"keepalive_ms":13,` +
+	`"lock_wait_ms":14,"catch_up_ms":15,"channel_idle_ms":16,"write_txn_idle_ms":17,` +
+	`"write_txn_lifetime_ms":18,"read_txn_idle_ms":19,"read_txn_lifetime_ms":20}`
+
+// TestDoneKinds checks the exact bytes of every done kind, with a distinct
+// value in every field.
+func TestDoneKinds(t *testing.T) {
+	const chID = "7c1d2e3f40a1b2c37c1d2e3f40a1b2c3"
+	ch := func(m Mode) *Channel {
+		return &Channel{Token: "t1.x", ID: chID, Mode: m, Epoch: 77, Limits: testLimits}
+	}
+	base := Done{Seq: 11, Txn: 22, TxnState: TxnOpen, RowsAffected: 33, LastInsertRowID: 44, Entries: 55, ParamCount: 66, Epoch: 77, LastSeq: 88, ReadOnly: true, Wrote: true}
+	kind := func(k DoneKind, edit func(*Done)) *Done {
+		d := base
+		d.Kind = k
+		if edit != nil {
+			edit(&d)
+		}
+		return &d
+	}
+	batch := kind(DoneBatch, nil)
+	for _, tc := range []struct {
+		d    *Done
+		want string
+	}{
+		{kind(DoneQuery, nil), `{"txn":22,"read_only":true,"rows_affected":33,"last_insert_rowid":44}`},
+		{kind(DoneDescribe, nil), `{"txn":22,"param_count":66}`},
+		{kind(DoneOpen, func(d *Done) { d.Channel = ch(ModeWrite) }), `{"txn":22,"channel":{"token":"t1.x","id":"` + chID + `","mode":"write","epoch":77,"limits":` + testLimitsJSON + `}}`},
+		{kind(DoneOpen, func(d *Done) { d.Channel = ch(ModeReadOnly) }), `{"txn":22,"channel":{"token":"t1.x","id":"` + chID + `","mode":"read_only","limits":` + testLimitsJSON + `}}`},
+		{kind(DoneBegin, nil), `{"seq":11,"txn_state":"open","txn":22}`},
+		{kind(DoneExecute, nil), `{"seq":11,"txn_state":"open","txn":22,"read_only":true,"rows_affected":33,"last_insert_rowid":44}`},
+		{kind(DoneExecute, func(d *Done) { d.DataOmitted, d.ReadOnly = true, false }), `{"seq":11,"txn_state":"open","txn":22,"read_only":false,"rows_affected":33,"last_insert_rowid":44,"data_omitted":true}`},
+		{batch, `{"seq":11,"txn_state":"open","txn":22,"rows_affected":33,"last_insert_rowid":44,"entries":55}`},
+		{kind(DoneChannelDescribe, func(d *Done) { d.DataOmitted = true }), `{"seq":11,"txn_state":"open","txn":22,"param_count":66,"data_omitted":true}`},
+		{kind(DoneCommit, func(d *Done) { d.TxnState, d.Wrote = TxnNone, false }), `{"seq":11,"txn_state":"none","txn":22,"committed":true,"wrote":false}`},
+		{kind(DoneRollback, func(d *Done) { d.TxnState, d.DataOmitted = TxnNone, true }), `{"seq":11,"txn_state":"none","txn":22,"data_omitted":true}`},
+		{kind(DoneCancel, func(d *Done) { d.Outcome = &Receipt{Done: batch} }), `{"seq":11,"txn_state":"open","outcome":{"seq":11,"ok":true,"txn_state":"open","txn":22,"rows_affected":33,"last_insert_rowid":44,"entries":55}}`},
+		{kind(DoneClose, func(d *Done) { d.Outcome = &Receipt{Done: kind(DoneBegin, func(d *Done) { d.DataOmitted = true })} }), `{"last_seq":88,"outcome":{"seq":11,"ok":true,"txn_state":"open","txn":22}}`},
+		{kind(DoneResolve, func(d *Done) { d.Resolution = ResolutionPending }), `{"resolution":"pending","txn":22}`},
+		{kind(DoneStatus, func(d *Done) { d.SQLiteVersion, d.Limits = "3.54.1", &testLimits }), `{"txn":22,"epoch":77,"sqlite_version":"3.54.1","limits":` + testLimitsJSON + `}`},
+		{kind(DonePut, nil), `{"txn":22,"epoch":77}`},
+	} {
+		w, buf := newTestWriter(DefaultFrameBytes, DefaultLimits())
+		must(t, w.Done(tc.d))
+		if want := `{"done":` + tc.want + "}\n"; buf.String() != want {
+			t.Errorf("done kind %d:\n got %s\nwant %s", tc.d.Kind, buf, want)
+		}
+	}
+}
+
+// TestErrorFields checks the exact bytes of every error field, present and
+// absent.
+func TestErrorFields(t *testing.T) {
+	for _, tc := range []struct {
+		e    *Error
+		want string
+	}{
+		{&Error{
+			Code: CodeSQLError, Final: true, Message: "m\"", RequestID: "Req_1-z", ChannelID: strings.Repeat("c", 32), Seq: 5,
+			TxnState: TxnOpen, SQLiteCode: 19, SQLiteExtendedCode: 2067, BatchIndex: maxInt(3), Cause: "maintenance", Txn: 22, Epoch: 77,
+		}, `{"code":"sql_error","not_executed":false,"final":true,"message":"m\"","request_id":"Req_1-z","channel_id":"` + strings.Repeat("c", 32) +
+			`","seq":5,"txn_state":"open","sqlite_code":19,"sqlite_extended_code":2067,"batch_index":3,"cause":"maintenance","txn":22,"epoch":77}`},
+		{
+			&Error{Code: CodeInternal, NotExecuted: true, RequestID: "r", BatchIndex: maxInt(0)},
+			`{"code":"internal","not_executed":true,"final":false,"message":"","request_id":"r","batch_index":0}`,
+		},
+		{
+			&Error{Code: CodeBehind, RequestID: strings.Repeat("r", 64), Epoch: 1},
+			`{"code":"behind","not_executed":false,"final":false,"message":"","request_id":"` + strings.Repeat("r", 64) + `","epoch":1}`,
+		},
+	} {
+		w, buf := newTestWriter(DefaultFrameBytes, DefaultLimits())
+		must(t, w.Error(tc.e))
+		if want := `{"error":` + tc.want + "}\n"; buf.String() != want {
+			t.Errorf("\n got %s\nwant %s", buf, want)
+		}
+	}
+}
+
+// TestWriterRefuses checks that the writer refuses, writing nothing and
+// staying usable, what would be a malformed terminal frame.
+func TestWriterRefuses(t *testing.T) {
+	okErr := &Error{Code: CodeCancelled, RequestID: "r"}
+	for name, write := range map[string]func(*Writer) error{
+		"no done":                func(w *Writer) error { return w.Done(nil) },
+		"zero done":              func(w *Writer) error { return w.Done(&Done{}) },
+		"unknown kind":           func(w *Writer) error { return w.Done(&Done{Kind: DonePut + 1}) },
+		"open without channel":   func(w *Writer) error { return w.Done(&Done{Kind: DoneOpen}) },
+		"status without limits":  func(w *Writer) error { return w.Done(&Done{Kind: DoneStatus}) },
+		"cancel without outcome": func(w *Writer) error { return w.Done(&Done{Kind: DoneCancel, Seq: 1}) },
+		"close without outcome":  func(w *Writer) error { return w.Done(&Done{Kind: DoneClose, LastSeq: 1}) },
+		"empty receipt":          func(w *Writer) error { return w.Done(&Done{Kind: DoneCancel, Outcome: &Receipt{}}) },
+		"two-sided receipt": func(w *Writer) error {
+			return w.Done(&Done{Kind: DoneCancel, Outcome: &Receipt{Done: &Done{Kind: DoneBegin}, Error: okErr}})
+		},
+		"receipt of a query": func(w *Writer) error {
+			return w.Done(&Done{Kind: DoneClose, LastSeq: 1, Outcome: &Receipt{Done: &Done{Kind: DoneQuery}}})
+		},
+		"receipt of a cancel": func(w *Writer) error {
+			return w.Done(&Done{Kind: DoneCancel, Outcome: &Receipt{Done: &Done{Kind: DoneCancel}}})
+		},
+		"receipt of a zero done": func(w *Writer) error { return w.Done(&Done{Kind: DoneCancel, Outcome: &Receipt{Done: &Done{}}}) },
+		"receipt with a bad error": func(w *Writer) error {
+			return w.Done(&Done{Kind: DoneCancel, Outcome: &Receipt{Error: &Error{Code: CodeCancelled}}})
+		},
+		"data_omitted on a query": func(w *Writer) error { return w.Done(&Done{Kind: DoneQuery, DataOmitted: true}) },
+		"data_omitted on a cancel": func(w *Writer) error {
+			return w.Done(&Done{Kind: DoneCancel, DataOmitted: true, Outcome: &Receipt{Error: okErr}})
+		},
+		"no error":              func(w *Writer) error { return w.Error(nil) },
+		"empty code":            func(w *Writer) error { return w.Error(&Error{RequestID: "r"}) },
+		"unknown code":          func(w *Writer) error { return w.Error(&Error{Code: "other", RequestID: "r"}) },
+		"empty request ID":      func(w *Writer) error { return w.Error(&Error{Code: CodeInternal}) },
+		"long request ID":       func(w *Writer) error { return w.Error(&Error{Code: CodeInternal, RequestID: strings.Repeat("r", 65)}) },
+		"request ID with a dot": func(w *Writer) error { return w.Error(&Error{Code: CodeInternal, RequestID: "r.1"}) },
+	} {
+		w, buf := newTestWriter(DefaultFrameBytes, DefaultLimits())
+		if err := write(w); err == nil || buf.Len() != 0 {
+			t.Errorf("%s: %v, %q written", name, err, buf)
+			continue
+		}
+		must(t, w.Error(okErr))
+	}
+}
+
+// TestTerminalReservation checks that a terminal frame above its
+// reservation is refused and that one at it is written.
+func TestTerminalReservation(t *testing.T) {
+	const frame = `{"done":{"txn":1,"epoch":1}}` + "\n"
+	l := DefaultLimits()
+	l.TerminalFrameBytes = int64(len(frame)) - 1
+	w, buf := newTestWriter(DefaultFrameBytes, l)
+	if err := w.Done(&Done{Kind: DonePut, Txn: 1, Epoch: 1}); err == nil || buf.Len() != 0 {
+		t.Fatalf("oversized terminal frame: %v, %q written", err, buf)
+	}
+	l.TerminalFrameBytes++
+	w, buf = newTestWriter(DefaultFrameBytes, l)
+	must(t, w.Done(&Done{Kind: DonePut, Txn: 1, Epoch: 1}))
+	if buf.String() != frame {
+		t.Fatalf("terminal frame %q", buf)
+	}
+}
+
+func TestNewWriterLimits(t *testing.T) {
+	if _, err := NewWriter(io.Discard, DefaultFrameBytes, DefaultLimits()); err != nil {
+		t.Fatalf("default limits: %v", err)
+	}
+	if _, err := NewWriter(io.Discard, DefaultFrameBytes, testLimits); err != nil {
+		t.Fatalf("small limits: %v", err)
+	}
+	for name, edit := range map[string]func(*Limits){
+		"zero request body":        func(l *Limits) { l.RequestBodyBytes = 0 },
+		"negative result":          func(l *Limits) { l.ResultBytes = -1 },
+		"zero frame entries":       func(l *Limits) { l.FrameEntries = 0 },
+		"frame entries above 1024": func(l *Limits) { l.FrameEntries = 1025 },
+		"batch above 10000":        func(l *Limits) { l.BatchEntries = 10001 },
+		"message above 1024":       func(l *Limits) { l.ErrorMessageBytes = 1025 },
+		"message below 2":          func(l *Limits) { l.ErrorMessageBytes = 1 },
+		"ms above 2^31-1":          func(l *Limits) { l.ResponseMS = math.MaxInt32 + 1 },
+		"zero ms":                  func(l *Limits) { l.ReadTxnLifetimeMS = 0 },
+	} {
+		l := DefaultLimits()
+		edit(&l)
+		if _, err := NewWriter(io.Discard, DefaultFrameBytes, l); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	l := DefaultLimits()
+	l.BatchEntries, l.ErrorMessageBytes, l.FrameEntries, l.StatementMS, l.ResultBytes = 1, 2, 1, math.MaxInt32, math.MaxInt64
+	if _, err := NewWriter(io.Discard, 1, l); err != nil {
+		t.Fatalf("limits at their bounds: %v", err)
+	}
+	if _, err := NewWriter(io.Discard, 0, DefaultLimits()); err == nil {
+		t.Fatal("a frame size of 0 accepted")
 	}
 }

@@ -4,10 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"slices"
 	"strconv"
 	"strings"
-
-	"github.com/go-json-experiment/json/jsontext"
 )
 
 // DefaultFrameBytes is the default frame size: the largest frame the server
@@ -65,12 +65,49 @@ func DefaultLimits() Limits {
 	}
 }
 
-func (l *Limits) append(b []byte) []byte {
-	o := object{b: append(b, '{')}
-	for _, m := range []struct {
-		name string
-		v    int64
-	}{
+// The largest error message bound, batch limit and entries per frame a
+// server may configure: ADR 0005's terminal frame bounds hold at them.
+const (
+	maxErrorMessageBytes = 1024
+	maxBatchEntries      = 10000
+	maxFrameEntries      = 1024
+)
+
+// Validate checks l against the limits object's ranges: every member from
+// 1 to 2^63-1, or to 2^31-1 in milliseconds, and the error message bound
+// (at least 2 bytes, the empty message), the batch limit and the entries
+// per frame at most their defaults, which are maxima.
+func (l *Limits) Validate() error {
+	for _, m := range l.members() {
+		hi := int64(math.MaxInt64)
+		switch m.name {
+		case "error_message_bytes":
+			if m.v < 2 {
+				return fmt.Errorf("wire: error_message_bytes %d cannot hold an empty message", m.v)
+			}
+			hi = maxErrorMessageBytes
+		case "batch_entries":
+			hi = maxBatchEntries
+		case "frame_entries":
+			hi = maxFrameEntries
+		}
+		if strings.HasSuffix(m.name, "_ms") {
+			hi = math.MaxInt32
+		}
+		if m.v < 1 || m.v > hi {
+			return fmt.Errorf("wire: %s %d is outside 1 to %d", m.name, m.v, hi)
+		}
+	}
+	return nil
+}
+
+type limit struct {
+	name string
+	v    int64
+}
+
+func (l *Limits) members() []limit {
+	return []limit{
 		{"request_body_bytes", l.RequestBodyBytes},
 		{"header_block_bytes", l.HeaderBlockBytes},
 		{"batch_entries", l.BatchEntries},
@@ -91,7 +128,12 @@ func (l *Limits) append(b []byte) []byte {
 		{"write_txn_lifetime_ms", l.WriteTxnLifetimeMS},
 		{"read_txn_idle_ms", l.ReadTxnIdleMS},
 		{"read_txn_lifetime_ms", l.ReadTxnLifetimeMS},
-	} {
+	}
+}
+
+func (l *Limits) append(b []byte) []byte {
+	o := object{b: append(b, '{')}
+	for _, m := range l.members() {
 		o.int(m.name, m.v)
 	}
 	return append(o.b, '}')
@@ -186,7 +228,7 @@ type Result struct {
 }
 
 // Writer writes a response body: frames in the order ADR 0005's grammar
-// allows, ending with one terminal frame.
+// allows, ending with one terminal frame. It is not safe for concurrent use.
 type Writer struct {
 	w          io.Writer
 	frameBytes int
@@ -203,7 +245,8 @@ type Writer struct {
 const (
 	stateStart   = iota // keepalives so far
 	stateRows           // after columns
-	stateEntries        // after results or params
+	stateResults        // after results
+	stateParams         // after params
 	stateEnded          // after the terminal frame
 )
 
@@ -215,10 +258,19 @@ var (
 
 // NewWriter returns a Writer that writes each frame to w with one Write
 // call. frameBytes is the frame size; l supplies the entries per frame, the
-// result size (lower it to the held-result bound for an autocommit write),
-// the terminal frame reservation and the error message bound.
-func NewWriter(w io.Writer, frameBytes int, l Limits) *Writer {
-	return &Writer{w: w, frameBytes: frameBytes, limits: l}
+// result size, which counts every byte before the terminal frame, the
+// terminal frame reservation and the error message bound. The held-result
+// bound, which counts rows and results frames only, is the caller's to
+// apply. NewWriter refuses a frame size below 1 and limits that Validate
+// refuses.
+func NewWriter(w io.Writer, frameBytes int, l Limits) (*Writer, error) {
+	if frameBytes < 1 {
+		return nil, fmt.Errorf("wire: frame size %d is below 1", frameBytes)
+	}
+	if err := l.Validate(); err != nil {
+		return nil, err
+	}
+	return &Writer{w: w, frameBytes: frameBytes, limits: l}, nil
 }
 
 // Written returns the bytes written before the terminal frame.
@@ -255,7 +307,11 @@ func (w *Writer) Keepalive() error {
 // Columns writes a columns frame, which must come first. A columns frame
 // above the frame size is refused with result_too_large.
 func (w *Writer) Columns(cols []Column) error {
-	if w.state != stateStart {
+	switch w.state {
+	case stateStart:
+	case stateEnded:
+		return errEnded
+	default:
 		return errOrder
 	}
 	b := append(w.buf[:0], `{"columns":[`...)
@@ -286,7 +342,11 @@ func (w *Writer) Columns(cols []Column) error {
 // Row writes a row, which must follow the columns frame and have one value
 // per column. A row is never split, whatever its size.
 func (w *Writer) Row(values []any) error {
-	if w.state != stateRows {
+	switch w.state {
+	case stateRows:
+	case stateEnded:
+		return errEnded
+	default:
 		return errOrder
 	}
 	if len(values) != w.columns {
@@ -309,9 +369,13 @@ func (w *Writer) Row(values []any) error {
 
 // Results writes a batch's results entries, continuing from the entries
 // already written, in frames of at most FrameEntries entries that end before
-// an entry that would take them past the frame size.
+// an entry that would take them past the frame size. Results may not follow
+// params.
 func (w *Writer) Results(entries []Result) error {
-	return w.entries(`{"results":{"from":`, `,"entries":[`, &w.results, len(entries), func(b []byte, i int) []byte {
+	if w.state == stateParams {
+		return errOrder
+	}
+	return w.entries(stateResults, `{"results":{"from":`, `,"entries":[`, &w.results, len(entries), func(b []byte, i int) []byte {
 		o := object{b: append(b, '{')}
 		o.int("rows_affected", entries[i].RowsAffected)
 		o.int("last_insert_rowid", entries[i].LastInsertRowID)
@@ -320,15 +384,19 @@ func (w *Writer) Results(entries []Result) error {
 }
 
 // Params writes a describe answer's parameter names, continuing from those
-// already written, split as Results splits. An empty name is written as
+// already written, split as Results splits. They must follow the columns
+// frame, which a describe answer always has. An empty name is written as
 // null.
 func (w *Writer) Params(names []string) error {
-	return w.entries(`{"params":{"from":`, `,"names":[`, &w.params, len(names), func(b []byte, i int) []byte {
+	if w.state != stateRows && w.state != stateParams && w.state != stateEnded {
+		return errOrder
+	}
+	return w.entries(stateParams, `{"params":{"from":`, `,"names":[`, &w.params, len(names), func(b []byte, i int) []byte {
 		return appendNullStr(b, names[i])
 	})
 }
 
-func (w *Writer) entries(head, key string, from *int64, n int, entry func([]byte, int) []byte) error {
+func (w *Writer) entries(state int, head, key string, from *int64, n int, entry func([]byte, int) []byte) error {
 	if w.state == stateEnded {
 		return errEnded
 	}
@@ -356,25 +424,37 @@ func (w *Writer) entries(head, key string, from *int64, n int, entry func([]byte
 			return err
 		}
 		*from += int64(i - start)
-		w.state = stateEntries
+		w.state = state
 	}
 	return nil
 }
 
-// Done writes a done frame, ending the response.
+// Done writes a done frame, ending the response. It refuses, writing
+// nothing, a Done whose kind is unknown, that lacks the Channel, Outcome or
+// Limits its kind writes, whose outcome is not one Done of a sequenced
+// request's kind or one Error, or that sets DataOmitted on an answer that
+// is not a sequenced request's.
 func (w *Writer) Done(d *Done) error {
 	b := append(w.buf[:0], `{"done":`...)
-	b = w.appendDone(b, d, false)
+	b, err := w.appendDone(b, d, false)
+	if err != nil {
+		return err
+	}
 	b = append(b, "}\n"...)
 	w.buf = b
 	return w.emit(b, true)
 }
 
 // Error writes an error frame, ending the response. The message is cut to
-// the error message bound.
+// the error message bound. It refuses, writing nothing, an error whose code
+// is not in the list or whose request ID is not 1 to 64 characters from
+// A-Z a-z 0-9 _ -.
 func (w *Writer) Error(e *Error) error {
 	b := append(w.buf[:0], `{"error":`...)
-	b = w.appendError(b, e)
+	b, err := w.appendError(b, e)
+	if err != nil {
+		return err
+	}
 	b = append(b, "}\n"...)
 	w.buf = b
 	return w.emit(b, true)
@@ -382,12 +462,23 @@ func (w *Writer) Error(e *Error) error {
 
 // appendDone appends d's object, or, for a receipt, d's fields after
 // "seq" and "ok":true.
-func (w *Writer) appendDone(b []byte, d *Done, receipt bool) []byte {
-	o := object{b: append(b, '{')}
-	seqKind := false
+func (w *Writer) appendDone(b []byte, d *Done, receipt bool) ([]byte, error) {
+	if d == nil {
+		return b, errors.New("wire: no done fields")
+	}
+	sequenced := false // the answer of a sequenced request, which a receipt records
 	switch d.Kind {
-	case DoneBegin, DoneExecute, DoneBatch, DoneChannelDescribe, DoneCommit, DoneRollback, DoneCancel:
-		seqKind = true
+	case DoneBegin, DoneExecute, DoneBatch, DoneChannelDescribe, DoneCommit, DoneRollback:
+		sequenced = true
+	}
+	switch {
+	case receipt && !sequenced:
+		return b, fmt.Errorf("wire: a receipt cannot hold done kind %d", d.Kind)
+	case d.DataOmitted && !receipt && !sequenced:
+		return b, fmt.Errorf("wire: data_omitted on done kind %d, which is never a replay", d.Kind)
+	}
+	o := object{b: append(b, '{')}
+	if sequenced || d.Kind == DoneCancel {
 		o.int("seq", d.Seq)
 		if receipt {
 			o.key("ok")
@@ -395,6 +486,7 @@ func (w *Writer) appendDone(b []byte, d *Done, receipt bool) []byte {
 		}
 		o.str("txn_state", string(d.TxnState))
 	}
+	var err error
 	switch d.Kind {
 	case DoneQuery, DoneExecute:
 		o.int("txn", d.Txn)
@@ -405,9 +497,12 @@ func (w *Writer) appendDone(b []byte, d *Done, receipt bool) []byte {
 		o.int("txn", d.Txn)
 		o.int("param_count", d.ParamCount)
 	case DoneOpen:
+		c := d.Channel
+		if c == nil {
+			return b, errors.New("wire: an open answer needs its channel")
+		}
 		o.int("txn", d.Txn)
 		o.key("channel")
-		c := d.Channel
 		co := object{b: append(o.b, '{')}
 		co.str("token", c.Token)
 		co.str("id", c.ID)
@@ -430,17 +525,20 @@ func (w *Writer) appendDone(b []byte, d *Done, receipt bool) []byte {
 		o.bool("wrote", d.Wrote)
 	case DoneCancel:
 		o.key("outcome")
-		o.b = w.appendReceipt(o.b, d.Outcome)
+		o.b, err = w.appendReceipt(o.b, d.Outcome)
 	case DoneClose:
 		o.int("last_seq", d.LastSeq)
 		if d.LastSeq != 0 {
 			o.key("outcome")
-			o.b = w.appendReceipt(o.b, d.Outcome)
+			o.b, err = w.appendReceipt(o.b, d.Outcome)
 		}
 	case DoneResolve:
 		o.str("resolution", string(d.Resolution))
 		o.int("txn", d.Txn)
 	case DoneStatus:
+		if d.Limits == nil {
+			return b, errors.New("wire: a status answer needs its limits")
+		}
 		o.int("txn", d.Txn)
 		o.int("epoch", d.Epoch)
 		o.str("sqlite_version", d.SQLiteVersion)
@@ -449,15 +547,23 @@ func (w *Writer) appendDone(b []byte, d *Done, receipt bool) []byte {
 	case DonePut:
 		o.int("txn", d.Txn)
 		o.int("epoch", d.Epoch)
+	default:
+		return b, fmt.Errorf("wire: unknown done kind %d", d.Kind)
 	}
-	if seqKind && d.DataOmitted && !receipt {
+	if err != nil {
+		return b, err
+	}
+	if d.DataOmitted && !receipt { // refused above unless sequenced
 		o.bool("data_omitted", true)
 	}
-	return append(o.b, '}')
+	return append(o.b, '}'), nil
 }
 
 // appendReceipt appends a receipt as embedded in a cancel or close answer.
-func (w *Writer) appendReceipt(b []byte, r *Receipt) []byte {
+func (w *Writer) appendReceipt(b []byte, r *Receipt) ([]byte, error) {
+	if r == nil || (r.Done == nil) == (r.Error == nil) {
+		return b, errors.New("wire: a receipt holds one done or one error")
+	}
 	if r.Error == nil {
 		return w.appendDone(b, r.Done, true)
 	}
@@ -465,10 +571,22 @@ func (w *Writer) appendReceipt(b []byte, r *Receipt) []byte {
 	o.int("seq", r.Error.Seq)
 	o.bool("ok", false)
 	o.key("error")
-	return append(w.appendError(o.b, r.Error), '}')
+	eb, err := w.appendError(o.b, r.Error)
+	if err != nil {
+		return b, err
+	}
+	return append(eb, '}'), nil
 }
 
-func (w *Writer) appendError(b []byte, e *Error) []byte {
+func (w *Writer) appendError(b []byte, e *Error) ([]byte, error) {
+	switch {
+	case e == nil:
+		return b, errors.New("wire: no error")
+	case !slices.Contains(codes, e.Code):
+		return b, fmt.Errorf("wire: unknown error code %q", e.Code)
+	case !validRequestID(e.RequestID):
+		return b, fmt.Errorf("wire: request ID %q is not 1 to 64 characters from A-Z a-z 0-9 _ -", e.RequestID)
+	}
 	o := object{b: append(b, '{')}
 	o.str("code", string(e.Code))
 	o.bool("not_executed", e.NotExecuted)
@@ -486,7 +604,21 @@ func (w *Writer) appendError(b []byte, e *Error) []byte {
 	o.optStr("cause", e.Cause)
 	o.optInt("txn", e.Txn)
 	o.optInt("epoch", e.Epoch)
-	return append(o.b, '}')
+	return append(o.b, '}'), nil
+}
+
+// validRequestID reports whether s is 1 to 64 characters from
+// A-Z a-z 0-9 _ -.
+func validRequestID(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for i := range len(s) {
+		if c := s[i]; (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // object appends the members of a JSON object, with commas between them.
@@ -519,9 +651,11 @@ func (o *object) bool(name string, v bool) {
 	o.b = strconv.AppendBool(o.b, v)
 }
 
+// str appends a string member. Text the server writes outside values
+// (names, messages) is diagnostic, so invalid UTF-8 in it becomes U+FFFD.
 func (o *object) str(name, v string) {
 	o.key(name)
-	o.b = appendString(o.b, v)
+	o.b = appendQuoted(o.b, v)
 }
 
 func (o *object) optStr(name, v string) {
@@ -539,15 +673,5 @@ func appendNullStr(b []byte, v string) []byte {
 	if v == "" {
 		return append(b, "null"...)
 	}
-	return appendString(b, v)
-}
-
-// appendString appends a JSON string. Text the server writes outside values
-// (names, messages) is diagnostic, so invalid UTF-8 in it becomes U+FFFD.
-func appendString(b []byte, s string) []byte {
-	out, err := jsontext.AppendQuote(b, s)
-	if err != nil {
-		out, _ = jsontext.AppendQuote(b, strings.ToValidUTF8(s, "\uFFFD"))
-	}
-	return out
+	return appendQuoted(b, v)
 }
