@@ -340,8 +340,7 @@ func TestSnapshotEdges(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		_ = l.stop(errors.New("test stop"))
-		<-done
-		t.Fatal("a write hangs after a start panicked")
+		t.Fatalf("a write hangs after a start panicked; after a stop: %v", <-done)
 	}
 	_ = l.stop(errors.New("test stop"))
 	ran := false
