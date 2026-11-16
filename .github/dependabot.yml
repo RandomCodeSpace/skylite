@@ -36,6 +36,16 @@ updates:
       maven-minor-patch:
         update-types: [minor, patch]
 
+  - package-ecosystem: maven
+    directory: /clients/java/driver
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      jdbc-maven-minor-patch:
+        update-types: [minor, patch]
+
   - package-ecosystem: gomod
     directory: /internal/spike/flightsql
     schedule:
