@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -149,6 +150,7 @@ func NewConnector(cfg Config) (*Connector, error) {
 			// net/http's DefaultTransport settings, so idle connections close.
 			t = &http.Transport{
 				Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true,
+				DialContext:  (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 				MaxIdleConns: 100, IdleConnTimeout: 90 * time.Second,
 				TLSHandshakeTimeout: 10 * time.Second, ExpectContinueTimeout: time.Second,
 			}
@@ -173,8 +175,8 @@ func NewConnector(cfg Config) (*Connector, error) {
 }
 
 // Close closes the idle connections of the driver's own HTTP client, never
-// those of a Config.HTTPClient. sql.DB.Close calls it. A connection a query
-// still uses then closes after its idle timeout, 90 seconds.
+// those of a Config.HTTPClient. sql.DB.Close calls it. An HTTP/2 connection
+// a query still uses then closes after its idle timeout, 90 seconds by default.
 func (c *Connector) Close() error {
 	if c.own {
 		c.client.CloseIdleConnections()
