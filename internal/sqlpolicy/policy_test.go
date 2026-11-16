@@ -192,9 +192,10 @@ func TestApplyFailsWhenTheDatabaseExceedsMaxPageCount(t *testing.T) {
 	}
 }
 
-// Apply's first statement loads the schema, which a client wrote: a schema
-// larger than the connection's memory is a memory refusal, not a panic, and
-// the load ends with ctx.
+// On a connection that has not read its schema, Apply's first statement, the
+// function list, loads it, and a client wrote it: a schema larger than the
+// connection's memory is a memory refusal, not a panic, and the load ends with
+// ctx.
 func TestApplyContainsTheSchemaLoad(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
 	raw, err := sqlite3.Open(path)
@@ -231,8 +232,33 @@ func TestApplyContainsTheSchemaLoad(t *testing.T) {
 	defer func() { _ = raw.Close() }()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := p.Apply(ctx, raw); !errors.Is(err, sqlite3.INTERRUPT) {
-		t.Fatalf("Apply with an ended context: got %v, want an interrupt", err)
+	if _, err := p.Apply(ctx, raw); !errors.Is(err, sqlite3.INTERRUPT) || !strings.Contains(err.Error(), "function list") {
+		t.Fatalf("Apply with an ended context: got %v, want an interrupt of the function list", err)
+	}
+}
+
+// Apply gives the connection back its own interrupt context, so the caller
+// ending Apply's does not interrupt the server's later statements.
+func TestApplyRestoresTheInterruptContext(t *testing.T) {
+	raw, err := sqlite3.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = raw.Close() }()
+	p, err := New(Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c, err := p.Apply(ctx, raw)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Privileged(func(c *sqlite3.Conn) error {
+		return c.Exec("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) SELECT count(*) FROM c")
+	}); err != nil {
+		t.Fatalf("a server statement after Apply's context ended: %v", err)
 	}
 }
 
@@ -871,6 +897,10 @@ func TestRefusedFunctionsInAlterTableAddColumn(t *testing.T) {
 		// SQLite's check does not cover a temp table, so the call reaches the
 		// stand-in, which refuses it.
 		wantRefused(t, db.run(fmt.Sprintf("ALTER TABLE e ADD COLUMN z CHECK (%s(%s) IS NULL)", name, args)), ReasonFunction)
+		// The stand-in is not deterministic, so a generated column refuses it.
+		if err := db.run(fmt.Sprintf("ALTER TABLE e ADD COLUMN z AS (%s(%s))", name, args)); err == nil || !strings.Contains(err.Error(), "non-deterministic functions prohibited in generated columns") {
+			t.Errorf("generated column on a temp table, %s: %v", name, err)
+		}
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1159,7 +1189,8 @@ func TestPrivilegedContainsAnEnginePanic(t *testing.T) {
 }
 
 // Statements within the default limits that overflow the C stack, measured
-// by the second review of record 0007. Each breaks only its connection: Run
+// by the second review of record 0007 and by the stack spike's verification.
+// Each breaks only its connection: Run
 // returns ErrBroken, at once, and so does every later Run.
 func TestStackOverflowBreaksTheConnection(t *testing.T) {
 	// Views whose bodies nest subqueries in FROM: each body has its own
@@ -1191,11 +1222,23 @@ func TestStackOverflowBreaksTheConnection(t *testing.T) {
 	chain := triggerChain(8, ctes+" SELECT * FROM c16")
 	i := strings.LastIndex(chain, ";") + 1
 	stat4 := "CREATE TABLE s(a); CREATE INDEX si ON s(a); INSERT INTO s VALUES (1)" + rep(", (1)", 1999) + "; UPDATE s SET a = rowid; ANALYZE;"
+	// Each generated column reads the next, and CREATE TABLE compiles a
+	// SELECT * of the new table itself, so one statement recurses down the
+	// chain. Found by the stack spike's verification.
+	gen := []string{"a"}
+	for i := 1; i <= 5; i++ {
+		next := fmt.Sprint("c", i+1)
+		if i == 5 {
+			next = "a"
+		}
+		gen = append(gen, fmt.Sprintf("c%d AS (%s%s%s)", i, rep("0 BETWEEN ", 17), next, rep(" AND 9", 17)))
+	}
 
 	for _, tc := range []struct{ name, setup, sql string }{
 		{"views over subqueries in FROM", views, "SELECT * FROM v4"},
 		{"flattened expressions", flat, q},
 		{"LIKE while planning", stat4 + chain[:i], chain[i:]},
+		{"chained generated columns", "", "CREATE TABLE g(" + strings.Join(gen, ", ") + ")"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := openDB(t, false, Limits{})
@@ -1325,6 +1368,15 @@ func TestResetDropsTablesThatReferenceEachOther(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.mustRun(t, "SELECT 1")
+}
+
+// Reset's own checks fit the lowest expression depth New accepts.
+func TestResetAtTheLowestExprDepth(t *testing.T) {
+	db := openDB(t, false, Limits{MaxExprDepth: 3})
+	db.mustRun(t, "CREATE TEMP TABLE x(i INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO x DEFAULT VALUES")
+	if err := db.conn.Reset(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRunReturnsAStepErrorThatFnIgnored(t *testing.T) {
@@ -1531,6 +1583,9 @@ func TestTrimMatchesSQLite(t *testing.T) {
 	}
 	// ADD COLUMN checks them with quick_check, which runs the policy's.
 	wantRefused(t, db.run("ALTER TABLE r ADD COLUMN e AS (rtrim(a, b)) NOT NULL"), ReasonFunction)
+	// ORMs run their DDL inside a transaction, which the server opened.
+	db.server(t, "BEGIN IMMEDIATE")
+	wantRefused(t, db.run("ALTER TABLE r ADD CHECK (length(ltrim(a, b)) >= 0)"), ReasonStatement)
 }
 
 func bind(s *sqlite3.Stmt, i int, a any) error {

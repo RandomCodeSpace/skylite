@@ -70,8 +70,8 @@ const defaultTimeout = 5 * time.Second
 // v0.37.0, a connection broke at about 180 units: nesting levels times terms,
 // whether the levels were views, CTEs or subqueries in FROM, plus about 2.5
 // units per level of trigger nesting. Views and CTEs nest to MaxExprDepth-2
-// levels; subqueries in FROM nest to about MaxParserDepth/6.5. The budget is
-// half of that. The model is a floor, not a guarantee: it counts one kind of
+// levels; subqueries in FROM nest to about MaxParserDepth/6.5, which the model
+// charges as MaxParserDepth/6. The budget is half of the 180 units. The model is a floor, not a guarantee: it counts one kind of
 // nesting at a time, and statements within the limits that combine kinds
 // still overflow the stack (record 0007, The C stack); Run then returns
 // ErrBroken. Re-measure on any upgrade of the binding.
@@ -94,8 +94,10 @@ type Policy struct {
 // It fails if a field is out of the range the SQLite build supports, or if
 // the nesting limits together exceed the modelled stack cost, which is a
 // floor: SQL within the limits can still overflow the stack. MaxSQLLength
-// and MaxVDBEOps also bound the policy's own statements, so Apply, not New,
-// fails when they are too low for them.
+// and MaxVDBEOps also bound the policy's own statements and the SQL SQLite
+// compiles itself, and New does not check their lower end: Apply fails below
+// about 26 bytes or 51 instructions, and a little above that Apply succeeds
+// but Reset or SQLite's own SQL, such as CREATE TABLE's, fails.
 func New(l Limits) (*Policy, error) {
 	for _, f := range l.limits() {
 		switch {
@@ -148,9 +150,13 @@ var ErrBroken = errors.New("sqlpolicy: connection unusable")
 // statements prepared on c before Apply, so SQLite compiles them again under
 // the policy if they are stepped.
 //
-// Apply's first statement loads the database's schema, which a client wrote.
-// It is interrupted when ctx ends, and a panic in the engine is returned as an
-// error, as in Run; the connection is then unusable.
+// The first statement on c that reads the schema loads it, and clients wrote
+// it. If the engine's set-up before Apply, such as PRAGMA journal_mode, ran
+// one, the schema was loaded there, outside Apply, and the engine must bound
+// and recover that set-up itself (record 0007, requirement 5). Otherwise
+// Apply's first statement loads it. Apply is interrupted when ctx ends, and a
+// panic in the engine is returned as an error, as in Run; the connection is
+// then unusable.
 func (p *Policy) Apply(ctx context.Context, c *sqlite3.Conn) (_ *Conn, err error) {
 	pc := &Conn{conn: c, limits: p.limits}
 	defer c.SetInterrupt(c.SetInterrupt(ctx))
@@ -323,14 +329,15 @@ func (c *Conn) Reset(ctx context.Context) error {
 		// With foreign keys on, dropping a parent table deletes its rows first,
 		// which a child table's references refuse.
 		drops := []string{"PRAGMA foreign_keys = OFF"}
-		left := "SELECT count(*) FROM temp.sqlite_schema WHERE name <> 'sqlite_sequence'"
+		// One query each, so that the check fits the lowest MaxExprDepth.
+		left := []string{"SELECT count(*) FROM temp.sqlite_schema WHERE name <> 'sqlite_sequence'"}
 		if err := rows(c, `SELECT type, name FROM temp.sqlite_schema WHERE type IN ('table', 'view', 'trigger')`, func(s *sqlite3.Stmt) {
 			if name := s.ColumnText(1); name != "sqlite_sequence" {
 				drops = append(drops, fmt.Sprintf(`DROP %s IF EXISTS temp."%s"`, s.ColumnText(0), strings.ReplaceAll(name, `"`, `""`)))
 			} else {
 				// SQLite does not let it be dropped, and a client can write to it.
 				drops = append(drops, "DELETE FROM temp.sqlite_sequence")
-				left = "SELECT (" + left + ") + (SELECT count(*) FROM temp.sqlite_sequence)"
+				left = append(left, "SELECT count(*) FROM temp.sqlite_sequence")
 			}
 		}); err != nil {
 			return err
@@ -342,12 +349,14 @@ func (c *Conn) Reset(ctx context.Context) error {
 			}
 		}
 		c.SetLastInsertRowID(0)
-		n, err := pragmaInt(c, left)
-		if err == nil && n != 0 {
-			err = fmt.Errorf("%d temp objects or sequence rows left", n)
-		}
-		if err != nil {
-			return err
+		for _, q := range left {
+			n, err := pragmaInt(c, q)
+			if err == nil && n != 0 {
+				err = fmt.Errorf("%d temp objects or sequence rows left", n)
+			}
+			if err != nil {
+				return err
+			}
 		}
 		on, err := pragmaInt(c, "PRAGMA foreign_keys")
 		if err == nil && on != 1 {
