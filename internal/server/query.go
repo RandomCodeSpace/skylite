@@ -452,18 +452,27 @@ func txnControl(sql string) bool {
 
 // firstWord returns the identifier characters at the start of s after white
 // space, comments and semicolons, as SQLite's parser reads them, and the
-// rest of s. SQLite's tokenizer reads a UTF-8 byte order mark as white space.
+// rest of s. SQLite's tokenizer reads a UTF-8 byte order mark as white space,
+// and a vertical tab too once a run of white space has begun.
 func firstWord(s string) (word, rest string) {
 	for s != "" {
 		switch {
-		case strings.IndexByte(" \t\n\f\r;", s[0]) >= 0: // SQLite skips empty statements before the first
+		case strings.IndexByte(" \t\n\f\r", s[0]) >= 0:
+			s = strings.TrimLeft(s, " \t\n\v\f\r")
+			continue
+		case s[0] == ';': // SQLite skips empty statements before the first
 			s = s[1:]
 			continue
 		case strings.HasPrefix(s, "\xef\xbb\xbf"):
 			s = s[3:]
 			continue
 		case strings.HasPrefix(s, "--"):
-			_, s, _ = strings.Cut(s, "\n")
+			// Up to the newline, which starts a run of white space.
+			if i := strings.IndexByte(s, '\n'); i >= 0 {
+				s = s[i:]
+			} else {
+				s = ""
+			}
 			continue
 		case strings.HasPrefix(s, "/*"):
 			_, s, _ = strings.Cut(s[2:], "*/")

@@ -371,6 +371,7 @@ func TestTxnControlRefusedStateless(t *testing.T) {
 			"BEGIN", "BEGIN IMMEDIATE", "COMMIT", "END", "EXPLAIN SAVEPOINT a", "EXPLAIN QUERY PLAN SAVEPOINT a",
 			// SQLite reads a UTF-8 byte order mark as white space.
 			"\ufeffSAVEPOINT a", ";\ufeff\ufeff;SAVEPOINT a", "EXPLAIN \ufeffQUERY \ufeffPLAN \ufeffSAVEPOINT a",
+			" \vSAVEPOINT a", "EXPLAIN \vSAVEPOINT a", "--\n\vBEGIN",
 		} {
 			if a := e.post(t, path, "reader", q(sql)); a.code() != "invalid_request" || len(a.frames) != 1 {
 				t.Errorf("%s %q: %d %v, want invalid_request alone", path, sql, a.status, a.frames)
@@ -385,7 +386,7 @@ func TestTxnControlRefusedStateless(t *testing.T) {
 func FuzzKeywordAgreesWithPolicy(f *testing.F) {
 	for _, s := range []string{
 		"SAVEPOINT a", "release a", "ROLLBACK TO a", "ROLLBACK", "BEGIN", "END", "COMMIT TRANSACTION", "-- x\nCOMMIT",
-		"/* x */ END", "EXPLAIN SAVEPOINT a", "EXPLAIN QUERY PLAN BEGIN", "explain select 1", "SELECT 1", ";SAVEPOINT a",
+		"/* x */ END", "EXPLAIN SAVEPOINT a", "EXPLAIN QUERY PLAN BEGIN", "explain select 1", "SELECT 1", ";SAVEPOINT a", " \vSAVEPOINT a", "--\n\vBEGIN",
 		"WITH x AS (SELECT 1) SELECT * FROM x", "endx", "\fBEGIN", "VALUES (1)", "PRAGMA foreign_keys",
 		"\ufeffSAVEPOINT a", ";\ufeff;\ufeffBEGIN", "EXPLAIN \ufeffQUERY \ufeffPLAN \ufeffEND", "SELECT\ufeff1",
 	} {

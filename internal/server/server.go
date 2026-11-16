@@ -96,12 +96,15 @@ func engineConfig() engine.Config {
 
 // Server serves the client protocol. Create it with New.
 type Server struct {
-	cfg    Config
-	log    *slog.Logger
-	guard  *auth.Guard
-	store  storage.Store
-	cert   *tls.Certificate
-	limits wire.Limits
+	// probeLn, if set, is the readiness probe's listener in place of
+	// cfg.ProbeListen; tests set it to keep their port bound.
+	probeLn net.Listener
+	cfg     Config
+	log     *slog.Logger
+	guard   *auth.Guard
+	store   storage.Store
+	cert    *tls.Certificate
+	limits  wire.Limits
 
 	policy   *sqlpolicy.Policy
 	pool     *pool
@@ -211,10 +214,12 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		}
 	}()
 	defer s.startOffice()()
-	if s.cfg.ProbeListen != "" {
-		pln, err := net.Listen("tcp", s.cfg.ProbeListen)
-		if err != nil {
-			return fmt.Errorf("server: probe: %w", err)
+	if pln := s.probeLn; pln != nil || s.cfg.ProbeListen != "" {
+		if pln == nil {
+			var err error
+			if pln, err = net.Listen("tcp", s.cfg.ProbeListen); err != nil {
+				return fmt.Errorf("server: probe: %w", err)
+			}
 		}
 		probe := &http.Server{Handler: http.HandlerFunc(s.readyz), ReadHeaderTimeout: s.headerDeadline, IdleTimeout: s.idleTimeout, ErrorLog: slog.NewLogLogger(s.log.Handler(), slog.LevelWarn)}
 		go func() { _ = probe.Serve(netutil.LimitListener(pln, probeConns)) }()

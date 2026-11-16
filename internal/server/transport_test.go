@@ -429,7 +429,7 @@ func TestProbeConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.s.cfg.ProbeListen = free.Addr().String()
-	_ = free.Close()
+	e.s.probeLn = free // stays bound: no other listener can take the port
 	e.start(t)
 	addr := e.s.cfg.ProbeListen
 	var held []net.Conn
