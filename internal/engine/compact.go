@@ -37,9 +37,10 @@ const (
 	defaultCompactBytes    = 256 << 20
 	defaultCompactInterval = time.Minute
 	defaultGrace           = 5 * time.Minute
-	// retireBatch is how many commits one retirement pass reads before it
-	// lets a compaction run.
-	retireBatch = 1024
+	// passBatch is how many commits one retirement pass reads, and how many
+	// garbage keys one collection pass deletes, before the pass releases
+	// the compaction lock to a compaction or maintenance step 7.
+	passBatch = 1024
 	// maxGarbage is how many garbage keys one collection holds between
 	// finding and deleting them; the rest wait for the next collection.
 	maxGarbage = 1 << 16
@@ -607,13 +608,13 @@ func (l *Leader) retireLimit(now time.Time) uint64 {
 	return l.covered[0].txn
 }
 
-// retireLocked retires, with l.cmpMu held, up to retireBatch commits above
+// retireLocked retires, with l.cmpMu held, up to passBatch commits above
 // the retired-through cursor that a manifest has covered for the grace
 // period, and advances the cursor over each one a read shows retired or a
 // bump.
 func (l *Leader) retireLocked() {
 	limit := l.retireLimit(time.Now())
-	for range retireBatch {
+	for range passBatch {
 		if l.retiredThrough >= limit || l.cctx.Err() != nil {
 			return
 		}
@@ -625,20 +626,26 @@ func (l *Leader) retireLocked() {
 	}
 }
 
-// collectLocked deletes, with l.cmpMu held, the garbage it found at least
-// the grace period ago, and then, after a compaction, looks for more. A
-// delete's outcome needs no resolution: what it removes is garbage for good.
+// collectLocked deletes, with l.cmpMu held, up to passBatch keys of the
+// garbage it found at least the grace period ago, and then, once none is
+// left, after a compaction, looks for more. A delete's outcome needs no
+// resolution: what it removes is garbage for good. Finding garbage holds the
+// lock for one listing of up to maxGarbage keys.
 func (l *Leader) collectLocked() {
 	now := time.Now()
 	if len(l.garbage) > 0 {
 		if now.Sub(l.garbageAt) < l.grace() {
 			return
 		}
-		for _, key := range l.garbage {
+		for range min(passBatch, len(l.garbage)) {
 			if l.cctx.Err() != nil {
 				return
 			}
-			_ = l.st.Delete(l.cctx, key)
+			_ = l.st.Delete(l.cctx, l.garbage[0])
+			l.garbage = l.garbage[1:]
+		}
+		if len(l.garbage) > 0 {
+			return
 		}
 		l.garbage = nil
 	}

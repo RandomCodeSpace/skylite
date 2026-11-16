@@ -31,6 +31,16 @@ func fastCompaction(t *testing.T) {
 	t.Cleanup(func() { compactPace, compactTick = pace, tick })
 }
 
+// quietCompaction removes the pace between manifest writes and keeps the
+// compaction loop asleep unless a commit wakes it: tests then run each
+// compaction, retirement and collection themselves.
+func quietCompaction(t *testing.T) {
+	t.Helper()
+	pace, tick := compactPace, compactTick
+	compactPace, compactTick = 0, time.Hour
+	t.Cleanup(func() { compactPace, compactTick = pace, tick })
+}
+
 // onTmpfs puts the test's directories on tmpfs where it is available, so
 // that fsync costs nothing: these tests are about the log, not the disk.
 func onTmpfs(t *testing.T) {
@@ -780,5 +790,298 @@ func TestLeaderReadAcrossOwnCompaction(t *testing.T) {
 	gate.open()
 	if res := <-got; res != "[0,1,2,3,4] <nil>" || l.Err() != nil {
 		t.Fatalf("a read across the leader's own compaction: %s; leader %v", res, l.Err())
+	}
+}
+
+// Covers: decision 7, the base version advances only to a head SQLite
+// completed: while a commit is uploaded and SQLite rolled it back without
+// the rollback hook, a TRUNCATE checkpoint does not reset the WAL, so a read
+// transaction begun before still reads its own snapshot; the leader stops
+// when the writer's Run returns.
+func TestCheckpointDuringRolledBackUpload(t *testing.T) {
+	quietCompaction(t)
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.Grace = time.Hour
+	l := lead(t, st, keys, o, cfg)
+	l.psow = false // the commit's padding is written after its sync, where the fault fails it
+	w, other := open(t, l), open(t, l)
+	mustRun(t, w, "BEGIN; CREATE TABLE a(x); CREATE TABLE t(x); COMMIT")
+	mustRun(t, w, "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<2000) INSERT INTO a SELECT randomblob(500) FROM c")
+	mustRun(t, w, "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<2000) INSERT INTO t SELECT i FROM c")
+	mustRun(t, w, "DROP TABLE a")
+	baseIsHead := func() bool {
+		l.mu.RLock()
+		defer l.mu.RUnlock()
+		return l.base == l.Head()
+	}
+	l.tryCheckpoint()
+	if !baseIsHead() {
+		t.Fatal("the base version is not the head before the test")
+	}
+	want := fmt.Sprint(queryConn(t, w, "SELECT count(*), sum(x) FROM t"))
+	started, goOn, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var got []string
+	var rerr error
+	go func() {
+		defer close(done)
+		_, rerr = other.Run(context.Background(), nil, func(db *sqlite3.Conn) error {
+			if err := db.Exec("BEGIN"); err != nil {
+				return err
+			}
+			if _, err := query(db, "SELECT count(*) FROM sqlite_schema"); err != nil {
+				return err
+			}
+			close(started)
+			<-goOn
+			var err error
+			got, err = query(db, "SELECT count(*), sum(x) FROM t")
+			return err
+		})
+	}()
+	<-started
+	armed, fired := false, false
+	l.afterUpload = func() { armed = true }
+	l.fault = func(file, op string, _ int64, _ int) error {
+		if armed && file == "wal" && op == "write" {
+			fired = true
+			return errInjected
+		}
+		return nil
+	}
+	headBefore := l.Head()
+	var moved bool
+	_, _ = w.Run(context.Background(), newID(), func(db *sqlite3.Conn) error {
+		err := db.Exec("VACUUM")
+		l.afterUpload = nil
+		l.tryCheckpoint()
+		moved = baseIsHead()
+		close(goOn)
+		<-done
+		return err
+	})
+	switch {
+	case !fired || l.Head() == headBefore:
+		t.Fatalf("no upload rolled back: fault fired %v, head %d before and %d after", fired, headBefore, l.Head())
+	case moved:
+		t.Fatalf("the base version advanced to the rolled-back commit %d", l.Head())
+	case rerr != nil || fmt.Sprint(got) != want:
+		t.Fatalf("a read transaction begun before: %v, %v; want %s", got, rerr, want)
+	case !errors.Is(l.Err(), ErrStopped):
+		t.Fatalf("the leader after a rolled-back upload: %v", l.Err())
+	}
+}
+
+// Covers: decision 8, "What an attempt reads and holds": the replacement is
+// conditioned on the token the attempt read first. A leader paused before
+// its first base object, while another takes office and compacts, loses
+// its replacement and leaves office.
+func TestStaleLeaderPausedBeforeBaseCreate(t *testing.T) {
+	quietCompaction(t)
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.Grace = time.Hour
+	a := lead(t, st, keys, o, cfg)
+	ca := open(t, a)
+	mustRun(t, ca, "CREATE TABLE t(x)")
+	for i := range 20 {
+		mustRun(t, ca, fmt.Sprintf("INSERT INTO t VALUES (%d)", i))
+	}
+	gate := newGate()
+	st.setRule(nth("create", isBase, 1, fault{before: gate}))
+	done := make(chan error, 1)
+	go func() { done <- compactNow(a) }()
+	<-gate.reached
+	st.setRule(nil)
+	b := lead(t, st, keys, takeOffice(t, st.Store, keys), cfg)
+	cb := open(t, b)
+	mustRun(t, cb, "INSERT INTO t VALUES (100)")
+	if err := compactNow(b); err != nil {
+		t.Fatal(err)
+	}
+	mb := checkLeaderManifest(t, st.Store, keys, o.DB)
+	gate.open()
+	if err := <-done; !errors.Is(err, ErrStopped) || !strings.Contains(fmt.Sprint(a.Err()), "fenced") {
+		t.Fatalf("the stale leader's compaction: %v; leader: %v", err, a.Err())
+	}
+	if m := checkLeaderManifest(t, st.Store, keys, o.DB); m.Txn != mb.Txn || m.Epoch != mb.Epoch || m.Nonce != mb.Nonce {
+		t.Fatalf("the stale leader replaced the manifest at %d epoch %d with one at %d epoch %d", mb.Txn, mb.Epoch, m.Txn, m.Epoch)
+	}
+	want := "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,100"
+	if got := rows(t, durable(t, st.Store, keys, 0)); got != want {
+		t.Fatalf("durable rows %s", got)
+	}
+}
+
+// Covers: decision 6 and decision 8, "A leader's own reads around its
+// compaction": a deposed leader's main-file read that meets a commit a later
+// leader retired, or a base object it deleted, returns no page, and the
+// leader leaves office.
+func TestDeposedLeaderReadMeetsRetiredOrDeleted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		base bool // the page comes from a base object, else from a commit
+	}{{"retired commit", false}, {"deleted base object", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			quietCompaction(t)
+			st, keys, o := newDatabase(t, 4096)
+			cfg := testConfig()
+			cfg.Cache, cfg.Grace = NewCache(0), time.Hour
+			a := lead(t, st, keys, o, cfg)
+			ca, ra := open(t, a), open(t, a)
+			mustRun(t, ca, "CREATE TABLE t(x)")
+			for i := range 5 {
+				mustRun(t, ca, fmt.Sprintf("INSERT INTO t VALUES (%d)", i))
+			}
+			// The base version is the head: every page is read from storage,
+			// from the commits, or from the base objects after a compaction.
+			a.tryCheckpoint()
+			if tc.base {
+				if err := compactNow(a); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b := lead(t, st, keys, takeOffice(t, st.Store, keys), cfg)
+			cb := open(t, b)
+			mustRun(t, cb, "INSERT INTO t VALUES (100)")
+			if err := compactNow(b); err != nil {
+				t.Fatal(err)
+			}
+			b.cmpMu.Lock()
+			b.cfg.Grace = time.Nanosecond
+			b.retireLocked()
+			b.collectLocked() // finds A's base objects
+			b.collectLocked() // deletes them
+			b.cmpMu.Unlock()
+			res := make(chan string, 1)
+			go func() {
+				var out []string
+				_, err := ra.Run(context.Background(), nil, func(db *sqlite3.Conn) (err error) {
+					out, err = query(db, "SELECT group_concat(x) FROM t")
+					return err
+				})
+				res <- fmt.Sprint(out, err)
+			}()
+			select {
+			case got := <-res:
+				if strings.HasSuffix(got, "<nil>") {
+					t.Fatalf("the deposed leader's read returned %s", got)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the deposed leader's read did not end")
+			}
+			if err := a.Err(); !errors.Is(err, ErrStopped) || !strings.Contains(err.Error(), "fenced") {
+				t.Fatalf("the deposed leader: %v", err)
+			}
+		})
+	}
+}
+
+// Covers: decision 10, step 8: a compaction that publishes while
+// maintenance runs readmits nothing; maintenance readmits when it ends.
+func TestInstallDuringMaintenanceKeepsAdmissionClosed(t *testing.T) {
+	quietCompaction(t)
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.Grace = time.Hour
+	l := lead(t, st, keys, o, cfg)
+	h, c := open(t, l), open(t, l)
+	mustRun(t, c, "CREATE TABLE t(x)")
+	mustRun(t, c, "INSERT INTO t VALUES (1)")
+	// h's Run holds its connection, so maintenance waits in steps 4 and 5.
+	entered, release, held := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(held)
+		_, _ = h.Run(context.Background(), nil, func(*sqlite3.Conn) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }); <-held }
+	t.Cleanup(free)
+	l.cmu.Lock()
+	before := l.manifestTxn
+	l.cmu.Unlock()
+	startMaintenance(l)
+	if err := compactNow(l); err != nil {
+		t.Fatal(err)
+	}
+	l.cmu.Lock()
+	after, closed := l.manifestTxn, l.admitClosed
+	l.cmu.Unlock()
+	if after == before || !closed {
+		t.Fatalf("a compaction during maintenance: manifest %d to %d, admission closed %v", before, after, closed)
+	}
+	if _, err := exec(c, "INSERT INTO t VALUES (2)"); !errors.Is(err, ErrRetry) {
+		t.Fatalf("a write during maintenance: %v", err)
+	}
+	free()
+	waitMaintenance(t, l)
+	mustRun(t, c, "INSERT INTO t VALUES (3)")
+}
+
+// Covers: decision 10, step 7: maintenance at the tail bound compacts up to
+// the new base version itself, with the compaction loop asleep, and
+// readmits writes when it ends.
+func TestMaintenanceCompactsAtTailBound(t *testing.T) {
+	quietCompaction(t)
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.Grace = time.Hour
+	l := lead(t, st, keys, o, cfg)
+	c := open(t, l)
+	mustRun(t, c, "CREATE TABLE t(x)")
+	mustRun(t, c, "INSERT INTO t VALUES (1)")
+	// The tail is at the bound with no commit to wake the loop.
+	l.cmu.Lock()
+	l.cfg.TailBound = l.head - l.manifestTxn
+	l.cmu.Unlock()
+	startMaintenance(l)
+	waitMaintenance(t, l)
+	l.cmu.Lock()
+	mt, head, closed := l.manifestTxn, l.head, l.admitClosed
+	l.cmu.Unlock()
+	if mt != head || closed {
+		t.Fatalf("after maintenance at the tail bound: manifest %d, head %d, admission closed %v", mt, head, closed)
+	}
+	mustRun(t, c, "INSERT INTO t VALUES (2)")
+}
+
+// Covers: decision 8, "What an attempt reads and holds": a commit a later
+// leader retires under an attempt sends the leader out of office at that
+// attempt, not at its next.
+func TestStaleCommitUnderAttemptLeavesOffice(t *testing.T) {
+	quietCompaction(t)
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.Grace = time.Hour
+	a := lead(t, st, keys, o, cfg)
+	ca := open(t, a)
+	mustRun(t, ca, "CREATE TABLE t(x)")
+	for i := range 5 {
+		mustRun(t, ca, fmt.Sprintf("INSERT INTO t VALUES (%d)", i))
+	}
+	gate := newGate()
+	st.setRule(nth("getrange", isCommit, 1, fault{before: gate}))
+	done := make(chan error, 1)
+	go func() { done <- compactNow(a) }()
+	<-gate.reached
+	st.setRule(nil)
+	b := lead(t, st, keys, takeOffice(t, st.Store, keys), cfg)
+	cb := open(t, b)
+	mustRun(t, cb, "INSERT INTO t VALUES (100)")
+	if err := compactNow(b); err != nil {
+		t.Fatal(err)
+	}
+	b.cmpMu.Lock()
+	b.cfg.Grace = time.Nanosecond
+	b.retireLocked()
+	b.cmpMu.Unlock()
+	gate.open()
+	if err := <-done; !errors.Is(err, ErrStopped) || !strings.Contains(fmt.Sprint(a.Err()), "fenced") {
+		t.Fatalf("an attempt over a retired commit: %v; leader: %v", err, a.Err())
 	}
 }

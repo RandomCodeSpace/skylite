@@ -193,17 +193,18 @@ type mainFile struct {
 	ckptDone bool // a checkpoint finished; it may now truncate the file
 }
 
-// fetch reads page pgno from s, the source locate names for it. It uses only
-// the reader's store, keys and cache, which never change, so it is safe while
-// the index changes; the leader reads that way outside its lock.
-func (r *Reader) fetch(ctx context.Context, s source, pgno uint32) ([]byte, error) {
+// fetch reads page pgno, of ps bytes, from s, the source locate names for
+// it. It uses only the reader's store, keys and cache, which never change, so
+// it is safe while the index changes; the leader reads that way outside its
+// lock.
+func (r *Reader) fetch(ctx context.Context, s source, pgno uint32, ps int64) ([]byte, error) {
 	switch {
 	case s.c != nil:
 		return r.commitPage(ctx, s.c, s.e)
 	case s.base.Txn != 0:
 		return r.basePage(ctx, s.base, pgno)
 	}
-	return make([]byte, r.a.m.PageSize), nil
+	return make([]byte, ps), nil
 }
 
 func (f *mainFile) ReadAt(p []byte, off int64) (int, error) {
@@ -218,7 +219,7 @@ func (f *mainFile) ReadAt(p []byte, off int64) (int, error) {
 		}
 		if src != nil {
 			pgno := uint32(pos/l.ps) + 1 //nolint:gosec // bounded by the file size
-			page, err := l.tmpl.fetch(ctx, *src, pgno)
+			page, err := l.tmpl.fetch(ctx, *src, pgno, l.ps)
 			var stale *staleError
 			if errors.As(err, &stale) {
 				l.mu.RLock()
@@ -548,6 +549,14 @@ func (w *walFile) Truncate(size int64) error {
 	err := l.stopped
 	switch {
 	case err != nil:
+	case size == 0 && l.uploading:
+		// A commit is uploaded but SQLite rolled it back without the
+		// rollback hook, and released the WAL lock: the leader stops when
+		// its Run returns. Until then the base version must not advance to
+		// a head that includes it, under a reader that began before. The
+		// WAL header write at offset 0 waits on the same condition, and
+		// Delete needs every other connection closed, the uploader's too.
+		err = errors.New("engine: WAL truncation while a commit is uploaded and not completed")
 	case size == 0:
 		l.wal = walState{start: -1}
 	case size < l.wal.end:

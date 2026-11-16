@@ -388,7 +388,8 @@ func (l *Leader) Snapshot(ctx context.Context, start func() error) (uint64, erro
 // This version holds the headers above the manifest it took office on and
 // of each commit since, and once a compaction has passed them drops those
 // more than 65,536 numbers below the head, so ok is false for `above` below
-// that point. It reads no header from storage. Lookup
+// that point; a caller must read that as unknown, never as not committed.
+// It reads no header from storage. Lookup
 // answers from memory on a stopped leader too: the caller does decision
 // 4's step 1 itself, with Err. A caller that also reads a table of its own
 // channels reads it before Lookup: a channel it found absent can then send
