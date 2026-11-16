@@ -865,6 +865,13 @@ func TestDefaultTransportWrapped(t *testing.T) {
 	if c := f.lastCalls(); c[0].proto != 2 {
 		t.Fatalf("HTTP/%d; want HTTP/2", c[0].proto)
 	}
+	c, err := NewConnector(f.config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr := c.client.Transport.(*http.Transport); tr.IdleConnTimeout == 0 || tr.TLSHandshakeTimeout == 0 || tr.Proxy == nil {
+		t.Fatalf("the fallback transport lacks net/http's defaults: idle %v, TLS handshake %v, proxy set %v", tr.IdleConnTimeout, tr.TLSHandshakeTimeout, tr.Proxy != nil)
+	}
 }
 
 func TestResponseHeaderTimeout(t *testing.T) {

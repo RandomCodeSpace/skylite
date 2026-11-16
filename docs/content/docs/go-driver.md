@@ -52,7 +52,7 @@ func open() (*sql.DB, error) {
 | `TLSConfig` | TLS settings, such as private roots, for the driver's own HTTP client. Without it the system roots are used. |
 | `AllowPlaintext` | Permits an `http://` endpoint. Without it only `https://` is accepted. |
 | `StatementTimeout` | Lowers the server's statement time limit for each query (1 ms to 2^31-1 ms). The caller's context bounds the request on the client side. |
-| `ResponseHeaderTimeout` | Bounds the wait for a response's headers on the driver's own HTTP client. Zero means 60 s, above the server's default statement time limit of 30 s. |
+| `ResponseHeaderTimeout` | Bounds the wait for a response's headers on the driver's own HTTP client. Zero means 60 s, ADR 0005's request time *T* at the server's default limits. Raise it with the server's statement time limit, or through a proxy that holds back headers. |
 | `HTTPClient` | Replaces the driver's HTTP client. Cannot be combined with `TLSConfig` or `ResponseHeaderTimeout`, which configure the driver's own client. |
 
 No secret goes in the configuration's strings. The driver never logs, and its errors never hold the token or the request URL; an error from the network or TLS can still name the host and port it could not reach. The driver uses HTTP/2 when the server offers it, and refuses every redirect, so a request and its token go only to the configured endpoint.

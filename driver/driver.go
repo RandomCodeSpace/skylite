@@ -93,7 +93,7 @@ var maxFrame = int(wire.DefaultLimits().ResultBytes) + 1
 
 // errRedirect refuses every redirect, as ADR 0005 decision 7 requires: a
 // request and its token go only to the configured endpoint.
-var errRedirect = errors.New("skylite: the server answered with a redirect, which the driver never follows")
+var errRedirect = errors.New("the server answered with a redirect, which the driver never follows")
 
 func refuseRedirect(*http.Request, []*http.Request) error { return errRedirect }
 
@@ -146,7 +146,12 @@ func NewConnector(cfg Config) (*Connector, error) {
 		if ok {
 			t = t.Clone() // keeps ForceAttemptHTTP2
 		} else { // replaced, for example by instrumentation
-			t = &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true}
+			// net/http's DefaultTransport settings, so idle connections close.
+			t = &http.Transport{
+				Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true,
+				MaxIdleConns: 100, IdleConnTimeout: 90 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second, ExpectContinueTimeout: time.Second,
+			}
 		}
 		t.TLSClientConfig = cfg.TLSConfig.Clone()
 		t.ResponseHeaderTimeout = cfg.ResponseHeaderTimeout
@@ -168,7 +173,8 @@ func NewConnector(cfg Config) (*Connector, error) {
 }
 
 // Close closes the idle connections of the driver's own HTTP client, never
-// those of a Config.HTTPClient. sql.DB.Close calls it.
+// those of a Config.HTTPClient. sql.DB.Close calls it. A connection a query
+// still uses then closes after its idle timeout, 90 seconds.
 func (c *Connector) Close() error {
 	if c.own {
 		c.client.CloseIdleConnections()
