@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +15,9 @@ const goodConfig = `{
     "issuers": [{"issuer": "https://kubernetes.default.svc", "audience": "skylite", "jwks_file": "/var/run/jwks.json"}],
     "rules": [{"issuer": "https://kubernetes.default.svc", "subject": "system:serviceaccount:apps:admin", "database": "*", "role": "admin"}]
   },
-  "storage": {"prefix": "prod/skylite", "s3": {"bucket": "b", "region": "eu-west-1", "endpoint": "http://127.0.0.1:9000", "path_style": true}}
+  "storage": {"prefix": "prod/skylite", "s3": {"bucket": "b", "region": "eu-west-1", "endpoint": "http://127.0.0.1:9000", "path_style": true}},
+  "databases": ["orders", "users"],
+  "probe_listen": ":8081"
 }`
 
 func writeConfig(t *testing.T, s string) string {
@@ -32,14 +35,16 @@ func TestLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.Listen != ":8443" || c.TLS.KeyFile != "/etc/skylite/tls.key" || c.Auth.Issuers[0].JWKSFile != "/var/run/jwks.json" ||
-		c.Auth.Rules[0].Role != "admin" || c.Storage.Prefix != "prod/skylite" || c.Storage.S3 == nil || !c.Storage.S3.PathStyle {
+		c.Auth.Rules[0].Role != "admin" || c.Storage.Prefix != "prod/skylite" || c.Storage.S3 == nil || !c.Storage.S3.PathStyle ||
+		strings.Join(c.Databases, ",") != "orders,users" || c.ProbeListen != ":8081" {
 		t.Errorf("Load = %+v", c)
 	}
 	for _, s := range []string{
 		`"storage": {"localfs": {"path": "/data"}}`,
 		`"storage": {"gcs": {"bucket": "b"}}`,
 	} {
-		alt := strings.Replace(goodConfig, goodConfig[strings.Index(goodConfig, `"storage"`):strings.LastIndex(goodConfig, "}")], s+"\n", 1)
+		alt := strings.Replace(goodConfig, goodConfig[strings.Index(goodConfig, `"storage"`):strings.Index(goodConfig, `,
+  "databases"`)], s, 1)
 		if _, err := Load(writeConfig(t, alt)); err != nil {
 			t.Errorf("%s: %v", s, err)
 		}
@@ -57,6 +62,11 @@ func TestLoadRefuses(t *testing.T) {
 		}
 		return strings.Replace(goodConfig, old, repl, 1)
 	}
+	names := make([]string, maxDatabases)
+	for i := range names {
+		names[i] = fmt.Sprintf("%q", fmt.Sprint("d", i))
+	}
+	many := "[" + strings.Join(names, ", ") + "]"
 	for name, s := range map[string]string{
 		"not JSON":             "listen",
 		"data after":           goodConfig + "{}",
@@ -74,6 +84,9 @@ func TestLoadRefuses(t *testing.T) {
 		"s3 without region":    edit(`, "region": "eu-west-1"`, ""),
 		"bad prefix":           edit(`"prod/skylite"`, `"prod//skylite"`),
 		"prefix too long":      edit(`"prod/skylite"`, `"`+strings.Repeat("p", 1000)+`"`),
+		"database name with _": edit(`"users"`, `"us_ers"`),
+		"database twice":       edit(`"users"`, `"orders"`),
+		"too many databases":   edit(`["orders", "users"]`, many),
 	} {
 		if _, err := Load(writeConfig(t, s)); err == nil {
 			t.Errorf("%s: config accepted", name)

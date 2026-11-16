@@ -2,11 +2,16 @@
 // (docs/content/docs/decisions/0005-client-protocol.md) with the
 // authentication of ADR 0006.
 //
-// This version serves one request, PUT /v1/databases/{db}, which creates a
-// database. Every other path of the protocol is authenticated and then
-// answered with not_serving: there is no leader, no forwarding and no
-// cluster membership yet. Of the admission control of ADR 0005 decision 9,
-// only the bound on HTTP connections is implemented.
+// This version serves PUT /v1/databases/{db}, which creates a database, and
+// the stateless query and describe requests on the databases it leads (see
+// query.go). For each configured database the server runs an office loop
+// (internal/office); only the pod in office serves the database, and every
+// other pod answers not_serving: there are no followers, no forwarding and
+// no cluster membership yet. Every other path of the protocol is
+// authenticated and then answered with not_serving. Of the admission
+// control of ADR 0005 decision 9, the bound on HTTP connections, the body
+// share of the memory budget and the SQLite connection limits are
+// implemented.
 package server
 
 import (
@@ -20,8 +25,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -29,6 +38,8 @@ import (
 
 	"github.com/RandomCodeSpace/skylite/internal/auth"
 	"github.com/RandomCodeSpace/skylite/internal/engine"
+	"github.com/RandomCodeSpace/skylite/internal/office"
+	"github.com/RandomCodeSpace/skylite/internal/sqlpolicy"
 	"github.com/RandomCodeSpace/skylite/internal/storage"
 	"github.com/RandomCodeSpace/skylite/internal/storage/gcs"
 	"github.com/RandomCodeSpace/skylite/internal/storage/localfs"
@@ -42,6 +53,7 @@ const (
 	bodyDeadline   = 30 * time.Second // body read deadline, from the end of the header block
 	maxStreams     = 16               // concurrent streams per HTTP/2 connection
 	maxConns       = 1024             // HTTP connections accepted
+	probeConns     = 64               // connections the readiness probe accepts
 )
 
 const (
@@ -58,14 +70,53 @@ const (
 	groupSize = 256
 )
 
+// The memory budget of ADR 0005 decision 9 and what it is divided into:
+// the body share, and SQLite connections at their ceiling in what is left.
+// Nothing else is charged; see docs/content/docs/server.md.
+//
+// shortcut: the budget is the decision's default without a container limit;
+// derive it from the cgroup limit with the rest of admission.
+const (
+	memoryBudget = 2 << 30
+	bodyShare    = memoryBudget / 2 // request bodies, charged at 8 × Content-Length
+	connCeiling  = 64 << 20         // SQLite connection memory ceiling
+	maxConnLimit = 256              // SQLite connections per pod
+	// maxDatabases is the SQLite connections the budget holds after the
+	// body share: each led database's engine connection is charged a
+	// ceiling, and one must stay for clients.
+	maxDatabases = min(maxConnLimit, (memoryBudget-bodyShare)/connCeiling)
+)
+
+// engineConfig is each leader's configuration. The tail bound is the
+// engine's largest; the cache and the temporary-file budget are outside the
+// memory budget (ADR 0005 decision 9, "the budget is the bound").
+func engineConfig() engine.Config {
+	return engine.Config{WALBound: 64 << 20, TailBound: 1 << 15, MaxMemory: connCeiling, TempBudget: 256 << 20, Cache: engine.NewCache(64 << 20)}
+}
+
 // Server serves the client protocol. Create it with New.
 type Server struct {
-	cfg    Config
-	log    *slog.Logger
-	guard  *auth.Guard
-	store  storage.Store
-	cert   *tls.Certificate
-	limits wire.Limits
+	// probeLn, if set, is the readiness probe's listener in place of
+	// cfg.ProbeListen; tests set it to keep their port bound.
+	probeLn net.Listener
+	cfg     Config
+	log     *slog.Logger
+	guard   *auth.Guard
+	store   storage.Store
+	cert    *tls.Certificate
+	limits  wire.Limits
+
+	policy   *sqlpolicy.Policy
+	pool     *pool
+	engine   engine.Config
+	dbs      map[string]*database // the configured databases
+	dir      string               // the leaders' local files
+	stopping atomic.Bool          // Serve is shutting down: not ready
+
+	bodyMu              sync.Mutex
+	bodyUsed, bodyShare int64            // request bodies' share of the memory budget, charged at 8 × Content-Length
+	bodyBy              map[string]int64 // the charge per principal, at most a quarter of the share
+	statementTime       time.Duration
 
 	// The constants above, and the response deadline of limits, as set by
 	// New; tests shorten them.
@@ -88,6 +139,12 @@ func New(cfg Config, log *slog.Logger) (*Server, error) {
 	if s.store, err = openStore(context.Background(), cfg.Storage); err != nil {
 		return nil, err
 	}
+	if err := s.addDatabases(); err != nil {
+		if c, ok := s.store.(io.Closer); ok {
+			_ = c.Close()
+		}
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -105,8 +162,16 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 		return nil, fmt.Errorf("server: %w", err)
 	}
 	l := wire.DefaultLimits()
+	stmt := time.Duration(l.StatementMS) * time.Millisecond
+	// The policy's time limit is the statement time; the request's deadline
+	// on the engine's Run context lowers it.
+	policy, err := sqlpolicy.New(sqlpolicy.Limits{Timeout: stmt})
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		cfg: cfg, log: log, guard: g, store: st, limits: l,
+		policy: policy, pool: newPool(maxDatabases - len(cfg.Databases)), engine: engineConfig(), bodyShare: bodyShare, bodyBy: map[string]int64{}, statementTime: stmt,
 		headerDeadline: headerDeadline, bodyDeadline: bodyDeadline, responseDeadline: time.Duration(l.ResponseMS) * time.Millisecond,
 		idleTimeout: idleTimeout, createTimeout: createTimeout, shutdownTimeout: shutdownTimeout, maxConns: maxConns,
 	}
@@ -136,16 +201,30 @@ func openStore(ctx context.Context, c Storage) (storage.Store, error) {
 }
 
 // Serve serves at most 1,024 connections at a time from ln until ctx is
-// done, then stops accepting connections, waits up to a minute for running
-// requests, closes the store and returns. It returns nil after a clean
-// shutdown, and an error if it had to close connections with requests still
-// running.
+// done. It runs an office loop for each configured database, and the
+// readiness probe if one is configured. When ctx is done it reports itself
+// not ready, stops accepting connections, waits up to a minute for running
+// requests, then leaves office, releasing each lease, closes the store and
+// returns. It returns nil after a clean shutdown, and an error if it had to
+// close connections with requests still running.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	defer func() {
 		if c, ok := s.store.(io.Closer); ok {
 			_ = c.Close()
 		}
 	}()
+	defer s.startOffice()()
+	if pln := s.probeLn; pln != nil || s.cfg.ProbeListen != "" {
+		if pln == nil {
+			var err error
+			if pln, err = net.Listen("tcp", s.cfg.ProbeListen); err != nil {
+				return fmt.Errorf("server: probe: %w", err)
+			}
+		}
+		probe := &http.Server{Handler: http.HandlerFunc(s.readyz), ReadHeaderTimeout: s.headerDeadline, IdleTimeout: s.idleTimeout, ErrorLog: slog.NewLogLogger(s.log.Handler(), slog.LevelWarn)}
+		go func() { _ = probe.Serve(netutil.LimitListener(pln, probeConns)) }()
+		defer func() { _ = probe.Close() }()
+	}
 	var p http.Protocols
 	p.SetHTTP1(true)
 	srv := &http.Server{
@@ -175,6 +254,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		return err
 	case <-ctx.Done():
 	}
+	s.stopping.Store(true)
 	sctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
 	defer cancel()
 	err := srv.Shutdown(sctx)
@@ -188,8 +268,105 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	return err
 }
 
-// ServeHTTP answers one request with ADR 0005's headers and one NDJSON
-// terminal frame.
+// database is a configured database: its office loop, and the leader that
+// last met the tail bound, which leaves this server not ready while it leads.
+type database struct {
+	loop *office.Loop
+	tail atomic.Pointer[engine.Leader]
+}
+
+// leader returns the database's leader while this server serves it, or nil.
+func (d *database) leader() *engine.Leader {
+	if d == nil {
+		return nil
+	}
+	if l := d.loop.State().Leader; l != nil && l.Err() == nil {
+		return l
+	}
+	return nil
+}
+
+// addDatabases creates an office loop for each configured database, on the
+// server's store. The leaders' files go under a directory of the system's
+// temporary directory that Lead creates and Serve removes; New creates
+// nothing.
+func (s *Server) addDatabases() error {
+	s.dbs = map[string]*database{}
+	if len(s.cfg.Databases) == 0 {
+		return nil
+	}
+	pod, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("server: host name: %w", err)
+	}
+	holder, err := office.NewHolder(pod)
+	if err != nil {
+		return fmt.Errorf("server: %w", err)
+	}
+	s.dir = filepath.Join(os.TempDir(), "skylite-"+holder)
+	for _, name := range s.cfg.Databases {
+		keys, err := s.cfg.Storage.keys(name)
+		var loop *office.Loop
+		if err == nil {
+			loop, err = office.New(office.Config{Store: s.store, Keys: keys, Holder: holder, Dir: s.dir, Engine: s.engine, Logger: s.log.With(slog.String("database", name))})
+		}
+		if err != nil {
+			return fmt.Errorf("server: database %s: %w", name, err)
+		}
+		s.dbs[name] = &database{loop: loop}
+	}
+	return nil
+}
+
+// startOffice runs the office loops. The function it returns stops them,
+// which releases their leases, and removes the leaders' directory.
+func (s *Server) startOffice() (stop func()) {
+	lctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	for _, d := range s.dbs {
+		wg.Go(func() { _ = d.loop.Run(lctx) })
+	}
+	return func() {
+		cancel()
+		wg.Wait()
+		if s.dir != "" {
+			_ = os.RemoveAll(s.dir)
+		}
+	}
+}
+
+// ready reports whether this server leads one of its databases and serves
+// it: not while shutting down, and not while a database it leads is at the
+// engine's tail bound, which this version cannot clear.
+func (s *Server) ready() bool {
+	if s.stopping.Load() {
+		return false
+	}
+	leads := false
+	for _, d := range s.dbs {
+		l := d.leader()
+		if l != nil && d.tail.Load() == l {
+			return false
+		}
+		leads = leads || l != nil
+	}
+	return leads
+}
+
+// readyz answers the readiness probe.
+func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.URL.Path != "/readyz" || r.Method != http.MethodGet:
+		http.NotFound(w, r)
+	case s.ready():
+		_, _ = io.WriteString(w, "ready\n")
+	default:
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+	}
+}
+
+// ServeHTTP answers one request with ADR 0005's headers and NDJSON frames,
+// ending with one terminal frame.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	// The body read deadline runs from the end of the header block, and also
@@ -202,11 +379,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Content-Type", "application/x-ndjson")
 	h.Set("Cache-Control", "no-store")
 	log := s.log.With(slog.String("request_id", id))
-	done, e, bodyRead := s.handle(w, r, log)
+	st := &stream{w: w, rc: rc}
+	var b bytes.Buffer
+	out, err := wire.NewWriter(st, wire.DefaultFrameBytes, s.limits)
+	if err != nil { // only limits Validate refuses, which New's are not
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	st.out = out
+	done, e, bodyRead := s.handle(st, r, log)
 	status := http.StatusOK
 	if e != nil {
 		e.RequestID = id
-		status = e.Code.Status()
+		status = e.Code.Status() // used only if the response has not started
 		if e.Code == wire.CodeUnauthenticated {
 			h.Set("WWW-Authenticate", "Bearer")
 		}
@@ -217,38 +402,71 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		log.LogAttrs(r.Context(), slog.LevelInfo, "request refused", slog.String("method", r.Method), slog.String("code", string(e.Code)))
 	}
-	// The frame is encoded before the status is sent, so that a frame the
-	// codec refuses becomes an internal error rather than a half answer.
-	var b bytes.Buffer
-	out, err := wire.NewWriter(&b, wire.DefaultFrameBytes, s.limits)
-	if err == nil {
-		if e != nil {
-			err = out.Error(e)
-		} else {
-			err = out.Done(done)
-		}
-		if err != nil {
-			log.LogAttrs(r.Context(), slog.LevelError, "response not encoded", slog.String("error", err.Error()))
-			status = http.StatusInternalServerError
-			ie := wire.NewError(wire.CodeInternal, "the server could not encode its answer")
-			ie.NotExecuted, ie.RequestID = false, id
-			b.Reset()
-			err = out.Error(ie)
-		}
-	}
-	if err != nil { // only limits Validate refuses, which New's are not
-		b.Reset()
-		status = http.StatusInternalServerError
+	// A response that has not started is encoded before its status is sent,
+	// so that a frame the codec refuses becomes an internal error rather
+	// than a half answer. One that has started gets an internal error frame.
+	started := st.started
+	if !started {
+		st.buf = &b
 	}
 	_ = rc.SetWriteDeadline(time.Now().Add(s.responseDeadline))
-	w.WriteHeader(status)
-	_, _ = w.Write(b.Bytes())
+	if e != nil {
+		err = out.Error(e)
+	} else {
+		err = out.Done(done)
+	}
+	if err != nil {
+		log.LogAttrs(r.Context(), slog.LevelError, "response not encoded", slog.String("error", err.Error()))
+		ie := wire.NewError(wire.CodeInternal, "the server could not encode its answer")
+		ie.NotExecuted, ie.RequestID = false, id
+		if !started {
+			status = http.StatusInternalServerError
+			b.Reset()
+		}
+		_ = out.Error(ie)
+	}
+	if !started {
+		w.WriteHeader(status)
+		_, _ = w.Write(b.Bytes())
+	}
+}
+
+// stream is a response body. Frames written before the terminal one start
+// the response with status 200; until then, and for the terminal frame of
+// a response that has not started, they go to buf.
+type stream struct {
+	w        http.ResponseWriter
+	rc       *http.ResponseController
+	out      *wire.Writer
+	buf      *bytes.Buffer
+	started  bool
+	deadline time.Time // the write deadline from the start, if set
+}
+
+// start sends status 200, if not already sent, with the write deadline.
+func (st *stream) start() {
+	if st.started {
+		return
+	}
+	if !st.deadline.IsZero() {
+		_ = st.rc.SetWriteDeadline(st.deadline)
+	}
+	st.w.WriteHeader(http.StatusOK)
+	st.started = true
+}
+
+func (st *stream) Write(p []byte) (int, error) {
+	if st.buf != nil {
+		return st.buf.Write(p)
+	}
+	st.start()
+	return st.w.Write(p)
 }
 
 // handle runs the checks before acceptance of ADR 0005 in their order, then
 // serves the request. Admission (check 2) is not implemented. bodyRead
 // reports whether the body was read to its end.
-func (s *Server) handle(w http.ResponseWriter, r *http.Request, log *slog.Logger) (done *wire.Done, e *wire.Error, bodyRead bool) {
+func (s *Server) handle(st *stream, r *http.Request, log *slog.Logger) (done *wire.Done, e *wire.Error, bodyRead bool) {
 	kind, db, e := wire.Route(r.Method, r.URL.EscapedPath())
 	if e != nil {
 		return nil, e, false
@@ -282,23 +500,69 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request, log *slog.Logger
 		log.LogAttrs(r.Context(), slog.LevelInfo, "authorisation refused", attrs...)
 		return nil, wire.NewError(wire.CodeForbidden, "the principal's role on this database name does not allow this request"), false
 	}
-	if kind != wire.KindPut {
-		return nil, wire.NewError(wire.CodeNotServing, "this server serves only database creation (PUT) in this version"), false
+	if kind != wire.KindPut && kind != wire.KindQuery && kind != wire.KindDescribe {
+		return nil, wire.NewError(wire.CodeNotServing, "this server serves only database creation (PUT), query and describe in this version"), false
 	}
-	body, e := s.readBody(w, r)
+	// Routing comes before the body here: a pod that does not lead the
+	// database cannot serve it, whatever the body holds.
+	d := s.dbs[db]
+	leader := d.leader()
+	if kind != wire.KindPut && leader == nil {
+		return nil, wire.NewError(wire.CodeNotServing, "this server does not lead the database; in this version only its leader serves it"), false
+	}
+	who := principal(p)
+	release, e := s.chargeBody(r, who)
 	if e != nil {
 		return nil, e, false
 	}
-	if _, e := wire.Parse(kind, body, int(s.limits.BatchEntries)); e != nil {
+	defer release()
+	body, e := s.readBody(r)
+	if e != nil {
+		return nil, e, false
+	}
+	req, e := wire.Parse(kind, body, int(s.limits.BatchEntries))
+	if e != nil {
 		return nil, e, true
 	}
-	done, e = s.create(r.Context(), db, p, log)
+	if kind == wire.KindPut {
+		done, e = s.create(r.Context(), db, p, log)
+	} else {
+		done, e = s.statement(r.Context(), st, d, leader, req, who, log)
+	}
 	return done, e, true
+}
+
+// principal identifies an authenticated principal in the per-principal
+// bounds: its issuer and subject.
+func principal(p *auth.Principal) string { return p.Issuer + "\x00" + p.Subject }
+
+// chargeBody charges a body's 8 × Content-Length to the body share of the
+// memory budget before it is read (ADR 0005, checks 3 and 5), and returns
+// the function that releases it. One principal, who, may hold a quarter of
+// the share, as of the SQLite connections. A body over its limit is left
+// to readBody.
+func (s *Server) chargeBody(r *http.Request, who string) (release func(), e *wire.Error) {
+	n := 8 * min(max(r.ContentLength, 0), s.limits.RequestBodyBytes)
+	s.bodyMu.Lock()
+	defer s.bodyMu.Unlock()
+	if s.bodyUsed+n > s.bodyShare || s.bodyBy[who]+n > s.bodyShare/4 {
+		return nil, wire.NewError(wire.CodeOverloaded, "the request bodies' share of the memory budget, or the principal's part of it, is full; retry later")
+	}
+	s.bodyUsed += n
+	s.bodyBy[who] += n
+	return func() {
+		s.bodyMu.Lock()
+		s.bodyUsed -= n
+		if s.bodyBy[who] -= n; s.bodyBy[who] == 0 {
+			delete(s.bodyBy, who)
+		}
+		s.bodyMu.Unlock()
+	}, nil
 }
 
 // readBody applies ADR 0005's body checks to a PUT or POST and reads the
 // complete body within the body read deadline.
-func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, *wire.Error) {
+func (s *Server) readBody(r *http.Request) ([]byte, *wire.Error) {
 	mt, _, _ := strings.Cut(r.Header.Get("Content-Type"), ";")
 	switch {
 	case !strings.EqualFold(strings.TrimSpace(mt), "application/json"):

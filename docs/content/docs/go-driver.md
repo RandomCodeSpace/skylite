@@ -7,7 +7,7 @@ status: current
 
 Package `github.com/RandomCodeSpace/skylite/driver`, whose package name is `skylite`, is a Go `database/sql` driver that speaks the protocol of [0005: Client protocol](/docs/decisions/0005-client-protocol/) over HTTPS. This version has the read path only: statements outside a transaction that the server accepts as pure reads.
 
-The [server](/docs/server/) in this version does not serve queries yet: it answers every `query` and `describe` with `not_serving`. Until it does, the driver has been tested only against an in-process fake server built from the protocol's codec.
+The [server](/docs/server/) answers `query` and `describe` on the databases it leads; the driver's own tests run against an in-process fake server built from the protocol's codec, and no test yet runs the driver against the real server.
 
 ## Usage
 

@@ -5,7 +5,7 @@ weight: 10
 status: current
 ---
 
-skylite is pre-alpha. The binary prints its version and its help text, and `skylite serve` runs a server that authenticates requests and creates databases in object storage. It accepts no SQL yet. This page covers everything that works today.
+skylite is pre-alpha. The binary prints its version and its help text, and `skylite serve` runs a server that authenticates requests, creates databases in object storage and answers read-only SQL queries on the databases it leads. It runs no writes yet. This page covers everything that works today.
 
 ## Install with Go
 
@@ -38,8 +38,8 @@ make build
 
 ## Run the server
 
-`skylite serve -config skylite.json` starts the server. The [server page](/docs/server/) describes the configuration file, the one request it serves (creating a database) and how to try it on a local directory.
+`skylite serve -config skylite.json` starts the server. The [server page](/docs/server/) describes the configuration file, the requests it serves (creating a database, and `query` and `describe` for pure reads) and how to try it on a local directory.
 
 ## What comes next
 
-There is no SQL to run and no driver to connect with yet. To follow the work, read the [architecture direction](/docs/architecture/) and the [roadmap](/docs/roadmap/). The planned storage design is recorded in [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/).
+There is no way to write to a database yet, and the [Go driver](/docs/go-driver/) has a read path only. To follow the work, read the [architecture direction](/docs/architecture/) and the [roadmap](/docs/roadmap/). The planned storage design is recorded in [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/).

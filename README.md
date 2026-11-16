@@ -14,8 +14,9 @@ will talk to it over HTTPS.
 ## Status: pre-alpha
 
 skylite does not work yet. Today the binary prints its version and help text,
-and `skylite serve` runs a server that authenticates requests and creates
-databases in object storage. It runs no SQL.
+and `skylite serve` runs a server that authenticates requests, creates
+databases in object storage and answers read-only SQL queries on the
+databases it leads. It runs no writes.
 Everything below the quickstart is a roadmap, not a feature list.
 
 ## Why

@@ -6,14 +6,22 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
+	"maps"
+	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -95,29 +103,8 @@ func TestSecondSignalStopsAtOnce(t *testing.T) {
 		os.Exit(run([]string{"serve", "-config", cfg}, os.Stdout, os.Stderr))
 	}
 	dir := t.TempDir()
-	cfg, token := serveConfig(t, dir)
-	cmd := exec.Command(os.Args[0], "-test.run=^TestSecondSignalStopsAtOnce$") //nolint:gosec // the test binary itself
-	cmd.Env = append(os.Environ(), "SKYLITE_SERVE_CHILD="+cfg)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
-	lines := bufio.NewScanner(stderr)
-	var addr string
-	for addr == "" && lines.Scan() {
-		var l struct{ Msg, Listen string }
-		if json.Unmarshal(lines.Bytes(), &l) == nil && l.Msg == "serving" {
-			addr = l.Listen
-		}
-	}
-	if addr == "" {
-		t.Fatal("the server did not start")
-	}
-	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+	cfg, token := serveConfig(t, dir, nil)
+	cmd, addr, _ := serveChild(t, "TestSecondSignalStopsAtOnce", cfg)
 	c, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -150,9 +137,179 @@ func TestSecondSignalStopsAtOnce(t *testing.T) {
 	}
 }
 
+// serveChild runs serve with the configuration cfg in a child process,
+// which runs the test named test, and returns it once it serves, with its
+// address and its log, which grows until it exits.
+func serveChild(t *testing.T, test, cfg string) (cmd *exec.Cmd, addr string, log *lockedBuffer) {
+	t.Helper()
+	cmd = exec.Command(os.Args[0], "-test.run=^"+test+"$") //nolint:gosec // the test binary itself
+	cmd.Env = append(os.Environ(), "SKYLITE_SERVE_CHILD="+cfg)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	log = &lockedBuffer{}
+	lines := bufio.NewScanner(stderr)
+	for addr == "" && lines.Scan() {
+		log.write(lines.Bytes())
+		var l struct{ Msg, Listen string }
+		if json.Unmarshal(lines.Bytes(), &l) == nil && l.Msg == "serving" {
+			addr = l.Listen
+		}
+	}
+	if addr == "" {
+		t.Fatalf("the server did not start: %s", log.String())
+	}
+	go func() {
+		for lines.Scan() {
+			log.write(lines.Bytes())
+		}
+	}()
+	return cmd, addr, log
+}
+
+// lockedBuffer collects a child's log lines.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBuffer) write(line []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.b.Write(line)
+	b.b.WriteByte('\n')
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+// TestServeQueryOverHTTPS runs serve over TLS in a child process, creates a
+// database with PUT, waits for the server to take office for it, and
+// queries and describes it with a signed token.
+func TestServeQueryOverHTTPS(t *testing.T) {
+	if cfg := os.Getenv("SKYLITE_SERVE_CHILD"); cfg != "" {
+		os.Exit(run([]string{"serve", "-config", cfg}, os.Stdout, os.Stderr))
+	}
+	dir := t.TempDir()
+	cert, key, roots := selfSigned(t, dir)
+	cfg, token := serveConfig(t, dir, map[string]any{
+		"plaintext": false, "tls": map[string]any{"cert_file": cert, "key_file": key}, "databases": []string{"e2e"},
+	})
+	cmd, addr, log := serveChild(t, "TestServeQueryOverHTTPS", cfg)
+	c := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}, ForceAttemptHTTP2: true}}
+	send := func(method, path, body string) (int, []string) {
+		t.Helper()
+		req, err := http.NewRequest(method, "https://"+addr+"/v1/databases/e2e"+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.ProtoMajor != 2 || resp.Header.Get("Skylite-Protocol") != "1" {
+			t.Fatalf("%s %s: %s, protocol marker %q", method, path, resp.Proto, resp.Header.Get("Skylite-Protocol"))
+		}
+		return resp.StatusCode, strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+	}
+	if code, frames := send(http.MethodPut, "", "{}"); code != http.StatusOK || frames[0] != `{"done":{"txn":1,"epoch":1}}` {
+		t.Fatalf("PUT: %d %v", code, frames)
+	}
+	const sql = `{"sql":"SELECT 1 + 1 AS two, 'x' AS s, x'00ff' AS b, 1.5 AS r, NULL AS n, ? AS p","params":["hello"]}`
+	var code int
+	var frames []string
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		// not_serving until the server's next candidacy takes office.
+		if code, frames = send(http.MethodPost, "/query", sql); code != http.StatusServiceUnavailable || time.Now().After(deadline) {
+			break
+		}
+	}
+	want := []string{
+		`{"columns":[{"name":"two","decltype":null,"database":null,"table":null,"origin":null},{"name":"s","decltype":null,"database":null,"table":null,"origin":null},{"name":"b","decltype":null,"database":null,"table":null,"origin":null},{"name":"r","decltype":null,"database":null,"table":null,"origin":null},{"name":"n","decltype":null,"database":null,"table":null,"origin":null},{"name":"p","decltype":null,"database":null,"table":null,"origin":null}]}`,
+		`[2,"x",{"blob":"AP8="},1.5e0,null,"hello"]`,
+		`{"done":{"txn":2,"read_only":true,"rows_affected":0,"last_insert_rowid":0}}`,
+	}
+	if code != http.StatusOK || strings.Join(frames, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("query: %d\n%s\nwant\n%s", code, strings.Join(frames, "\n"), strings.Join(want, "\n"))
+	}
+	if code, frames := send(http.MethodPost, "/describe", `{"sql":"SELECT :name AS n"}`); code != http.StatusOK || frames[len(frames)-1] != `{"done":{"txn":2,"param_count":1}}` {
+		t.Errorf("describe: %d %v", code, frames)
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("serve ended with %v, want exit status 0", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("serve did not stop within 30 s of SIGTERM")
+	}
+	// Server logs carry no SQL text, parameters or tokens (ADR 0005 decision 6).
+	if l := log.String(); strings.Contains(l, token) || strings.Contains(l, "hello") || strings.Contains(l, "SELECT") || !strings.Contains(l, "office: leading") {
+		t.Errorf("the log holds a token or SQL, or no office: %s", l)
+	}
+}
+
+// selfSigned writes a certificate for 127.0.0.1 and its key into dir, and
+// returns their paths and a pool that trusts the certificate.
+func selfSigned(t *testing.T, dir string) (cert, key string, roots *x509.CertPool) {
+	t.Helper()
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "skylite test"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, k.Public(), k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kb, err := x509.MarshalPKCS8PrivateKey(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, key = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	for path, b := range map[string]*pem.Block{cert: {Type: "CERTIFICATE", Bytes: der}, key: {Type: "PRIVATE KEY", Bytes: kb}} {
+		if err := os.WriteFile(path, pem.EncodeToMemory(b), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots = x509.NewCertPool()
+	roots.AddCert(c)
+	return cert, key, roots
+}
+
 // serveConfig writes a plaintext configuration, with a JWKS file and a
-// local store in dir, and returns its path and an admin token.
-func serveConfig(t *testing.T, dir string) (path, token string) {
+// local store in dir, changed by extra, and returns its path and an admin
+// token.
+func serveConfig(t *testing.T, dir string, extra map[string]any) (path, token string) {
 	t.Helper()
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -171,14 +328,16 @@ func serveConfig(t *testing.T, dir string) (path, token string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := json.Marshal(map[string]any{
+	c := map[string]any{
 		"listen": "127.0.0.1:0", "plaintext": true,
 		"auth": map[string]any{
 			"issuers": []any{map[string]any{"issuer": iss, "audience": "skylite", "jwks_file": filepath.Join(dir, "jwks.json")}},
 			"rules":   []any{map[string]any{"issuer": iss, "subject": "admin", "database": "*", "role": "admin"}},
 		},
 		"storage": map[string]any{"localfs": map[string]any{"path": dir}},
-	})
+	}
+	maps.Copy(c, extra)
+	cfg, err := json.Marshal(c)
 	if err != nil {
 		t.Fatal(err)
 	}
