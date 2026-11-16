@@ -271,12 +271,7 @@ func statusBefore(status int, code string) faultFunc {
 // refused dials a closed local port for the request: the dial fails with
 // net/http's dial error, so nothing is sent.
 func refused(t *testing.T) faultFunc {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := l.Addr().String()
-	_ = l.Close()
+	addr := strings.TrimPrefix(closedURL(t), "http://")
 	return func(req *http.Request, next http.RoundTripper) (*http.Response, error) {
 		tr := next.(*http.Transport).Clone()
 		tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {

@@ -1,11 +1,11 @@
 ---
 title: Getting started
-description: Install the skylite binary and run the one command that works today.
+description: Install the skylite binary, check its version, and run the server, which so far only creates databases.
 weight: 10
 status: current
 ---
 
-skylite is pre-alpha. The binary prints its version and its help text. It does not store data, open a port or accept SQL yet. This page covers everything that works today.
+skylite is pre-alpha. The binary prints its version and its help text, and `skylite serve` runs a server that authenticates requests and creates databases in object storage. It accepts no SQL yet. This page covers everything that works today.
 
 ## Install with Go
 
@@ -36,6 +36,10 @@ make build
 
 `skylite help` prints the commands the binary knows about. The same text is published as the [CLI reference](/docs/reference/), generated from the binary on every docs build.
 
+## Run the server
+
+`skylite serve -config skylite.json` starts the server. The [server page](/docs/server/) describes the configuration file, the one request it serves (creating a database) and how to try it on a local directory.
+
 ## What comes next
 
-There is nothing to configure or connect to yet. To follow the work, read the [architecture direction](/docs/architecture/) and the [roadmap](/docs/roadmap/). The planned storage design is recorded in [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/).
+There is no SQL to run and no driver to connect with yet. To follow the work, read the [architecture direction](/docs/architecture/) and the [roadmap](/docs/roadmap/). The planned storage design is recorded in [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/).

@@ -480,3 +480,36 @@ func TestErrorSubjectIsBounded(t *testing.T) {
 		t.Errorf("error subject is not cut to 200 bytes (%v)", err)
 	}
 }
+
+func TestLoadKeyFiles(t *testing.T) {
+	c := newClock()
+	k1 := newKey(t, "k1", jose.ES256)
+	file := filepath.Join(t.TempDir(), "jwks.json")
+	if err := os.WriteFile(file, jwksOf(t, k1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g, err := New(Config{Issuers: []Issuer{{Issuer: "k8s", Audience: testAudience, JWKSFile: file}}}, nil, c.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.LoadKeyFiles(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Verify(context.Background(), sign(t, k1, map[string]any{"iss": "k8s", "sub": "s", "aud": testAudience, "exp": c.Now().Unix() + 600})); err != nil {
+		t.Errorf("a key read by LoadKeyFiles: %v", err)
+	}
+	if err := g.LoadKeyFiles(); err == nil || !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("LoadKeyFiles of a missing file: %v", err)
+	}
+}
+
+func TestPrincipalLogAttrs(t *testing.T) {
+	p := &Principal{Issuer: "iss", Subject: strings.Repeat("s", 300)}
+	got := p.LogAttrs()
+	if len(got) != 2 || got[0].Value.String() != "iss" || got[1].Value.String() != strings.Repeat("s", maxLoggedValue)+"..." {
+		t.Errorf("LogAttrs = %v", got)
+	}
+}

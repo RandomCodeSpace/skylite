@@ -15,7 +15,7 @@ gate = "The storage architecture that follows from it is recorded in decision re
 [[items]]
 title = "Storage interface and four backends"
 status = "planned"
-detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators. So far the interface, its conformance suite, the local filesystem backend, the S3 backend, the Google Cloud Storage backend and the Azure Blob backend exist as library packages, each tested against an emulator only: the S3 backend against RustFS, the Google Cloud Storage backend against fake-gcs-server and the Azure Blob backend against Azurite. The server cannot use them yet."
+detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators. So far the interface, its conformance suite, the local filesystem backend, the S3 backend, the Google Cloud Storage backend and the Azure Blob backend exist, each tested against an emulator only: the S3 backend against RustFS, the Google Cloud Storage backend against fake-gcs-server and the Azure Blob backend against Azurite. `skylite serve` can use the local filesystem, S3 and Google Cloud Storage backends; the Azure Blob backend is not wired into the server yet."
 
 [[items]]
 title = "Storage engine: commit log, paged reads, compaction"
@@ -25,7 +25,7 @@ detail = "A storage layer under SQLite (ncruces/go-sqlite3) that uploads each co
 [[items]]
 title = "Leader lease and failover"
 status = "planned"
-detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader."
+detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader. So far the takeover, the lease and a loop that takes office, renews the lease, steps down when deposed or stopped, and drains and releases on shutdown exist as library packages; the server cannot use them yet."
 
 [[items]]
 title = "Read replicas"
@@ -35,7 +35,7 @@ detail = "Followers read pages from object storage on demand through a read-only
 [[items]]
 title = "HTTPS query API and sessions"
 status = "planned"
-detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests."
+detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, and database creation (PUT). Not yet: SQL, sessions, admission control, forwarding."
 
 [[items]]
 title = "Clients: Go driver, JDBC driver and Hibernate dialect"

@@ -13,8 +13,9 @@ will talk to it over HTTPS.
 
 ## Status: pre-alpha
 
-skylite does not work yet. Today the repository contains project scaffolding
-and a binary that prints its version and help text. Nothing else exists.
+skylite does not work yet. Today the binary prints its version and help text,
+and `skylite serve` runs a server that authenticates requests and creates
+databases in object storage. It runs no SQL.
 Everything below the quickstart is a roadmap, not a feature list.
 
 ## Why
