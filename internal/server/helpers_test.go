@@ -166,7 +166,8 @@ type env struct {
 	sig   signer
 	logs  *lockedBuffer
 	store *countingStore
-	addr  string // set by start
+	addr  string       // set by start
+	halt  func() error // set by newQueryEnv: stops the server and returns Serve's error
 }
 
 // newEnv returns a server on a local directory store, wrapped by wrap if

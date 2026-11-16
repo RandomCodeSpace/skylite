@@ -1,39 +1,91 @@
 ---
 title: Server
-description: What `skylite serve` does in this version, which is authenticate requests and create databases, and how to configure it.
+description: What `skylite serve` does in this version, which is authenticate requests, create databases, lead the databases it is configured for and answer read-only queries on them, and how to configure it.
 weight: 15
 status: current
 ---
 
-`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it does one thing: it creates a database. It runs no SQL, opens no channels and leads no database. Drivers do not exist yet.
+`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, and answers the two stateless requests, `query` and `describe`, on the databases it leads. It runs pure reads only: it opens no channels and runs no write or transaction. The [Go driver](/docs/go-driver/)'s read path uses these two requests.
 
 ## What it serves
 
 | Request | Answer |
 |---|---|
 | `PUT /v1/databases/{db}` with body `{}` | `200` and `{"done":{"txn":1,"epoch":1}}` when it created the database; `409` `database_exists` when the database exists or a concurrent `PUT` won |
-| Every other path of 0005 (`query`, `describe`, `channels`, `channel`, `channel/cancel`, `channel/close`, `resolve`, `GET` status) | After authentication, and authorisation at the `read` role on the name, `503` `not_serving`. The body is not read |
+| `POST /v1/databases/{db}/query` with `sql` and optionally `params` or `named`, `min_txn` and `timeout_ms` | One pure read on the leader: a `columns` frame, one frame per row, then `done` with `txn`, `read_only`, `rows_affected` and `last_insert_rowid`. See [Queries](#queries) |
+| `POST /v1/databases/{db}/describe` with `sql` and optionally `min_txn` | The statement's result columns and parameter names, without running it: a `columns` frame, `params` frames, then `done` with `txn` and `param_count` |
+| `query` or `describe` on a database this server does not lead | `503` `not_serving`. The body is not read |
+| Every other path of 0005 (`channels`, `channel`, `channel/cancel`, `channel/close`, `resolve`, `GET` status) | After authentication, and authorisation at the `read` role on the name, `503` `not_serving`. The body is not read |
 | Anything else, or a path with a query string | `400` `invalid_request` |
 
-`{db}` is 1 to 63 characters from `a-z`, `0-9` and `-`, starting with a letter or a digit. A `PUT` needs the `admin` role on the name, and every other request the `read` role. Every answer is one NDJSON frame with the headers `Skylite-Protocol: 1`, `Skylite-Request-Id`, `Content-Type: application/x-ndjson` and `Cache-Control: no-store`; a `401` also carries `WWW-Authenticate: Bearer`. The error object and its codes are those of [0005's errors](/docs/decisions/0005-client-protocol/#errors).
+`{db}` is 1 to 63 characters from `a-z`, `0-9` and `-`, starting with a letter or a digit. A `PUT` needs the `admin` role on the name, and every other request the `read` role. Every answer is a sequence of NDJSON frames ending in one terminal frame, and a refusal is one error frame, with the headers `Skylite-Protocol: 1`, `Skylite-Request-Id`, `Content-Type: application/x-ndjson` and `Cache-Control: no-store`; a `401` also carries `WWW-Authenticate: Bearer`. The error object and its codes are those of [0005's errors](/docs/decisions/0005-client-protocol/#errors).
 
 A new database has 4,096-byte pages and base groups of 256 pages. When the store cannot tell whether a create landed, the answer is `500` `internal`, never `database_exists`: the database may or may not exist, and a `PUT` sent again answers which.
 
 ### Checks before acceptance
 
-The server runs [0005's checks](/docs/decisions/0005-client-protocol/#checks-before-acceptance) that apply to a `PUT`, in their order:
+The server runs [0005's checks](/docs/decisions/0005-client-protocol/#checks-before-acceptance) that apply to a `PUT`, a `query` and a `describe`, in this order, with routing before the body as 0005 allows:
 
 1. The header block is at most 64 KiB, to which Go's HTTP/1.1 server adds 4 KiB of slack (otherwise `431` from the HTTP layer), and arrives within 10 seconds on HTTP/1.1; the method and path are known, and the path has no query string.
-2. *Admission is implemented only for connections:* the server accepts at most 1,024 connections at a time, and one beyond that waits in the operating system's listen queue until another closes. There are no request or memory bounds yet.
+2. *Admission is implemented only for connections:* the server accepts at most 1,024 connections at a time, and one beyond that waits in the operating system's listen queue until another closes. There are no request bounds yet.
 3. The bearer token verifies, read from the headers only (`401` `unauthenticated`). The body is never read before this.
 4. The principal holds `read` on the name, and `admin` for a `PUT` (`403` `forbidden`). This comes before routing and before anything that depends on whether the database exists, so the answer is the same either way.
-5. `Content-Type` is `application/json`, compared without regard to case, with parameters ignored; `Content-Length` is present once, with one value, and at most 16 MiB (`413` `request_too_large` above it); there is no `Transfer-Encoding`. The whole body is read within 30 seconds and must be exactly `Content-Length` bytes and exactly `{}`. A cut body, a reset stream or a body that arrives late is `400` `invalid_request`, and nothing is created.
+5. For a `query` or `describe`, this server leads the database (`503` `not_serving`, the body unread). A server that does not lead the database cannot serve it whatever the body holds, so it does not read it; 0005 allows `not_serving` there, and does not promise the order of refusals before acceptance.
+6. The body share of the memory budget has room for 8 × `Content-Length`, and so does the principal's part of it (`429` `overloaded`, the body unread). The share is half the memory budget, 1 GiB; a principal, an issuer and a subject, may hold a quarter of it, 256 MiB, at once. A body is charged from before its read until its request ends, so one that is declared and never sent stays charged until the 30-second body read deadline or the client's close.
+7. `Content-Type` is `application/json`, compared without regard to case, with parameters ignored; `Content-Length` is present once, with one value, and at most 16 MiB (`413` `request_too_large` above it); there is no `Transfer-Encoding`. The whole body is read within 30 seconds and must be exactly `Content-Length` bytes: one JSON object of 0005's form with only the fields its request allows, and exactly `{}` for a `PUT`. A cut body, a reset stream or a body that arrives late is `400` `invalid_request`, and nothing is created or run.
+8. For a `query` or `describe`, the server reserves a SQLite connection (`429` `overloaded`; see [Connections for queries](#connections-for-queries)), and the leader is not in maintenance (`503` `maintenance`).
 
 The 30-second body read deadline starts when the server has read the header block, so it also bounds a body that a refusal leaves unread. Such a refusal is answered at once. On HTTP/1.1 it carries `Connection: close`, and Go's HTTP server reads and discards what is left of the body, within the same deadline, before it closes the connection.
 
 ### Connections
 
 An answer must be written within 10 seconds (0005's response deadline), refusals included; a client that does not read it loses it and the connection, and on HTTP/2 every stream on that connection. Over TLS the connection is released up to 5 seconds later, while Go's TLS layer tries to send its closing alert. A connection with no request running is closed after 90 seconds, on HTTP/1.1 and HTTP/2. 0005 gives no value for this idle timeout; 90 seconds is this server's. On HTTP/2 it also bounds a header block that never ends. An HTTP/2 connection carries at most 16 concurrent streams.
+
+## Queries
+
+### Leading a database
+
+For each name in `databases`, the server runs the office loop of [0004](/docs/decisions/0004-storage-engine/): it takes office when the database's lease is free, renews the lease every 20 seconds (a lease lives 60 seconds), and steps down when it is deposed or its leader stops. A server that does not hold office is a standby: it reads the lease at most every 5 seconds and runs a candidacy once the lease is released or expires. Only the server in office serves the database; every other server answers `query` and `describe` with `503` `not_serving`. There are no followers and no forwarding, so run one active server and let the [readiness probe](#readiness) steer traffic to it. A database in `databases` need not exist: once a `PUT` has created it, the server takes office within its retry backoff, at most 20 seconds.
+
+### How a query runs
+
+A `query` runs on a pooled SQLite connection of the leader, which has [0007's SQL policy](/docs/decisions/0007-sql-policy/) installed before its first statement. The server begins a read transaction, takes its snapshot's transaction number from the engine, and compiles the statement under the policy. Before it binds or steps anything it checks, in this order:
+
+1. The policy allowed the statement (`403` `statement_forbidden`), which is one statement (`400` `invalid_request`) that compiles (`400` `sql_error`).
+2. SQLite's read-only test is true for it (`409` `needs_channel`). Nothing is executed: a write is never stepped, so no commit reaches the log.
+3. It is not transaction control by its first keyword, `BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT` or `RELEASE`, after white space, comments, semicolons and `EXPLAIN` (`400` `invalid_request`). The policy itself allows `SAVEPOINT`, `RELEASE` and `ROLLBACK TO` inside a transaction, and the query runs inside the server's own.
+
+From there the statement has started executing, and the answer is `200` whatever follows: every parameter is bound exactly once (`invalid_request` otherwise), the rows stream as they are produced, and an error ends the body as its terminal frame. `txn` in `done` is the transaction number of the snapshot the rows were read from. The server then rolls the read transaction back.
+
+| Limit | Value |
+|---|---|
+| Statement time, from the end of the body read to the last row written, storage page reads included (`timeout`) | 30 seconds; `timeout_ms` lowers it |
+| Result size: the bytes of all frames before the terminal one (`result_too_large`) | 64 MiB |
+| Frame size; a `columns` frame above it fails with `result_too_large` | 1 MiB |
+| `min_txn` above the snapshot's transaction number | `503` `behind` |
+
+A `describe` compiles the statement under the same policy and makes checks 1 and 3, then answers its result columns and parameter names without binding or stepping it; any statement can be described, writes included. A dropped connection stops a query's rows, and a client that stops reading them holds its connection until the statement time ends.
+
+A pragma's table-valued function, such as `SELECT * FROM pragma_user_version`, is compiled by SQLite when the statement first scans it, not when it is prepared, so the policy refuses it only at the first step: `describe` answers `200` with its columns, and `query` answers `200` with `statement_forbidden` as its terminal frame. Nothing is executed either way.
+
+### Connections for queries
+
+The memory budget is 2 GiB, and it charges exactly two things: request bodies, at 8 × `Content-Length`, within the body share of 1 GiB; and SQLite connections, at a 64 MiB ceiling each, within the other 1 GiB. So the server holds at most 16 SQLite connections, less one for each database in `databases`, whose leader keeps a connection of its own; with every limit reached, bodies and connections hold the whole 2 GiB and no more. Nothing else is charged: not HTTP connections or their header blocks, not response frames, and not the engine's page cache (64 MiB per server, shared by the databases it leads) or temporary files (256 MiB per led database), which must fit in what the container has beyond the budget. A principal, an issuer and a subject, may use a quarter of them at once, at least one. A query that finds its principal's share in use, or every connection in use with none idle, gets `429` `overloaded`. An idle connection of another database is closed to make room.
+
+A connection is reset before every reuse, [as 0007 requires](/docs/decisions/0007-sql-policy/#session-state): an open transaction is rolled back, temporary objects are dropped, foreign keys are enforced and the last inserted row id is cleared. A connection whose reset fails is closed and replaced. A statement that breaks its connection, by overflowing SQLite's C stack or exhausting the connection's memory, gets `internal`; the engine discards the connection without running SQLite on it again, and the leader serves on.
+
+### Maintenance, the tail bound and a stopping leader
+
+While the leader is in maintenance, a query or describe gets `503` `maintenance`, and a running one ends with `maintenance` as its terminal frame. When the database's log reaches the engine's tail bound, 32,768 commits above the manifest, the engine refuses every read and write for good, because this version has no compaction: a query then gets `maintenance` with a message that names the bound, and the server reports itself not ready for as long as it leads that database. A query running when the leader stops, on shutdown, step-down or fail-stop, is interrupted and ends with `not_serving`.
+
+### Readiness
+
+With `probe_listen` set, the server answers `GET /readyz` on that address, in plain HTTP and without authentication: `200` while it leads at least one database of `databases` and none it leads is at its tail bound, and `503` otherwise and from the start of shutdown. A server whose databases do not exist yet is not ready, so a Service that sends traffic only to ready pods never delivers the first `PUT`. Send it through a second Kubernetes Service over the same pods with `publishNotReadyAddresses: true`, or through `kubectl port-forward` to one pod.
+
+Known limits of readiness in this version:
+
+- Readiness is per pod, not per database. One database at its tail bound makes the pod not ready for every database it leads.
+- Each database's office loop runs on its own, so the databases of a set of pods can be led by different pods, and readiness cannot steer a request to the pod that leads its database; the others answer `not_serving`. List each database on one set of active pods, or run one active pod.
 
 ## Configuration
 
@@ -54,7 +106,9 @@ The configuration is one JSON file. Unknown fields are refused, and the server d
   "storage": {
     "prefix": "skylite",
     "s3": {"bucket": "my-bucket", "region": "eu-west-1"}
-  }
+  },
+  "databases": ["orders"],
+  "probe_listen": ":8081"
 }
 ```
 
@@ -69,6 +123,8 @@ The configuration is one JSON file. Unknown fields are refused, and the server d
 | `storage.localfs.path` | A local directory. For trying the server out; a pod's local disk is not durable |
 | `storage.s3` | `bucket` and `region` (required), `endpoint` for an S3-compatible service, `path_style` to address the bucket in the path |
 | `storage.gcs` | `bucket` (required) and `endpoint` for an emulator, which then gets no credentials |
+| `databases` | The databases this server leads and answers queries on: names of the `{db}` form, each once, at most 15. Optional; without it the server serves `PUT` alone. The leaders' local files go in a directory under the system's temporary directory (`TMPDIR`), removed on shutdown |
+| `probe_listen` | TCP address of the [readiness probe](#readiness). Optional |
 
 An `endpoint` must be an `http` or `https` URL with a host and no user information, query string or fragment, so that it carries no credential; the server does not start with one that breaks this, and the error does not repeat the value.
 
@@ -76,9 +132,9 @@ An `endpoint` must be an `http` or `https` URL with a host and no user informati
 
 ## Logs and shutdown
 
-The server writes JSON log lines to standard error: one when it starts; one per refused request with its request id and code; one for each authentication or authorisation refusal with the fields of [0006](/docs/decisions/0006-authentication/#principal-and-logging): the reason, the configured issuer, the subject once the signature has verified, the key id and the first 12 hex digits of the token's SHA-256 hash, and for a `403` the database and the role it needed; and one for each created database with the principal's issuer and subject. Logs never hold a bearer token or part of one.
+The server writes JSON log lines to standard error: one when it starts; one per refused request with its request id and code; one for each authentication or authorisation refusal with the fields of [0006](/docs/decisions/0006-authentication/#principal-and-logging): the reason, the configured issuer, the subject once the signature has verified, the key id and the first 12 hex digits of the token's SHA-256 hash, and for a `403` the database and the role it needed; one for each created database with the principal's issuer and subject; the office loop's lines, with the database's name, when it takes office, steps down or fails a candidacy; and one for each query that fails with `internal`, with the engine's class of the failure. Logs never hold a bearer token or part of one, SQL text, parameters or SQLite's messages.
 
-On SIGTERM or SIGINT the server stops accepting connections, waits for running requests (a create runs for at most 30 seconds, and the wait is at most a minute), then exits with status 0. If requests are still running after a minute, it closes their connections and exits with status 1. A second SIGTERM or SIGINT during the wait ends the process at once.
+On SIGTERM or SIGINT the server reports itself not ready, stops accepting connections, waits for running requests (a create or a query runs for at most 30 seconds, and the wait is at most a minute), leaves office, releasing each lease, then exits with status 0. If requests are still running after a minute, it closes their connections and exits with status 1. A second SIGTERM or SIGINT during the wait ends the process at once.
 
 ## Try it locally
 
@@ -93,19 +149,27 @@ cat > skylite.json <<'EOF'
     "issuers": [{"issuer": "https://issuer.example", "audience": "skylite", "jwks_file": "jwks.json"}],
     "rules": [{"issuer": "https://issuer.example", "subject": "me", "database": "*", "role": "admin"}]
   },
-  "storage": {"localfs": {"path": "data"}}
+  "storage": {"localfs": {"path": "data"}},
+  "databases": ["orders"]
 }
 EOF
 mkdir -p data
 skylite serve -config skylite.json &
 curl -i -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data '{}' http://127.0.0.1:8080/v1/databases/orders
+curl -i -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data '{"sql":"SELECT 1 + ? AS two","params":[1]}' http://127.0.0.1:8080/v1/databases/orders/query
 ```
+
+The query answers `503` `not_serving` until the server has taken office for the new database. Its office loop retries a candidacy that fails, as one does while the database does not exist, with a backoff that doubles up to 20 seconds, so that can take about 20 seconds after the `PUT`. A new database has no tables, and there is no write path yet to create one.
 
 ## Not built yet, and not verified
 
-- Admission control and the memory budget of [0005 decision 9](/docs/decisions/0005-client-protocol/#9-limits-and-defaults): request and per-principal bounds, the body share, and the memory budget's limit on connections. Only the count of connections is bounded.
-- Leading databases, queries, channels, `resolve` and `GET` status; forwarding between pods and cluster membership. Until then, run one pod.
+- Admission control of [0005 decision 9](/docs/decisions/0005-client-protocol/#9-limits-and-defaults): request and per-principal request bounds. The memory budget is fixed at 2 GiB rather than taken from the container's limit, and response frames are not charged to it.
+- Writes, channels, transactions, `batch`, `resolve` and `GET` status; followers, forwarding between pods and cluster membership. Until then, run one active server per database.
+- `database_not_found` for a query: a server that does not lead the database answers `not_serving`, whether or not it exists.
+- Keepalive frames during a long query, and the compiled-statement cache: every query compiles its statement.
+- The tail bound is noticed when a request meets it, so a server that takes office at the bound reports itself ready until its first query.
 - The header block deadline on HTTP/2 streams: there, only the idle timeout bounds a header block that never ends. The 431 answer is tested on HTTP/1.1 only.
 - Reloading a rotated TLS certificate without a restart.
 - Running behind a real mesh or ingress has not been tested.
