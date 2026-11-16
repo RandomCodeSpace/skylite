@@ -298,7 +298,7 @@ func lead(t *testing.T, st storage.Store, keys format.Keys, o Office, cfg Config
 
 func open(t *testing.T, l *Leader) *Conn {
 	t.Helper()
-	c, err := l.Open()
+	c, err := l.Open(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

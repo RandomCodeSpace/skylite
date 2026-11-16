@@ -552,7 +552,7 @@ func TestPanicInOpen(t *testing.T) {
 		}
 		return fault{}
 	})
-	_, err := l.Open()
+	_, err := l.Open(context.Background())
 	st.setRule(nil)
 	if err == nil || !strings.Contains(err.Error(), "panicked") {
 		t.Fatalf("Open: %v", err)
@@ -577,7 +577,7 @@ func TestMaintenanceEndsHungOpen(t *testing.T) {
 	armed.Store(true)
 	opened := make(chan error, 1)
 	go func() {
-		c, err := l.Open()
+		c, err := l.Open(context.Background())
 		if err == nil {
 			err = c.Close()
 		}
@@ -615,7 +615,7 @@ func TestOpenFailureNotRetry(t *testing.T) {
 			}
 			return fault{}
 		})
-		if _, err := l.Open(); err == nil || errors.Is(err, ErrRetry) {
+		if _, err := l.Open(context.Background()); err == nil || errors.Is(err, ErrRetry) {
 			t.Fatalf("Open through a failed read: %v, want an error that does not match ErrRetry", err)
 		}
 	})
@@ -625,7 +625,7 @@ func TestOpenFailureNotRetry(t *testing.T) {
 		armed.Store(true)
 		opened := make(chan error, 1)
 		go func() {
-			_, err := l.Open()
+			_, err := l.Open(context.Background())
 			opened <- err
 		}()
 		reached(t, hs)
@@ -641,7 +641,7 @@ func TestOpenFailureNotRetry(t *testing.T) {
 		armed.Store(true)
 		opened := make(chan error, 1)
 		go func() {
-			_, err := l.Open()
+			_, err := l.Open(context.Background())
 			opened <- err
 		}()
 		reached(t, hs)
@@ -692,7 +692,7 @@ func TestMaintenanceEndsOpenAfterListing(t *testing.T) {
 	armed.Store(true)
 	opened := make(chan error, 1)
 	go func() {
-		c, err := l.Open()
+		c, err := l.Open(context.Background())
 		if err == nil {
 			err = c.Close()
 		}
@@ -744,7 +744,7 @@ func TestOpenFailsDuringMaintenance(t *testing.T) {
 	})
 	errc := make(chan error, 1)
 	go func() {
-		_, err := l.Open()
+		_, err := l.Open(context.Background())
 		errc <- err
 	}()
 	select {

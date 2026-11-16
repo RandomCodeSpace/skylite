@@ -368,6 +368,9 @@ func (f *mainFile) DeviceCharacteristics() vfs.DeviceCharacteristic {
 // than the uploaded one gets here.
 func (f *mainFile) CommitPhaseTwo() error {
 	l, c := f.l, f.c
+	if l.beforePhaseTwo != nil {
+		l.beforePhaseTwo(c)
+	}
 	l.cmu.Lock()
 	defer l.cmu.Unlock()
 	if c.uploaded == 0 {
