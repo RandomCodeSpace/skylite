@@ -7,7 +7,7 @@ status: current
 
 Every durable byte in skylite is to go through one Go interface, `storage.Store` in `internal/storage`. Its package documentation is the contract: create-if-absent, compare-and-swap on a version token and an unconditional delete, with no unconditional put; range reads; listing; and a rule for writes whose outcome is unknown. Package `internal/storage/storagetest` is the conformance suite that every backend must pass, and each backend carries its own tests for what the suite cannot check. Package `internal/storage/localfs` is the reference backend on a local directory.
 
-The backends are library packages. The skylite server cannot be configured to use any of them yet.
+The backends are library packages, and the only cloud backend so far is Azure Blob Storage, tested against an emulator only; backends for AWS S3 and Google Cloud Storage are still to come. The skylite server cannot be configured to use any of them yet.
 
 ## Azure Blob Storage
 
