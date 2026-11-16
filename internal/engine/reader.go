@@ -1,8 +1,9 @@
 // Package engine is skylite's storage engine: it keeps a database in object
 // storage as decision record 0004 (docs/content/docs/decisions/0004-storage-engine.md)
-// lays it out, in the objects package format encodes. This package so far
-// creates a database (Create) and reads its pages as of a transaction
-// number (Open, Reader).
+// lays it out, in the objects package format encodes. It creates a database
+// (Create), reads its pages as of a transaction number (Open, Reader), and
+// takes office by lease, epoch swap and epoch bump (Takeover, Office,
+// Lease).
 //
 // # Reading
 //
