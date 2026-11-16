@@ -1,17 +1,26 @@
 package gcs
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httptrace"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +29,8 @@ import (
 	"testing/iotest"
 	"time"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 	"google.golang.org/api/googleapi"
 
 	"github.com/RandomCodeSpace/skylite/internal/storage"
@@ -66,37 +77,53 @@ func TestCommits(t *testing.T) {
 	}
 }
 
-// TestWriteError checks the classification of a failed write: 412 is a
-// precondition failure, other 4xx but 408 and a connection that was never made
-// mean no effect, and everything else after the commit request started is an
-// unknown outcome. Before it started every error is definite.
+// TestWriteError checks the classification of a failed write: 412 for the
+// write's condition is a precondition failure, other 4xx but 408 and a
+// connection that was never made mean no effect, and everything else after
+// the commit request started is an unknown outcome. Before it started every
+// error is definite. Once net/http may have sent the commit request twice,
+// every error is an unknown outcome.
 func TestWriteError(t *testing.T) {
 	cancelled, cancel := context.WithCancel(bg)
 	cancel()
 	reset := &urlError{err: &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}}
+	dial := &urlError{err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}
+	reason := func(r ...string) *googleapi.Error {
+		ge := &googleapi.Error{Code: 412, Message: "the service's message"}
+		for _, r := range r {
+			ge.Errors = append(ge.Errors, googleapi.ErrorItem{Reason: r})
+		}
+		return ge
+	}
 	for _, tc := range []struct {
-		name    string
-		ctx     context.Context
-		err     error
-		sent    bool
-		is      []error
-		unknown bool
+		name         string
+		ctx          context.Context
+		err          error
+		sent, resent bool
+		is           []error
+		unknown      bool
 	}{
-		{"412", bg, &googleapi.Error{Code: 412}, true, []error{storage.ErrPreconditionFailed}, false},
-		{"412 not sent", bg, &googleapi.Error{Code: 412}, false, []error{storage.ErrPreconditionFailed}, false},
-		{"403", bg, &googleapi.Error{Code: 403}, true, nil, false},
-		{"429", bg, &googleapi.Error{Code: 429}, true, nil, false},
-		{"408", bg, &googleapi.Error{Code: 408}, true, nil, true},
-		{"500", bg, &googleapi.Error{Code: 500}, true, nil, true},
-		{"503", bg, &googleapi.Error{Code: 503}, true, nil, true},
-		{"503 before the commit", bg, &googleapi.Error{Code: 503}, false, nil, false},
-		{"reset", bg, reset, true, nil, true},
-		{"reset before the commit", bg, reset, false, nil, false},
-		{"dial", bg, &urlError{err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}, true, nil, false},
-		{"cancelled", cancelled, context.Canceled, true, []error{context.Canceled}, true},
-		{"cancelled before the commit", cancelled, context.Canceled, false, []error{context.Canceled}, false},
+		{"412", bg, &googleapi.Error{Code: 412}, true, false, []error{storage.ErrPreconditionFailed}, false},
+		{"412 not sent", bg, &googleapi.Error{Code: 412}, false, false, []error{storage.ErrPreconditionFailed}, false},
+		{"412 conditionNotMet", bg, reason("conditionNotMet"), true, false, []error{storage.ErrPreconditionFailed}, false},
+		{"412 orgPolicyConstraintFailed", bg, reason("orgPolicyConstraintFailed"), true, false, nil, false},
+		{"412 conditionNotMet and another reason", bg, reason("conditionNotMet", "objectNotSoftDeleted"), true, false, nil, false},
+		{"403", bg, &googleapi.Error{Code: 403}, true, false, nil, false},
+		{"429", bg, &googleapi.Error{Code: 429}, true, false, nil, false},
+		{"408", bg, &googleapi.Error{Code: 408}, true, false, nil, true},
+		{"500", bg, &googleapi.Error{Code: 500}, true, false, nil, true},
+		{"503", bg, &googleapi.Error{Code: 503}, true, false, nil, true},
+		{"503 before the commit", bg, &googleapi.Error{Code: 503}, false, false, nil, false},
+		{"reset", bg, reset, true, false, nil, true},
+		{"reset before the commit", bg, reset, false, false, nil, false},
+		{"dial", bg, dial, true, false, nil, false},
+		{"cancelled", cancelled, context.Canceled, true, false, []error{context.Canceled}, true},
+		{"cancelled before the commit", cancelled, context.Canceled, false, false, []error{context.Canceled}, false},
+		{"412 after a re-send", bg, reason("conditionNotMet"), true, true, nil, true},
+		{"403 after a re-send", bg, &googleapi.Error{Code: 403}, true, true, nil, true},
+		{"dial after a re-send", bg, dial, true, true, nil, true},
 	} {
-		err := writeError(tc.ctx, "create", "k", tc.err, tc.sent)
+		err := writeError(tc.ctx, "create", "k", tc.err, tc.sent, tc.resent)
 		var se *storage.Error
 		if !errors.As(err, &se) || se.Op != "create" || se.Key != "k" {
 			t.Errorf("%s: %v is not the *storage.Error of create \"k\"", tc.name, err)
@@ -112,6 +139,9 @@ func TestWriteError(t *testing.T) {
 		if !slices.Contains(tc.is, storage.ErrPreconditionFailed) && errors.Is(err, storage.ErrPreconditionFailed) {
 			t.Errorf("%s: %v wraps ErrPreconditionFailed", tc.name, err)
 		}
+		if ge := (*googleapi.Error)(nil); errors.As(tc.err, &ge) && ge.Message != "" && !errors.Is(err, storage.ErrPreconditionFailed) && !strings.Contains(err.Error(), ge.Message) {
+			t.Errorf("%s: %v lost the service's message", tc.name, err)
+		}
 	}
 }
 
@@ -124,7 +154,7 @@ func (u *urlError) Error() string {
 func (u *urlError) Unwrap() error { return u.err }
 
 func TestRedact(t *testing.T) {
-	err := writeError(bg, "create", "k", &urlError{err: syscall.ECONNRESET}, true)
+	err := writeError(bg, "create", "k", &urlError{err: syscall.ECONNRESET}, true, false)
 	if strings.Contains(err.Error(), "secret-session") || strings.Contains(err.Error(), "upload_id") {
 		t.Fatalf("error %q contains the upload session", err)
 	}
@@ -299,10 +329,14 @@ func refuse(r *http.Request, _ http.RoundTripper) (*http.Response, error) {
 }
 
 func injected(r *http.Request, code int) *http.Response {
+	return jsonResponse(r, code, fmt.Sprintf(`{"error":{"code":%d,"message":"injected"}}`, code))
+}
+
+func jsonResponse(r *http.Request, code int, body string) *http.Response {
 	return &http.Response{
 		StatusCode: code, Status: fmt.Sprint(code, " ", http.StatusText(code)), Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
 		Header:  http.Header{"Content-Type": {"application/json"}},
-		Body:    io.NopCloser(strings.NewReader(fmt.Sprintf(`{"error":{"code":%d,"message":"injected"}}`, code))),
+		Body:    io.NopCloser(strings.NewReader(body)),
 		Request: r,
 	}
 }
@@ -328,14 +362,19 @@ func statusAfter(code int) fault {
 }
 
 // stall forwards the request and holds the response until the call's context
-// ends.
+// ends, or for ten seconds, so that a call that ignores its context fails its
+// test instead of hanging it.
 func stall(r *http.Request, next http.RoundTripper) (*http.Response, error) {
 	resp, err := next.RoundTrip(r)
 	if err == nil {
 		drain(resp)
 	}
-	<-r.Context().Done()
-	return nil, r.Context().Err()
+	select {
+	case <-r.Context().Done():
+		return nil, r.Context().Err()
+	case <-time.After(10 * time.Second):
+		return nil, errors.New("stall: the request's context did not end")
+	}
 }
 
 // cut sends the first 64 KiB of the request body and then breaks the
@@ -663,8 +702,8 @@ func TestRetries(t *testing.T) {
 	}
 }
 
-// TestReadFaults checks that a read past its deadline fails with the
-// context's error, and that a body whose connection breaks after the object
+// TestReadFaults checks that a Head, Get, GetRange or List whose response is
+// held past its deadline fails promptly with the context's error, and that a body whose connection breaks after the object
 // was replaced fails instead of returning bytes of the new version.
 func TestReadFaults(t *testing.T) {
 	f, s, check := fixture(t)
@@ -673,12 +712,23 @@ func TestReadFaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.once(stall, "meta")
-	ctx, cancel := context.WithTimeout(bg, time.Second)
-	_, err = s.Head(ctx, "k")
-	cancel()
-	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, storage.ErrOutcomeUnknown) {
-		t.Fatalf("Head past its deadline = %v, want context.DeadlineExceeded", err)
+	for _, tc := range []struct {
+		name, kind string
+		call       func(ctx context.Context) error
+	}{
+		{"Head", "meta", func(ctx context.Context) error { _, err := s.Head(ctx, "k"); return err }},
+		{"Get", "media", func(ctx context.Context) error { _, _, err := s.Get(ctx, "k"); return err }},
+		{"GetRange", "media", func(ctx context.Context) error { _, _, err := s.GetRange(ctx, "k", 1, 10); return err }},
+		{"List", "list", func(ctx context.Context) error { _, err := s.List(ctx, "", "", 10); return err }},
+	} {
+		f.once(stall, tc.kind)
+		ctx, cancel := context.WithTimeout(bg, time.Second)
+		start := time.Now()
+		err := tc.call(ctx)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, storage.ErrOutcomeUnknown) || time.Since(start) > 5*time.Second {
+			t.Fatalf("%s past its 1 s deadline = %v after %v, want context.DeadlineExceeded promptly", tc.name, err, time.Since(start))
+		}
 	}
 	// The first download response breaks after 64 KiB; by then the object has
 	// been replaced, so the client's resumed download must not find it.
@@ -1101,4 +1151,478 @@ func TestPendingCommit(t *testing.T) {
 	expectDefinite(t, err, "create", "never")
 	time.Sleep(time.Second)
 	expectAbsent(t, check, "never")
+}
+
+// TestListPageRefused makes the service refuse the second page of a listing.
+// List must return the error, not the entries it had so far: a result
+// shorter than limit reads as the end of the listing.
+func TestListPageRefused(t *testing.T) {
+	f, s, _ := fixture(t)
+	for i := range 3 {
+		if _, err := s.Create(bg, fmt.Sprint("p/", i), strings.NewReader("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var lists atomic.Int64
+	f.set(func(r *http.Request) (*http.Response, error) {
+		if kind(r) == "list" {
+			if lists.Add(1) == 2 {
+				closeBody(r)
+				return injected(r, 403), nil
+			}
+			r = r.Clone(r.Context())
+			q := r.URL.Query()
+			q.Set("maxResults", "1")
+			r.URL.RawQuery = q.Encode()
+		}
+		return f.next.RoundTrip(r)
+	})
+	if e, err := s.List(bg, "p/", "", 10); err == nil || lists.Load() != 2 {
+		t.Fatalf("List whose second page was refused = %+v, %v after %d list requests; want an error after 2", e, err, lists.Load())
+	}
+}
+
+// TestBodyDataWithEOF writes a body whose last Read returns its last bytes
+// together with io.EOF; they must be part of the object.
+func TestBodyDataWithEOF(t *testing.T) {
+	_, s, check := fixture(t)
+	body := data("eof", 1000)
+	if _, err := s.Create(bg, "eof", iotest.DataErrReader(bytes.NewReader(body))); err != nil {
+		t.Fatal(err)
+	}
+	expectObject(t, check, "eof", body)
+}
+
+// h2Server is an HTTP/2 server, framed by hand, that answers uploads like the
+// JSON API, except that it resets the stream of the first commit request it
+// receives with PROTOCOL_ERROR after reading all of it. That code does not
+// tell the client whether the server processed the stream, and net/http
+// re-sends the request on its own, below the store's transport. The server
+// answers the re-sent commit request with second, or, if redial is set,
+// sends GOAWAY with the reset, closes the connection and stops listening, so
+// that the re-send has to dial and is refused.
+type h2Server struct {
+	ln      net.Listener
+	second  int
+	redial  bool
+	mu      sync.Mutex
+	commits int
+}
+
+func (s *h2Server) accept() {
+	for {
+		c, err := s.ln.Accept()
+		if err != nil {
+			return
+		}
+		go s.serve(c)
+	}
+}
+
+func (s *h2Server) commitCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.commits
+}
+
+func (s *h2Server) serve(c net.Conn) {
+	defer func() { _ = c.Close() }()
+	if _, err := io.ReadFull(c, make([]byte, len(http2.ClientPreface))); err != nil {
+		return
+	}
+	fr := http2.NewFramer(c, c)
+	dec := hpack.NewDecoder(4096, nil)
+	_ = fr.WriteSettings()
+	respond := func(id uint32, status int, body string, header ...string) {
+		var hb bytes.Buffer
+		enc := hpack.NewEncoder(&hb)
+		_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: strconv.Itoa(status)})
+		for i := 0; i+1 < len(header); i += 2 {
+			_ = enc.WriteField(hpack.HeaderField{Name: header[i], Value: header[i+1]})
+		}
+		_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: hb.Bytes(), EndHeaders: true, EndStream: body == ""})
+		if body != "" {
+			_ = fr.WriteData(id, true, []byte(body))
+		}
+	}
+	requests := map[uint32]*http.Request{}
+	// done answers the request on stream id, whose body has been read, and
+	// reports whether to keep the connection.
+	done := func(id uint32) bool {
+		r := requests[id]
+		delete(requests, id)
+		switch kind(r) {
+		case "session":
+			respond(id, 200, "", "location", "https://"+s.ln.Addr().String()+"/upload/storage/v1/b/b/o?uploadType=resumable&upload_id=x")
+			return true
+		case "chunk":
+			cr := strings.TrimSuffix(r.Header.Get("Content-Range"), "/*")
+			respond(id, 200, "", "x-http-status-code-override", "308", "range", "bytes=0-"+cr[strings.IndexByte(cr, '-')+1:])
+			return true
+		case "single", "final", "delete":
+		default:
+			respond(id, 404, `{"error":{"code":404,"message":"not found"}}`, "content-type", "application/json")
+			return true
+		}
+		s.mu.Lock()
+		s.commits++
+		n := s.commits
+		s.mu.Unlock()
+		if n > 1 {
+			respond(id, s.second, fmt.Sprintf(`{"error":{"code":%d,"message":"second","errors":[{"reason":"conditionNotMet"}]}}`, s.second), "content-type", "application/json")
+			return true
+		}
+		if s.redial {
+			_ = fr.WriteGoAway(id, http2.ErrCodeNo, nil)
+		}
+		_ = fr.WriteRSTStream(id, http2.ErrCodeProtocol)
+		if s.redial {
+			_ = s.ln.Close()
+			return false
+		}
+		return true
+	}
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			return
+		}
+		var end uint32
+		switch f := f.(type) {
+		case *http2.SettingsFrame:
+			if !f.IsAck() {
+				_ = fr.WriteSettingsAck()
+			}
+		case *http2.PingFrame:
+			if !f.IsAck() {
+				_ = fr.WritePing(true, f.Data)
+			}
+		case *http2.HeadersFrame:
+			fields, err := dec.DecodeFull(f.HeaderBlockFragment())
+			if err != nil {
+				return
+			}
+			r := &http.Request{Header: http.Header{}, URL: &url.URL{}}
+			for _, h := range fields {
+				switch h.Name {
+				case ":method":
+					r.Method = h.Value
+				case ":path":
+					if r.URL, err = url.Parse(h.Value); err != nil {
+						return
+					}
+				default:
+					r.Header.Add(h.Name, h.Value)
+				}
+			}
+			requests[f.StreamID] = r
+			if f.StreamEnded() {
+				end = f.StreamID
+			}
+		case *http2.DataFrame:
+			if n := f.Header().Length; n > 0 {
+				_ = fr.WriteWindowUpdate(0, n)
+				if !f.StreamEnded() {
+					_ = fr.WriteWindowUpdate(f.StreamID, n)
+				}
+			}
+			if f.StreamEnded() && requests[f.StreamID] != nil {
+				end = f.StreamID
+			}
+		}
+		if end != 0 && !done(end) {
+			return
+		}
+	}
+}
+
+// TestHTTP2Resend runs every kind of commit request against h2Server through
+// net/http's own HTTP/2 transport. The server reset the first attempt without
+// saying whether it applied it, so whatever the re-send gets back, a 412, a
+// 403 or a refused connection, the call's outcome is unknown.
+func TestHTTP2Resend(t *testing.T) {
+	ts := httptest.NewUnstartedServer(nil)
+	ts.StartTLS()
+	cert, roots := ts.TLS.Certificates[0], ts.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	ts.Close()
+	for _, tc := range []struct {
+		name, op string
+		second   int
+		redial   bool
+		run      func(s *Store) error
+	}{
+		{"create of 11 bytes", "create", 412, false, func(s *Store) error { _, err := s.Create(bg, "k", strings.NewReader("hello world")); return err }},
+		{"replace of 11 bytes", "replace", 412, false, func(s *Store) error { _, err := s.Replace(bg, "k", "7", strings.NewReader("hello world")); return err }},
+		{"create of ChunkSize+1 bytes", "create", 412, false, func(s *Store) error {
+			_, err := s.Create(bg, "k", bytes.NewReader(make([]byte, ChunkSize+1)))
+			return err
+		}},
+		{"delete", "delete", 403, false, func(s *Store) error { return s.Delete(bg, "k") }},
+		{"create re-sent on a refused connection", "create", 0, true, func(s *Store) error { _, err := s.Create(bg, "k", strings.NewReader("hello world")); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = ln.Close() })
+			srv := &h2Server{ln: ln, second: tc.second, redial: tc.redial}
+			go srv.accept()
+			var dials atomic.Int64
+			tr := &http.Transport{
+				TLSClientConfig:   &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
+				ForceAttemptHTTP2: true,
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					dials.Add(1)
+					return (&net.Dialer{}).DialContext(ctx, network, addr)
+				},
+			}
+			t.Cleanup(tr.CloseIdleConnections)
+			s := openStore(t, Config{Bucket: "b", Endpoint: "https://" + ln.Addr().String() + "/storage/v1/"}, tr)
+			err = tc.run(s)
+			if n, d := srv.commitCount(), dials.Load(); tc.redial && (n != 1 || d != 2) || !tc.redial && n != 2 {
+				t.Fatalf("the server saw %d commit requests over %d connections; net/http did not re-send as expected", n, d)
+			}
+			expectUnknown(t, err, tc.op, "k")
+		})
+	}
+}
+
+// adc points Application Default Credentials at a made-up authorized_user
+// file whose token endpoint is a local server running token, and returns a
+// service transport that answers every request itself and counts them.
+// Nothing leaves the machine.
+func adc(t *testing.T, token http.HandlerFunc) (tokens, requests *atomic.Int64, service http.RoundTripper) {
+	t.Helper()
+	tokens, requests = new(atomic.Int64), new(atomic.Int64)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		token(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	file := filepath.Join(t.TempDir(), "adc.json")
+	cred := `{"type":"authorized_user","client_id":"id","client_secret":"not-a-secret","refresh_token":"not-a-token","token_uri":"` + ts.URL + `"}`
+	if err := os.WriteFile(file, []byte(cred), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", file)
+	t.Setenv("STORAGE_EMULATOR_HOST", "")
+	return tokens, requests, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		if r.Body != nil {
+			_, _ = io.Copy(io.Discard, r.Body)
+		}
+		closeBody(r)
+		if r.Method == http.MethodDelete {
+			return jsonResponse(r, 204, ""), nil
+		}
+		return jsonResponse(r, 200, `{"name":"k","generation":"7","size":"11"}`), nil
+	})
+}
+
+func grantToken(w http.ResponseWriter, _ *http.Request) {
+	_, _ = io.WriteString(w, `{"access_token":"not-a-token","token_type":"Bearer","expires_in":3600}`)
+}
+
+// TestTokenFailure checks that a mutation whose credentials cannot be
+// fetched fails definitely: no request reached the service.
+func TestTokenFailure(t *testing.T) {
+	tokens, requests, service := adc(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+	})
+	s := openStore(t, Config{Bucket: "b"}, service)
+	_, err := s.Create(bg, "k", strings.NewReader("hello world"))
+	expectDefinite(t, err, "create", "k")
+	expectDefinite(t, s.Delete(bg, "k"), "delete", "k")
+	if tokens.Load() == 0 || requests.Load() != 0 {
+		t.Fatalf("%d token requests and %d service requests, want some and none", tokens.Load(), requests.Load())
+	}
+}
+
+// TestOpenContext checks that the Store keeps working after the context given
+// to Open has ended: credentials that fetch tokens later must not use it.
+func TestOpenContext(t *testing.T) {
+	tokens, _, service := adc(t, grantToken)
+	ctx, cancel := context.WithCancel(bg)
+	s, err := open(ctx, Config{Bucket: "b"}, service)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if _, err := s.Head(bg, "k"); err != nil {
+		t.Fatalf("Head after Open's context ended: %v", err)
+	}
+	if _, err := s.Create(bg, "k", strings.NewReader("hello world")); err != nil {
+		t.Fatalf("Create after Open's context ended: %v", err)
+	}
+	if tokens.Load() == 0 {
+		t.Fatal("no token was fetched")
+	}
+}
+
+// TestResponseWithoutGeneration answers every request with a success that
+// carries no generation. A write must not return a token for it, since it
+// cannot tell what it published, and a Head must not return version "0".
+func TestResponseWithoutGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		body string
+	}{{"204 without a body", 204, ""}, {"200 with an empty object", 200, "{}"}} {
+		s := openStore(t, Config{Bucket: "b", Endpoint: "http://127.0.0.1:1/storage/v1/"}, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			closeBody(r)
+			return jsonResponse(r, tc.code, tc.body), nil
+		}))
+		v, err := s.Create(bg, "k", strings.NewReader("hello world"))
+		if v != "" {
+			t.Errorf("%s: Create returned the token %q", tc.name, v)
+		}
+		expectUnknown(t, err, "create", "k")
+		if info, err := s.Head(bg, "k"); err == nil {
+			t.Errorf("%s: Head = %+v, want an error", tc.name, info)
+		}
+	}
+}
+
+// TestSmallWriteMemory checks that a small write does not allocate a whole
+// chunk: the client buffers ChunkSize bytes per upload unless it is told the
+// body is smaller.
+func TestSmallWriteMemory(t *testing.T) {
+	s := openStore(t, Config{Bucket: "b", Endpoint: "http://127.0.0.1:1/storage/v1/"}, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		closeBody(r)
+		return jsonResponse(r, 200, `{"name":"k","generation":"7","size":"11"}`), nil
+	}))
+	const n = 10
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for range n {
+		if _, err := s.Create(bg, "k", strings.NewReader("hello world")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if per := (after.TotalAlloc - before.TotalAlloc) / n; per > ChunkSize/4 {
+		t.Fatalf("an 11-byte Create allocates %d bytes", per)
+	}
+}
+
+const (
+	envKillPoint  = "SKYLITE_TEST_GCS_KILL_POINT"
+	envKillBucket = "SKYLITE_TEST_GCS_KILL_BUCKET"
+)
+
+func TestMain(m *testing.M) {
+	if point := os.Getenv(envKillPoint); point != "" {
+		os.Exit(killHelper(point))
+	}
+	os.Exit(m.Run())
+}
+
+// killBody is what the helper of TestKilled writes: one chunk and a byte, so
+// that it goes through a resumable session.
+func killBody() []byte { return data("killed", ChunkSize+1) }
+
+// killHelper creates key "k" with killBody and, at point, prints "at <point>"
+// and stops, to be killed: "chunk" once the first chunk has been stored,
+// "commit sent" once the commit request has been written but before its
+// response is read, "committed" once its response has arrived.
+func killHelper(point string) int {
+	next := http.DefaultTransport
+	stop := func() {
+		fmt.Println("at " + point)
+		select {}
+	}
+	base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch k := kind(r); {
+		case k == "chunk" && point == "chunk", slices.Contains(commitKinds, k) && point == "committed":
+			resp, err := next.RoundTrip(r)
+			if err == nil {
+				stop()
+			}
+			return resp, err
+		case slices.Contains(commitKinds, k) && point == "commit sent":
+			wrote, once := make(chan struct{}), new(sync.Once)
+			r = r.WithContext(httptrace.WithClientTrace(r.Context(), &httptrace.ClientTrace{
+				WroteRequest: func(httptrace.WroteRequestInfo) { once.Do(func() { close(wrote) }) },
+			}))
+			go func() {
+				if resp, err := next.RoundTrip(r); err == nil {
+					drain(resp)
+				}
+			}()
+			<-wrote
+			stop()
+		}
+		return next.RoundTrip(r)
+	})
+	s, err := open(bg, Config{Bucket: os.Getenv(envKillBucket), Endpoint: os.Getenv(endpointEnv)}, base)
+	if err != nil {
+		fmt.Println("error:", err)
+		return 1
+	}
+	_, err = s.Create(bg, "k", bytes.NewReader(killBody()))
+	fmt.Println("finished without stopping:", err)
+	return 1
+}
+
+// TestKilled kills a process inside a Create, during and just after
+// publication, and checks that the key is whole or absent and that a later
+// Create succeeds when it is absent.
+func TestKilled(t *testing.T) {
+	ep := endpoint(t)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ point, want string }{
+		{"chunk", "absent"},
+		{"commit sent", "whole or absent"},
+		{"committed", "whole"},
+	} {
+		t.Run(tc.point, func(t *testing.T) {
+			bucket := newBucket(t)
+			cmd := exec.Command(exe, "-test.run=^$") //nolint:gosec // re-executes this test binary
+			cmd.Env = append(os.Environ(), envKillPoint+"="+tc.point, envKillBucket+"="+bucket)
+			cmd.Stderr = os.Stderr
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			line, err := bufio.NewReader(stdout).ReadString('\n')
+			if line != "at "+tc.point+"\n" {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				t.Fatalf("helper printed %q, %v; want at %s", line, err, tc.point)
+			}
+			if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+				t.Fatal(err)
+			}
+			_ = cmd.Wait()
+			time.Sleep(time.Second) // let the emulator finish a request the helper had sent
+			s := openStore(t, Config{Bucket: bucket, Endpoint: ep}, newTransport(t))
+			_, err = s.Head(bg, "k")
+			absent := errors.Is(err, storage.ErrNotFound)
+			switch {
+			case !absent && err != nil:
+				t.Fatal(err)
+			case absent && tc.want == "whole", !absent && tc.want == "absent":
+				t.Fatalf("after the kill at %s the key is absent = %v, want %s", tc.point, absent, tc.want)
+			case absent:
+				body := data("after the kill", 11)
+				if _, err := s.Create(bg, "k", bytes.NewReader(body)); err != nil {
+					t.Fatalf("Create after the kill: %v", err)
+				}
+				expectObject(t, s, "k", body)
+			default:
+				expectObject(t, s, "k", killBody())
+			}
+		})
+	}
 }

@@ -10,14 +10,15 @@
 // changes object metadata, so the metageneration plays no part.
 //
 // Create uploads with ifGenerationMatch=0 and Replace with
-// ifGenerationMatch=<generation>; the service checks the condition and commits
-// the object in one step and answers 412 when it does not hold. Because the
-// service evaluates the condition, exactly one of concurrent Creates of a key,
-// or of Replaces from one version, succeeds across all processes and hosts
-// that share the bucket. A Replace token
-// that is not a generation this store could have returned fails its
-// precondition without a request. Delete is unconditional and treats 404 as
-// success.
+// ifGenerationMatch=<generation>; the service answers 412 with reason
+// conditionNotMet when the condition does not hold. Exactly one of concurrent
+// Creates of a key, or of Replaces from one version, succeeds across all
+// processes and hosts that share the bucket if the service checks the
+// condition and commits the object in one step. For a resumable upload
+// (below) that is an assumption, observed on fake-gcs-server and not
+// documented by Google; see Limits. A Replace token that is not a generation
+// this store could have returned fails its precondition without a request.
+// Delete is unconditional and treats 404 as success.
 //
 // # Uploads
 //
@@ -27,35 +28,48 @@
 // through a resumable upload session: every chunk but the last is sent while
 // the body is read, and the object exists only once the last request of the
 // session, sent after the body has ended, completes. Memory per write is bounded
-// by one chunk plus a copy buffer: [ChunkSize] + 256 KiB. There is no size
-// limit beyond the service's own (5 TiB per object).
+// by one chunk plus a copy buffer: [ChunkSize] + 256 KiB. A body with a Len
+// method (bytes.Reader, strings.Reader, bytes.Buffer) shorter than a chunk
+// gets a chunk of its length plus one, which the client rounds up to a
+// multiple of 256 KiB. There is no size limit beyond the service's own
+// (5 TiB per object).
 //
 // The request that can make a write take effect is the commit request: the
 // single-request upload, the last request of a resumable session (whose
 // Content-Range names the total size), or the DELETE. The store marks, in its
-// own http.RoundTripper, when a call's commit request starts. An error before
-// that point means the call had no effect; an error after it wraps
-// storage.ErrOutcomeUnknown unless the service answered 412 (precondition
-// failed) or another 4xx other than 408, or the connection was never made.
+// own http.RoundTripper, below authentication, when a call's commit request
+// starts, so a failed token fetch is an error before that point. An error
+// before that point means the call had no effect; an error after it wraps
+// storage.ErrOutcomeUnknown unless the service answered 412 with reason
+// conditionNotMet (precondition failed) or another 4xx other than 408, or the
+// connection was never made. A 412 with another reason, such as
+// orgPolicyConstraintFailed, is the service's error, with no effect.
 //
 // # Retries
 //
 // The client retries on its own. The store allows that only where a retry
 // cannot change the outcome: reads, listings, and the request that opens a
-// resumable session, which publishes nothing and carries none of the body. A
-// commit request is never retried, so a lost response is reported as
-// storage.ErrOutcomeUnknown and a 412 is always the answer to the only
-// attempt, never to a retry of an attempt that took effect. Delete is not
-// retried either. Nor is a chunk of a resumable session: a retried chunk whose
-// first attempt the emulator had stored was stored twice, giving an object
-// longer than the body, and the service's documentation does not say how it
-// treats a chunk it already has. A failed chunk fails the write, with no
+// resumable session, which publishes nothing and carries none of the body.
+// The client never retries a commit request, so a lost response is reported
+// as storage.ErrOutcomeUnknown. net/http can still send a request twice on its
+// own, below the store's transport: over HTTP/2 it re-sends a request whose
+// stream the server reset with PROTOCOL_ERROR, which does not say whether the
+// server processed it. The store counts the connections net/http asks for to
+// send a commit request; after more than one, every error of the call, a 412,
+// another 4xx or a refused connection included, wraps
+// storage.ErrOutcomeUnknown, because the answer may be to the re-send of an
+// attempt that took effect. The client does not retry a chunk of a resumable
+// session either: a retried chunk whose first attempt the emulator had stored
+// was stored twice, giving an object longer than the body, and the service's
+// documentation does not say how it treats a chunk it already has. A failed chunk fails the write, with no
 // effect.
 //
 // # Configuration
 //
-// [Open] takes a bucket, which must exist, and an optional endpoint. Without
-// an endpoint the store uses Application Default Credentials with the
+// [Open] takes a bucket, which must exist, and an optional endpoint. The
+// credentials keep the values of Open's context but not its cancellation, so
+// the Store keeps working after that context ends. Without an endpoint the
+// store uses Application Default Credentials with the
 // devstorage.read_write scope: a GKE workload identity, a service-account key
 // named by GOOGLE_APPLICATION_CREDENTIALS, or the metadata server. With an
 // endpoint, such as an emulator's, it sends no credentials. The client reads
@@ -66,6 +80,12 @@
 //
 //   - Tested against the fake-gcs-server emulator only (see the package
 //     tests), not against the real service.
+//   - Exactly one winner among concurrent conditional writes of [ChunkSize]
+//     bytes or more assumes that the service evaluates ifGenerationMatch at
+//     the last request of a resumable session, as the emulator does. Google
+//     does not document when it does; if it checked only when the session
+//     opens, two writers could both succeed. This must be checked against the
+//     real service before the server may use this backend.
 //   - Version tokens of one bucket are not portable to another.
 //   - The bucket must not have object versioning, retention policies or
 //     holds that make a Delete fail; a Delete that the service refuses is
@@ -80,6 +100,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"regexp"
 	"strconv"
@@ -131,6 +152,7 @@ func open(ctx context.Context, cfg Config, base http.RoundTripper) (*Store, erro
 		return nil, errors.New("gcs: no bucket")
 	}
 	opts := []option.ClientOption{gcs.WithJSONReads()}
+	base = markCommits{base} // below authentication, so a failed token fetch sends no commit request
 	if cfg.Endpoint != "" {
 		opts = append(opts, option.WithEndpoint(cfg.Endpoint))
 	} else {
@@ -138,11 +160,13 @@ func open(ctx context.Context, cfg Config, base http.RoundTripper) (*Store, erro
 			return nil, errors.New("gcs: STORAGE_EMULATOR_HOST is set; set Config.Endpoint to use an emulator")
 		}
 		var err error
-		if base, err = htransport.NewTransport(ctx, base, option.WithScopes(gcs.ScopeReadWrite)); err != nil {
+		// Some credentials fetch every later token with this context, so it
+		// must not end with Open's.
+		if base, err = htransport.NewTransport(context.WithoutCancel(ctx), base, option.WithScopes(gcs.ScopeReadWrite)); err != nil {
 			return nil, fmt.Errorf("gcs: credentials: %w", redact(err))
 		}
 	}
-	opts = append(opts, option.WithHTTPClient(&http.Client{Transport: markCommits{base}}))
+	opts = append(opts, option.WithHTTPClient(&http.Client{Transport: base}))
 	c, err := gcs.NewClient(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("gcs: %w", redact(err))
@@ -156,13 +180,21 @@ func (s *Store) Close() error { return s.client.Close() }
 // progress is what markCommits records of one Create, Replace or Delete. It
 // travels in the call's context.
 type progress struct {
-	data   atomic.Bool // a request carrying the body, or the commit request, has started
-	commit atomic.Bool // the commit request has started
+	data   atomic.Bool  // a request carrying the body, or the commit request, has started
+	commit atomic.Bool  // the commit request has started
+	conns  atomic.Int32 // connections net/http has asked for to send the commit request
 }
+
+// resent reports whether net/http may have sent the commit request more than
+// once. It re-sends a request on its own, below this store's transport, for
+// example when an HTTP/2 server resets the stream with PROTOCOL_ERROR, which
+// does not say whether the server processed it.
+func (p *progress) resent() bool { return p.conns.Load() > 1 }
 
 type progressKey struct{}
 
-// markCommits is the client's outermost http.RoundTripper.
+// markCommits is the http.RoundTripper right above net/http's, below
+// authentication.
 type markCommits struct{ next http.RoundTripper }
 
 func (m markCommits) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -173,6 +205,10 @@ func (m markCommits) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 		if c {
 			p.commit.Store(true)
+			// GetConn runs once per attempt, before any dial.
+			r = r.WithContext(httptrace.WithClientTrace(r.Context(), &httptrace.ClientTrace{
+				GetConn: func(string) { p.conns.Add(1) },
+			}))
 		}
 	}
 	return m.next.RoundTrip(r)
@@ -227,6 +263,11 @@ func (s *Store) write(ctx context.Context, op, key string, cond gcs.Conditions, 
 		return !p.data.Load() && gcs.ShouldRetry(err)
 	})).NewWriter(wctx)
 	w.ChunkSize = ChunkSize
+	if l, ok := body.(interface{ Len() int }); ok && l.Len() < ChunkSize {
+		// The client allocates a whole chunk per upload; one byte more than the
+		// body still sends it in one request. A wrong Len changes only that plan.
+		w.ChunkSize = l.Len() + 1
+	}
 	w.ContentType = "application/octet-stream"
 	// stop ends the upload and waits for the Writer's goroutine. Without an
 	// end of the body no commit request is sent, so the write has no effect.
@@ -245,7 +286,7 @@ func (s *Store) write(ctx context.Context, op, key string, cond gcs.Conditions, 
 			if _, err := w.Write(buf[:n]); err != nil {
 				cancel()
 				_ = w.Close()
-				return "", writeError(ctx, op, key, err, p.commit.Load())
+				return "", writeError(ctx, op, key, err, p.commit.Load(), p.resent())
 			}
 		}
 		if err := ctx.Err(); err != nil {
@@ -256,23 +297,30 @@ func (s *Store) write(ctx context.Context, op, key string, cond gcs.Conditions, 
 		}
 	}
 	if err := w.Close(); err != nil {
-		return "", writeError(ctx, op, key, err, p.commit.Load())
+		return "", writeError(ctx, op, key, err, p.commit.Load(), p.resent())
 	}
-	return strconv.FormatInt(w.Attrs().Generation, 10), nil
+	if a := w.Attrs(); a != nil && a.Generation > 0 {
+		return strconv.FormatInt(a.Generation, 10), nil
+	}
+	return "", fail(op, key, fmt.Errorf("%w: gcs: response without generation", storage.ErrOutcomeUnknown))
 }
 
 // writeError classifies err from a Create, Replace or Delete; sent reports
-// whether its commit request had started.
-func writeError(ctx context.Context, op, key string, err error, sent bool) error {
+// whether its commit request had started, resent whether net/http may have
+// sent it twice, in which case the answer may be to the second attempt.
+func writeError(ctx context.Context, op, key string, err error, sent, resent bool) error {
 	var ge *googleapi.Error
 	isHTTP := errors.As(err, &ge)
-	if isHTTP && ge.Code == http.StatusPreconditionFailed {
+	if isHTTP && ge.Code == http.StatusPreconditionFailed && !resent && conditionNotMet(ge) {
 		return fail(op, key, storage.ErrPreconditionFailed)
 	}
 	definite := !sent || isHTTP && ge.Code >= 400 && ge.Code < 500 && ge.Code != http.StatusRequestTimeout
 	var oe *net.OpError
 	if errors.As(err, &oe) && oe.Op == "dial" {
 		definite = true // the connection was never made, so nothing was sent
+	}
+	if resent {
+		definite = false
 	}
 	e := redact(err)
 	if cerr := ctx.Err(); cerr != nil {
@@ -282,6 +330,17 @@ func writeError(ctx context.Context, op, key string, err error, sent bool) error
 		e = fmt.Errorf("%w: %w", storage.ErrOutcomeUnknown, e)
 	}
 	return fail(op, key, e)
+}
+
+// conditionNotMet reports whether a 412 is the write's own condition failing.
+// The service also answers 412 for reasons such as orgPolicyConstraintFailed.
+func conditionNotMet(ge *googleapi.Error) bool {
+	for _, e := range ge.Errors {
+		if e.Reason != "conditionNotMet" {
+			return false
+		}
+	}
+	return true
 }
 
 // readError wraps err from a read, list or body Read: storage.ErrNotFound for
@@ -407,6 +466,9 @@ func (s *Store) head(ctx context.Context, op, key string) (storage.Info, error) 
 	if err != nil {
 		return storage.Info{}, fail(op, key, readError(ctx, err))
 	}
+	if a.Generation <= 0 || a.Size < 0 {
+		return storage.Info{}, fail(op, key, errors.New("gcs: response without generation or size"))
+	}
 	return storage.Info{Size: a.Size, Version: strconv.FormatInt(a.Generation, 10)}, nil
 }
 
@@ -478,5 +540,5 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 	if err == nil || errors.Is(err, gcs.ErrObjectNotExist) {
 		return nil
 	}
-	return writeError(ctx, "delete", key, err, p.commit.Load())
+	return writeError(ctx, "delete", key, err, p.commit.Load(), p.resent())
 }

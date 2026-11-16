@@ -10,6 +10,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/ncruces/go-sqlite3 v0.37.0
 	github.com/superfly/ltx v0.5.2
+	golang.org/x/net v0.62.0
 	google.golang.org/api v0.307.0
 	modernc.org/sqlite v1.49.1
 )
@@ -73,7 +74,6 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.45.0 // indirect
 	go.opentelemetry.io/otel/trace v1.45.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
-	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
