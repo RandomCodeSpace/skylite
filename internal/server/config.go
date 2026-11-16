@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 
@@ -121,12 +122,30 @@ func (s Storage) validate() error {
 		return errors.New("storage.s3 needs bucket and region")
 	case s.GCS != nil && s.GCS.Bucket == "":
 		return errors.New("storage.gcs.bucket is empty")
+	case s.S3 != nil && !validEndpoint(s.S3.Endpoint):
+		return errors.New("storage.s3.endpoint " + endpointRule)
+	case s.GCS != nil && !validEndpoint(s.GCS.Endpoint):
+		return errors.New("storage.gcs.endpoint " + endpointRule)
 	}
 	// The longest database name must still leave room for every key.
 	if _, err := s.keys(strings.Repeat("a", 63)); err != nil {
 		return fmt.Errorf("storage.prefix: %w", err)
 	}
 	return nil
+}
+
+const endpointRule = "must be an http or https URL with a host and no user information, query or fragment"
+
+// validEndpoint reports whether e is empty or follows endpointRule, so that
+// it holds no credential and can be logged. The value is never put in an
+// error, because one that breaks the rule may hold a secret.
+func validEndpoint(e string) bool {
+	if e == "" {
+		return true
+	}
+	u, err := url.Parse(e)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" &&
+		u.User == nil && u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && !strings.Contains(e, "#")
 }
 
 // keys returns the keys of database db.

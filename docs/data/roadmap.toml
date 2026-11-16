@@ -15,7 +15,7 @@ gate = "The storage architecture that follows from it is recorded in decision re
 [[items]]
 title = "Storage interface and four backends"
 status = "planned"
-detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators. So far the interface, its conformance suite, the local filesystem backend, the S3 backend and the Google Cloud Storage backend exist as library packages, the S3 backend tested against the RustFS emulator only and the Google Cloud Storage backend against fake-gcs-server only; the server cannot use them yet, and the Azure Blob backend is still to come."
+detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators. So far the interface, its conformance suite, the local filesystem backend, the S3 backend and the Google Cloud Storage backend exist as library packages, the S3 backend tested against the RustFS emulator only and the Google Cloud Storage backend against fake-gcs-server only; `skylite serve` can use the local filesystem, S3 and Google Cloud Storage backends, and the Azure Blob backend is still to come."
 
 [[items]]
 title = "Storage engine: commit log, paged reads, compaction"

@@ -6,9 +6,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -76,8 +78,10 @@ func TestForbiddenWhetherOrNotExists(t *testing.T) {
 		t.Fatalf("admin PUT: %s %v", resp.Status, m)
 	}
 	creates := e.store.creates.Load()
-	for _, sub := range []string{"reader", "scoped", "nobody"} {
+	tokens := map[string]string{}
+	for _, sub := range []string{"writer", "reader", "scoped", "nobody"} {
 		tok := e.sig.token(t, sub)
+		tokens[sub] = tok
 		var frames []map[string]any
 		for _, db := range []string{"taken", "absent"} {
 			resp, m := e.put(t, c, db, tok)
@@ -94,6 +98,10 @@ func TestForbiddenWhetherOrNotExists(t *testing.T) {
 	if n := e.store.creates.Load(); n != creates {
 		t.Errorf("refused PUTs sent %d creates", n-creates)
 	}
+	e.logs.waitFor(t, 1, `"msg":"database created"`, `"issuer":"`+testIssuer+`"`, `"subject":"admin"`, `"database":"taken"`)
+	sum := sha256.Sum256([]byte(tokens["writer"]))
+	e.logs.waitFor(t, 1, `"msg":"authorisation refused"`, `"code":"forbidden"`, `"issuer":"`+testIssuer+`"`, `"subject":"writer"`,
+		`"token_sha256_prefix":"`+hex.EncodeToString(sum[:6])+`"`, `"database":"absent"`, `"role":"admin"`)
 }
 
 // failingBody fails the test that reads it.
@@ -113,7 +121,9 @@ func TestUnauthenticatedBodyNeverRead(t *testing.T) {
 		{"garbage token", http.MethodPut, "/v1/databases/a", "Bearer x.y.z", "unauthenticated"},
 		{"unknown key", http.MethodPut, "/v1/databases/a", "Bearer " + other.token(t, "admin"), "unauthenticated"},
 		{"query, no token", http.MethodPost, "/v1/databases/a/query", "", "unauthenticated"},
-		{"query, authenticated", http.MethodPost, "/v1/databases/a/query", "Bearer " + e.sig.token(t, "admin"), "not_serving"},
+		{"query, authenticated", http.MethodPost, "/v1/databases/a/query", "Bearer " + e.sig.token(t, "reader"), "not_serving"},
+		{"query, no role", http.MethodPost, "/v1/databases/a/query", "Bearer " + e.sig.token(t, "nobody"), "forbidden"},
+		{"status, no role on the name", http.MethodGet, "/v1/databases/a", "Bearer " + e.sig.token(t, "scoped"), "forbidden"},
 		{"unknown path", http.MethodPost, "/v1/databases/a/other", "", "invalid_request"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -142,7 +152,8 @@ func TestUnauthenticatedBodyNeverRead(t *testing.T) {
 
 // TestBodyCutAtEveryOffset cuts a PUT whose Content-Length is 4 after each
 // of its first 4 bytes. At offset 2 the bytes sent, {}, are a valid body by
-// themselves, so only the length check refuses it.
+// themselves; net/http already fails the read of a body that ends before
+// its Content-Length, and the length check is a second guard.
 func TestBodyCutAtEveryOffset(t *testing.T) {
 	e := newEnv(t, nil)
 	e.start(t)
@@ -343,8 +354,47 @@ func TestPutUnknownOutcome(t *testing.T) {
 	if resp.StatusCode != http.StatusInternalServerError || errorCode(m) != "internal" {
 		t.Fatalf("%s %v, want 500 internal", resp.Status, m)
 	}
-	if !strings.Contains(e.logs.String(), "outcome unknown") {
-		t.Errorf("no log of the unknown outcome:\n%s", e.logs)
+	em := m["error"].(map[string]any)
+	if em["not_executed"] != false || em["final"] != false || em["message"] != "the create's outcome is unknown: the database may or may not exist" {
+		t.Errorf("error %v, want not_executed false, final false and the unknown-outcome message", em)
+	}
+	e.logs.waitFor(t, 1, `"msg":"database create outcome unknown"`, `"database":"unknown"`)
+}
+
+// failStore fails op ("get" or "create") with an error that is not a
+// storage error.
+type failStore struct {
+	storage.Store
+	op string
+}
+
+func (s failStore) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	if s.op == "get" {
+		return nil, storage.Info{}, errors.New("disk on fire")
+	}
+	return s.Store.Get(ctx, key)
+}
+
+func (s failStore) Create(ctx context.Context, key string, body io.Reader) (string, error) {
+	if s.op == "create" {
+		return "", errors.New("disk on fire")
+	}
+	return s.Store.Create(ctx, key, body)
+}
+
+func TestPutStoreFailure(t *testing.T) {
+	for _, op := range []string{"get", "create"} {
+		t.Run(op, func(t *testing.T) {
+			e := newEnv(t, func(st storage.Store) storage.Store { return failStore{st, op} })
+			e.start(t)
+			resp, m := e.put(t, h1Client(), "broken", e.sig.token(t, "admin"))
+			em, _ := m["error"].(map[string]any)
+			if resp.StatusCode != http.StatusInternalServerError || errorCode(m) != "internal" || m["done"] != nil ||
+				em["not_executed"] != true || em["final"] != false || em["message"] != "the database could not be created" {
+				t.Fatalf("%s %v, want 500 internal, not executed", resp.Status, m)
+			}
+			e.logs.waitFor(t, 1, `"msg":"database create failed"`, `"database":"broken"`, `disk on fire`)
+		})
 	}
 }
 
@@ -359,7 +409,11 @@ func TestJWKSFileIssuer(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized || errorCode(m) != "unauthenticated" {
 		t.Fatalf("token signed with another key: %s %v", resp.Status, m)
 	}
-	e.logs.waitFor(t, 1, `"auth_code":"unknown_key"`)
+	tok := newSigner(t, "k2").token(t, "admin")
+	e.put(t, h1Client(), "jwks", tok)
+	sum := sha256.Sum256([]byte(tok))
+	e.logs.waitFor(t, 1, `"msg":"authentication refused"`, `"code":"unknown_key"`, `"issuer":"`+testIssuer+`"`, `"kid":"k2"`,
+		`"token_sha256_prefix":"`+hex.EncodeToString(sum[:6])+`"`)
 }
 
 func TestNoSecretInLogs(t *testing.T) {
@@ -368,8 +422,10 @@ func TestNoSecretInLogs(t *testing.T) {
 	c := h1Client()
 	admin, reader := e.sig.token(t, "admin"), e.sig.token(t, "reader")
 	forged := admin[:strings.LastIndexByte(admin, '.')+1] + "AAAA"
+	var bodies []string
 	for _, tok := range []string{admin, reader, forged} {
-		e.put(t, c, "secrets", tok)
+		_, m := e.put(t, c, "secrets", tok)
+		bodies = append(bodies, fmt.Sprint(m))
 	}
 	e.logs.waitFor(t, 3, "request refused")
 	logs := e.logs.String()
@@ -377,6 +433,11 @@ func TestNoSecretInLogs(t *testing.T) {
 		for part := range strings.SplitSeq(tok, ".") {
 			if len(part) > 8 && strings.Contains(logs, part) {
 				t.Errorf("the log holds part of a token: %q\n%s", part, logs)
+			}
+			for _, b := range bodies {
+				if len(part) > 8 && strings.Contains(b, part) {
+					t.Errorf("a response holds part of a token: %q\n%s", part, b)
+				}
 			}
 		}
 	}
@@ -389,12 +450,12 @@ func TestServeTLSAndShutdown(t *testing.T) {
 	sig := newSigner(t, "k1")
 	cfg.Auth.Issuers[0].JWKSFile = jwksFile(t, sig)
 	cfg.Plaintext, cfg.TLS = false, cert
-	block := make(chan struct{})
 	s, err := New(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.store = blockingStore{s.store, block}
+	gate := newGateStore(s.store)
+	s.store = gate
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -423,14 +484,14 @@ func TestServeTLSAndShutdown(t *testing.T) {
 		b, _ := io.ReadAll(resp.Body)
 		got <- answer{resp, string(b)}
 	}()
-	time.Sleep(100 * time.Millisecond) // the request is running
+	<-gate.entered // the request is running
 	cancel()
 	select {
 	case err := <-served:
 		t.Fatalf("Serve returned while a request was running: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	close(block)
+	close(gate.release)
 	a := <-got
 	if a.resp == nil || a.resp.StatusCode != http.StatusOK || a.resp.ProtoMajor != 2 {
 		t.Fatalf("PUT over TLS during shutdown: %+v", a)
@@ -438,17 +499,6 @@ func TestServeTLSAndShutdown(t *testing.T) {
 	if err := <-served; err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
-}
-
-// blockingStore holds every create until block is closed.
-type blockingStore struct {
-	storage.Store
-	block chan struct{}
-}
-
-func (s blockingStore) Create(ctx context.Context, key string, body io.Reader) (string, error) {
-	<-s.block
-	return s.Store.Create(ctx, key, body)
 }
 
 // selfSigned writes a certificate for 127.0.0.1 and its key into dir.
@@ -485,6 +535,20 @@ func selfSigned(t *testing.T, dir string) (*TLS, *x509.CertPool) {
 	pool := x509.NewCertPool()
 	pool.AddCert(cert)
 	return c, pool
+}
+
+func TestNewRefusesABadJWKSFile(t *testing.T) {
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty.json")
+	if err := os.WriteFile(empty, []byte(`{"keys":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{"missing": filepath.Join(dir, "absent.json"), "a directory": dir, "no usable key": empty} {
+		_, err := New(testConfig(t, path), nil)
+		if err == nil || (name == "missing" && !errors.Is(err, os.ErrNotExist)) {
+			t.Errorf("New with a JWKS file that is %s: %v", name, err)
+		}
+	}
 }
 
 func TestNewRefusesABadCertificate(t *testing.T) {

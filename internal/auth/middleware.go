@@ -39,7 +39,7 @@ func (g *Guard) Require(need Role, database func(*http.Request) string, next htt
 			if !errors.As(err, &e) {
 				e = &Error{Code: CodeMalformed}
 			}
-			g.log.LogAttrs(r.Context(), slog.LevelInfo, "auth: request refused", refusalAttrs(e, token)...)
+			g.log.LogAttrs(r.Context(), slog.LevelInfo, "auth: request refused", RefusalAttrs(e, token)...)
 			if e.Code == CodeMissingToken {
 				w.Header().Set("WWW-Authenticate", "Bearer")
 				http.Error(w, string(CodeMissingToken), http.StatusUnauthorized)
@@ -51,7 +51,7 @@ func (g *Guard) Require(need Role, database func(*http.Request) string, next htt
 		}
 		db := database(r)
 		if !g.Authorize(p, db, need) {
-			attrs := refusalAttrs(&Error{Code: CodeForbidden, Issuer: p.Issuer, Subject: p.Subject}, token)
+			attrs := RefusalAttrs(&Error{Code: CodeForbidden, Issuer: p.Issuer, Subject: p.Subject}, token)
 			attrs = append(attrs, slog.String("database", clip(db)), slog.String("role", string(need)))
 			g.log.LogAttrs(r.Context(), slog.LevelInfo, "auth: request refused", attrs...)
 			w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope"`)
@@ -81,9 +81,10 @@ func BearerToken(h http.Header) (string, error) {
 	return token, nil
 }
 
-// refusalAttrs are the log attributes of a refusal, each value cut to 200
-// bytes. The token itself is represented only by a prefix of its SHA-256 hash.
-func refusalAttrs(e *Error, token string) []slog.Attr {
+// RefusalAttrs are the log attributes of a refusal of ADR 0006, each value
+// cut to 200 bytes. The token itself is represented only by a prefix of its
+// SHA-256 hash.
+func RefusalAttrs(e *Error, token string) []slog.Attr {
 	attrs := []slog.Attr{slog.String("code", string(e.Code))}
 	for _, a := range []struct{ k, v string }{{"issuer", e.Issuer}, {"subject", e.Subject}, {"kid", e.KeyID}} {
 		if a.v != "" {
@@ -95,4 +96,10 @@ func refusalAttrs(e *Error, token string) []slog.Attr {
 		attrs = append(attrs, slog.String("token_sha256_prefix", hex.EncodeToString(sum[:6])))
 	}
 	return attrs
+}
+
+// LogAttrs are the log attributes naming p: its issuer and subject, each cut
+// to 200 bytes.
+func (p *Principal) LogAttrs() []slog.Attr {
+	return []slog.Attr{slog.String("issuer", clip(p.Issuer)), slog.String("subject", clip(p.Subject))}
 }

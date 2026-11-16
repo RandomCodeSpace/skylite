@@ -33,12 +33,13 @@ Commands:
              Run the HTTPS server with the JSON configuration in <file>. It
              logs JSON lines to standard error and stops on SIGTERM or
              SIGINT after running requests finish, waiting at most a minute.
+             A second SIGTERM or SIGINT stops it at once.
   version    Print the skylite version and exit.
   help       Print this help text and exit. Also: -h, --help, or no command.
 
 Exit status:
   0  success, or the server stopped cleanly
-  1  the server could not start or failed
+  1  the server could not start or failed, or cut running requests to stop
   2  unknown command or bad arguments
 
 Documentation: https://randomcodespace.github.io/skylite/
@@ -101,6 +102,10 @@ func serve(args []string, stderr io.Writer) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop() // a second signal gets its default action and ends the process
+	}()
 	log.Info("serving", slog.String("version", version()), slog.String("listen", ln.Addr().String()))
 	if err := s.Serve(ctx, ln); err != nil {
 		log.Error("skylite serve: " + err.Error())

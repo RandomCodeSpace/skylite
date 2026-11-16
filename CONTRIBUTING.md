@@ -52,8 +52,8 @@ targets select Go 1.26.11 unless `GOTOOLCHAIN` is already set.
 | `make vuln`             | `govulncheck ./...` at the pinned version                                               |
 | `make check`            | all of the above                                                                        |
 | `make integration`      | Azurite in Docker, then `go test -race -tags integration ./...`                         |
-| `make integration-s3`   | RustFS in Docker, then the S3 backend's tests and the conformance suite against it      |
-| `make integration-gcs`  | fake-gcs-server in Docker, then the `gcs` backend's tests and conformance suite         |
+| `make integration-s3`   | RustFS in Docker, then the S3 backend's tests, its conformance suite and the server's tests against it |
+| `make integration-gcs`  | fake-gcs-server in Docker, then the `gcs` backend's tests, its conformance suite and the server's tests against it |
 | `make java-acceptance`  | JPA acceptance suite against sqlite-jdbc (needs a JDK and Maven)                        |
 | `make java-fault-check` | checks that the acceptance suite catches injected driver faults (needs a JDK and Maven) |
 

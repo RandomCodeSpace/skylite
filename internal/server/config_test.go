@@ -83,3 +83,39 @@ func TestLoadRefuses(t *testing.T) {
 		t.Error("a missing file was accepted")
 	}
 }
+
+func TestLoadRefusesAnEndpointWithASecret(t *testing.T) {
+	const good = `"endpoint": "http://127.0.0.1:9000"`
+	for _, ep := range []string{
+		"http://u:hunter2@127.0.0.1:9000",
+		"http://127.0.0.1:9000/?X-Amz-Signature=hunter2",
+		"http://127.0.0.1:9000/?",
+		"http://127.0.0.1:9000/#hunter2",
+		"http://127.0.0.1:9000/#",
+		"ftp://127.0.0.1:9000",
+		"127.0.0.1:9000",
+		"http:///hunter2",
+		"http://127.0.0.1:9000/\x7fhunter2",
+	} {
+		for _, backend := range []string{"s3", "gcs"} {
+			s := strings.Replace(goodConfig, good, `"endpoint": "`+strings.ReplaceAll(ep, "\x7f", `\u007f`)+`"`, 1)
+			if backend == "gcs" {
+				s = strings.Replace(s, `"s3": {"bucket": "b", "region": "eu-west-1",`, `"gcs": {"bucket": "b",`, 1)
+				s = strings.Replace(s, `, "path_style": true`, "", 1)
+			}
+			_, err := Load(writeConfig(t, s))
+			if err == nil {
+				t.Errorf("%s endpoint %q accepted", backend, ep)
+				continue
+			}
+			if want := "storage." + backend + ".endpoint"; !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "hunter2") {
+				t.Errorf("%s endpoint %q: error %q, want one naming %s and not the value", backend, ep, err, want)
+			}
+		}
+	}
+	for _, ep := range []string{"https://storage.example:443/base/", "http://[::1]:9000"} {
+		if _, err := Load(writeConfig(t, strings.Replace(goodConfig, good, `"endpoint": "`+ep+`"`, 1))); err != nil {
+			t.Errorf("endpoint %q: %v", ep, err)
+		}
+	}
+}

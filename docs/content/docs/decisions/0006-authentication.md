@@ -80,6 +80,8 @@ The request must carry one `Authorization` header with the `Bearer` scheme, then
 | The token fails any check, or the header appears more than once | 401 | `Bearer error="invalid_token"` | `invalid_token` |
 | Authenticated, but without the role | 403 | `Bearer error="insufficient_scope"` | `forbidden` |
 
+*Superseded for the client protocol:* this table describes `internal/auth`'s `Require` middleware. The server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) answers with that record's responses instead: an NDJSON error frame with the code `unauthenticated` (401, `WWW-Authenticate: Bearer`) or `forbidden` (403, no `WWW-Authenticate`), not these text bodies and not `insufficient_scope`.
+
 The log records the specific reason: `token_too_large`, `malformed_token`, `unsupported_algorithm`, `untrusted_issuer`, `unknown_key`, `keys_unavailable`, `invalid_signature`, `missing_claim`, `invalid_audience`, `token_expired`, `token_not_yet_valid` or `issued_in_future`.
 
 ### Authorisation
