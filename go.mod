@@ -11,6 +11,7 @@ require (
 	github.com/aws/smithy-go v1.28.9
 	github.com/benbjohnson/litestream v0.5.18
 	github.com/go-jose/go-jose/v4 v4.1.9
+	github.com/go-json-experiment/json v1.27.2
 	github.com/ncruces/go-sqlite3 v0.37.0
 	github.com/superfly/ltx v0.5.2
 	golang.org/x/net v0.62.0

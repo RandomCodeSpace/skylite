@@ -1,0 +1,118 @@
+{"name":"null","wire":"null","class":"null","value":null}
+{"name":"integer zero","wire":"0","class":"integer","value":"0"}
+{"name":"integer one","wire":"1","class":"integer","value":"1"}
+{"name":"integer minus one","wire":"-1","class":"integer","value":"-1"}
+{"name":"integer largest","wire":"9223372036854775807","class":"integer","value":"9223372036854775807"}
+{"name":"integer smallest","wire":"-9223372036854775808","class":"integer","value":"-9223372036854775808"}
+{"name":"integer negative zero","wire":"-0","class":"integer","value":"0","decode_only":true}
+{"name":"integer above range","wire":"9223372036854775808","error":"invalid_request"}
+{"name":"integer below range","wire":"-9223372036854775809","error":"invalid_request"}
+{"name":"integer far above range","wire":"100000000000000000000","error":"invalid_request"}
+{"name":"real 100","wire":"1e2","class":"real","value":"4059000000000000"}
+{"name":"real 0.1","wire":"1e-1","class":"real","value":"3fb999999999999a"}
+{"name":"real 1.5","wire":"1.5e0","class":"real","value":"3ff8000000000000"}
+{"name":"real 0.5 one digit","wire":"5e-1","class":"real","value":"3fe0000000000000"}
+{"name":"real 1","wire":"1e0","class":"real","value":"3ff0000000000000"}
+{"name":"real minus 25 integral","wire":"-2.5e1","class":"real","value":"c039000000000000"}
+{"name":"real 2^53 integral","wire":"9.007199254740992e15","class":"real","value":"4340000000000000"}
+{"name":"real 1e23 one digit","wire":"1e23","class":"real","value":"44b52d02c7e14af6"}
+{"name":"real zero","wire":"0e0","class":"real","value":"0000000000000000"}
+{"name":"real negative zero","wire":"-0e0","class":"real","value":"8000000000000000"}
+{"name":"real smallest subnormal","wire":"5e-324","class":"real","value":"0000000000000001"}
+{"name":"real largest subnormal","wire":"2.225073858507201e-308","class":"real","value":"000fffffffffffff"}
+{"name":"real smallest normal","wire":"2.2250738585072014e-308","class":"real","value":"0010000000000000"}
+{"name":"real largest","wire":"1.7976931348623157e308","class":"real","value":"7fefffffffffffff"}
+{"name":"real most negative","wire":"-1.7976931348623157e308","class":"real","value":"ffefffffffffffff"}
+{"name":"real pi","wire":"3.141592653589793e0","class":"real","value":"400921fb54442d18"}
+{"name":"real 1/3","wire":"3.333333333333333e-1","class":"real","value":"3fd5555555555555"}
+{"name":"real 2^-1074 times 3","wire":"1.5e-323","class":"real","value":"0000000000000003"}
+{"name":"real 1.0 decode only","wire":"1.0","class":"real","value":"3ff0000000000000","decode_only":true}
+{"name":"real 1E2 decode only","wire":"1E2","class":"real","value":"4059000000000000","decode_only":true}
+{"name":"real 1e+2 decode only","wire":"1e+2","class":"real","value":"4059000000000000","decode_only":true}
+{"name":"real 100.0 decode only","wire":"100.0","class":"real","value":"4059000000000000","decode_only":true}
+{"name":"real 0.1 decode only","wire":"0.1","class":"real","value":"3fb999999999999a","decode_only":true}
+{"name":"real 1e02 decode only","wire":"1e02","class":"real","value":"4059000000000000","decode_only":true}
+{"name":"real 1.50e0 decode only","wire":"1.50e0","class":"real","value":"3ff8000000000000","decode_only":true}
+{"name":"real -0.0 decode only","wire":"-0.0","class":"real","value":"8000000000000000","decode_only":true}
+{"name":"real underflow to zero","wire":"1e-400","class":"real","value":"0000000000000000","decode_only":true}
+{"name":"real underflow to subnormal","wire":"3e-324","class":"real","value":"0000000000000001","decode_only":true}
+{"name":"real underflow negative","wire":"-1e-400","class":"real","value":"8000000000000000","decode_only":true}
+{"name":"real rounds to largest","wire":"1.7976931348623158e308","class":"real","value":"7fefffffffffffff","decode_only":true}
+{"name":"real infinity","wire":"{\"real\":\"Infinity\"}","class":"real","value":"7ff0000000000000"}
+{"name":"real negative infinity","wire":"{\"real\":\"-Infinity\"}","class":"real","value":"fff0000000000000"}
+{"name":"real infinity, escaped tag name decode only","wire":"{\"\\u0072eal\":\"Infinity\"}","class":"real","value":"7ff0000000000000","decode_only":true}
+{"name":"real infinity, escaped tag value decode only","wire":"{\"real\":\"\\u0049nfinity\"}","class":"real","value":"7ff0000000000000","decode_only":true}
+{"name":"real overflow","wire":"1e999","error":"invalid_request"}
+{"name":"real negative overflow","wire":"-1e999","error":"invalid_request"}
+{"name":"real overflow just above largest","wire":"1.7976931348623159e308","error":"invalid_request"}
+{"name":"real NaN tag","wire":"{\"real\":\"NaN\"}","error":"invalid_request"}
+{"name":"real NaN bare","wire":"NaN","error":"invalid_request"}
+{"name":"real Infinity bare","wire":"Infinity","error":"invalid_request"}
+{"name":"real tag with number text","wire":"{\"real\":\"1.5\"}","error":"invalid_request"}
+{"name":"real tag with number","wire":"{\"real\":1}","error":"invalid_request"}
+{"name":"real tag lowercase infinity","wire":"{\"real\":\"infinity\"}","error":"invalid_request"}
+{"name":"real tag plus infinity","wire":"{\"real\":\"+Infinity\"}","error":"invalid_request"}
+{"name":"text","wire":"\"Dune\"","class":"text","value":"44756e65"}
+{"name":"text empty","wire":"\"\"","class":"text","value":""}
+{"name":"text embedded NUL","wire":"\"a\\u0000b\"","class":"text","value":"610062"}
+{"name":"text control escapes","wire":"\"\\b\\f\\n\\r\\t\\u0001\\u001f\"","class":"text","value":"080c0a0d09011f"}
+{"name":"text every control character","wire":"\"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\"","class":"text","value":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}
+{"name":"text uppercase control escape decode only","wire":"\"\\u001F\"","class":"text","value":"1f","decode_only":true}
+{"name":"text escaped short form decode only","wire":"\"\\u0008\\u0009\\u000a\\u000c\\u000d\\u0022\\u005c\"","class":"text","value":"08090a0c0d225c","decode_only":true}
+{"name":"text quote and backslash","wire":"\"\\\"\\\\\"","class":"text","value":"225c"}
+{"name":"text slash and delete raw","wire":"\"/\"","class":"text","value":"2f7f"}
+{"name":"text html characters raw","wire":"\"<>&\"","class":"text","value":"3c3e26"}
+{"name":"text two-byte UTF-8","wire":"\"é\"","class":"text","value":"c3a9"}
+{"name":"text line separator raw","wire":"\" \"","class":"text","value":"e280a8"}
+{"name":"text paragraph separator raw","wire":"\" \"","class":"text","value":"e280a9"}
+{"name":"text escaped line separator decode only","wire":"\"\\u2028\"","class":"text","value":"e280a8","decode_only":true}
+{"name":"text four-byte UTF-8","wire":"\"😀\"","class":"text","value":"f09f9880"}
+{"name":"text escaped two-byte decode only","wire":"\"\\u00e9\"","class":"text","value":"c3a9","decode_only":true}
+{"name":"text escaped slash decode only","wire":"\"\\/\"","class":"text","value":"2f","decode_only":true}
+{"name":"text escaped pair decode only","wire":"\"\\ud83d\\ude00\"","class":"text","value":"f09f9880","decode_only":true}
+{"name":"text uppercase escape decode only","wire":"\"\\u00E9\"","class":"text","value":"c3a9","decode_only":true}
+{"name":"text lone high surrogate","wire":"\"\\ud800\"","error":"invalid_request"}
+{"name":"text lone low surrogate","wire":"\"\\udc00\"","error":"invalid_request"}
+{"name":"text reversed surrogates","wire":"\"\\ude00\\ud83d\"","error":"invalid_request"}
+{"name":"text high surrogate then letter","wire":"\"\\ud83da\"","error":"invalid_request"}
+{"name":"text invalid UTF-8 byte","wire_hex":"22ff22","error":"invalid_request"}
+{"name":"text truncated UTF-8 sequence","wire_hex":"22c322","error":"invalid_request"}
+{"name":"text encoded surrogate","wire_hex":"22eda08022","error":"invalid_request"}
+{"name":"text overlong encoding","wire_hex":"22c0af22","error":"invalid_request"}
+{"name":"text raw control character","wire":"\"a\nb\"","error":"invalid_request"}
+{"name":"text_bytes invalid UTF-8","wire":"{\"text_bytes\":\"/w==\"}","class":"text","value":"ff"}
+{"name":"text_bytes encoded surrogate","wire":"{\"text_bytes\":\"7aCA\"}","class":"text","value":"eda080"}
+{"name":"text_bytes valid UTF-8 decode only","wire":"{\"text_bytes\":\"QQ==\"}","class":"text","value":"41","decode_only":true}
+{"name":"text_bytes empty decode only","wire":"{\"text_bytes\":\"\"}","class":"text","value":"","decode_only":true}
+{"name":"text_bytes non-zero unused bits","wire":"{\"text_bytes\":\"/x==\"}","error":"invalid_request"}
+{"name":"text_bytes escaped base64 decode only","wire":"{\"text_bytes\":\"\\/w==\"}","class":"text","value":"ff","decode_only":true}
+{"name":"blob empty","wire":"{\"blob\":\"\"}","class":"blob","value":""}
+{"name":"blob one byte","wire":"{\"blob\":\"/w==\"}","class":"blob","value":"ff"}
+{"name":"blob two bytes","wire":"{\"blob\":\"AAE=\"}","class":"blob","value":"0001"}
+{"name":"blob three bytes","wire":"{\"blob\":\"AAEC\"}","class":"blob","value":"000102"}
+{"name":"blob escaped slash decode only","wire":"{\"blob\":\"\\/w==\"}","class":"blob","value":"ff","decode_only":true}
+{"name":"blob escaped base64 letters decode only","wire":"{\"blob\":\"\\u0041A\\u0045=\"}","class":"blob","value":"0001","decode_only":true}
+{"name":"blob escaped tag name decode only","wire":"{\"\\u0062lob\":\"AAE=\"}","class":"blob","value":"0001","decode_only":true}
+{"name":"blob non-zero unused bits, one byte","wire":"{\"blob\":\"/x==\"}","error":"invalid_request"}
+{"name":"blob non-zero unused bits, two bytes","wire":"{\"blob\":\"AAF=\"}","error":"invalid_request"}
+{"name":"blob without padding","wire":"{\"blob\":\"/w\"}","error":"invalid_request"}
+{"name":"blob URL alphabet","wire":"{\"blob\":\"-_8=\"}","error":"invalid_request"}
+{"name":"blob line break","wire":"{\"blob\":\"AA\\nEC\"}","error":"invalid_request"}
+{"name":"blob carriage return","wire":"{\"blob\":\"AAEC\\r\"}","error":"invalid_request"}
+{"name":"blob space","wire":"{\"blob\":\"AA EC\"}","error":"invalid_request"}
+{"name":"blob padding inside","wire":"{\"blob\":\"AA==AAEC\"}","error":"invalid_request"}
+{"name":"blob number","wire":"{\"blob\":1}","error":"invalid_request"}
+{"name":"blob null","wire":"{\"blob\":null}","error":"invalid_request"}
+{"name":"boolean true","wire":"true","error":"invalid_request"}
+{"name":"boolean false","wire":"false","error":"invalid_request"}
+{"name":"array","wire":"[1]","error":"invalid_request"}
+{"name":"empty object","wire":"{}","error":"invalid_request"}
+{"name":"unknown tag","wire":"{\"date\":\"2026-11-16\"}","error":"invalid_request"}
+{"name":"tag in upper case","wire":"{\"BLOB\":\"\"}","error":"invalid_request"}
+{"name":"two members","wire":"{\"blob\":\"\",\"text_bytes\":\"\"}","error":"invalid_request"}
+{"name":"duplicate tag","wire":"{\"blob\":\"\",\"blob\":\"\"}","error":"invalid_request"}
+{"name":"leading space","wire":" 1","error":"invalid_request"}
+{"name":"trailing space","wire":"1 ","error":"invalid_request"}
+{"name":"two values","wire":"1 2","error":"invalid_request"}
+{"name":"empty","wire":"","error":"invalid_request"}
+{"name":"text at the frame size","wire":"\"a\"","class":"text","value":"61","repeat":1048571}
