@@ -1083,6 +1083,25 @@ func TestReadErrorsAreNotMissing(t *testing.T) {
 	}
 }
 
+// TestWriteErrorsAreNotPreconditions answers every write with an error that
+// does not say the condition failed: access denied and a missing bucket. The
+// contract: ErrPreconditionFailed means the condition did not hold, so each of
+// these is an error that wraps no storage sentinel.
+func TestWriteErrorsAreNotPreconditions(t *testing.T) {
+	for _, c := range []struct {
+		code   int
+		s3Code string
+	}{{403, "AccessDenied"}, {404, "NoSuchBucket"}} {
+		t.Run(fmt.Sprint(c.code, " ", c.s3Code), func(t *testing.T) {
+			s := offline(t, func(r *http.Request) (*http.Response, error) { return status(c.code, c.s3Code, false)(nil, r) })
+			_, err := s.Create(ctx, "k", strings.NewReader("x"))
+			expectDefinite(t, err, nil)
+			_, err = s.Replace(ctx, "k", `"e"`, strings.NewReader("x"))
+			expectDefinite(t, err, nil)
+		})
+	}
+}
+
 // TestRangeAfter416 answers GetRange's GET with 416, as S3 does for a range
 // that starts past the object, and the HEAD that follows with an object that
 // has grown past the offset, with an error, or with growth on every attempt.

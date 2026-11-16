@@ -516,23 +516,55 @@ func TestValidKeys(t *testing.T) {
 			t.Fatalf("Create(%.40q): %v", k, err)
 		}
 	}
+	for i, k := range keys {
+		expectReads(t, s, k, k, versions[i])
+	}
 	want := slices.Sorted(slices.Values(keys))
 	if got := list(); !slices.Equal(got, want) {
 		t.Fatalf("List = %q, want %q", got, want)
 	}
 	for i, k := range keys {
-		expectHolds(t, s, k, k, versions[i])
-		v, err := s.Replace(ctx, k, versions[i], strings.NewReader(k+" replaced"))
-		if err != nil {
+		var err error
+		if versions[i], err = s.Replace(ctx, k, versions[i], strings.NewReader(k+" replaced")); err != nil {
 			t.Fatalf("Replace(%.40q): %v", k, err)
 		}
-		expectHolds(t, s, k, k+" replaced", v)
+	}
+	for i, k := range keys {
+		expectReads(t, s, k, k+" replaced", versions[i])
+	}
+	for _, k := range keys {
 		if err := s.Delete(ctx, k); err != nil {
 			t.Fatalf("Delete(%.40q): %v", k, err)
 		}
 		expectMissing(t, s, k)
+		want = slices.DeleteFunc(want, func(w string) bool { return w == k })
+		if got := list(); !slices.Equal(got, want) {
+			t.Fatalf("after Delete(%.40q) List = %q, want %q", k, got, want)
+		}
 	}
-	if got := list(); len(got) != 0 {
-		t.Fatalf("List after every Delete = %q, want nothing", got)
+}
+
+// expectReads makes the conformance suite's reads of an existing key: Head,
+// a bounded GetRange, Get and a listing with the key as its prefix.
+func expectReads(t *testing.T, s storage.Store, key, content, version string) {
+	t.Helper()
+	want := storage.Info{Size: int64(len(content)), Version: version}
+	if info, err := s.Head(ctx, key); err != nil || info != want {
+		t.Fatalf("Head(%.40q) = %+v, %v; want %+v", key, info, err, want)
+	}
+	off, n := len(content)/3, len(content)/3+1
+	body, info, err := s.GetRange(ctx, key, int64(off), int64(n))
+	if err != nil {
+		t.Fatalf("GetRange(%.40q, %d, %d): %v", key, off, n, err)
+	}
+	got, err := io.ReadAll(body)
+	_ = body.Close()
+	if err != nil || string(got) != content[off:min(off+n, len(content))] || info != want {
+		t.Fatalf("GetRange(%.40q, %d, %d) = %.40q, %+v, %v; want bytes [%d, %d) of the content, %+v", key, off, n, got, info, err, off, min(off+n, len(content)), want)
+	}
+	expectHolds(t, s, key, content, version)
+	entries, err := s.List(ctx, key, "", 1)
+	if wantEntry := (storage.Entry{Key: key, Size: want.Size}); err != nil || len(entries) != 1 || entries[0] != wantEntry {
+		t.Fatalf("List(%.40q, \"\", 1) = %+v, %v; want [%+v]", key, entries, err, wantEntry)
 	}
 }
