@@ -143,6 +143,9 @@ func TestDuplicateCollisions(t *testing.T) {
 // TestDepth checks the nesting bound: 16 levels, the root object included,
 // and a deeper body refused before acceptance whatever field it is in.
 func TestDepth(t *testing.T) {
+	if MaxDepth != 16 {
+		t.Fatalf("MaxDepth is %d; the protocol fixes it at 16", MaxDepth)
+	}
 	const ch = `{"channel":"c","seq":1,"op":"ping","x":`
 	nest := func(levels int, open, close string) string {
 		return strings.Repeat(open, levels) + "0" + strings.Repeat(close, levels)
@@ -693,6 +696,7 @@ func TestDecodedMemory(t *testing.T) {
 		{"unknown fields", KindChannel, names(`{"channel":"c","seq":1,"op":"ping",`, `}`), record},
 		{"named, duplicate last", KindQuery, names(`{"sql":"x","named":{`, `,"0":0}}`), refuse},
 		{"unknown fields, duplicate last", KindPut, names(`{`, `,"0":0}`), refuse},
+		{"named, one empty name repeated", KindQuery, many(`{"sql":"x","named":{`, `"":0`, ",", "}}", 500000), refuse},
 		{"bad values []", KindChannel, many(`{"channel":"c","seq":1,"op":"execute","sql":"x","params":[`, "[]", ",", "]}", 500000), record},
 		{"bad values {}", KindChannel, many(`{"channel":"c","seq":1,"op":"execute","sql":"x","params":[`, "{}", ",", "]}", 500000), record},
 		{"bad values true", KindChannel, many(`{"channel":"c","seq":1,"op":"execute","sql":"x","params":[`, "true", ",", "]}", 500000), record},
