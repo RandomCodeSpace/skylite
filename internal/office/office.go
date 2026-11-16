@@ -84,6 +84,8 @@ type State struct {
 	// A leader that has stopped (its Err is set) stays here until the
 	// loop notices, within about a second.
 	Leader *engine.Leader
+	// Office is the office Leader holds, and zero while Leader is nil.
+	Office engine.Office
 	// Reason is why the loop last stopped leading, or last failed to start
 	// a leader after taking office; nil if neither has happened. It wraps
 	// engine.ErrStopped, ErrDeposed, ErrUnchecked or ErrShutdown, or is the
@@ -171,10 +173,10 @@ func (l *Loop) State() State {
 	return s
 }
 
-func (l *Loop) set(leader *engine.Leader, reason error) {
+func (l *Loop) set(leader *engine.Leader, o engine.Office, reason error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.state.Leader = leader
+	l.state.Leader, l.state.Office = leader, o
 	if reason != nil {
 		l.state.Reason = reason
 	}
@@ -256,7 +258,7 @@ func (l *Loop) Run(ctx context.Context) error {
 			if !errors.Is(err, ErrDeposed) && !errors.Is(err, ErrUnchecked) {
 				rerr = l.release(ctx, t.lease)
 			}
-			l.set(nil, err)
+			l.set(nil, engine.Office{}, err)
 			if ctx.Err() != nil {
 				return rerr
 			}
@@ -267,7 +269,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		}
 		backoff = first
 		l.log.Info("office: leading", "epoch", t.office.Epoch, "head", t.office.Head)
-		l.set(leader, nil)
+		l.set(leader, t.office, nil)
 		done, err := l.lead(ctx, t, leader, renewal.C)
 		renewal.Stop()
 		if done {
@@ -473,13 +475,13 @@ func (l *Loop) renew(ctx context.Context, t *term, leader *engine.Leader) error 
 // stepDown leaves office without a lease write.
 func (l *Loop) stepDown(leader *engine.Leader, reason error) {
 	l.log.Warn("office: leaving office", "reason", reason)
-	l.set(nil, reason)
+	l.set(nil, engine.Office{}, reason)
 	_ = leader.Close()
 }
 
 // shutdown drains, closes the leader and releases the lease.
 func (l *Loop) shutdown(ctx context.Context, lease *engine.Lease, leader *engine.Leader) error {
-	l.set(nil, ErrShutdown)
+	l.set(nil, engine.Office{}, ErrShutdown)
 	if l.cfg.Drain != nil {
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.cfg.DrainTimeout)
 		l.cfg.Drain(dctx)

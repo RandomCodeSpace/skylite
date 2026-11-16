@@ -108,12 +108,7 @@ func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, w
 	if evict != nil {
 		_ = evict.ec.Close()
 	}
-	refuse := func(err error) *wire.Error {
-		if ctx.Err() == context.DeadlineExceeded { //nolint:errorlint // context.Err returns the sentinel itself
-			return timeoutError(0)
-		}
-		return s.engineError(d, leader, err)
-	}
+	refuse := func(err error) *wire.Error { return s.refusal(ctx, d, leader, err) }
 	if c != nil {
 		_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
 			return broken(c.pc.Reset(db.GetInterrupt()))
@@ -135,6 +130,15 @@ func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, w
 		return nil, refuse(err), err
 	}
 	return c, nil, nil
+}
+
+// refusal is the refusal before acceptance of a request whose connection
+// could not be opened or reset under ctx.
+func (s *Server) refusal(ctx context.Context, d *database, leader *engine.Leader, err error) *wire.Error {
+	if ctx.Err() == context.DeadlineExceeded { //nolint:errorlint // context.Err returns the sentinel itself
+		return timeoutError(0)
+	}
+	return s.engineError(d, leader, err)
 }
 
 // open opens an engine connection and applies the policy once, inside a Run

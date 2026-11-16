@@ -23,6 +23,7 @@ import (
 	"github.com/RandomCodeSpace/skylite/internal/engine"
 	"github.com/RandomCodeSpace/skylite/internal/format"
 	"github.com/RandomCodeSpace/skylite/internal/sqlpolicy"
+	"github.com/RandomCodeSpace/skylite/internal/storage"
 	"github.com/RandomCodeSpace/skylite/internal/storage/localfs"
 )
 
@@ -33,7 +34,13 @@ import (
 // set, changes the server before it starts.
 func newQueryEnv(t *testing.T, edit func(*env)) *env {
 	t.Helper()
-	e := newEnv(t, nil)
+	return newLeaderEnv(t, nil, edit)
+}
+
+// newLeaderEnv is newQueryEnv on a store wrapped by wrap, if it is set.
+func newLeaderEnv(t *testing.T, wrap func(storage.Store) storage.Store, edit func(*env)) *env {
+	t.Helper()
+	e := newEnv(t, wrap)
 	e.s.cfg.Databases = []string{"d"}
 	keys, err := e.s.cfg.Storage.keys("d")
 	if err != nil {
@@ -891,9 +898,10 @@ func TestBodySharePerPrincipal(t *testing.T) {
 	}
 }
 
-// TestMemoryBudgetHolds: whatever the number of databases, the body share
-// and the SQLite connections at their ceiling, the leaders' included, stay
-// within the memory budget, and clients keep a connection.
+// TestMemoryBudgetHolds: whatever the number of databases, the body share,
+// the channels' share and the SQLite connections at their ceiling, the
+// leaders' included, stay within the memory budget, and clients keep a
+// connection.
 func TestMemoryBudgetHolds(t *testing.T) {
 	for n := range maxDatabases + 1 {
 		cfg := testConfig(t, jwksFile(t, newSigner(t, "k1")))
@@ -913,7 +921,9 @@ func TestMemoryBudgetHolds(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if total := s.bodyShare + int64(s.pool.capacity+n)*connCeiling; total > memoryBudget || s.pool.capacity < 1 {
+		// The channels' share: a receipt per channel, held rows and replay data.
+		channels := int64(s.chl.channels)*receiptBytes + s.chl.held + s.chl.replay
+		if total := s.bodyShare + channels + int64(s.pool.capacity+n)*connCeiling; total > memoryBudget || s.pool.capacity < 1 {
 			t.Errorf("%d databases: %d bytes charged at most, %d client connections; budget %d", n, total, s.pool.capacity, memoryBudget)
 		}
 	}

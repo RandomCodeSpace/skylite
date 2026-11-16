@@ -412,6 +412,9 @@ func TestStepDownWhenDeposed(t *testing.T) {
 	a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: ttl, Renew: 50 * time.Millisecond})
 	s := waitFor(t, a, 5*time.Second, "leading", leading)
 	e := epoch(t, st, keys)
+	if s.Office.Epoch != e || s.Office.DB == (format.DatabaseID{}) {
+		t.Fatalf("state office %+v, want epoch %d", s.Office, e)
+	}
 
 	// The usurper's clock is a time to live ahead, so a's lease reads as
 	// expired to it, and its own reads as live to a for two.
@@ -433,6 +436,9 @@ func TestStepDownWhenDeposed(t *testing.T) {
 		}
 	}
 	down := waitFor(t, a, time.Second, "deposed", func(s office.State) bool { return s.Leader == nil })
+	if down.Office != (engine.Office{}) {
+		t.Errorf("state office %+v without a leader", down.Office)
+	}
 	if !errors.Is(down.Reason, office.ErrDeposed) {
 		t.Fatalf("reason %v, want %v", down.Reason, office.ErrDeposed)
 	}
