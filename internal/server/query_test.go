@@ -674,19 +674,41 @@ func TestBodyShareOverloaded(t *testing.T) {
 
 func TestTailBoundAnswersMaintenance(t *testing.T) {
 	// Creation and the takeover's epoch bump put two commits above the
-	// manifest, the bound.
+	// manifest, the bound. Compaction clears it in the background, so a
+	// request may also find it cleared already.
 	e := newQueryEnv(t, func(e *env) { e.s.engine.TailBound = 2 })
-	if !e.s.ready() {
-		t.Error("not ready before the bound was met")
-	}
-	for _, path := range []string{"query", "describe"} {
-		a := e.post(t, path, "reader", q("SELECT 1"))
-		if msg, _ := a.last()["error"].(map[string]any)["message"].(string); a.status != http.StatusServiceUnavailable || a.code() != "maintenance" || !strings.Contains(msg, "tail bound of 2") {
-			t.Errorf("%s: %d %v, want maintenance naming the bound", path, a.status, a.last())
+	served := false
+	for deadline := time.Now().Add(10 * time.Second); !served; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("compaction did not clear the tail bound")
+		}
+		for _, path := range []string{"query", "describe"} {
+			a := e.post(t, path, "reader", q("SELECT 1"))
+			em, _ := a.last()["error"].(map[string]any)
+			msg, _ := em["message"].(string)
+			switch {
+			case a.status == 200 && a.code() == "":
+				served = true
+			case a.status != http.StatusServiceUnavailable || a.code() != "maintenance" || !strings.Contains(msg, "tail bound of 2") || !strings.Contains(msg, "retry"):
+				t.Fatalf("%s: %d %v, want maintenance naming the bound", path, a.status, a.last())
+			}
+		}
+		if !e.s.ready() {
+			t.Fatal("not ready at a tail bound compaction clears")
 		}
 	}
+}
+
+func TestTailBoundWithoutCompactionNotReady(t *testing.T) {
+	// A leader that cannot compact refuses without ErrRetry.
+	e := newQueryEnv(t, nil)
+	d := e.s.dbs["d"]
+	we := e.s.engineError(d, e.leader(t), fmt.Errorf("%w: %w", engine.ErrNotCommitted, engine.ErrTailBound))
+	if we.Code != "maintenance" || !strings.Contains(we.Message, "cannot compact") {
+		t.Errorf("%v, want maintenance saying the leader cannot compact", we)
+	}
 	if e.s.ready() {
-		t.Error("ready at the tail bound")
+		t.Error("ready at a tail bound the leader cannot compact past")
 	}
 }
 
@@ -724,16 +746,31 @@ func TestStandbyNotServingAndNotReady(t *testing.T) {
 }
 
 func TestMaintenanceEndsRunningQuery(t *testing.T) {
-	// Creation and the takeover's epoch bump leave two commits above the
-	// manifest; the write below makes three, the bound, and starts
-	// maintenance, which interrupts the running query.
-	e := newQueryEnv(t, func(e *env) { e.s.engine.TailBound = 3 })
+	// Writes past the local WAL bound start maintenance, which interrupts
+	// the running query.
+	e := newQueryEnv(t, func(e *env) { e.s.engine.WALBound = 256 << 10 })
 	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != 200 {
-		t.Fatalf("before the bound: %d %v", a.status, a.last())
+		t.Fatalf("before maintenance: %d %v", a.status, a.last())
 	}
 	got := e.postAsync(t, "query", "reader", q(cpuBound))
 	e.running(t, 1)
 	e.exec(t, "CREATE TABLE t (a)")
+	c, err := e.leader(t).Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	for i := 0; ; i++ {
+		_, err := c.Run(context.Background(), fmt.Appendf(nil, "test-%d", commitIDs.Add(1)), func(db *sqlite3.Conn) error {
+			return db.Exec("INSERT INTO t VALUES (randomblob(32768))")
+		})
+		if errors.Is(err, engine.ErrRetry) {
+			break
+		}
+		if err != nil || i == 100 {
+			t.Fatalf("write %d before the WAL bound: %v", i, err)
+		}
+	}
 	select {
 	case a := <-got:
 		if a.status != 200 || a.code() != "maintenance" {
@@ -742,8 +779,17 @@ func TestMaintenanceEndsRunningQuery(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("maintenance did not end the running query")
 	}
-	if e.s.ready() {
-		t.Error("ready at the tail bound")
+	// Maintenance passes: the server stays ready and serves again.
+	if !e.s.ready() {
+		t.Error("not ready during maintenance")
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if a := e.post(t, "query", "reader", q("SELECT 1")); a.status == 200 && a.code() == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the database did not serve again after maintenance")
+		}
 	}
 }
 
@@ -796,14 +842,50 @@ func TestDeadlineBeforeTheStatement(t *testing.T) {
 	}
 }
 
-// TestTailBoundKeepsIdleConnection: a refusal by the engine before the
+// TestMaintenanceKeepsIdleConnection: a refusal by the engine before the
 // Reset runs leaves the idle connection pooled.
-func TestTailBoundKeepsIdleConnection(t *testing.T) {
-	e := newQueryEnv(t, func(e *env) { e.s.engine.TailBound = 3 })
+func TestMaintenanceKeepsIdleConnection(t *testing.T) {
+	// A refusal before the Reset runs keeps the pooled connection. Writes
+	// past the local WAL bound start maintenance, which refuses every Run
+	// while it waits for a held engine connection.
+	e := newQueryEnv(t, func(e *env) { e.s.engine.WALBound = 256 << 10 })
 	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != 200 {
-		t.Fatalf("before the bound: %d %v", a.status, a.last())
+		t.Fatalf("before maintenance: %d %v", a.status, a.last())
 	}
-	e.exec(t, "CREATE TABLE t (a)") // the third commit: the bound
+	e.exec(t, "CREATE TABLE t (a)")
+	l := e.leader(t)
+	h, err := l.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = h.Close() }()
+	entered, release, held := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(held)
+		_, _ = h.Run(context.Background(), nil, func(*sqlite3.Conn) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	defer func() { close(release); <-held }()
+	<-entered
+	w, err := l.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	for i := 0; ; i++ {
+		_, err := w.Run(context.Background(), fmt.Appendf(nil, "test-%d", commitIDs.Add(1)), func(db *sqlite3.Conn) error {
+			return db.Exec("INSERT INTO t VALUES (randomblob(32768))")
+		})
+		if errors.Is(err, engine.ErrRetry) {
+			break
+		}
+		if err != nil || i == 100 {
+			t.Fatalf("write %d before the WAL bound: %v", i, err)
+		}
+	}
 	if a := e.post(t, "query", "reader", q("SELECT 1")); a.code() != "maintenance" {
 		t.Fatalf("%d %v, want maintenance", a.status, a.last())
 	}

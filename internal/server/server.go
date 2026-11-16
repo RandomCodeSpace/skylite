@@ -269,7 +269,8 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 }
 
 // database is a configured database: its office loop, and the leader that
-// last met the tail bound, which leaves this server not ready while it leads.
+// last met a tail bound it cannot compact past, which leaves this server
+// not ready while it leads.
 type database struct {
 	loop *office.Loop
 	tail atomic.Pointer[engine.Leader]
@@ -337,7 +338,7 @@ func (s *Server) startOffice() (stop func()) {
 
 // ready reports whether this server leads one of its databases and serves
 // it: not while shutting down, and not while a database it leads is at the
-// engine's tail bound, which this version cannot clear.
+// engine's tail bound and cannot compact past it.
 func (s *Server) ready() bool {
 	if s.stopping.Load() {
 		return false
