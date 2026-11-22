@@ -22,6 +22,7 @@ const goodConfig = `{
   },
   "storage": {"prefix": "prod/skylite", "s3": {"bucket": "b", "region": "eu-west-1", "endpoint": "http://127.0.0.1:9000", "path_style": true}},
   "databases": ["orders", "users"],
+  "follower_reads": true,
   "probe_listen": ":8081"
 }`
 
@@ -41,7 +42,7 @@ func TestLoad(t *testing.T) {
 	}
 	if c.Listen != ":8443" || c.TLS.KeyFile != "/etc/skylite/tls.key" || c.Auth.Issuers[0].JWKSFile != "/var/run/jwks.json" ||
 		c.Auth.Rules[0].Role != "admin" || c.Storage.Prefix != "prod/skylite" || c.Storage.S3 == nil || !c.Storage.S3.PathStyle ||
-		strings.Join(c.Databases, ",") != "orders,users" || c.ProbeListen != ":8081" {
+		strings.Join(c.Databases, ",") != "orders,users" || !c.FollowerReads || c.ProbeListen != ":8081" {
 		t.Errorf("Load = %+v", c)
 	}
 	for _, s := range []string{
@@ -59,6 +60,10 @@ func TestLoad(t *testing.T) {
 	plain := strings.Replace(goodConfig, `"tls": {"cert_file": "/etc/skylite/tls.crt", "key_file": "/etc/skylite/tls.key"}`, `"plaintext": true`, 1)
 	if c, err := Load(writeConfig(t, plain)); err != nil || !c.Plaintext || c.TLS != nil {
 		t.Errorf("plaintext: %+v, %v", c, err)
+	}
+	defaultReads := strings.Replace(goodConfig, "  \"follower_reads\": true,\n", "", 1)
+	if c, err := Load(writeConfig(t, defaultReads)); err != nil || c.FollowerReads {
+		t.Errorf("default follower_reads = %t, %v", c.FollowerReads, err)
 	}
 }
 

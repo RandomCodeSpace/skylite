@@ -37,9 +37,11 @@ type Config struct {
 	// leads. A database need not exist yet; the server takes office once it
 	// does.
 	Databases []string `json:"databases"`
+	// FollowerReads enables stateless reads on fresh local followers.
+	FollowerReads bool `json:"follower_reads"`
 	// ProbeListen, if set, is a TCP address for a plain HTTP listener that
-	// answers GET /readyz: 200 while this server leads one of Databases
-	// and serves it, 503 otherwise.
+	// answers GET /readyz: 200 while this server can serve at least one
+	// database and no leader is blocked at its tail bound, 503 otherwise.
 	ProbeListen string `json:"probe_listen"`
 }
 

@@ -18,10 +18,10 @@ import (
 	"github.com/RandomCodeSpace/skylite/internal/wire"
 )
 
-// The stateless requests of ADR 0005, query and describe, served on the
-// leader. Each runs in one engine Run on a pooled connection: a privileged
-// BEGIN, the read's snapshot through Leader.Snapshot, the client's
-// statement under the SQL policy (ADR 0007), and a privileged ROLLBACK.
+// The stateless requests of ADR 0005, query and describe. Each runs on a
+// leader connection or a follower pin: a privileged BEGIN, the read's
+// snapshot, the client's statement under the SQL policy (ADR 0007), and a
+// privileged ROLLBACK.
 
 // pconn is a pooled connection: an engine connection with the policy
 // applied, of one leader.
@@ -101,12 +101,9 @@ func (p *pool) release(who string, c *pconn, keep bool) {
 // conn returns a connection of leader for who, reset for its new holder, or
 // the refusal before acceptance and the engine's error behind it, if any.
 func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, who string) (*pconn, *wire.Error, error) {
-	c, evict, ok := s.pool.take(leader, who)
-	if !ok {
-		return nil, wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later"), nil
-	}
-	if evict != nil {
-		_ = evict.ec.Close()
+	c, refusal := s.reserve(leader, who)
+	if refusal != nil {
+		return nil, refusal, nil
 	}
 	refuse := func(err error) *wire.Error { return s.refusal(ctx, d, leader, err) }
 	if c != nil {
@@ -130,6 +127,17 @@ func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, w
 		return nil, refuse(err), err
 	}
 	return c, nil, nil
+}
+
+func (s *Server) reserve(leader *engine.Leader, who string) (*pconn, *wire.Error) {
+	c, evict, ok := s.pool.take(leader, who)
+	if !ok {
+		return nil, wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later")
+	}
+	if evict != nil {
+		_ = evict.ec.Close()
+	}
+	return c, nil
 }
 
 // refusal is the refusal before acceptance of a request whose connection
@@ -174,8 +182,8 @@ func broken(err error) error {
 // errEnded ends a Run whose request failed with an error it recorded.
 var errEnded = errors.New("server: the statement ended")
 
-// statement serves a query or describe on d, which leader leads.
-func (s *Server) statement(ctx context.Context, st *stream, d *database, leader *engine.Leader, req *wire.Request, who string, log *slog.Logger) (*wire.Done, *wire.Error) {
+// statement serves a query or describe using the local leader or follower.
+func (s *Server) statement(ctx context.Context, st *stream, d *database, leader *engine.Leader, follower *engine.Follower, req *wire.Request, who string, log *slog.Logger) (*wire.Done, *wire.Error) {
 	limit := s.statementTime
 	if req.TimeoutMS > 0 {
 		limit = min(limit, time.Duration(req.TimeoutMS)*time.Millisecond)
@@ -188,6 +196,9 @@ func (s *Server) statement(ctx context.Context, st *stream, d *database, leader 
 	defer cancel()
 	deadline, _ := ctx.Deadline()
 	st.deadline = deadline.Add(terminalMargin)
+	if leader == nil {
+		return s.followerStatement(ctx, st, follower, req, who, log)
+	}
 	c, e, err := s.conn(ctx, d, leader, who)
 	if e != nil {
 		logInternal(ctx, log, e, err)
@@ -197,7 +208,9 @@ func (s *Server) statement(ctx context.Context, st *stream, d *database, leader 
 	keep := true
 	_, err = c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
 		var ferr error
-		done, e, keep, ferr = s.run(db, c, req, st)
+		done, e, keep, ferr = s.run(db, c.pc, func(start func() error) (uint64, error) {
+			return leader.Snapshot(db.GetInterrupt(), start)
+		}, req, st)
 		return ferr
 	})
 	switch {
@@ -220,6 +233,87 @@ func (s *Server) statement(ctx context.Context, st *stream, d *database, leader 
 	return done, e
 }
 
+func (s *Server) followerStatement(ctx context.Context, st *stream, f *engine.Follower, req *wire.Request, who string, log *slog.Logger) (*wire.Done, *wire.Error) {
+	remaining := engine.FollowerMaxWait
+	minTxn := uint64(req.MinTxn) //nolint:gosec // validated nonnegative by wire.Parse
+	for attempt := 0; ; attempt++ {
+		started := time.Now()
+		pctx, cancel := context.WithTimeout(ctx, remaining)
+		pin, err := f.Pin(pctx, minTxn)
+		cancel()
+		remaining -= time.Since(started)
+		if err != nil {
+			switch {
+			case errors.Is(err, engine.ErrStale) || errors.Is(err, context.Canceled):
+				return nil, followerUnavailable()
+			case errors.Is(err, engine.ErrBehind) || errors.Is(err, context.DeadlineExceeded):
+				if !f.Fresh() || attempt > 0 {
+					return nil, followerUnavailable()
+				}
+				if req.MinTxn == 0 {
+					return nil, timeoutError(0)
+				}
+				return nil, wire.NewError(wire.CodeBehind, "the follower did not reach min_txn within the catch-up budget")
+			default:
+				e := wire.NewError(wire.CodeInternal, "the follower could not validate its snapshot")
+				logInternal(ctx, log, e, err)
+				return nil, e
+			}
+		}
+		done, e, err := s.runFollower(ctx, pin, req, st, who)
+		switch {
+		case err == nil, errors.Is(err, errEnded):
+			return done, e
+		case errors.Is(err, engine.ErrCompacted) && st.started:
+			e = wire.NewError(wire.CodeInternal, "compaction ended the follower snapshot during the read")
+		case errors.Is(err, engine.ErrCompacted):
+			if attempt == 0 && ctx.Err() == nil && remaining > 0 {
+				minTxn = pin.Txn() + 1
+				continue
+			}
+			return nil, followerUnavailable()
+		case errors.Is(ctx.Err(), context.Canceled) && !errors.Is(err, engine.ErrBroken):
+			return nil, followerUnavailable() // the request was cut off: not a fault of this read
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			e = timeoutError(0)
+		default:
+			e = wire.NewError(wire.CodeInternal, "the follower read failed")
+		}
+		logInternal(ctx, log, e, err)
+		return nil, e // a read has no effect, so not_executed stays true (0005)
+	}
+}
+
+func followerUnavailable() *wire.Error {
+	return wire.NewError(wire.CodeNotServing, "this server has no usable fresh follower snapshot for the database")
+}
+
+// runFollower serves the request on pin. A refusal for want of a SQLite
+// slot is returned as e with a nil err.
+func (s *Server) runFollower(ctx context.Context, pin *engine.ReadPin, req *wire.Request, st *stream, who string) (done *wire.Done, e *wire.Error, err error) {
+	// Follower connections use the same slots as leader connections. Each
+	// pin has its own SQLite connection and is discarded on release.
+	if _, e := s.reserve(nil, who); e != nil {
+		return nil, e, nil
+	}
+	defer s.pool.release(who, nil, false)
+	c, err := pin.Open(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = c.Close() }()
+	err = c.Run(ctx, func(db *sqlite3.Conn) error {
+		pc, err := s.policy.Apply(db.GetInterrupt(), db)
+		if err != nil {
+			return broken(err)
+		}
+		snapshot := func(start func() error) (uint64, error) { return c.Txn(), start() }
+		done, e, _, err = s.run(db, pc, snapshot, req, st)
+		return err
+	})
+	return done, e, err
+}
+
 // logInternal logs an internal answer with the engine's class of err.
 func logInternal(ctx context.Context, log *slog.Logger, e *wire.Error, err error) {
 	if e != nil && e.Code == wire.CodeInternal {
@@ -227,22 +321,22 @@ func logInternal(ctx context.Context, log *slog.Logger, e *wire.Error, err error
 	}
 }
 
-// run serves the request inside the Run on c. It returns the answer, and
+// run serves the request inside the engine's Run. It returns the answer, and
 // the error that ends the Run: nil on success, errEnded after a failure,
 // or one that wraps engine.ErrBroken. keep is false if c must be closed.
-func (s *Server) run(db *sqlite3.Conn, c *pconn, req *wire.Request, st *stream) (done *wire.Done, e *wire.Error, keep bool, err error) {
+func (s *Server) run(db *sqlite3.Conn, pc *sqlpolicy.Conn, snapshot func(func() error) (uint64, error), req *wire.Request, st *stream) (done *wire.Done, e *wire.Error, keep bool, err error) {
 	ictx := db.GetInterrupt() // the Run's context: its deadline, Close and maintenance interrupt it
-	err = c.pc.Privileged(func(db *sqlite3.Conn) error { return db.Exec("BEGIN") })
+	err = pc.Privileged(func(db *sqlite3.Conn) error { return db.Exec("BEGIN") })
 	var snap uint64
 	if err == nil {
-		snap, err = c.leader.Snapshot(ictx, func() error {
-			return c.pc.Privileged(func(db *sqlite3.Conn) error { return db.Exec("PRAGMA main.schema_version") })
+		snap, err = snapshot(func() error {
+			return pc.Privileged(func(db *sqlite3.Conn) error { return db.Exec("PRAGMA main.schema_version") })
 		})
 	}
 	defer func() {
 		// The server's ROLLBACK ends the read; a connection it fails on is
 		// closed rather than pooled with a snapshot held.
-		rerr := c.pc.Privileged(func(db *sqlite3.Conn) error {
+		rerr := pc.Privileged(func(db *sqlite3.Conn) error {
 			if db.GetAutocommit() {
 				return nil
 			}
@@ -258,7 +352,7 @@ func (s *Server) run(db *sqlite3.Conn, c *pconn, req *wire.Request, st *stream) 
 	}
 	total := db.TotalChanges()
 	describe := req.Kind == wire.KindDescribe
-	err = c.pc.Run(ictx, req.SQL, func(stmt *sqlite3.Stmt) error {
+	err = pc.Run(ictx, req.SQL, func(stmt *sqlite3.Stmt) error {
 		// The policy has compiled the statement; nothing has been bound or
 		// stepped (ADR 0005 decision 5, step 3).
 		switch {
@@ -385,7 +479,7 @@ func engineClass(err error) string {
 	for _, c := range []struct {
 		err  error
 		name string
-	}{{engine.ErrBroken, "broken"}, {engine.ErrStopped, "stopped"}, {engine.ErrUnknown, "unknown"}, {engine.ErrNotCommitted, "not_committed"}} {
+	}{{engine.ErrBroken, "broken"}, {engine.ErrCompacted, "compacted"}, {engine.ErrStopped, "stopped"}, {engine.ErrUnknown, "unknown"}, {engine.ErrNotCommitted, "not_committed"}} {
 		if errors.Is(err, c.err) {
 			return c.name
 		}
@@ -446,16 +540,39 @@ func value(stmt *sqlite3.Stmt, i int) any {
 // a transaction, and a stateless request runs inside the server's own read
 // transaction.
 func txnControl(sql string) bool {
+	w, _ := leadWord(sql)
+	switch strings.ToUpper(w) {
+	case "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE":
+		return true
+	}
+	return false
+}
+
+// leadWord returns sql's first keyword after EXPLAIN [QUERY PLAN], and the
+// rest of sql.
+func leadWord(sql string) (word, rest string) {
 	w, rest := firstWord(sql)
 	if strings.EqualFold(w, "EXPLAIN") {
 		if w, rest = firstWord(rest); strings.EqualFold(w, "QUERY") {
 			_, rest = firstWord(rest) // PLAN
-			w, _ = firstWord(rest)
+			w, rest = firstWord(rest)
 		}
 	}
+	return w, rest
+}
+
+// savepointSQL reports whether sql is SAVEPOINT, RELEASE or ROLLBACK
+// [TRANSACTION] TO by its first keywords, after EXPLAIN [QUERY PLAN].
+func savepointSQL(sql string) bool {
+	w, rest := leadWord(sql)
 	switch strings.ToUpper(w) {
-	case "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE":
+	case "SAVEPOINT", "RELEASE":
 		return true
+	case "ROLLBACK":
+		if w, rest = firstWord(rest); strings.EqualFold(w, "TRANSACTION") {
+			w, _ = firstWord(rest)
+		}
+		return strings.EqualFold(w, "TO")
 	}
 	return false
 }

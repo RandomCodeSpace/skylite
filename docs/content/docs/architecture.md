@@ -5,7 +5,7 @@ weight: 20
 status: design
 ---
 
-Most of this page is not implemented. It records the design the project has decided on and plans to build. Parts of the storage engine exist as a library package: database creation, paged reads, the leader's commit path, takeover, and compaction, retirement and garbage collection. The server leads the databases it is configured for through it, compaction included, and serves read-only queries; it runs no writes yet. The storage design follows [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/), which rests on the [durability spike](/docs/decisions/0002-durability-spike/) and on exploratory probes. The spike ran against an object-store emulator. The probes ran against in-memory models of storage, which is weaker evidence. The record is accepted on condition: the SQLite-side mechanisms must pass the engine's own tests at the pinned versions, or the design falls back to a single-connection mode or returns to the record. The record lists what those tests must prove before any of it is relied on.
+Most of this page is not implemented. It records the design the project has decided on and plans to build. Parts of the storage engine exist as a library package: database creation, paged reads, the leader's commit path, takeover, compaction, retirement, garbage collection and follower snapshots. The server leads the databases it is configured for through it, compaction included, serves stateless reads on leaders and opt-in followers, and runs autocommit writes on leader-owned channels. The storage design follows [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/), which rests on the [durability spike](/docs/decisions/0002-durability-spike/) and on exploratory probes. The spike ran against an object-store emulator. The probes ran against in-memory models of storage, which is weaker evidence. The record is accepted on condition: the SQLite-side mechanisms must pass the engine's own tests at the pinned versions, or the design falls back to a single-connection mode or returns to the record. The record lists what those tests must prove before any of it is relied on.
 
 ## The shape of the system
 
@@ -38,13 +38,13 @@ The first version accepts these limits: one upload per commit; a maximum transac
 
 ## One leader per database
 
-Each database is to have exactly one leader, and other pods forward writes to it. A lease object in object storage lets a new leader take over, but the lease is not what keeps a stale leader out. A lease on its own cannot stop a leader that has paused, lost its network or missed its expiry from writing again.
+Each database has one leader that serves writes. Forwarding from other pods is planned. A lease object in object storage lets a new leader take over, but the lease is not what keeps a stale leader out. A lease on its own cannot stop a leader that has paused, lost its network or missed its expiry from writing again.
 
 The fence is the storage layout. Commits are created only if absent, so a stale leader's next commit meets the new leader's epoch-bump commit at its name, and the stale leader stops. No commit-log object is ever deleted, so this holds even after old commits have been folded into the base. Compaction and the start of a takeover change the manifest by compare-and-swap, and a takeover changes it first, so a stale leader's compaction cannot win. Lease updates and garbage collection do not go through the manifest: the lease carries no safety, and garbage collection only retires commits the base already covers and deletes base objects that no current or future manifest can reference. Two pods may briefly both believe they lead; the design prevents conflicting history, not that belief. A takeover downloads no database content, but it reads the manifest, which grows with the number of base groups.
 
 ## Reads
 
-The leader and the followers read pages from object storage on demand and keep them in a bounded local cache. Followers pin each read transaction to one version of the database and move to the newest version between transactions. A client that needs to read its own write presents the transaction number it was given. Read capacity is planned to grow by adding pods; it is not limited by the size of any one pod's disk.
+The engine's leader and follower both read pages from object storage on demand and can use a bounded local cache. A follower polls the durable log and opens a read-only SQLite connection pinned to one transaction. With [`follower_reads`](/docs/server/#reading-on-a-follower) enabled, a standby can serve stateless reads from a fresh local snapshot. A client that needs to read its own write presents the transaction number it was given as `min_txn`. A follower waits within its catch-up budget, then answers `behind` if its fresh snapshot still falls short. Channel requests still go to the leader.
 
 ## Interface and clients
 
