@@ -1046,3 +1046,55 @@ func TestForwardDeposedLeader(t *testing.T) {
 		t.Errorf("the leader in office: %d %v, after %v", again.status, again.frames, stale.frames)
 	}
 }
+
+// otherOwner records a peer of another process as the leader of the
+// database that leader serves, and returns a channel token naming that
+// process and a count of the requests the peer receives.
+func otherOwner(t *testing.T, leader *env) (string, *atomic.Int64) {
+	t.Helper()
+	rec := waitRecord(t, leader, func(r leaderRecord) bool { return r.Instance == leader.s.instance && r.Address != "" })
+	n := new(atomic.Int64)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Skylite-Protocol", "1")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, notServingAnswer)
+	}))
+	srv.TLS = leader.s.peer.server.Clone()
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	leader.writeRecord(t, leaderRecord{Instance: "OTHER", Address: srv.Listener.Addr().String(), DB: rec.DB, Epoch: rec.Epoch, Head: rec.Head})
+	return fmt.Sprintf("%s.OTHER.%s.%d.%s", channelTokenPrefix, rec.DB, rec.Head+5, strings.Repeat("A", 43)), n
+}
+
+// TestForwardHopAtLeaderStays: a hop that reaches a leader with a token of
+// another process is answered there, never forwarded again, while the same
+// request from a client is forwarded.
+func TestForwardHopAtLeaderStays(t *testing.T) {
+	p := peerConfig(t)
+	leader, _ := newPeerLeader(t, p)
+	tok, n := otherOwner(t, leader)
+	a, _, err := call(peerClient(leader), http.MethodPost, leader.peerURL("/channel"), leader.sig.token(t, "writer"), ex(tok, 1, "SELECT 1"), "Skylite-Forwarded", "1", "Skylite-Budget-Ms", "1000")
+	if err != nil || n.Load() != 0 {
+		t.Fatalf("a hop at the leader: %d %v %v, forwarded %d times", a.status, a.frames, err, n.Load())
+	}
+	if c := leader.post(t, "channel", "writer", ex(tok, 1, "SELECT 1")); n.Load() != 1 {
+		t.Fatalf("from a client: %d %v, forwarded %d times", c.status, c.frames, n.Load())
+	}
+}
+
+// TestForwardLeaderRoutesCloseCancel: a leader routes close and cancel on a
+// token of another process, as it routes a channel request.
+func TestForwardLeaderRoutesCloseCancel(t *testing.T) {
+	p := peerConfig(t)
+	leader, _ := newPeerLeader(t, p)
+	tok, n := otherOwner(t, leader)
+	for _, tc := range []struct{ path, body string }{{"channel/close", closeBody(tok)}, {"channel/cancel", cancelBody(tok, 1)}} {
+		before := n.Load()
+		if a := leader.post(t, tc.path, "writer", tc.body); n.Load()-before != 1 {
+			t.Errorf("%s with a token of another process: %d %v, forwarded %d times", tc.path, a.status, a.frames, n.Load()-before)
+		}
+	}
+}
