@@ -395,7 +395,7 @@ func TestLifetimeFiresWhileCommitting(t *testing.T) {
 
 func TestTxnIdleLimitAndStatementTime(t *testing.T) {
 	e, _, tok := newTxnEnv(t, func(e *env) {
-		e.s.limits.ChannelIdleMS, e.s.limits.WriteTxnIdleMS, e.s.chl.sweep = 1500, 500, 20*time.Millisecond
+		e.s.limits.ChannelIdleMS, e.s.limits.WriteTxnIdleMS, e.s.chl.sweep = 4000, 500, 20*time.Millisecond
 	})
 	post := func(body string) answer { return e.post(t, "channel", "writer", body) }
 	// The statement time inside a transaction: a read times out, and the
