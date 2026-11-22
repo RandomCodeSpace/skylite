@@ -46,6 +46,16 @@ updates:
       jdbc-maven-minor-patch:
         update-types: [minor, patch]
 
+  - package-ecosystem: maven
+    directory: /clients/java/hibernate
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      hibernate-maven-minor-patch:
+        update-types: [minor, patch]
+
   - package-ecosystem: gomod
     directory: /internal/spike/flightsql
     schedule:
