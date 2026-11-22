@@ -7,9 +7,37 @@ status: current
 
 skylite is pre-alpha. The binary prints its version and its help text, and `skylite serve` runs a server that authenticates requests, creates databases in object storage, answers read-only SQL queries on the databases it leads, and runs autocommit writes and transactions sent on write channels. This page covers everything that works today.
 
+## Download a release
+
+Each [release](https://github.com/RandomCodeSpace/skylite/releases) has a `tar.gz` archive of the binary for Linux and macOS on amd64 and arm64, a `SHA256SUMS` file, an SBOM for each archive, and a [Cosign](https://docs.sigstore.dev/) signature of `SHA256SUMS`. Download an archive and the checksum files, for example with the GitHub CLI:
+
+```sh
+VERSION=0.0.1
+gh release download "v$VERSION" -R RandomCodeSpace/skylite \
+  -p "skylite_${VERSION}_linux_amd64.tar.gz" -p 'SHA256SUMS*'
+```
+
+Check that `SHA256SUMS` was signed by this repository's release workflow for that tag, then check the archive against it:
+
+```sh
+cosign verify-blob \
+  --certificate SHA256SUMS.pem --signature SHA256SUMS.sig \
+  --certificate-identity "https://github.com/RandomCodeSpace/skylite/.github/workflows/release.yml@refs/tags/v$VERSION" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+```
+
+Then unpack it and put `skylite` on your `PATH`:
+
+```sh
+tar -xzf "skylite_${VERSION}_linux_amd64.tar.gz"
+./skylite version
+```
+
 ## Install with Go
 
-You need a Go toolchain. Install the binary into your Go bin directory:
+You need a Go toolchain. Install the latest release into your Go bin directory, or name a version such as `@v0.0.1`:
 
 ```sh
 go install github.com/RandomCodeSpace/skylite/cmd/skylite@latest
