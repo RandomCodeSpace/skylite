@@ -8,7 +8,7 @@
   <artifactId>skylite-jdbc</artifactId>
   <version>0.0.0-SNAPSHOT</version>
   <name>skylite JDBC driver</name>
-  <description>JDBC driver for skylite over its HTTPS protocol (ADR 0005). Read path only.</description>
+  <description>JDBC driver for skylite over its HTTPS protocol (ADR 0005).</description>
 
   <licenses>
     <license>

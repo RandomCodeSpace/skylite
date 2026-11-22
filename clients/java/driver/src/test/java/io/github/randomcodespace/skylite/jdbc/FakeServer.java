@@ -24,8 +24,9 @@ import tools.jackson.core.JsonParser;
 import tools.jackson.core.JsonToken;
 
 /**
- * An in-process server that checks every request against ADR 0005's rules for query and describe, answering a
- * violation with 400 invalid_request and recording it, then answers valid requests with a scripted responder.
+ * An in-process server that checks every request against ADR 0005's rules for its path, answering a violation with
+ * 400 invalid_request and recording it, then answers valid requests with a scripted responder. It keeps no channel
+ * state: the responder scripts the channel's answers.
  */
 final class FakeServer implements AutoCloseable {
     /** A request as received. */
@@ -40,10 +41,15 @@ final class FakeServer implements AutoCloseable {
         void respond(Received r, HttpExchange ex) throws Exception;
     }
 
-    private static final Pattern PATH = Pattern.compile("/v1/databases/([a-z0-9][a-z0-9-]{0,62})/(query|describe)");
+    private static final Pattern PATH = Pattern.compile(
+            "/v1/databases/([a-z0-9][a-z0-9-]{0,62})/(query|describe|channels|channel|channel/cancel|channel/close)");
     private static final Map<String, Set<String>> FIELDS = Map.of(
             "query", Set.of("sql", "params", "named", "min_txn", "timeout_ms"),
-            "describe", Set.of("sql", "min_txn"));
+            "describe", Set.of("sql", "min_txn"),
+            "channels", Set.of("mode", "min_txn"),
+            "channel", Set.of("channel", "seq", "op", "sql", "params", "named", "min_txn", "timeout_ms", "execute"),
+            "channel/cancel", Set.of("channel", "seq"),
+            "channel/close", Set.of("channel"));
 
     final List<Received> requests = new CopyOnWriteArrayList<>();
     final List<String> violations = new CopyOnWriteArrayList<>();
@@ -162,7 +168,7 @@ final class FakeServer implements AutoCloseable {
                         named = true;
                         p.skipChildren();
                     }
-                    case "min_txn", "timeout_ms" -> {
+                    case "min_txn", "timeout_ms", "seq" -> {
                         if (t != JsonToken.VALUE_NUMBER_INT || p.getNumberType() == JsonParser.NumberType.BIG_INTEGER) {
                             return name + " is not an integer";
                         }
@@ -178,7 +184,7 @@ final class FakeServer implements AutoCloseable {
                 return "bytes follow the object";
             }
         }
-        if (!sql) {
+        if (!sql && (kind.equals("query") || kind.equals("describe"))) {
             return "sql is missing";
         }
         if (params && named) {
@@ -189,6 +195,29 @@ final class FakeServer implements AutoCloseable {
 
     static String done(long txn) {
         return "{\"done\":{\"txn\":" + txn + ",\"read_only\":true,\"rows_affected\":0,\"last_insert_rowid\":0}}";
+    }
+
+    /** An open answer with the given token. */
+    static String opened(String token) {
+        return "{\"done\":{\"txn\":1,\"channel\":{\"token\":\"" + token + "\",\"id\":\"00\",\"mode\":\"write\","
+                + "\"epoch\":1,\"limits\":{}}}}";
+    }
+
+    /** The answer to an execute, or to a begin with its first statement. */
+    static String executed(long seq, String state, long rows, long rowid) {
+        return "{\"done\":{\"seq\":" + seq + ",\"txn_state\":\"" + state + "\",\"txn\":2,\"read_only\":false,"
+                + "\"rows_affected\":" + rows + ",\"last_insert_rowid\":" + rowid + "}}";
+    }
+
+    /** The answer to a commit or a rollback. */
+    static String stepped(long seq) {
+        return "{\"done\":{\"seq\":" + seq + ",\"txn_state\":\"none\",\"txn\":3,\"committed\":true,\"wrote\":true}}";
+    }
+
+    /** An error of a channel request, with its flags. */
+    static String channelError(String code, boolean notExecuted, boolean isFinal, String state) {
+        return "{\"error\":{\"code\":\"" + code + "\",\"not_executed\":" + notExecuted + ",\"final\":" + isFinal
+                + ",\"message\":\"m\",\"request_id\":\"req-1\",\"txn_state\":\"" + state + "\"}}";
     }
 
     static String describeDone(long txn, int params) {

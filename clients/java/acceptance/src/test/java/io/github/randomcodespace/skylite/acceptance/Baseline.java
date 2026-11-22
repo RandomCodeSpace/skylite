@@ -22,6 +22,16 @@ class Baseline implements TestWatcher {
         return SpringExtension.getApplicationContext(context).getBean(ConnectionReport.class).isBaseline();
     }
 
+    static final String NO_SAVEPOINTS = "io.github.randomcodespace.skylite.acceptance.Baseline#lacksSavepoints";
+
+    /**
+     * Whether the verified connection's driver reports no savepoint support. Never true on skylite or the baseline,
+     * whose drivers support them.
+     */
+    static boolean lacksSavepoints(ExtensionContext context) {
+        return !SpringExtension.getApplicationContext(context).getBean(ConnectionReport.class).supportsSavepoints();
+    }
+
     @Override
     public void testDisabled(ExtensionContext context, Optional<String> reason) {
         System.out.printf("SKIPPED %s.%s: %s%n", context.getRequiredTestClass().getSimpleName(),

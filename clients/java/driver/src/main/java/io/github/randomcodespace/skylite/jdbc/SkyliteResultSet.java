@@ -52,7 +52,7 @@ import javax.sql.rowset.serial.SerialBlob;
  */
 final class SkyliteResultSet implements ResultSet {
     private final SkyliteStatement stmt;
-    private final Exchange ex;
+    private final FrameReader.Frames ex;
     private final List<Column> columns;
     private final long maxRows;
     private Object[] row;
@@ -61,7 +61,7 @@ final class SkyliteResultSet implements ResultSet {
     private volatile boolean closed;
     private int fetchSize;
 
-    SkyliteResultSet(SkyliteStatement stmt, Exchange ex, List<Column> columns, long maxRows, int fetchSize) {
+    SkyliteResultSet(SkyliteStatement stmt, FrameReader.Frames ex, List<Column> columns, long maxRows, int fetchSize) {
         this.stmt = stmt;
         this.ex = ex;
         this.columns = columns;
