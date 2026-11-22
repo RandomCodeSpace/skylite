@@ -974,9 +974,11 @@ func (s *Server) begin(ctx context.Context, d *database, t *table, ch *channel, 
 	var done *wire.Done
 	var e *wire.Error
 	var snap uint64
+	auto := false
 	_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
 		var ferr error
 		done, e, ferr = s.write(db, c, req, req.Execute, true, false, w, &snap)
+		auto = db.GetAutocommit()
 		return ferr
 	})
 	if err != nil {
@@ -987,6 +989,11 @@ func (s *Server) begin(ctx context.Context, d *database, t *table, ch *channel, 
 		done = &wire.Done{Kind: wire.DoneBegin}
 	}
 	done.Txn = int64(snap) //nolint:gosec // as in openChannel
+	if auto {
+		// The first statement ran but the transaction is gone (ADR 0007
+		// requirement 8); the deferred release frees c and the lock.
+		return &wire.Receipt{Done: done}, nil, wire.TxnAborted
+	}
 	tx := &txn{c: c, snap: snap, began: began}
 	s.chMu.Lock()
 	ch.tx = tx
@@ -1013,9 +1020,19 @@ func (s *Server) inTxn(ctx context.Context, d *database, t *table, ch *channel, 
 		auto = db.GetAutocommit() // SQLite rolls back the whole transaction after some errors
 		return ferr
 	})
-	if err == nil {
+	if err == nil && !auto {
 		done.Txn = int64(tx.snap) //nolint:gosec // as in openChannel
 		return &wire.Receipt{Done: done}, nil, wire.TxnOpen
+	}
+	if err == nil {
+		// The statement ran but the transaction is gone (ADR 0007
+		// requirement 8): what it did is not the client's to commit.
+		done.Txn = int64(tx.snap) //nolint:gosec // as above
+		s.chMu.Lock()
+		drop := s.dropTxn(ch)
+		s.chMu.Unlock()
+		drop()
+		return &wire.Receipt{Done: done}, nil, wire.TxnAborted
 	}
 	rec, lost := s.failure(ctx, d, t, err, e, limit, true, log)
 	maint := errors.Is(err, engine.ErrRetry) || errors.Is(err, engine.ErrTailBound)

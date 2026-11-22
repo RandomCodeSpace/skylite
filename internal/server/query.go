@@ -446,13 +446,7 @@ func value(stmt *sqlite3.Stmt, i int) any {
 // a transaction, and a stateless request runs inside the server's own read
 // transaction.
 func txnControl(sql string) bool {
-	w, rest := firstWord(sql)
-	if strings.EqualFold(w, "EXPLAIN") {
-		if w, rest = firstWord(rest); strings.EqualFold(w, "QUERY") {
-			_, rest = firstWord(rest) // PLAN
-			w, _ = firstWord(rest)
-		}
-	}
+	w, _ := leadWord(sql)
 	switch strings.ToUpper(w) {
 	case "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE":
 		return true
@@ -460,10 +454,23 @@ func txnControl(sql string) bool {
 	return false
 }
 
-// savepointSQL reports whether sql is SAVEPOINT, RELEASE or ROLLBACK
-// [TRANSACTION] TO by its first keywords.
-func savepointSQL(sql string) bool {
+// leadWord returns sql's first keyword after EXPLAIN [QUERY PLAN], and the
+// rest of sql.
+func leadWord(sql string) (word, rest string) {
 	w, rest := firstWord(sql)
+	if strings.EqualFold(w, "EXPLAIN") {
+		if w, rest = firstWord(rest); strings.EqualFold(w, "QUERY") {
+			_, rest = firstWord(rest) // PLAN
+			w, rest = firstWord(rest)
+		}
+	}
+	return w, rest
+}
+
+// savepointSQL reports whether sql is SAVEPOINT, RELEASE or ROLLBACK
+// [TRANSACTION] TO by its first keywords, after EXPLAIN [QUERY PLAN].
+func savepointSQL(sql string) bool {
+	w, rest := leadWord(sql)
 	switch strings.ToUpper(w) {
 	case "SAVEPOINT", "RELEASE":
 		return true

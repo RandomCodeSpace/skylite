@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ncruces/go-sqlite3"
+
 	"github.com/RandomCodeSpace/skylite/internal/wire"
 )
 
@@ -708,21 +710,51 @@ func TestSavepointsInTxn(t *testing.T) {
 		t.Errorf("a savepoint outside a transaction: %v, want refused", r.frames)
 	}
 	post(sq(tok, 3, "begin", "execute", map[string]any{"sql": "INSERT INTO t VALUES (1)"}))
-	for i, sql := range []string{"SAVEPOINT s", "INSERT INTO t VALUES (2)", "ROLLBACK TO s", "SAVEPOINT r", "INSERT INTO t VALUES (3)", "RELEASE r", "rollback transaction to s", "RELEASE s"} {
+	for i, sql := range []string{"SAVEPOINT s", "INSERT INTO t VALUES (2)", "ROLLBACK TO s", "SAVEPOINT r", "INSERT INTO t VALUES (3)", "RELEASE r", "rollback transaction to s", "EXPLAIN SAVEPOINT q", "EXPLAIN QUERY PLAN SAVEPOINT q", "RELEASE s"} {
 		if r := post(ex(tok, int64(4+i), sql)); r.code() != "" || r.done()["txn_state"] != "open" {
 			t.Fatalf("%s: %v", sql, r.frames)
 		}
 	}
-	if r := post(ex(tok, 12, "ROLLBACK")); r.code() != "invalid_request" {
+	if r := post(ex(tok, 14, "ROLLBACK")); r.code() != "invalid_request" {
 		t.Errorf("a plain ROLLBACK in a transaction: %v, want invalid_request", r.frames)
 	}
 	if st, open := e.txState(tok); st != wire.TxnOpen || !open {
 		t.Errorf("state %q, open %v after the refused ROLLBACK", st, open)
 	}
-	if r := post(sq(tok, 13, "commit")); r.code() != "" {
+	if r := post(sq(tok, 15, "commit")); r.code() != "" {
 		t.Fatalf("commit: %v", r.frames)
 	}
 	if got := e.count(t, "SELECT count(*) FROM t"); got != "[1]" {
 		t.Errorf("rows %s, want only the first insert", got)
+	}
+}
+
+// TestTxnGoneAfterStatement: a statement that succeeds after SQLite's
+// transaction has gone underneath it answers aborted and frees the lock
+// (ADR 0007 requirement 8). The rollback is injected.
+func TestTxnGoneAfterStatement(t *testing.T) {
+	e, _, tok := newTxnEnv(t, nil)
+	post := func(body string) answer { return e.post(t, "channel", "writer", body) }
+	post(sq(tok, 2, "begin", "execute", map[string]any{"sql": "INSERT INTO t VALUES (1)"}))
+	e.s.chMu.Lock()
+	tx := e.s.dbs["d"].chans.chans[tok].tx
+	e.s.chMu.Unlock()
+	if _, err := tx.c.ec.Run(t.Context(), nil, func(*sqlite3.Conn) error {
+		return tx.c.pc.Privileged(func(db *sqlite3.Conn) error { return db.Exec("ROLLBACK") })
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if r := post(ex(tok, 3, "SELECT 1")); r.code() != "" || r.done()["txn_state"] != "aborted" {
+		t.Errorf("a statement after the transaction went: %v, want done with txn_state aborted", r.frames)
+	}
+	other := e.open(t, "admin")
+	if r := e.post(t, "channel", "admin", ex(other, 1, "INSERT INTO other VALUES (1)")); r.code() != "" {
+		t.Errorf("a write after the transaction went: %v, want the lock free", r.frames)
+	}
+	if r := post(sq(tok, 4, "rollback")); r.code() != "" || r.done()["txn_state"] != "none" {
+		t.Errorf("rollback: %v, want txn_state none", r.frames)
+	}
+	if got := e.count(t, "SELECT count(*) FROM t"); got != "[0]" {
+		t.Errorf("rows %s, want none", got)
 	}
 }
