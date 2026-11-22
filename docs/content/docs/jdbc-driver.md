@@ -7,7 +7,7 @@ status: current
 
 `clients/java/driver` is a JDBC driver, artifact `io.github.randomcodespace:skylite-jdbc`, that speaks the protocol of [0005: Client protocol](/docs/decisions/0005-client-protocol/) over HTTPS, as [0003: JDBC transport](/docs/decisions/0003-jdbc-transport/) decided. It needs Java 21 or later. This version has the read path only: statements outside a transaction that the server accepts as pure reads. It is not published to a Maven repository; build it with `mvn -f clients/java/driver/pom.xml verify`.
 
-Its tests run against an in-process fake server that checks every request against 0005, and against a real `skylite serve` built from this repository. That server has no write channels yet, so the integration test queries constant SQL only. Nothing has been run through Hibernate, Spring or a connection pool.
+Its tests run against an in-process fake server that checks every request against 0005, and against a real `skylite serve` built from this repository. That server now accepts autocommit writes on write channels, but this driver does not send them yet, so the integration test queries constant SQL only. Nothing has been run through Hibernate, Spring or a connection pool.
 
 ## Usage
 
@@ -119,7 +119,7 @@ The rows from `busy` down answer channel requests, which this version never send
 
 ## Not yet
 
-- Writes and transactions. `setAutoCommit(false)`, `setReadOnly(false)`, savepoints, batches and generated keys raise `SQLFeatureNotSupportedException`; a write statement reaches the server, which refuses it with `needs_channel`. They need the server's write channels, replay and `resolve`.
+- Writes and transactions. `setAutoCommit(false)`, `setReadOnly(false)`, savepoints, batches and generated keys raise `SQLFeatureNotSupportedException`; a write statement reaches the server, which refuses it with `needs_channel`. The server has write channels with replay for autocommit writes; the driver does not use them yet, and the server's transactions and `resolve` do not exist yet.
 - The Hibernate dialect, and a run of the Spring Data JPA acceptance suite in `clients/java/acceptance/` against skylite.
 - Catalog metadata (`DatabaseMetaData.getTables` and the like), streams and LOB parameters, and JDBC escape syntax, which is sent unprocessed.
 - Retries. A read refused before acceptance, such as `overloaded` or `not_serving`, is raised to the caller.
