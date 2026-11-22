@@ -3,13 +3,16 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -55,6 +58,53 @@ func TestPutOnGCS(t *testing.T) {
 		t.Fatalf("creating bucket: %s", resp.Status)
 	}
 	putTwice(t, Storage{Prefix: "it", GCS: &GCS{Bucket: bucket, Endpoint: ep}})
+}
+
+// TestPutOnAzure does the same against the Azurite emulator named by
+// SKYLITE_TEST_AZURITE_BLOB_ENDPOINT (make integration), exercising both a
+// shared-key file and an environment variable.
+func TestPutOnAzure(t *testing.T) {
+	ep := os.Getenv("SKYLITE_TEST_AZURITE_BLOB_ENDPOINT")
+	if ep == "" {
+		t.Skip("SKYLITE_TEST_AZURITE_BLOB_ENDPOINT is not set")
+	}
+	// Azurite's documented default development account; the key is public and
+	// only works against the emulator.
+	const (
+		account = "devstoreaccount1"
+		key     = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" //nolint:gosec // Azurite's public development key
+	)
+	cred, err := service.NewSharedKeyCredential(account, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := service.NewClientWithSharedKeyCredential(ep, cred, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(t.TempDir(), "azure.key")
+	if err := os.WriteFile(keyFile, []byte(key+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SKYLITE_TEST_AZURE_KEY", key)
+	for _, tc := range []struct {
+		name string
+		az   Azure
+	}{
+		{"file", Azure{Account: account, Endpoint: ep, SharedKeyFile: keyFile}},
+		{"env", Azure{Account: account, Endpoint: ep, SharedKeyEnv: "SKYLITE_TEST_AZURE_KEY"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctr := "skylite-server-" + tc.name + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+			if _, err := svc.CreateContainer(t.Context(), ctr, nil); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _, _ = svc.DeleteContainer(context.Background(), ctr, nil) })
+			az := tc.az
+			az.Container = ctr
+			putTwice(t, Storage{Prefix: "it", Azure: &az})
+		})
+	}
 }
 
 // putTwice serves st through New and creates one database twice.
