@@ -240,13 +240,14 @@ func TestNewAzureSharedKey(t *testing.T) {
 }
 
 func TestAzureRefusesRedirect(t *testing.T) {
-	var elsewhere atomic.Int32
+	var sent, elsewhere atomic.Int32
 	dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		elsewhere.Add(1)
 		w.WriteHeader(http.StatusCreated)
 	}))
 	defer dst.Close()
 	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sent.Add(1)
 		w.Header().Set("Location", dst.URL+r.URL.Path)
 		w.WriteHeader(http.StatusTemporaryRedirect)
 	}))
@@ -259,6 +260,9 @@ func TestAzureRefusesRedirect(t *testing.T) {
 	defer func() { _ = st.(io.Closer).Close() }()
 	if _, err := st.Create(context.Background(), "k", strings.NewReader("database bytes")); err == nil {
 		t.Error("a create answered with a redirect succeeded")
+	}
+	if n := sent.Load(); n != 1 {
+		t.Errorf("the endpoint got %d requests, want 1", n)
 	}
 	if n := elsewhere.Load(); n != 0 {
 		t.Errorf("the redirect target got %d requests, want 0", n)

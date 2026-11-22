@@ -283,7 +283,11 @@ func readAzureSharedKey(a *Azure) (string, error) {
 		defer func() { _ = f.Close() }()
 		b, err := io.ReadAll(io.LimitReader(f, maxAzureKeyFile+1))
 		if err != nil {
-			return "", errors.New("server: azure shared key file could not be read")
+			var pe *fs.PathError
+			if errors.As(err, &pe) {
+				err = pe.Err
+			}
+			return "", fmt.Errorf("server: azure shared key file: %w", err)
 		}
 		if len(b) > maxAzureKeyFile {
 			return "", fmt.Errorf("server: azure shared key file is larger than %d bytes", maxAzureKeyFile)
