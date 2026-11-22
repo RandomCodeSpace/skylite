@@ -359,13 +359,16 @@ func timeoutError(limit time.Duration) *wire.Error {
 }
 
 // engineError maps an engine failure of a stateless request to its answer.
-// At the tail bound it marks d, which leaves the server not ready while
-// leader leads.
+// At a tail bound the leader cannot compact past, it marks d, which leaves
+// the server not ready while leader leads; at one compaction is clearing,
+// the refusal matches ErrRetry and marks nothing.
 func (s *Server) engineError(d *database, leader *engine.Leader, err error) *wire.Error {
 	switch {
-	case errors.Is(err, engine.ErrTailBound):
+	case errors.Is(err, engine.ErrTailBound) && !errors.Is(err, engine.ErrRetry):
 		d.tail.Store(leader)
-		return wire.NewError(wire.CodeMaintenance, fmt.Sprintf("the database's log is at its tail bound of %d commits; this version has no compaction to clear it, and serves no reads or writes of it", s.engine.TailBound))
+		return wire.NewError(wire.CodeMaintenance, fmt.Sprintf("the database's log is at its tail bound of %d commits and the leader cannot compact it, so it serves no reads or writes of it", s.engine.TailBound))
+	case errors.Is(err, engine.ErrTailBound):
+		return wire.NewError(wire.CodeMaintenance, fmt.Sprintf("the database's log is at its tail bound of %d commits until a compaction clears it; retry", s.engine.TailBound))
 	case errors.Is(err, engine.ErrRetry):
 		return wire.NewError(wire.CodeMaintenance, "the leader is in maintenance; retry")
 	case errors.Is(err, engine.ErrStopped):
