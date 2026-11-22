@@ -335,6 +335,7 @@ func TestReaderRefusesBadChannels(t *testing.T) {
 	const id, limits = `"7c1d2e3f40a1b2c37c1d2e3f40a1b2c3"`, `{"request_body_bytes":256,"result_bytes":64}`
 	for name, channel := range map[string]string{
 		"short id":        `{"token":"w1.x","id":"c1","mode":"write","epoch":1,"limits":` + limits + `}`,
+		"unknown mode":    `{"token":"w1.x","id":` + id + `,"mode":"admin","epoch":1,"limits":` + limits + `}`,
 		"upper-case id":   `{"token":"w1.x","id":"7C1D2E3F40A1B2C37C1D2E3F40A1B2C3","mode":"write","epoch":1,"limits":` + limits + `}`,
 		"no limits":       `{"token":"w1.x","id":` + id + `,"mode":"write","epoch":1}`,
 		"no result_bytes": `{"token":"w1.x","id":` + id + `,"mode":"write","epoch":1,"limits":{"request_body_bytes":256}}`,

@@ -205,21 +205,37 @@ func (cn *conn) ExecContext(ctx context.Context, query string, args []driver.Nam
 // read whole: ADR 0005 decision 6 settles a channel request before any of
 // its rows reach database/sql. A read-only statement whose replay omits its
 // rows is sent again as a new request, within the same resend window (ADR
-// 0005 decision 3).
+// 0005 decision 3), when it is a statement of a transaction with no rows
+// affected: outside one, it is a query refused as not a pure read. It is
+// sent again at most reissues times, after a pause, and not once the pause
+// would pass the window.
 func (cn *conn) channelQuery(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	by := time.Now().Add(resendWindow)
 	a, err := cn.do(ctx, by, cn.execute(query, args), wire.DoneExecute, true)
-	for err == nil && a.done.DataOmitted && a.done.ReadOnly {
+reissue:
+	for n, wait := 0, 100*time.Millisecond; err == nil && cn.inTx && a.done.DataOmitted && a.done.ReadOnly && a.done.RowsAffected == 0 && n < reissues; n, wait = n+1, 2*wait {
+		if time.Now().Add(wait).After(by) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			break reissue
+		case <-time.After(wait):
+		}
 		a, err = cn.do(ctx, by, cn.execute(query, args), wire.DoneExecute, true)
 	}
 	if err != nil {
 		return nil, err
 	}
 	if a.done.DataOmitted {
-		return nil, &Error{
+		e := &Error{
 			Message: "the response was lost and its replay omits its rows", Seq: a.done.Seq, Txn: a.done.Txn,
 			committed: !cn.inTx && !a.done.ReadOnly, is: []error{ErrResultUnavailable},
 		}
+		if err := ctx.Err(); err != nil {
+			e.is = append(e.is, err)
+		}
+		return nil, e
 	}
 	return &rows{c: cn.c, cols: a.cols, buf: a.rows}, nil
 }

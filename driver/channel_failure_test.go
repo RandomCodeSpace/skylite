@@ -662,3 +662,163 @@ func TestTransactionReplayAndUnknownCommit(t *testing.T) {
 		t.Fatalf("commit: %v; want ErrOutcomeUnknown only", err)
 	}
 }
+
+// frames is a response holding what write writes.
+func frames(write func(*wire.Writer) error) (*http.Response, error) {
+	var b bytes.Buffer
+	ww, err := wire.NewWriter(&b, wire.DefaultFrameBytes, wire.DefaultLimits())
+	if err != nil {
+		return nil, err
+	}
+	if err := write(ww); err != nil {
+		return nil, err
+	}
+	return &http.Response{StatusCode: 200, Header: http.Header{"Skylite-Protocol": {"1"}}, Body: io.NopCloser(&b)}, nil
+}
+
+// omitted answers every execute after delay with a read-only done frame
+// whose rows were omitted, reporting rows affected, and counts them. A
+// query is refused with needs_channel.
+func omitted(executes *atomic.Int32, delay time.Duration, state wire.TxnState, rowsAffected int64) roundTripper {
+	return func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/query") {
+			return frames(func(ww *wire.Writer) error {
+				e := wire.NewError(wire.CodeNeedsChannel, "not a pure read")
+				e.RequestID = "id"
+				return ww.Error(e)
+			})
+		}
+		if !strings.HasSuffix(r.URL.Path, "/channel") {
+			return nil, io.ErrUnexpectedEOF
+		}
+		n := executes.Add(1)
+		if n > 20 { // a reissue without bound
+			return nil, io.ErrUnexpectedEOF
+		}
+		select {
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		case <-time.After(delay):
+		}
+		return frames(func(ww *wire.Writer) error {
+			return ww.Done(&wire.Done{Kind: wire.DoneExecute, Seq: int64(n), TxnState: state, Txn: 1, ReadOnly: true, DataOmitted: true, RowsAffected: rowsAffected})
+		})
+	}
+}
+
+// TestReadOnlyReissue checks that a channel query whose replay omits its
+// rows is sent again only inside a transaction, as a read-only statement
+// with no rows affected, a bounded number of times with a pause between
+// them, and within the resend window: its error then matches
+// ErrResultUnavailable, not the window's deadline.
+func TestReadOnlyReissue(t *testing.T) {
+	tests := []struct {
+		name         string
+		inTx         bool
+		delay        time.Duration
+		rowsAffected int64
+		executes     int32
+		want         error
+	}{
+		{"after_needs_channel", false, time.Second, 0, 1, ErrResultUnavailable},
+		{"rows_affected", true, time.Second, 1, 1, ErrOutcomeUnknown},
+		{"bounded", true, 0, 0, 1 + reissues, ErrResultUnavailable},
+		{"window", true, resendWindow - 50*time.Millisecond, 0, 1, ErrResultUnavailable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var executes atomic.Int32
+				state := wire.TxnNone
+				if tc.inTx {
+					state = wire.TxnOpen
+				}
+				cn := channelConn(t, omitted(&executes, tc.delay, state, tc.rowsAffected))
+				cn.inTx, cn.ch.state = tc.inTx, state
+				start := time.Now()
+				_, err := cn.QueryContext(context.Background(), "insert into t values(1) returning id", nil)
+				if !errors.Is(err, tc.want) || errors.Is(err, context.DeadlineExceeded) || executes.Load() != tc.executes {
+					t.Fatalf("err %v after %d executes; want %v after %d", err, executes.Load(), tc.want, tc.executes)
+				}
+				if tc.name == "bounded" && time.Since(start) < 700*time.Millisecond {
+					t.Fatalf("%d reissues took %s; want a pause between them", reissues, time.Since(start))
+				}
+				time.Sleep(abandonWait) // the cancel and close of an unknown outcome
+			})
+		})
+	}
+}
+
+// TestCancelAfterProvenBehind ends the caller's context while the driver
+// waits to send again a request refused with behind, which the close proved
+// never accepted: the error is the context's.
+func TestCancelAfterProvenBehind(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cn := channelConn(t, func(r *http.Request) (*http.Response, error) {
+			return frames(func(ww *wire.Writer) error {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/close"):
+					return ww.Done(&wire.Done{Kind: wire.DoneClose})
+				case strings.HasSuffix(r.URL.Path, "/channel"):
+					e := wire.NewError(wire.CodeBehind, "below min_txn")
+					e.RequestID = "id"
+					return ww.Error(e)
+				}
+				return ww.Done(&wire.Done{Kind: wire.DoneOpen, Txn: 5, Channel: &wire.Channel{
+					Token: testChannel, ID: testChannelID, Mode: wire.ModeWrite, Epoch: 1, Limits: wire.DefaultLimits(),
+				}})
+			})
+		})
+		cn.c.raise(5)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		if _, err := cn.ExecContext(ctx, "insert into t values(1)", nil); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err %v; want the context's", err)
+		}
+	})
+}
+
+// TestBackgroundAbandonBounded replaces many idle channels against a server
+// whose close never answers: at most abandonLimit closes run at once, and
+// Connector.Close ends them.
+func TestBackgroundAbandonBounded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var running, peak atomic.Int32
+		first := channelConn(t, func(r *http.Request) (*http.Response, error) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/close"):
+				n := running.Add(1)
+				defer running.Add(-1)
+				for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+				}
+				<-r.Context().Done()
+				return nil, r.Context().Err()
+			case strings.HasSuffix(r.URL.Path, "/channel"):
+				return frames(func(ww *wire.Writer) error {
+					return ww.Done(&wire.Done{Kind: wire.DoneExecute, Seq: 1, TxnState: wire.TxnNone, Txn: 1})
+				})
+			}
+			return frames(func(ww *wire.Writer) error {
+				return ww.Done(&wire.Done{Kind: wire.DoneOpen, Txn: 1, Channel: &wire.Channel{
+					Token: testChannel, ID: testChannelID, Mode: wire.ModeWrite, Epoch: 1, Limits: wire.DefaultLimits(),
+				}})
+			})
+		})
+		start := time.Now()
+		for range 20 {
+			cn := &conn{c: first.c, ch: &channel{token: testChannel, id: testChannelID, epoch: 1, last: time.Now().Add(-2 * channelIdle), limits: wire.DefaultLimits()}}
+			if _, err := cn.ExecContext(context.Background(), "delete from t", nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		synctest.Wait()
+		if p := peak.Load(); p > abandonLimit {
+			t.Fatalf("%d closes ran at once; want at most %d", p, abandonLimit)
+		}
+		_ = first.c.Close()
+		synctest.Wait()
+		if n := running.Load(); n != 0 || time.Since(start) >= abandonWait {
+			t.Fatalf("%d closes still running after %s", n, time.Since(start))
+		}
+	})
+}

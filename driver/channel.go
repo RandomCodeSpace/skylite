@@ -27,6 +27,12 @@ const (
 	// abandonWait bounds the cancel and the close sent for a channel the
 	// driver stops using.
 	abandonWait = 5 * time.Second
+	// abandonLimit bounds the cancels and closes a Connector sends in the
+	// background at once.
+	abandonLimit = 8
+	// reissues bounds the reissues of a read-only statement of a transaction
+	// whose replay omits its rows.
+	reissues = 3
 )
 
 // channel is a connection's write channel.
@@ -53,9 +59,10 @@ type answer struct {
 // same sequence number and body, which the server answers from its record
 // (ADR 0005 decisions 2 and 3). by bounds the whole request: its token, its
 // deliveries and their bodies. channel_lost, commit_outcome_unknown, a
-// receipt that contradicts the request, an ended context and the end of by
-// leave the outcome unknown. A request refused with behind is sent again on
-// a new channel once the close of the old one proves it was never accepted.
+// receipt that contradicts the request or itself (read-only with rows
+// affected), an ended context and the end of by leave the outcome unknown.
+// A request refused with behind is sent again on a new channel once the
+// close of the old one proves it was never accepted.
 func (cn *conn) do(ctx context.Context, by time.Time, call *wire.Call, kind wire.DoneKind, keep bool) (*answer, error) {
 	if err := cn.usable(); err != nil {
 		return nil, err
@@ -93,7 +100,7 @@ func (cn *conn) do(ctx context.Context, by time.Time, call *wire.Call, kind wire
 		switch {
 		case err != nil:
 		case e == nil:
-			if a.done.TxnState != cn.after(call.Op) {
+			if a.done.TxnState != cn.after(call.Op) || a.done.ReadOnly && a.done.RowsAffected > 0 {
 				return nil, cn.unknown(ctx, call, nil)
 			}
 			cn.ch.last, cn.ch.state = time.Now(), a.done.TxnState
@@ -178,10 +185,14 @@ func (cn *conn) failedIn(op wire.Op, state wire.TxnState) bool {
 }
 
 // giveUp is the error of a request abandoned at the end of its time: its
-// last refusal when its close proved it never accepted and nothing was sent
-// since, otherwise an unknown outcome.
+// last refusal, or the caller's context's error once it ended, when its
+// close proved it never accepted and nothing was sent since, otherwise an
+// unknown outcome.
 func (cn *conn) giveUp(ctx context.Context, call *wire.Call, last *wire.Error, sent bool) error {
 	if !sent {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return serverError(last)
 	}
 	return cn.unknown(ctx, call, last)
@@ -239,7 +250,7 @@ func (cn *conn) ready(ctx context.Context) error {
 		return nil
 	}
 	if cn.ch != nil {
-		go cn.c.abandon(cn.ch.token, 0) //nolint:gosec // the old channel's close must not hold up the caller's request
+		cn.c.abandonLater(cn.ch.token, 0) // the old channel's close must not hold up the caller's request
 		cn.ch = nil
 	}
 	body, err := wire.AppendCall(nil, wire.KindOpen, &wire.Call{Mode: wire.ModeWrite})
@@ -279,7 +290,7 @@ func (cn *conn) ready(ctx context.Context) error {
 func (cn *conn) unknown(ctx context.Context, call *wire.Call, last *wire.Error) error {
 	ch := cn.ch
 	cn.ch, cn.lost = nil, true
-	go cn.c.abandon(ch.token, call.Seq) //nolint:gosec // the request's context may have ended; the cancel and close outlive it
+	cn.c.abandonLater(ch.token, call.Seq) // the request's context may have ended; the cancel and close outlive it
 	e := &Error{
 		Message: "the request was sent and its outcome is unknown", ChannelID: ch.id, Seq: call.Seq, Epoch: ch.epoch,
 		is: []error{ErrOutcomeUnknown},
@@ -321,13 +332,27 @@ func (cn *conn) closeProves(ctx context.Context, seq int64) bool {
 	return true
 }
 
+// abandonLater runs abandon in the background, at most abandonLimit at
+// once. With none free it sends nothing: the server closes the channel, and
+// rolls back what it holds, once its idle limit passes.
+func (c *Connector) abandonLater(token string, seq int64) {
+	select {
+	case c.abandons <- struct{}{}:
+		go func() {
+			defer func() { <-c.abandons }()
+			c.abandon(token, seq)
+		}()
+	default:
+	}
+}
+
 // abandon cancels sequence number seq of the channel of token, unless seq
 // is 0, then closes the channel. The cancel may take half of abandonWait,
-// and the close the rest. Their answers change nothing the driver reports,
-// so they are not read.
+// and the close the rest; Connector.Close ends both. Their answers change
+// nothing the driver reports, so they are not read.
 func (c *Connector) abandon(token string, seq int64) {
 	post := func(kind wire.Kind, call *wire.Call, by time.Time) {
-		ctx, cancel := context.WithDeadline(context.Background(), by)
+		ctx, cancel := context.WithDeadline(c.ctx, by)
 		defer cancel()
 		body, err := wire.AppendCall(nil, kind, call)
 		if err != nil {

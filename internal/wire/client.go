@@ -685,6 +685,7 @@ func (r *Reader) channel(c *Channel) error {
 			var s string
 			s, ok, err = r.p.str()
 			c.Mode = map[string]Mode{"write": ModeWrite, "read_only": ModeReadOnly}[s]
+			ok = ok && c.Mode != 0
 		case "epoch":
 			c.Epoch, ok, err = r.p.integer(1, math.MaxInt64)
 		default:
