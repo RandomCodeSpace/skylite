@@ -935,6 +935,35 @@ class DriverTest {
     }
 
     @Test
+    void aShadowedOrForeignSavepointIsRefusedBeforeAnythingIsSent() throws Exception {
+        channel(FakeServer.executed(1, "open", 0, 0), FakeServer.executed(2, "open", 0, 0),
+                FakeServer.executed(3, "open", 0, 0), FakeServer.executed(4, "open", 0, 0),
+                FakeServer.executed(5, "open", 0, 0), FakeServer.executed(6, "open", 0, 0),
+                FakeServer.executed(7, "open", 0, 0));
+        Savepoint permissive = new Savepoint() {
+            @Override public int getSavepointId() { return 99; }
+            @Override public String getSavepointName() { return "nope"; }
+            @Override public boolean equals(Object o) { return true; }
+            @Override public int hashCode() { return 0; }
+        };
+        try (Connection c = connect()) {
+            c.setAutoCommit(false);
+            Savepoint older = c.setSavepoint("x");
+            Savepoint mid = c.setSavepoint("mid");
+            Savepoint later = c.setSavepoint("x");
+            Savepoint unnamed = c.setSavepoint(); // sent as skylite_savepoint_1
+            c.setSavepoint("skylite_savepoint_1");
+            assertEquals("3B001", fails(SQLNonTransientException.class, () -> c.rollback(older)).getSQLState());
+            assertEquals("3B001", fails(SQLNonTransientException.class, () -> c.rollback(unnamed)).getSQLState());
+            assertEquals("3B001", fails(SQLNonTransientException.class, () -> c.rollback(permissive)).getSQLState());
+            assertEquals(5, channelBodies().size(), channelBodies().toString());
+            c.rollback(later);
+            c.releaseSavepoint(mid);
+            assertEquals(7, channelBodies().size(), channelBodies().toString());
+        }
+    }
+
+    @Test
     void aSavepointWhoseOutcomeIsUnknownLosesTheTransaction() throws Exception {
         channel(FakeServer.executed(1, "open", 0, 0), "drop", "drop", "drop");
         try (Connection c = connect()) {

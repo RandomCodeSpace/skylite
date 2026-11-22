@@ -504,7 +504,15 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     /** The index of savepoint, which must be one of this connection's open transaction not yet released. */
     private int live(Savepoint savepoint) throws SQLException {
         dropEnded();
-        int i = savepoints.indexOf(savepoint);
+        int i = savepoints.size() - 1;
+        while (i >= 0 && savepoints.get(i) != savepoint) {
+            i--;
+        }
+        for (int j = i + 1; i >= 0 && j < savepoints.size(); j++) {
+            if (savepoints.get(j).sql().equals(savepoints.get(i).sql())) {
+                i = -1; // shadowed: SQLite would act on the later savepoint of that name
+            }
+        }
         if (i < 0 || savepointTxn == 0) {
             throw new SQLNonTransientException("skylite: the savepoint is not one of this connection's open "
                     + "transaction, or was released or rolled back past", "3B001");
@@ -514,8 +522,7 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
 
     /**
      * A savepoint of one transaction, by name or by id. An unnamed one is sent as skylite_savepoint_&lt;id&gt;.
-     * shortcut: two live savepoints of one name, or a name of that form, resolve to the latest, as in SQLite; refuse
-     * duplicates if that bites.
+     * A savepoint shadowed by a later live one of the same SQL name, a name of that form included, is refused.
      */
     private static final class SkyliteSavepoint implements Savepoint {
         private final int id;
