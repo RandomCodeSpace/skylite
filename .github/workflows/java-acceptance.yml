@@ -27,7 +27,7 @@ jobs:
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
-          java-version: "25.0.5+8"
+          java-version: "21.0.13+9"
 
       # Every event restores the Maven repository, but only pushes to main save it,
       # so a pull request or merge-group run cannot write an entry that main reads.
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
-          java-version: "25.0.5+8"
+          java-version: "21.0.13+9"
 
       # The integration test builds cmd/skylite and runs it.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
