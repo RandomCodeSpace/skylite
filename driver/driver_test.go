@@ -97,9 +97,11 @@ func TestWatermarkNeverLowers(t *testing.T) {
 	})
 	db := openDB(t, f.config())
 	for range 4 {
-		if _, err := db.Exec("SELECT 1"); err != nil {
+		rows, err := db.Query("SELECT 1")
+		if err != nil {
 			t.Fatal(err)
 		}
+		_ = rows.Close()
 		if int(n.Load()) == len(txns) {
 			break
 		}
@@ -109,25 +111,6 @@ func TestWatermarkNeverLowers(t *testing.T) {
 		if calls[i].req.MinTxn != want {
 			t.Errorf("request %d min_txn %d; want %d", i, calls[i].req.MinTxn, want)
 		}
-	}
-}
-
-func TestExecReadsTheResult(t *testing.T) {
-	f := newFake(t, true, func(_ http.ResponseWriter, ww *wire.Writer, _ call, _ *http.Request) {
-		_ = ww.Columns(bookColumns[:1])
-		_ = ww.Row([]any{int64(1)})
-		_ = ww.Row([]any{int64(2)})
-		_ = ww.Done(&wire.Done{Kind: wire.DoneQuery, Txn: 3, ReadOnly: true, RowsAffected: 5, LastInsertRowID: 6})
-	})
-	db := openDB(t, f.config())
-	res, err := db.Exec("SELECT id FROM books")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ra, _ := res.RowsAffected()
-	id, _ := res.LastInsertId()
-	if ra != 5 || id != 6 {
-		t.Fatalf("result %d, %d; want 5, 6", ra, id)
 	}
 }
 
@@ -189,33 +172,6 @@ func TestPing(t *testing.T) {
 	}
 }
 
-func TestWritesAndTransactionsUnsupported(t *testing.T) {
-	f := newFake(t, true, func(w http.ResponseWriter, ww *wire.Writer, _ call, _ *http.Request) {
-		refuse(w, ww, wire.NewError(wire.CodeNeedsChannel, "the statement is not a pure read"))
-	})
-	db := openDB(t, f.config())
-	_, err := db.Exec("INSERT INTO books (title) VALUES (?)", "Dune")
-	var se *Error
-	if !errors.Is(err, ErrWritesUnsupported) || !errors.Is(err, errors.ErrUnsupported) || !errors.As(err, &se) || se.Code != CodeNeedsChannel || !se.NotExecuted {
-		t.Fatalf("write: %v", err)
-	}
-	if !strings.Contains(err.Error(), "writes are not supported in this driver version") {
-		t.Fatalf("write error %q does not say writes are unsupported", err)
-	}
-	if n := f.hits.Load(); n != 1 {
-		t.Fatalf("%d requests; database/sql retried the write", n)
-	}
-	if _, err := db.Begin(); !errors.Is(err, ErrTransactionsUnsupported) {
-		t.Fatalf("Begin: %v", err)
-	}
-	if _, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true}); !errors.Is(err, ErrTransactionsUnsupported) {
-		t.Fatalf("BeginTx: %v", err)
-	}
-	if n := f.hits.Load(); n != 1 {
-		t.Fatalf("%d requests; Begin sent something", n)
-	}
-}
-
 // allCodes is ADR 0005's closed list of error codes.
 var allCodes = []Code{
 	CodeInvalidRequest, CodeUnauthenticated, CodeForbidden, CodeStatementForbidden, CodeDatabaseNotFound,
@@ -238,6 +194,9 @@ func TestEveryErrorCode(t *testing.T) {
 	})
 	db := openDB(t, f.config())
 	for _, c := range append(allCodes, "a_code_from_a_later_version") {
+		if c == CodeNeedsChannel { // sends the query on to a write channel: TestQueryFallsBackToTheChannel
+			continue
+		}
 		t.Run(string(c), func(t *testing.T) {
 			code.Store(c)
 			before := f.hits.Load()
@@ -253,9 +212,6 @@ func TestEveryErrorCode(t *testing.T) {
 			}
 			if errors.Is(err, driver.ErrBadConn) || f.hits.Load()-before != 1 {
 				t.Fatalf("err %v sent %d requests; want 1 and no ErrBadConn", err, f.hits.Load()-before)
-			}
-			if errors.Is(err, ErrWritesUnsupported) != (c == CodeNeedsChannel) {
-				t.Fatalf("ErrWritesUnsupported matched %v", err)
 			}
 			if !strings.Contains(err.Error(), string(c)) || !strings.Contains(err.Error(), "req-"+string(c)) {
 				t.Fatalf("message %q lacks the code or request id", err)
@@ -480,9 +436,11 @@ func TestBindConversions(t *testing.T) {
 	db := openDB(t, f.config())
 	at := time.Date(2024, 2, 29, 23, 30, 0, 5, time.FixedZone("", -3600))
 	first, last := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
-	if _, err := db.Exec("SELECT ?, ?, ?, ?, ?, ?, ?", true, false, at, int8(-3), float32(0.5), first, last); err != nil {
+	rows, err := db.Query("SELECT ?, ?, ?, ?, ?, ?, ?", true, false, at, int8(-3), float32(0.5), first, last)
+	if err != nil {
 		t.Fatal(err)
 	}
+	_ = rows.Close()
 	if want := `"params":[1,0,"2024-03-01 00:30:00.000000005",-3,5e-1,"0001-01-01 00:00:00.000000000","9999-12-31 23:59:59.999999999"]`; !strings.Contains(f.lastCalls()[0].body, want) {
 		t.Fatalf("body %s; want %s", f.lastCalls()[0].body, want)
 	}
@@ -500,7 +458,7 @@ func TestBindConversions(t *testing.T) {
 	}
 	before := f.hits.Load()
 	for _, r := range refused {
-		if _, err := db.Exec("SELECT 1", r.args...); err == nil || errors.Is(err, driver.ErrBadConn) {
+		if _, err := db.Query("SELECT 1", r.args...); err == nil || errors.Is(err, driver.ErrBadConn) {
 			t.Errorf("%s: %v; want a refusal", r.name, err)
 		}
 	}
@@ -647,11 +605,11 @@ func TestNewConnectorRefuses(t *testing.T) {
 		})
 	}
 	c, err := NewConnector(ok)
-	if err != nil || c.query != "https://db.example/prefix/v1/databases/library/query" || c.describe != "https://db.example/prefix/v1/databases/library/describe" {
+	if err != nil || c.base != "https://db.example/prefix" || c.db != "library" {
 		t.Fatalf("NewConnector = %+v, %v", c, err)
 	}
 	ok.AllowPlaintext, ok.Endpoint = true, "http://db.example"
-	if c, err := NewConnector(ok); err != nil || c.query != "http://db.example/v1/databases/library/query" {
+	if c, err := NewConnector(ok); err != nil || c.base != "http://db.example" {
 		t.Fatalf("plaintext with opt-in: %+v, %v", c, err)
 	}
 }

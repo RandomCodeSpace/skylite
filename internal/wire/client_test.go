@@ -57,6 +57,19 @@ func TestAppendCallParses(t *testing.T) {
 		},
 		{"query bare", KindQuery, Call{SQL: "SELECT \"a\"\n"}, `{"sql":"SELECT \"a\"\n"}`, nil},
 		{"describe", KindDescribe, Call{SQL: "SELECT 1", MinTxn: 3}, `{"sql":"SELECT 1","min_txn":3}`, nil},
+		{"open", KindOpen, Call{Mode: ModeWrite}, `{"mode":"write"}`, nil},
+		{"open read-only", KindOpen, Call{Mode: ModeReadOnly, MinTxn: 5}, `{"mode":"read_only","min_txn":5}`, nil},
+		{
+			"execute", KindChannel,
+			Call{Channel: "w1.a-b_c", Seq: 14, Op: OpExecute, SQL: "UPDATE t SET a = ?", Params: []any{int64(1)}, MinTxn: 9, TimeoutMS: 20},
+			`{"channel":"w1.a-b_c","seq":14,"op":"execute","sql":"UPDATE t SET a = ?","params":[1],"min_txn":9,"timeout_ms":20}`,
+			[]any{int64(1)},
+		},
+		{"begin", KindChannel, Call{Channel: "w1.x", Seq: 1, Op: OpBegin, MinTxn: 3}, `{"channel":"w1.x","seq":1,"op":"begin","min_txn":3}`, nil},
+		{"commit", KindChannel, Call{Channel: "w1.x", Seq: 2, Op: OpCommit}, `{"channel":"w1.x","seq":2,"op":"commit"}`, nil},
+		{"rollback", KindChannel, Call{Channel: "w1.x", Seq: 3, Op: OpRollback}, `{"channel":"w1.x","seq":3,"op":"rollback"}`, nil},
+		{"cancel", KindCancel, Call{Channel: "w1.x", Seq: 3}, `{"channel":"w1.x","seq":3}`, nil},
+		{"close", KindClose, Call{Channel: "w1.x"}, `{"channel":"w1.x"}`, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -68,7 +81,8 @@ func TestAppendCallParses(t *testing.T) {
 			if perr != nil {
 				t.Fatalf("Parse: %v", perr)
 			}
-			if r.SQL != tt.call.SQL || r.MinTxn != tt.call.MinTxn || r.TimeoutMS != tt.call.TimeoutMS {
+			if e := r.Validate(); e != nil || r.SQL != tt.call.SQL || r.MinTxn != tt.call.MinTxn || r.TimeoutMS != tt.call.TimeoutMS ||
+				r.Channel != tt.call.Channel || r.Seq != tt.call.Seq || r.Op != tt.call.Op || r.Mode != tt.call.Mode {
 				t.Fatalf("Parse = %+v", r)
 			}
 			names := []string{"", ""}
@@ -90,7 +104,20 @@ func TestAppendCallRefuses(t *testing.T) {
 		kind Kind
 		call Call
 	}{
-		{"channel kind", KindChannel, Call{SQL: "SELECT 1"}},
+		{"channel request without op", KindChannel, Call{Channel: "w1.x", Seq: 1, SQL: "SELECT 1"}},
+		{"batch", KindChannel, Call{Channel: "w1.x", Seq: 1, Op: OpBatch, SQL: "SELECT 1"}},
+		{"resolve", KindResolve, Call{Channel: "w1.x", Seq: 1}},
+		{"execute without channel", KindChannel, Call{Seq: 1, Op: OpExecute, SQL: "SELECT 1"}},
+		{"execute without seq", KindChannel, Call{Channel: "w1.x", Op: OpExecute, SQL: "SELECT 1"}},
+		{"execute without sql", KindChannel, Call{Channel: "w1.x", Seq: 1, Op: OpExecute}},
+		{"commit with sql", KindChannel, Call{Channel: "w1.x", Seq: 1, Op: OpCommit, SQL: "SELECT 1"}},
+		{"rollback with timeout", KindChannel, Call{Channel: "w1.x", Seq: 1, Op: OpRollback, TimeoutMS: 1}},
+		{"negative seq", KindCancel, Call{Channel: "w1.x", Seq: -1}},
+		{"bad token", KindClose, Call{Channel: "w1 x"}},
+		{"close with seq", KindClose, Call{Channel: "w1.x", Seq: 1}},
+		{"open without mode", KindOpen, Call{}},
+		{"write open with min_txn", KindOpen, Call{Mode: ModeWrite, MinTxn: 1}},
+		{"query with channel", KindQuery, Call{SQL: "SELECT 1", Channel: "w1.x"}},
 		{"empty sql", KindQuery, Call{}},
 		{"NUL in sql", KindQuery, Call{SQL: "SELECT 1\x00"}},
 		{"invalid UTF-8 sql", KindQuery, Call{SQL: "SELECT '\xff'"}},
@@ -233,6 +260,13 @@ func TestReaderRefuses(t *testing.T) {
 		{"bytes after the terminal frame", DoneQuery, qdone + "\n", false},
 		{"params in a query", DoneQuery, cols + `{"params":{"from":0,"names":["a"]}}` + "\n" + qdone, false},
 		{"results in a query", DoneQuery, `{"results":{"from":0,"entries":[{"rows_affected":1,"last_insert_rowid":1}]}}` + "\n" + qdone, false},
+		{"row in a describe", DoneDescribe, cols + "[1]\n" + `{"done":{"txn":1,"param_count":0}}` + "\n", false},
+		{"columns in a commit", DoneCommit, cols + `{"done":{"seq":1,"txn_state":"none","txn":1,"committed":true,"wrote":true}}` + "\n", false},
+		{"committed false", DoneCommit, `{"done":{"seq":1,"txn_state":"none","txn":1,"committed":false,"wrote":true}}` + "\n", false},
+		{"bad txn_state", DoneRollback, `{"done":{"seq":1,"txn_state":"closed","txn":1}}` + "\n", false},
+		{"execute without seq", DoneExecute, `{"done":{"txn_state":"none","txn":1,"read_only":true,"rows_affected":0,"last_insert_rowid":0}}` + "\n", false},
+		{"open without token", DoneOpen, `{"done":{"txn":1,"channel":{"id":"c"}}}` + "\n", false},
+		{"open with a bad token", DoneOpen, `{"done":{"txn":1,"channel":{"token":"a b","id":"c"}}}` + "\n", false},
 		{"describe without columns", DoneDescribe, `{"done":{"txn":1,"param_count":0}}` + "\n", false},
 		{"params before columns", DoneDescribe, `{"params":{"from":0,"names":["a"]}}` + "\n" + cols + ddone, false},
 		{"params count short", DoneDescribe, cols + ddone, false},
@@ -262,6 +296,88 @@ func TestReaderRefuses(t *testing.T) {
 	}
 }
 
+func TestReaderReadsChannelAnswers(t *testing.T) {
+	l := DefaultLimits()
+	for _, d := range []*Done{
+		{Kind: DoneOpen, Txn: 7, Channel: &Channel{Token: "w1.x", ID: "7c1d2e3f40a1b2c37c1d2e3f40a1b2c3", Mode: ModeWrite, Epoch: 2, Limits: l}},
+		{Kind: DoneBegin, Seq: 1, TxnState: TxnOpen, Txn: 7},
+		{Kind: DoneExecute, Seq: 2, TxnState: TxnAborted, Txn: 7, RowsAffected: 1, LastInsertRowID: -3, DataOmitted: true},
+		{Kind: DoneCommit, Seq: 3, TxnState: TxnNone, Txn: 8, Wrote: true},
+		{Kind: DoneRollback, Seq: 4, TxnState: TxnNone, Txn: 8},
+	} {
+		var buf bytes.Buffer
+		w, _ := NewWriter(&buf, DefaultFrameBytes, l)
+		if err := w.Done(d); err != nil {
+			t.Fatal(err)
+		}
+		frames, err := readAll(buf.String(), d.Kind, 1<<10)
+		want := *d
+		if want.Channel != nil {
+			c := *want.Channel
+			c.Limits = Limits{RequestBodyBytes: l.RequestBodyBytes, ResultBytes: l.ResultBytes} // the rest are skipped
+			want.Channel = &c
+		}
+		if err != nil || len(frames) != 1 || !reflect.DeepEqual(frames[0].Done, &want) {
+			t.Fatalf("%s: frames %+v, %v; want %+v", buf.String(), frames, err, want)
+		}
+	}
+	// A close answer: its last_seq, with its outcome skipped.
+	frames, err := readAll(`{"done":{"last_seq":4,"outcome":{"done":{"seq":4,"txn_state":"none","txn":8}}}}`+"\n", DoneClose, 1<<10)
+	if err != nil || len(frames) != 1 || frames[0].Done.LastSeq != 4 {
+		t.Fatalf("close answer: frames %+v, %v", frames, err)
+	}
+}
+
+// TestReaderRefusesBadChannels checks that an open answer needs a channel
+// identifier of 32 lowercase hexadecimal characters and both limits a driver
+// enforces.
+func TestReaderRefusesBadChannels(t *testing.T) {
+	const id, limits = `"7c1d2e3f40a1b2c37c1d2e3f40a1b2c3"`, `{"request_body_bytes":256,"result_bytes":64}`
+	for name, channel := range map[string]string{
+		"short id":        `{"token":"w1.x","id":"c1","mode":"write","epoch":1,"limits":` + limits + `}`,
+		"unknown mode":    `{"token":"w1.x","id":` + id + `,"mode":"admin","epoch":1,"limits":` + limits + `}`,
+		"upper-case id":   `{"token":"w1.x","id":"7C1D2E3F40A1B2C37C1D2E3F40A1B2C3","mode":"write","epoch":1,"limits":` + limits + `}`,
+		"no limits":       `{"token":"w1.x","id":` + id + `,"mode":"write","epoch":1}`,
+		"no result_bytes": `{"token":"w1.x","id":` + id + `,"mode":"write","epoch":1,"limits":{"request_body_bytes":256}}`,
+		"zero body limit": `{"token":"w1.x","id":` + id + `,"mode":"write","epoch":1,"limits":{"request_body_bytes":0,"result_bytes":64}}`,
+	} {
+		if _, err := readAll(`{"done":{"txn":1,"channel":`+channel+`}}`+"\n", DoneOpen, 1<<10); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// TestReaderLimitsResult checks that LimitResult counts every frame before
+// the terminal frame, newlines included, and skips keepalives.
+func TestReaderLimitsResult(t *testing.T) {
+	const body = `{"keepalive":{}}` + "\n" + `{"columns":[{"name":"id"}]}` + "\n" + "[1]\n[2]\n" + `{"done":{"seq":1,"txn_state":"none","txn":1,"read_only":false,"last_insert_rowid":0,"rows_affected":0}}` + "\n"
+	for limit, ok := range map[int64]bool{36: true, 35: false} { // the columns frame is 28 bytes, each row 4
+		r, err := NewReader(strings.NewReader(body), DoneExecute, 1<<10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.LimitResult(limit)
+		for err == nil {
+			_, err = r.Next()
+		}
+		if errors.Is(err, io.EOF) != ok {
+			t.Errorf("limit %d: %v", limit, err)
+		}
+	}
+}
+
+// TestReaderBoundsParamsWhileParsing checks that a params frame is refused at
+// its 1,025th name, before that name is parsed: the name here is not a string,
+// which would be the error if it were.
+func TestReaderBoundsParamsWhileParsing(t *testing.T) {
+	names := strings.Repeat(`"a",`, 1024) + "1"
+	body := `{"columns":[]}` + "\n" + `{"params":{"from":0,"names":[` + names + `]}}` + "\n"
+	_, err := readAll(body, DoneDescribe, 1<<20)
+	if !errors.Is(err, ErrMalformed) || !strings.Contains(err.Error(), "1 to 1024 entries") {
+		t.Fatalf("err = %v; want the 1,024-entry bound", err)
+	}
+}
+
 func TestReaderSkipsWhatItDoesNotKnow(t *testing.T) {
 	body := `{"future":{"x":[1]}}` + "\n" +
 		`{"columns":[{"name":"a","decltype":null,"extra":true}]}` + "\n" +
@@ -275,7 +391,7 @@ func TestReaderSkipsWhatItDoesNotKnow(t *testing.T) {
 }
 
 func TestNewReaderRefuses(t *testing.T) {
-	if _, err := NewReader(strings.NewReader(""), DoneCommit, 1<<10); err == nil {
+	if _, err := NewReader(strings.NewReader(""), DoneBatch, 1<<10); err == nil {
 		t.Error("NewReader accepted a done kind it does not read")
 	}
 	if _, err := NewReader(strings.NewReader(""), DoneQuery, 1); err == nil {

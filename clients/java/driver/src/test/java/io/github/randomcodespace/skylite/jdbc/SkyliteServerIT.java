@@ -28,7 +28,6 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLInvalidAuthorizationSpecException;
 import java.sql.SQLSyntaxErrorException;
 import java.sql.SQLTransientConnectionException;
@@ -54,8 +53,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * The driver against a real {@code skylite serve}, built from this repository with Go, over HTTPS with a test OIDC
- * issuer: a JWKS file and an ES256 token signed here. The database is created with a PUT; the driver sends no
- * writes yet, so the queries are constant SQL.
+ * issuer: a JWKS file and an ES256 token signed here. The database is created with a PUT; each test that writes
+ * uses tables of its own.
  */
 class SkyliteServerIT {
     static final String ISSUER = "https://issuer.skylite.test";
@@ -313,13 +312,152 @@ class SkyliteServerIT {
     }
 
     @Test
-    void refusesWritesAndBadSql() throws Exception {
+    void refusesBadSql() throws Exception {
         try (Connection c = connect(); Statement s = c.createStatement()) {
-            SQLFeatureNotSupportedException e =
-                    assertThrows(SQLFeatureNotSupportedException.class, () -> s.executeUpdate("CREATE TABLE t (x)"));
-            assertTrue(e.getMessage().contains("needs_channel"), e.getMessage());
             assertThrows(SQLSyntaxErrorException.class, () -> s.executeQuery("SELEC 1"));
             assertThrows(SQLSyntaxErrorException.class, () -> s.executeQuery("SELECT * FROM no_such_table"));
+        }
+    }
+
+    /** DDL, autocommit inserts with their keys and counts, batches, and the catalog queries over what they made. */
+    @Test
+    void writesInAutoCommit() throws Exception {
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            assertEquals(0, s.executeUpdate("CREATE TABLE w_auto (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)"));
+            assertFalse(s.execute("CREATE INDEX w_auto_name ON w_auto (name)"), "DDL through execute");
+            try (PreparedStatement ins = c.prepareStatement("INSERT INTO w_auto (name) VALUES (?)",
+                    Statement.RETURN_GENERATED_KEYS)) {
+                ins.setString(1, "a");
+                assertEquals(1, ins.executeUpdate());
+                try (ResultSet keys = ins.getGeneratedKeys()) {
+                    assertTrue(keys.next());
+                    assertEquals(1, keys.getLong(1));
+                    assertFalse(keys.next());
+                }
+                ins.setString(1, "b");
+                ins.addBatch();
+                ins.setString(1, "c");
+                ins.addBatch();
+                assertArrayEquals(new int[] {1, 1}, ins.executeBatch());
+                ins.setString(1, "a");
+                SQLException dup = assertThrows(SQLException.class, ins::executeUpdate);
+                assertTrue(dup instanceof java.sql.SQLIntegrityConstraintViolationException, dup.toString());
+                assertEquals("23000", dup.getSQLState());
+            }
+            assertEquals(3, s.executeUpdate("UPDATE w_auto SET name = name || '!'"));
+            try (ResultSet rs = s.executeQuery("SELECT count(*) FROM w_auto WHERE name LIKE '%!'")) {
+                assertTrue(rs.next());
+                assertEquals(3, rs.getLong(1), "the next read sees the autocommit writes");
+            }
+            try (ResultSet rs = c.getMetaData().getTables(null, null, "w_auto", new String[] {"TABLE"})) {
+                assertTrue(rs.next());
+                assertEquals("w_auto", rs.getString("TABLE_NAME"));
+                assertFalse(rs.next());
+            }
+            try (ResultSet rs = c.getMetaData().getColumns(null, null, "w_auto", "%")) {
+                assertTrue(rs.next());
+                assertEquals("id", rs.getString("COLUMN_NAME"));
+                assertEquals(java.sql.Types.BIGINT, rs.getInt("DATA_TYPE"));
+                assertTrue(rs.next());
+                assertEquals("name", rs.getString("COLUMN_NAME"));
+                assertEquals("TEXT", rs.getString("TYPE_NAME"));
+                assertEquals("NO", rs.getString("IS_NULLABLE"));
+                assertFalse(rs.next());
+            }
+        }
+    }
+
+    /**
+     * A transaction is invisible to another connection until its commit, survives a failed statement, and leaves
+     * nothing after a rollback; a read-only connection refuses writes; a rollback to a savepoint keeps what came before
+     * it.
+     */
+    @Test
+    void runsTransactions() throws Exception {
+        try (Connection writer = connect(); Connection reader = connect(); Statement w = writer.createStatement()) {
+            w.executeUpdate("CREATE TABLE w_txn (id INTEGER PRIMARY KEY, v TEXT UNIQUE)");
+            writer.setAutoCommit(false);
+            w.executeUpdate("INSERT INTO w_txn (v) VALUES ('one')");
+            assertThrows(java.sql.SQLIntegrityConstraintViolationException.class,
+                    () -> w.executeUpdate("INSERT INTO w_txn (v) VALUES ('one')"));
+            w.executeUpdate("INSERT INTO w_txn (v) VALUES ('two')");
+            try (ResultSet rs = w.executeQuery("SELECT count(*) FROM w_txn")) {
+                assertTrue(rs.next());
+                assertEquals(2, rs.getLong(1), "the transaction reads its own writes");
+            }
+            assertEquals(0, count(reader, "w_txn"));
+            writer.commit();
+            assertEquals(2, count(reader, "w_txn"));
+
+            w.executeUpdate("DELETE FROM w_txn");
+            writer.rollback();
+            writer.setAutoCommit(true);
+            assertEquals(2, count(reader, "w_txn"));
+
+            reader.setReadOnly(true);
+            SQLException ro = assertThrows(SQLException.class,
+                    () -> reader.createStatement().executeUpdate("DELETE FROM w_txn"));
+            assertEquals("25006", ro.getSQLState(), ro.toString());
+
+            writer.setAutoCommit(false);
+            java.sql.Savepoint first = writer.setSavepoint(); // begins the transaction
+            w.executeUpdate("INSERT INTO w_txn (v) VALUES ('three')");
+            java.sql.Savepoint named = writer.setSavepoint("x\"y");
+            w.executeUpdate("INSERT INTO w_txn (v) VALUES ('four')");
+            writer.rollback(named);
+            writer.releaseSavepoint(first);
+            writer.commit();
+            try (ResultSet rs = w.executeQuery("SELECT group_concat(v) FROM (SELECT v FROM w_txn ORDER BY id)")) {
+                assertTrue(rs.next());
+                assertEquals("one,two,three", rs.getString(1), "rolled back to the savepoint, then committed");
+            }
+        }
+    }
+
+    /**
+     * Closing a connection with its transaction open rolls it back and releases the write lock: another connection
+     * writes at once.
+     */
+    @Test
+    void closingRollsBackAndReleasesTheLock() throws Exception {
+        try (Connection c = connect()) {
+            c.createStatement().executeUpdate("CREATE TABLE w_close (v TEXT)");
+        }
+        Connection open = connect();
+        open.setAutoCommit(false);
+        open.createStatement().executeUpdate("INSERT INTO w_close VALUES ('lost')");
+        open.close();
+        try (Connection c = connect()) {
+            long t0 = System.nanoTime();
+            assertEquals(1, c.createStatement().executeUpdate("INSERT INTO w_close VALUES ('kept')"));
+            assertTrue(Duration.ofNanos(System.nanoTime() - t0).toMillis() < 4_000, "the lock was released");
+            assertEquals(1, count(c, "w_close"));
+        }
+    }
+
+    /** A query timeout inside a transaction reaches the server, which ends the statement; the transaction goes on. */
+    @Test
+    void theStatementDeadlineEndsAChannelStatement() throws Exception {
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            c.setAutoCommit(false);
+            s.executeUpdate("CREATE TABLE w_deadline (v)");
+            s.setQueryTimeout(1);
+            long t0 = System.nanoTime();
+            SQLException e = assertThrows(SQLException.class, () -> s.executeQuery("WITH RECURSIVE n(i) AS "
+                    + "(SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n"));
+            long ms = Duration.ofNanos(System.nanoTime() - t0).toMillis();
+            assertTrue(e instanceof java.sql.SQLTimeoutException, e.toString());
+            assertTrue(ms >= 900 && ms < 2_900, "ended after " + ms + " ms");
+            s.executeUpdate("INSERT INTO w_deadline VALUES (1)");
+            c.commit();
+            assertEquals(1, count(c, "w_deadline"));
+        }
+    }
+
+    static long count(Connection c, String table) throws SQLException {
+        try (Statement s = c.createStatement(); ResultSet rs = s.executeQuery("SELECT count(*) FROM " + table)) {
+            assertTrue(rs.next());
+            return rs.getLong(1);
         }
     }
 

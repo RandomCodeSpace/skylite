@@ -1,17 +1,26 @@
 package io.github.randomcodespace.skylite.jdbc;
 
+import io.github.randomcodespace.skylite.jdbc.FrameReader.Column;
+import io.github.randomcodespace.skylite.jdbc.FrameReader.Done;
+import io.github.randomcodespace.skylite.jdbc.FrameReader.Frame;
+import io.github.randomcodespace.skylite.jdbc.FrameReader.Row;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.RowIdLifetime;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientException;
-import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Minimal metadata: the product (SQLite and the server's {@code sqlite_version()}), the driver, and the constant
- * capabilities of this version, which reads only. Catalog queries such as getTables and getColumns are not
- * supported yet.
+ * Minimal metadata: the product (SQLite and the server's {@code sqlite_version()}), the driver, the constant
+ * capabilities of this version, and getTables and getColumns, read from {@code sqlite_schema} and
+ * {@code pragma_table_info}. Its queries are stateless reads, also inside a transaction. Other catalog queries are
+ * not supported yet.
  */
 final class SkyliteDatabaseMetaData implements DatabaseMetaData {
     private final SkyliteConnection conn;
@@ -36,7 +45,7 @@ final class SkyliteDatabaseMetaData implements DatabaseMetaData {
     @Override
     public String getDatabaseProductVersion() throws SQLException {
         if (productVersion == null) {
-            try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery("SELECT sqlite_version()")) {
+            try (PreparedStatement s = conn.metadataStatement("SELECT sqlite_version()"); ResultSet rs = s.executeQuery()) {
                 if (!rs.next()) {
                     throw new SQLNonTransientException("skylite: sqlite_version() returned no row", "HY000");
                 }
@@ -116,22 +125,22 @@ final class SkyliteDatabaseMetaData implements DatabaseMetaData {
 
     @Override
     public boolean isReadOnly() {
-        return true;
+        return conn.readOnly();
     }
 
     // ---- capabilities of this version ----
 
-    @Override public boolean supportsTransactions() { return false; }
+    @Override public boolean supportsTransactions() { return true; }
     @Override public int getDefaultTransactionIsolation() { return Connection.TRANSACTION_SERIALIZABLE; }
     @Override public boolean supportsTransactionIsolationLevel(int level) { return level == Connection.TRANSACTION_SERIALIZABLE; }
-    @Override public boolean supportsDataDefinitionAndDataManipulationTransactions() { return false; }
+    @Override public boolean supportsDataDefinitionAndDataManipulationTransactions() { return true; }
     @Override public boolean supportsDataManipulationTransactionsOnly() { return false; }
     @Override public boolean dataDefinitionCausesTransactionCommit() { return false; }
     @Override public boolean dataDefinitionIgnoredInTransactions() { return false; }
-    @Override public boolean supportsMultipleTransactions() { return false; }
-    @Override public boolean supportsSavepoints() { return false; }
-    @Override public boolean supportsGetGeneratedKeys() { return false; }
-    @Override public boolean supportsBatchUpdates() { return false; }
+    @Override public boolean supportsMultipleTransactions() { return true; }
+    @Override public boolean supportsSavepoints() { return true; }
+    @Override public boolean supportsGetGeneratedKeys() { return true; }
+    @Override public boolean supportsBatchUpdates() { return true; }
     @Override public boolean supportsNamedParameters() { return false; }
     @Override public boolean supportsMultipleOpenResults() { return false; }
     @Override public boolean supportsMultipleResultSets() { return false; }
@@ -264,16 +273,14 @@ final class SkyliteDatabaseMetaData implements DatabaseMetaData {
     @Override public int getMaxTablesInSelect() { return 0; }
     @Override public int getMaxUserNameLength() { return 0; }
 
-    // ---- catalog queries: not yet ----
+    // ---- catalog queries ----
 
     @Override public ResultSet getProcedures(String c, String s, String p) throws SQLException { throw catalog("getProcedures"); }
     @Override public ResultSet getProcedureColumns(String c, String s, String p, String col) throws SQLException { throw catalog("getProcedureColumns"); }
-    @Override public ResultSet getTables(String c, String s, String t, String[] types) throws SQLException { throw catalog("getTables"); }
     @Override public ResultSet getSchemas() throws SQLException { throw catalog("getSchemas"); }
     @Override public ResultSet getSchemas(String c, String s) throws SQLException { throw catalog("getSchemas"); }
     @Override public ResultSet getCatalogs() throws SQLException { throw catalog("getCatalogs"); }
     @Override public ResultSet getTableTypes() throws SQLException { throw catalog("getTableTypes"); }
-    @Override public ResultSet getColumns(String c, String s, String t, String col) throws SQLException { throw catalog("getColumns"); }
     @Override public ResultSet getColumnPrivileges(String c, String s, String t, String col) throws SQLException { throw catalog("getColumnPrivileges"); }
     @Override public ResultSet getTablePrivileges(String c, String s, String t) throws SQLException { throw catalog("getTablePrivileges"); }
     @Override public ResultSet getBestRowIdentifier(String c, String s, String t, int scope, boolean nullable) throws SQLException { throw catalog("getBestRowIdentifier"); }
@@ -292,6 +299,85 @@ final class SkyliteDatabaseMetaData implements DatabaseMetaData {
     @Override public ResultSet getFunctions(String c, String s, String f) throws SQLException { throw catalog("getFunctions"); }
     @Override public ResultSet getFunctionColumns(String c, String s, String f, String col) throws SQLException { throw catalog("getFunctionColumns"); }
     @Override public ResultSet getPseudoColumns(String c, String s, String t, String col) throws SQLException { throw catalog("getPseudoColumns"); }
+
+    /** Tables and views of the main database, without SQLite's own; catalog and schema are ignored. */
+    @Override
+    public ResultSet getTables(String catalog, String schema, String tablePattern, String[] types) throws SQLException {
+        StringBuilder sql = new StringBuilder("SELECT NULL AS TABLE_CAT, NULL AS TABLE_SCHEM, name AS TABLE_NAME, "
+                + "CASE type WHEN 'table' THEN 'TABLE' ELSE 'VIEW' END AS TABLE_TYPE, NULL AS REMARKS, "
+                + "NULL AS TYPE_CAT, NULL AS TYPE_SCHEM, NULL AS TYPE_NAME, NULL AS SELF_REFERENCING_COL_NAME, "
+                + "NULL AS REF_GENERATION FROM sqlite_schema WHERE type IN ('table', 'view') "
+                + "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name LIKE ?");
+        List<Object> params = new ArrayList<>(List.of(tablePattern == null ? "%" : tablePattern));
+        if (types != null) {
+            sql.append(" AND TABLE_TYPE IN (NULL");
+            for (String t : types) {
+                sql.append(", ?");
+                params.add(t);
+            }
+            sql.append(')');
+        }
+        PreparedStatement ps = conn.metadataStatement(sql.append(" ORDER BY TABLE_TYPE, TABLE_NAME").toString());
+        for (int i = 0; i < params.size(); i++) {
+            ps.setObject(i + 1, params.get(i));
+        }
+        ps.closeOnCompletion();
+        try {
+            return ps.executeQuery();
+        } catch (SQLException e) {
+            ps.close();
+            throw e;
+        }
+    }
+
+    private static final String[] COLUMNS = {"TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "COLUMN_NAME", "DATA_TYPE",
+        "TYPE_NAME", "COLUMN_SIZE", "BUFFER_LENGTH", "DECIMAL_DIGITS", "NUM_PREC_RADIX", "NULLABLE", "REMARKS",
+        "COLUMN_DEF", "SQL_DATA_TYPE", "SQL_DATETIME_SUB", "CHAR_OCTET_LENGTH", "ORDINAL_POSITION", "IS_NULLABLE",
+        "SCOPE_CATALOG", "SCOPE_SCHEMA", "SCOPE_TABLE", "SOURCE_DATA_TYPE", "IS_AUTOINCREMENT", "IS_GENERATEDCOLUMN"};
+    private static final Pattern SIZE = Pattern.compile("\\(\\s*(\\d+)\\s*(?:,\\s*(\\d+)\\s*)?\\)");
+
+    /**
+     * The columns of tables and views of the main database. DATA_TYPE is the JDBC type of the declared type, as
+     * {@link java.sql.ResultSetMetaData#getColumnType} reports it; TYPE_NAME is the declared type without its
+     * arguments, which COLUMN_SIZE and DECIMAL_DIGITS hold. Catalog and schema are ignored.
+     */
+    @Override
+    public ResultSet getColumns(String catalog, String schema, String tablePattern, String columnPattern)
+            throws SQLException {
+        List<Frame> rows = new ArrayList<>();
+        try (PreparedStatement ps = conn.metadataStatement("SELECT m.name, p.name, p.type, p.\"notnull\", "
+                + "p.dflt_value, p.cid + 1 FROM sqlite_schema AS m JOIN pragma_table_info(m.name) AS p "
+                + "WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+                + "AND m.name LIKE ? AND p.name LIKE ? ORDER BY m.name, p.cid")) {
+            ps.setString(1, tablePattern == null ? "%" : tablePattern);
+            ps.setString(2, columnPattern == null ? "%" : columnPattern);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String decl = rs.getString(3);
+                    Matcher m = SIZE.matcher(decl == null ? "" : decl);
+                    boolean sized = m.find();
+                    boolean notNull = rs.getLong(4) != 0;
+                    rows.add(new Row(new Object[] {null, null, rs.getString(1), rs.getString(2),
+                        (long) SkyliteResultSetMetaData.jdbcType(decl == null ? "" : decl),
+                        SkyliteResultSetMetaData.typeName(decl), sized ? Long.valueOf(m.group(1)) : null, null,
+                        sized && m.group(2) != null ? Long.valueOf(m.group(2)) : null, 10L,
+                        notNull ? (long) columnNoNulls : (long) columnNullable, null, rs.getString(5), null, null,
+                        null, rs.getLong(6), notNull ? "NO" : "YES", null, null, null, null, "", ""}));
+                }
+            }
+        }
+        rows.add(new Done(0, true, 0, 0, 0, 0, null, null, 0, null, false));
+        List<Column> cols = new ArrayList<>();
+        for (String name : COLUMNS) {
+            boolean number = name.equals("DATA_TYPE") || name.endsWith("_SIZE") || name.endsWith("_LENGTH")
+                    || name.equals("DECIMAL_DIGITS") || name.equals("NUM_PREC_RADIX") || name.equals("NULLABLE")
+                    || name.startsWith("SQL_") || name.equals("ORDINAL_POSITION") || name.equals("SOURCE_DATA_TYPE");
+            cols.add(new Column(name, number ? "INTEGER" : "TEXT", null, null, null));
+        }
+        SkyliteStatement owner = (SkyliteStatement) conn.createStatement();
+        owner.closeOnCompletion();
+        return owner.publish(new SkyliteResultSet(owner, FrameReader.Frames.of(rows), cols, 0, 0));
+    }
 
     @Override
     public <T> T unwrap(Class<T> iface) throws SQLException {

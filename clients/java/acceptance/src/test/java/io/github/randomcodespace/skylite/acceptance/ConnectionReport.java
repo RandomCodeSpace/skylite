@@ -51,6 +51,7 @@ class ConnectionReport implements BeanPostProcessor, HibernatePropertiesCustomiz
 
     private volatile HikariDataSource pool;
     private volatile Boolean baseline;
+    private volatile boolean savepoints;
 
     @Override
     public Object postProcessAfterInitialization(Object bean, String name) {
@@ -98,6 +99,7 @@ class ConnectionReport implements BeanPostProcessor, HibernatePropertiesCustomiz
             compare(differences, "URL reported by the driver", url, md.getURL());
             failOn(differences);
             baseline = BASELINE_DRIVER.equals(driver) && BASELINE_DIALECT.equals(dialect);
+            savepoints = md.supportsSavepoints();
             log.info("Connected to {} with driver {} ({} {}), dialect {}, database {} {}{}", md.getURL(), driver,
                     md.getDriverName(), md.getDriverVersion(), dialect, md.getDatabaseProductName(),
                     md.getDatabaseProductVersion(), baseline ? "; this is the baseline stack" : "");
@@ -115,17 +117,25 @@ class ConnectionReport implements BeanPostProcessor, HibernatePropertiesCustomiz
         return b;
     }
 
+    /** Whether the verified connection's driver reports savepoint support; fails if start-up has not verified it. */
+    boolean supportsSavepoints() {
+        isBaseline();
+        return savepoints;
+    }
+
     /**
      * A new physical connection outside the pool, opened with the requested driver class and URL that start-up
-     * verified, never with Spring's separately bound {@code spring.datasource.*} values. The pool's user name and
-     * password, if any, are passed on. Start-up does not verify them: with a driver that authenticates they decide
-     * the principal, and with some drivers the default database or schema.
+     * verified, never with Spring's separately bound {@code spring.datasource.*} values. The pool's driver properties
+     * (skylite's tokenFile and tlsRootCertificates, for example), user name and password, if any, are passed on.
+     * Start-up does not verify them: with a driver that authenticates they decide the principal, and with some
+     * drivers the default database or schema.
      */
     Connection openOutsidePool() throws SQLException {
         isBaseline(); // fails unless start-up verified the connection
         String url = requested("jdbc.url");
         String driver = requested("jdbc.driver");
         Properties credentials = new Properties();
+        credentials.putAll(pool.getDataSourceProperties());
         if (pool.getUsername() != null) {
             credentials.setProperty("user", pool.getUsername());
         }

@@ -18,6 +18,8 @@ import java.sql.SQLXML;
 import java.sql.Savepoint;
 import java.sql.Statement;
 import java.sql.Struct;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -25,9 +27,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 
 /**
- * A connection holds no server state in this version: every statement is one stateless {@code query} request, and
- * the connection is read-only and in auto-commit. Writes, transactions and channels come with the server's write
- * channels; until then they raise {@link java.sql.SQLFeatureNotSupportedException}.
+ * A connection reads in auto-commit through stateless {@code query} requests, and writes through one write channel
+ * of its own, opened on its first write and closed with it. With auto-commit off, the first statement begins a
+ * transaction on the channel and every statement runs in it until commit or rollback; a read-only connection runs
+ * every statement as a stateless read instead, each at the latest committed state. Savepoints are statements of the
+ * transaction, sent as SAVEPOINT, ROLLBACK TO and RELEASE.
  */
 final class SkyliteConnection implements Connection, Exchange.Owner {
     private final Session session;
@@ -35,11 +39,38 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     private final Set<SkyliteStatement> statements = ConcurrentHashMap.newKeySet();
     private final Set<Exchange> validations = ConcurrentHashMap.newKeySet();
     private final Object validationLock = new Object();
+    private final Channel channel;
     private volatile boolean closed;
+    private volatile boolean autoCommit = true;
+    private volatile boolean readOnly;
+    private final List<SkyliteSavepoint> savepoints = new ArrayList<>(); // oldest first; guarded by channel
+    private long savepointTxn; // Channel.transaction() the savepoints belong to; guarded by channel
+    private int savepointIds; // guarded by channel
 
     SkyliteConnection(Session session, String url) {
         this.session = session;
         this.url = url;
+        this.channel = new Channel(this);
+    }
+
+    Channel channel() {
+        return channel;
+    }
+
+    /** Whether a statement runs on the channel: with auto-commit off, or for an update, unless read-only. */
+    boolean onChannel(boolean update) {
+        return !readOnly && (update || !autoCommit);
+    }
+
+    /** Runs a statement on the channel, in the transaction when auto-commit is off. */
+    java.util.List<FrameReader.Frame> execute(String sql, java.util.List<Object> params, int timeoutSeconds,
+            SkyliteStatement stmt) throws SQLException {
+        return channel.execute(sql, params, timeoutSeconds, stmt);
+    }
+
+    /** getAutoCommit for the driver's own use, which checks openness itself; changed under the channel's lock. */
+    boolean autoCommit() {
+        return autoCommit;
     }
 
     Session session() {
@@ -50,10 +81,21 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         return url;
     }
 
+    /** Refuses every use of a closed connection, and of one whose transaction was lost (ADR 0005). */
     void checkOpen() throws SQLException {
         if (closed) {
-            throw Errors.closed("connection");
+            throw closedError();
         }
+        SQLException refused = channel.refusal();
+        if (refused != null) {
+            throw refused;
+        }
+    }
+
+    /** The error for a use of the closed connection: 08003 when it was discarded after an unknown outcome. */
+    SQLException closedError() {
+        SQLException discarded = channel.discarded();
+        return discarded != null ? discarded : Errors.closed("connection");
     }
 
     void forget(SkyliteStatement s) {
@@ -64,7 +106,7 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         statements.add(s);
         if (closed) { // closed while s was made, perhaps after close() went through the statements
             s.close();
-            throw Errors.closed("connection");
+            throw closedError();
         }
         return s;
     }
@@ -101,7 +143,22 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         if (sql == null) {
             throw new SQLNonTransientException("skylite: the SQL is null", "HY009");
         }
-        return track(new SkylitePreparedStatement(this, sql));
+        return track(new SkylitePreparedStatement(this, sql, null));
+    }
+
+    /** A statement of the driver's own metadata queries: always a stateless read, inside a transaction too. */
+    PreparedStatement metadataStatement(String sql) throws SQLException {
+        SkylitePreparedStatement s = (SkylitePreparedStatement) prepare(sql, null);
+        s.statelessOnly = true;
+        return s;
+    }
+
+    private PreparedStatement prepare(String sql, String keyLabel) throws SQLException {
+        checkOpen();
+        if (sql == null) {
+            throw new SQLNonTransientException("skylite: the SQL is null", "HY009");
+        }
+        return track(new SkylitePreparedStatement(this, sql, keyLabel));
     }
 
     @Override
@@ -116,22 +173,22 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         return prepareStatement(sql);
     }
 
+    /** With RETURN_GENERATED_KEYS, getGeneratedKeys returns the rowid of each insert. */
     @Override
     public PreparedStatement prepareStatement(String sql, int autoGeneratedKeys) throws SQLException {
-        if (autoGeneratedKeys != Statement.NO_GENERATED_KEYS) {
-            throw Errors.writes();
-        }
-        return prepareStatement(sql);
+        return prepare(sql, SkyliteStatement.keyLabel(autoGeneratedKeys));
     }
 
+    /** The rowid is the only generated key, whichever columns are asked for. */
     @Override
     public PreparedStatement prepareStatement(String sql, int[] columnIndexes) throws SQLException {
-        throw Errors.writes();
+        return prepare(sql, SkyliteStatement.keyLabel(columnIndexes));
     }
 
+    /** The rowid is the only generated key, labelled with the first name asked for. */
     @Override
     public PreparedStatement prepareStatement(String sql, String[] columnNames) throws SQLException {
-        throw Errors.writes();
+        return prepare(sql, SkyliteStatement.keyLabel(columnNames));
     }
 
     @Override
@@ -156,35 +213,84 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         return sql;
     }
 
+    /** Turning auto-commit on commits an open transaction, as JDBC requires. */
     @Override
     public void setAutoCommit(boolean autoCommit) throws SQLException {
         checkOpen();
-        if (!autoCommit) {
-            throw Errors.unsupported("a transaction (auto-commit off)");
+        synchronized (channel) { // after a statement in flight, which may begin a transaction
+            if (autoCommit && !this.autoCommit) {
+                channel.commit();
+            }
+            this.autoCommit = autoCommit;
         }
     }
 
     @Override
     public boolean getAutoCommit() throws SQLException {
         checkOpen();
-        return true;
+        return autoCommit;
     }
 
+    /**
+     * Commits the open transaction; with none open, as when no statement ran since the last commit, nothing is sent.
+     * A commit whose outcome is unknown raises {@code 08007}, and the connection is given up; a transaction lost
+     * with its channel raises {@code SKR03} and sends nothing.
+     */
     @Override
     public void commit() throws SQLException {
         checkOpen();
-        throw new SQLNonTransientException("skylite: commit in auto-commit mode", "25000");
+        synchronized (channel) {
+            if (autoCommit) {
+                throw new SQLNonTransientException("skylite: commit in auto-commit mode", "25000");
+            }
+            channel.commit();
+        }
     }
 
+    /**
+     * Rolls back the open or aborted transaction; with none, nothing is sent. A transaction lost with its channel
+     * rolls back locally. After an unknown commit the connection is closed, and rollback raises {@code 08003}.
+     */
     @Override
     public void rollback() throws SQLException {
-        checkOpen();
-        throw new SQLNonTransientException("skylite: rollback in auto-commit mode", "25000");
+        if (closed) {
+            throw closedError();
+        }
+        synchronized (channel) {
+            if (autoCommit) {
+                throw new SQLNonTransientException("skylite: rollback in auto-commit mode", "25000");
+            }
+            channel.rollback();
+        }
     }
 
-    /** Closes the connection's statements and validations, which releases their responses. Nothing is sent. */
+    /**
+     * Closes the connection's statements and validations, which releases their responses and ends a statement in
+     * flight, then its write channel, which rolls back an open transaction, waiting up to 2 s for the server's
+     * answer. A commit or rollback in flight on another thread settles first.
+     */
     @Override
     public void close() {
+        release();
+        channel.close();
+    }
+
+    /** {@link #close}, except that the channel's close, which waits for its answer, runs on another thread. */
+    void closeLater() {
+        release();
+        Exchange.async(channel::close);
+    }
+
+    /**
+     * Closes the connection after an unknown outcome (ADR 0005 decision 4), on the thread that learnt it, which holds
+     * the channel's lock and has detached its token: nothing more is sent, and every later use raises {@code 08003}.
+     */
+    void discard() {
+        release();
+    }
+
+    /** Marks the connection closed and closes its statements and validations, none of which waits. */
+    private void release() {
         closed = true;
         for (SkyliteStatement s : statements) {
             s.close();
@@ -233,18 +339,30 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         return new SkyliteDatabaseMetaData(this);
     }
 
+    /**
+     * A read-only connection sends no writes: every statement is a stateless read, and one that is not a pure read
+     * fails with SQLState 25006. Refused while a transaction is open.
+     */
     @Override
     public void setReadOnly(boolean readOnly) throws SQLException {
         checkOpen();
-        if (!readOnly) {
-            throw Errors.unsupported("a writable connection (setReadOnly(false))");
+        synchronized (channel) {
+            if (readOnly != this.readOnly && !channel.state().equals("none")) {
+                throw new SQLNonTransientException("skylite: setReadOnly inside a transaction", "25000");
+            }
+            this.readOnly = readOnly;
         }
     }
 
     @Override
     public boolean isReadOnly() throws SQLException {
         checkOpen();
-        return true;
+        return readOnly;
+    }
+
+    /** isReadOnly for the driver's own use, which checks openness itself. */
+    boolean readOnly() {
+        return readOnly;
     }
 
     /** Ignored: a skylite URL names one database, and there are no catalogs to switch. */
@@ -313,24 +431,128 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         return ResultSet.CLOSE_CURSORS_AT_COMMIT;
     }
 
+    /** An unnamed savepoint, which begins the transaction when none is open. */
     @Override
     public Savepoint setSavepoint() throws SQLException {
-        throw Errors.writes();
+        return savepoint(null);
     }
 
+    /** A named savepoint, which begins the transaction when none is open. */
     @Override
     public Savepoint setSavepoint(String name) throws SQLException {
-        throw Errors.writes();
+        if (name == null) {
+            throw new SQLNonTransientException("skylite: the savepoint name is null", "HY009");
+        }
+        return savepoint(name);
     }
 
+    private Savepoint savepoint(String name) throws SQLException {
+        checkOpen();
+        synchronized (channel) {
+            checkSavepoints();
+            SkyliteSavepoint sp = new SkyliteSavepoint(name == null ? ++savepointIds : 0, name);
+            execute("SAVEPOINT " + sp.sql(), List.of(), 0, null);
+            dropEnded();
+            savepoints.add(sp);
+            return sp;
+        }
+    }
+
+    /** Rolls back to the savepoint, which stays; the savepoints set after it are released. */
     @Override
     public void rollback(Savepoint savepoint) throws SQLException {
-        throw Errors.writes();
+        checkOpen();
+        synchronized (channel) {
+            checkSavepoints();
+            int i = live(savepoint);
+            execute("ROLLBACK TO SAVEPOINT " + savepoints.get(i).sql(), List.of(), 0, null);
+            savepoints.subList(i + 1, savepoints.size()).clear();
+        }
     }
 
+    /** Releases the savepoint and the savepoints set after it. */
     @Override
     public void releaseSavepoint(Savepoint savepoint) throws SQLException {
-        throw Errors.writes();
+        checkOpen();
+        synchronized (channel) {
+            checkSavepoints();
+            int i = live(savepoint);
+            execute("RELEASE SAVEPOINT " + savepoints.get(i).sql(), List.of(), 0, null);
+            savepoints.subList(i, savepoints.size()).clear();
+        }
+    }
+
+    private void checkSavepoints() throws SQLException {
+        if (autoCommit) {
+            throw new SQLNonTransientException("skylite: a savepoint in auto-commit mode", "25000");
+        }
+        if (readOnly) {
+            throw new SQLNonTransientException("skylite: a savepoint on a read-only connection, which runs no "
+                    + "transaction", "25000");
+        }
+    }
+
+    /** Forgets the savepoints of a transaction that ended. */
+    private void dropEnded() {
+        long txn = channel.transaction();
+        if (txn != savepointTxn) {
+            savepoints.clear();
+            savepointTxn = txn;
+        }
+    }
+
+    /** The index of savepoint, which must be one of this connection's open transaction not yet released. */
+    private int live(Savepoint savepoint) throws SQLException {
+        dropEnded();
+        int i = savepoints.size() - 1;
+        while (i >= 0 && savepoints.get(i) != savepoint) {
+            i--;
+        }
+        for (int j = i + 1; i >= 0 && j < savepoints.size(); j++) {
+            if (savepoints.get(j).sql().equals(savepoints.get(i).sql())) {
+                i = -1; // shadowed: SQLite would act on the later savepoint of that name
+            }
+        }
+        if (i < 0 || savepointTxn == 0) {
+            throw new SQLNonTransientException("skylite: the savepoint is not one of this connection's open "
+                    + "transaction, or was released or rolled back past", "3B001");
+        }
+        return i;
+    }
+
+    /**
+     * A savepoint of one transaction, by name or by id. An unnamed one is sent as skylite_savepoint_&lt;id&gt;.
+     * A savepoint shadowed by a later live one of the same SQL name, a name of that form included, is refused.
+     */
+    private static final class SkyliteSavepoint implements Savepoint {
+        private final int id;
+        private final String name;
+
+        SkyliteSavepoint(int id, String name) {
+            this.id = id;
+            this.name = name;
+        }
+
+        String sql() {
+            String n = name != null ? name : "skylite_savepoint_" + id;
+            return '"' + n.replace("\"", "\"\"") + '"';
+        }
+
+        @Override
+        public int getSavepointId() throws SQLException {
+            if (name != null) {
+                throw new SQLNonTransientException("skylite: a named savepoint has no id", "HY000");
+            }
+            return id;
+        }
+
+        @Override
+        public String getSavepointName() throws SQLException {
+            if (name == null) {
+                throw new SQLNonTransientException("skylite: an unnamed savepoint has no name", "HY000");
+            }
+            return name;
+        }
     }
 
     @Override
@@ -439,7 +661,9 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         if (executor == null) {
             throw new SQLNonTransientException("skylite: abort needs an executor", "HY009");
         }
-        close();
+        release();
+        channel.abort();
+        executor.execute(channel::close); // the channel's close waits for its answer
     }
 
     /**
