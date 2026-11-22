@@ -30,12 +30,12 @@ detail = "One leader per database. A lease object lets a new leader take over wi
 [[items]]
 title = "Read replicas"
 status = "planned"
-detail = "The engine follower polls the durable log and pins each read-only SQLite connection to one transaction. It fetches pages on demand and supports a bounded page cache. With `follower_reads` enabled, a standby serves stateless query and describe requests while its snapshot is fresh. Forwarding and follower-owned read channels are planned."
+detail = "The engine follower polls the durable log and pins each read-only SQLite connection to one transaction. It fetches pages on demand and supports a bounded page cache. With `follower_reads`, on by default when a peer listener is configured, a standby serves stateless query and describe requests while its snapshot is fresh, and with a peer listener forwards to the leader a read it cannot serve. Follower-owned read channels are planned."
 
 [[items]]
 title = "HTTPS query API and sessions"
 status = "planned"
-detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, database creation (PUT), the stateless query and describe requests on leaders and opt-in followers, and write channels on the leader: open, close, cancel, autocommit writes, ping and transactions (begin, commit, rollback, the aborted state and the transaction timers) on a channel, with sequence numbers, receipts and replay, so that a resent write never runs twice. Not yet: batch, read-only channels, resolve, admission control, forwarding."
+detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, database creation (PUT), the stateless query and describe requests on leaders and opt-in followers, and write channels on the leader: open, close, cancel, autocommit writes, ping and transactions (begin, commit, rollback, the aborted state and the transaction timers) on a channel, with sequence numbers, receipts and replay, so that a resent write never runs twice. With a peer listener, any pod takes any request and forwards it one hop, over mutual TLS, to the leader or the channel's owner, located through a leader record in object storage. Not yet: batch, read-only channels, resolve, admission control."
 
 [[items]]
 title = "Clients: Go driver, JDBC driver and Hibernate dialect"

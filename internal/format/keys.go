@@ -71,6 +71,10 @@ func (k Keys) Manifest() string { return k.prefix + "/manifest" }
 // Lease is the key of the lease.
 func (k Keys) Lease() string { return k.prefix + "/lease" }
 
+// Leader is the key of the server's leader record, which routes requests
+// to the pod in office (ADR 0005 decision 7). The engine never reads it.
+func (k Keys) Leader() string { return k.prefix + "/leader" }
+
 // db is the start of every log and base key of database db. A key built
 // for the zero DatabaseID is invalid, and the parsers reject it.
 func (k Keys) db(db DatabaseID) string { return k.prefix + "/" + hex.EncodeToString(db[:]) }

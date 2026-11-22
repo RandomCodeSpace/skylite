@@ -37,12 +37,38 @@ type Config struct {
 	// leads. A database need not exist yet; the server takes office once it
 	// does.
 	Databases []string `json:"databases"`
-	// FollowerReads enables stateless reads on fresh local followers.
+	// FollowerReads enables stateless reads on fresh local followers. When
+	// the file leaves it out, Load sets it to true if Peer is set: without
+	// a peer listener a ready standby could not deliver writes.
 	FollowerReads bool `json:"follower_reads"`
+	// Peer, if set, lets this server forward a request it cannot serve
+	// itself, one hop, to the pod that can (ADR 0005 decision 7).
+	Peer *Peer `json:"peer"`
 	// ProbeListen, if set, is a TCP address for a plain HTTP listener that
 	// answers GET /readyz: 200 while this server can serve at least one
 	// database and no leader is blocked at its tail bound, 503 otherwise.
 	ProbeListen string `json:"probe_listen"`
+}
+
+// Peer is the pod-to-pod listener and its mutual TLS. Every pod of a
+// deployment presents a certificate issued by CAFile, which must issue
+// peer certificates and nothing else, for ServerName, and requires one
+// from the pod that calls it.
+type Peer struct {
+	// Listen is the TCP address of the peer listener, for example ":8444".
+	Listen string `json:"listen"`
+	// AddressEnv names an environment variable holding the host:port other
+	// pods dial to reach this pod's peer listener, for example
+	// "$(POD_IP):8444" set from the downward API.
+	AddressEnv string `json:"address_env"`
+	// CertFile and KeyFile are this pod's peer certificate and key, used
+	// both as server and as client certificate.
+	CertFile string `json:"cert_file"`
+	KeyFile  string `json:"key_file"`
+	// CAFile holds the PEM certificates that issue peer certificates.
+	CAFile string `json:"ca_file"`
+	// ServerName is the DNS name every peer certificate carries.
+	ServerName string `json:"server_name"`
 }
 
 // TLS names PEM files holding the server's certificate chain and its key.
@@ -119,6 +145,13 @@ func Load(path string) (Config, error) {
 	if _, err := d.Token(); !errors.Is(err, io.EOF) {
 		return Config{}, fmt.Errorf("server: config %s: data after the configuration object", path)
 	}
+	var set struct {
+		FollowerReads *bool `json:"follower_reads"`
+	}
+	_ = json.Unmarshal(b, &set) // b decoded above
+	if set.FollowerReads == nil {
+		c.FollowerReads = c.Peer != nil
+	}
 	if err := c.Validate(); err != nil {
 		return Config{}, fmt.Errorf("server: config %s: %w", path, err)
 	}
@@ -134,6 +167,9 @@ func (c Config) Validate() error {
 		return errors.New("exactly one of tls and plaintext must be set")
 	case c.TLS != nil && (c.TLS.CertFile == "" || c.TLS.KeyFile == ""):
 		return errors.New("tls needs cert_file and key_file")
+	}
+	if p := c.Peer; p != nil && (p.Listen == "" || p.CertFile == "" || p.KeyFile == "" || p.CAFile == "" || p.ServerName == "" || !validEnvName(p.AddressEnv)) {
+		return errors.New("peer needs listen, cert_file, key_file, ca_file, server_name and address_env, an environment variable name")
 	}
 	if err := c.Auth.Validate(); err != nil {
 		return err

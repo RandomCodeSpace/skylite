@@ -38,13 +38,13 @@ The first version accepts these limits: one upload per commit; a maximum transac
 
 ## One leader per database
 
-Each database has one leader that serves writes. Forwarding from other pods is planned. A lease object in object storage lets a new leader take over, but the lease is not what keeps a stale leader out. A lease on its own cannot stop a leader that has paused, lost its network or missed its expiry from writing again.
+Each database has one leader that serves writes. With a peer listener configured, other pods [forward](/docs/server/#forwarding-between-pods) writes and channel requests to it. A lease object in object storage lets a new leader take over, but the lease is not what keeps a stale leader out. A lease on its own cannot stop a leader that has paused, lost its network or missed its expiry from writing again.
 
 The fence is the storage layout. Commits are created only if absent, so a stale leader's next commit meets the new leader's epoch-bump commit at its name, and the stale leader stops. No commit-log object is ever deleted, so this holds even after old commits have been folded into the base. Compaction and the start of a takeover change the manifest by compare-and-swap, and a takeover changes it first, so a stale leader's compaction cannot win. Lease updates and garbage collection do not go through the manifest: the lease carries no safety, and garbage collection only retires commits the base already covers and deletes base objects that no current or future manifest can reference. Two pods may briefly both believe they lead; the design prevents conflicting history, not that belief. A takeover downloads no database content, but it reads the manifest, which grows with the number of base groups.
 
 ## Reads
 
-The engine's leader and follower both read pages from object storage on demand and can use a bounded local cache. A follower polls the durable log and opens a read-only SQLite connection pinned to one transaction. With [`follower_reads`](/docs/server/#reading-on-a-follower) enabled, a standby can serve stateless reads from a fresh local snapshot. A client that needs to read its own write presents the transaction number it was given as `min_txn`. A follower waits within its catch-up budget, then answers `behind` if its fresh snapshot still falls short. Channel requests still go to the leader.
+The engine's leader and follower both read pages from object storage on demand and can use a bounded local cache. A follower polls the durable log and opens a read-only SQLite connection pinned to one transaction. With [`follower_reads`](/docs/server/#reading-on-a-follower) enabled, a standby can serve stateless reads from a fresh local snapshot. A client that needs to read its own write presents the transaction number it was given as `min_txn`. A follower waits within its catch-up budget, then answers `behind` if its fresh snapshot still falls short, or forwards the read to the leader when a peer listener is configured. Channel requests go to the leader.
 
 ## Interface and clients
 

@@ -302,6 +302,7 @@ func TestLayout(t *testing.T) {
 		k.Base(DatabaseID{0: 0xff}, 4294967295, 1, 18446744073709551615): "tenant-1/db/ff000000000000000000000000000000/base/4294967295-00000000000000000001-ffffffffffffffff",
 		k.Manifest(): "tenant-1/db/manifest",
 		k.Lease():    "tenant-1/db/lease",
+		k.Leader():   "tenant-1/db/leader",
 	} {
 		if got != want {
 			t.Errorf("key %q, want %q", got, want)
