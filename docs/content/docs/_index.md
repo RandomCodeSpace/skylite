@@ -16,7 +16,7 @@ The project is pre-alpha. The binary prints its version and help, and its server
 - [Architecture](/docs/architecture/) sets out the design direction and the questions that are still open.
 - [Go driver](/docs/go-driver/) describes the Go `database/sql` driver's read path.
 - [JDBC driver](/docs/jdbc-driver/) describes the JDBC driver, its Hibernate dialect and their run of the Spring Data JPA acceptance suite.
-- [Storage backends](/docs/storage-backends/) describes the storage interface's backends, of which the server can use the local filesystem, S3 and Google Cloud Storage backends; the Azure Blob backend is a library package the server does not use yet.
+- [Storage backends](/docs/storage-backends/) describes the storage interface's backends, all four of which (`localfs`, `s3`, `gcs` and `azure`) the server can use.
 - [Roadmap and status](/docs/roadmap/) lists the planned milestones in order.
 - [Decisions](/docs/decisions/) is where architecture decision records will live.
 - [Reference](/docs/reference/) holds pages generated from the source, starting with the CLI.
