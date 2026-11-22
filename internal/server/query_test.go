@@ -623,6 +623,45 @@ func TestTimeoutMS(t *testing.T) {
 	}
 }
 
+// TestTimeoutAfterRows: a statement that reaches its time limit after its
+// response started ends with the timeout frame, not a cut stream.
+func TestTimeoutAfterRows(t *testing.T) {
+	e := newQueryEnv(t, nil)
+	// More rows than one frame holds, then no more rows, never ending.
+	body := fmt.Sprintf(`{"sql":%q,"timeout_ms":300}`, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c WHERE x <= 3000")
+	for _, c := range []struct {
+		name   string
+		client *http.Client
+		proto  int
+	}{{"HTTP/1.1", h1Client(), 1}, {"HTTP/2", h2cClient(), 2}} {
+		t.Run(c.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, "http://"+e.addr+"/v1/databases/d/query", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+e.sig.token(t, "reader"))
+			resp, err := c.client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("HTTP/%d: reading the body: %v", resp.ProtoMajor, err)
+			}
+			frames, err := parseFrames(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := answer{resp.StatusCode, frames}
+			if resp.ProtoMajor != c.proto || a.status != 200 || a.code() != "timeout" || len(a.rows()) < 1024 {
+				t.Errorf("HTTP/%d %d, %d rows, %v, want rows then timeout", resp.ProtoMajor, a.status, len(a.rows()), a.last())
+			}
+		})
+	}
+}
+
 func TestResultTooLarge(t *testing.T) {
 	e := newQueryEnv(t, func(e *env) { e.s.limits.ResultBytes = 4096 })
 	a := e.post(t, "query", "reader", q("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 1000) SELECT x, printf('%100d', x) FROM c"))

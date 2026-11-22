@@ -181,10 +181,13 @@ func (s *Server) statement(ctx context.Context, st *stream, d *database, leader 
 		limit = min(limit, time.Duration(req.TimeoutMS)*time.Millisecond)
 	}
 	// The statement time runs to the last row written, and its deadline is
-	// on the Run's context, which page reads from storage use.
+	// on the Run's context, which page reads from storage use. The write
+	// deadline is a margin later, so that the statement, not the stream,
+	// ends first and its timeout frame is written.
 	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
-	st.deadline, _ = ctx.Deadline()
+	deadline, _ := ctx.Deadline()
+	st.deadline = deadline.Add(terminalMargin)
 	c, e, err := s.conn(ctx, d, leader, who)
 	if e != nil {
 		logInternal(ctx, log, e, err)

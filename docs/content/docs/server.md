@@ -67,7 +67,7 @@ From there the statement has started executing, and the answer is `200` whatever
 | Frame size; a `columns` frame above it fails with `result_too_large` | 1 MiB |
 | `min_txn` above the snapshot's transaction number | `503` `behind` |
 
-A `describe` compiles the statement under the same policy and makes checks 1 and 3, then answers its result columns and parameter names without binding or stepping it; any statement can be described, writes included. A dropped connection stops a query's rows, and a client that stops reading them holds its connection until the statement time ends.
+A `describe` compiles the statement under the same policy and makes checks 1 and 3, then answers its result columns and parameter names without binding or stepping it; any statement can be described, writes included. A statement that reaches its time limit ends with the `timeout` frame, also after rows were sent. A dropped connection stops a query's rows, and a client that stops reading them holds its connection until a second after the statement time ends: the response's write deadline is that second later, so that the statement ends first and its `timeout` frame can be written.
 
 A pragma's table-valued function, such as `SELECT * FROM pragma_user_version`, is compiled by SQLite when the statement first scans it, not when it is prepared, so the policy refuses it only at the first step: `describe` answers `200` with its columns, and `query` answers `200` with `statement_forbidden` as its terminal frame. Nothing is executed either way.
 

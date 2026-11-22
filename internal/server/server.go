@@ -55,6 +55,7 @@ const (
 	maxStreams     = 16               // concurrent streams per HTTP/2 connection
 	maxConns       = 1024             // HTTP connections accepted
 	probeConns     = 64               // connections the readiness probe accepts
+	terminalMargin = time.Second      // a query's write deadline past its statement deadline
 )
 
 const (
