@@ -163,20 +163,22 @@ func (f *Follower) pin(ctx context.Context, minTxn uint64) (Reader, error) {
 		f.mu.Lock()
 		r, invalid, changed := f.current, f.invalid, f.changed
 		f.mu.Unlock()
+		// A snapshot that already meets minTxn is returned even under an
+		// expired ctx, so that the caller reports its own deadline.
 		switch {
-		case ctx.Err() != nil:
-			return Reader{}, ctx.Err()
 		case f.ctx.Err() != nil:
 			return Reader{}, f.ctx.Err()
+		case invalid != nil:
+			return Reader{}, invalid
+		case fresh(r) && r.Txn() >= minTxn:
+			return *r, nil
+		case ctx.Err() != nil:
+			return Reader{}, ctx.Err()
 		case wait.Err() != nil:
 			if !fresh(r) {
 				return Reader{}, ErrStale
 			}
 			return Reader{}, ErrBehind
-		case invalid != nil:
-			return Reader{}, invalid
-		case fresh(r) && r.Txn() >= minTxn:
-			return *r, nil
 		}
 
 		select {

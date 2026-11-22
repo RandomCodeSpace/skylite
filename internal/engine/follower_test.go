@@ -101,9 +101,13 @@ func TestFollowerWait(t *testing.T) {
 		defer cancel()
 		check(short, 3, context.DeadlineExceeded, 20*time.Millisecond)
 
-		time.Sleep(2*time.Second - 520*time.Millisecond)
-		check(ctx, 2, ErrBehind, 500*time.Millisecond)
+		time.Sleep(followerFreshness)
+		check(ctx, 3, ErrStale, 500*time.Millisecond)
+		f.current = &Reader{txn: 2, observedAt: time.Now()}
 		stop()
+		if f.Fresh() {
+			t.Fatal("a stopped follower reported a fresh snapshot")
+		}
 		check(t.Context(), 0, context.Canceled, 0)
 	})
 }
@@ -392,6 +396,124 @@ func TestFollowerWalk(t *testing.T) {
 	}
 }
 
+func TestFollowerClosesUnusableSQLite(t *testing.T) {
+	ctx := t.Context()
+	st, keys := newStore(t)
+	if _, err := Create(ctx, st, keys, 1024, 64); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(ctx, st, keys, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fault := range []string{"close_busy", "broken", "panic", "nomem"} {
+		t.Run(fault, func(t *testing.T) {
+			c, err := openReadConn(ctx, *r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A live statement makes normal SQLite close fail with BUSY.
+			// Leave it open to exercise the forced release path.
+			var stmt *sqlite3.Stmt
+			t.Cleanup(func() {
+				if c.db != nil && stmt != nil {
+					_ = stmt.Close()
+				}
+				_ = c.Close()
+			})
+			err = runAndCatchPanic(func() error {
+				return c.Run(ctx, func(db *sqlite3.Conn) error {
+					var err error
+					stmt, _, err = db.Prepare("SELECT 1")
+					if err != nil {
+						return err
+					}
+					switch fault {
+					case "broken":
+						return ErrBroken
+					case "panic":
+						panic("injected SQLite panic")
+					case "nomem":
+						// More than openReadConn's 64 MiB ceiling.
+						return db.Exec("SELECT count(*) FROM (SELECT randomblob(1000000) AS b FROM generate_series(1, 80) ORDER BY b)")
+					default:
+						return nil
+					}
+				})
+			})
+			if fault != "close_busy" {
+				if !errors.Is(err, ErrBroken) {
+					t.Errorf("Run error = %v, want ErrBroken", err)
+				}
+				if err := c.Run(ctx, func(*sqlite3.Conn) error {
+					t.Error("ran SQLite callback after the connection broke")
+					return nil
+				}); !errors.Is(err, ErrBroken) {
+					t.Errorf("second Run error = %v, want ErrBroken", err)
+				}
+			} else if err != nil {
+				t.Error(err)
+			}
+			if err := c.Close(); err != nil {
+				t.Errorf("close: %v", err)
+			}
+			if vfs.Find(c.name) != nil || c.db != nil || c.file != nil {
+				t.Error("close retained the VFS, SQLite connection or snapshot")
+			}
+			if err := c.Close(); err != nil {
+				t.Errorf("second close: %v", err)
+			}
+		})
+	}
+}
+
+func runAndCatchPanic(run func() error) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("Run let a panic escape: %v", p)
+		}
+	}()
+	return run()
+}
+
+func TestFollowerImmutablePageOne(t *testing.T) {
+	ctx := t.Context()
+	st, keys := newStore(t)
+	if _, err := Create(ctx, st, keys, 1024, 64); err != nil {
+		t.Fatal(err)
+	}
+	// This database has one page and no cache. Any read after warmup
+	// fetches page 1 again from storage.
+	r, err := Open(ctx, st, keys, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Size() != 1 {
+		t.Fatalf("snapshot has %d pages, want 1", r.Size())
+	}
+	c, err := openReadConn(ctx, *r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	read := func() {
+		t.Helper()
+		if err := c.Run(ctx, func(db *sqlite3.Conn) error {
+			return db.Exec("BEGIN; PRAGMA main.schema_version; COMMIT")
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read()
+	st.resetCounts()
+	for range 3 {
+		read()
+	}
+	if calls, _ := st.counts(); calls != 0 {
+		t.Errorf("re-read page 1 after warming the SQLite cache: %d storage reads", calls)
+	}
+}
+
 func TestFollowerVFS(t *testing.T) {
 	ctx := t.Context()
 	st, keys := newStore(t)
@@ -527,6 +649,9 @@ func TestFollowerRefreshFailure(t *testing.T) {
 	h.overwrite(keys.Manifest(), h.encodeManifest(m))
 	if err := f.poll(st, keys, nil); !errors.Is(err, format.ErrMisplaced) || f.current != before {
 		t.Fatalf("poll after manifest identity change: %v", err)
+	}
+	if f.Fresh() {
+		t.Fatal("a follower with a corrupt manifest reported a fresh snapshot")
 	}
 	if _, err := f.pin(ctx, 1); !errors.Is(err, format.ErrMisplaced) {
 		t.Fatalf("pin after manifest identity change: %v", err)

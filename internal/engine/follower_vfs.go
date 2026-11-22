@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -22,11 +23,12 @@ var readConnID atomic.Uint64
 // and Close are serialized. The caller must close its statements before
 // closing the connection.
 type ReadConn struct {
-	mu   sync.Mutex
-	db   *sqlite3.Conn
-	file *snapshotFile
-	name string
-	txn  uint64
+	mu     sync.Mutex
+	db     *sqlite3.Conn
+	file   *snapshotFile
+	name   string
+	txn    uint64
+	broken bool // a Run panicked or reported ErrBroken; Close releases db
 }
 
 func openReadConn(ctx context.Context, r Reader) (*ReadConn, error) {
@@ -44,7 +46,9 @@ func openReadConn(ctx context.Context, r Reader) (*ReadConn, error) {
 		err = f.readErr // SQLite reports a failed read as a bare I/O error
 	}
 	if err != nil {
-		_ = db.Close()
+		if db != nil && !closeQuietly(db) {
+			release(db)
+		}
 		vfs.Unregister(name)
 		return nil, err
 	}
@@ -57,20 +61,36 @@ func (c *ReadConn) Txn() uint64 { return c.txn }
 
 // Run uses ctx for SQLite interrupts and reads from storage. The callback
 // uses SQLite synchronously and must not retain the connection. SQL
-// admission policy is the caller's responsibility.
-func (c *ReadConn) Run(ctx context.Context, fn func(*sqlite3.Conn) error) error {
+// admission policy is the caller's responsibility. A panic in fn, or an
+// error of fn's that wraps ErrBroken, breaks the connection: Run then fails
+// with ErrBroken, later Runs refuse, and Close frees it without SQLite.
+func (c *ReadConn) Run(ctx context.Context, fn func(*sqlite3.Conn) error) (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.db == nil {
+	switch {
+	case c.db == nil:
 		return sqlite3.MISUSE
+	case c.broken:
+		return fmt.Errorf("%w: the follower connection broke earlier", ErrBroken)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	c.file.ctx, c.file.readErr = ctx, nil
 	defer func() { c.file.ctx, c.file.readErr = nil, nil }()
-	defer c.db.SetInterrupt(c.db.SetInterrupt(ctx))
-	err := fn(c.db)
+	old := c.db.SetInterrupt(ctx)
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("%w: panic: %v", ErrBroken, p)
+		}
+		if c.broken = errors.Is(err, ErrBroken); !c.broken {
+			c.db.SetInterrupt(old)
+		}
+	}()
+	err = fn(c.db)
+	if errors.Is(err, ErrBroken) {
+		return err
+	}
 	if c.file.readErr != nil {
 		return c.file.readErr
 	}
@@ -87,12 +107,15 @@ func (c *ReadConn) Close() error {
 	if c.db == nil {
 		return nil
 	}
-	if err := c.db.Close(); err != nil {
-		return err
+	// As the leader's discard: a broken connection, or one whose close
+	// fails, is released without running SQLite.
+	var err error
+	if (c.broken || !closeQuietly(c.db)) && !release(c.db) {
+		err = errors.New("engine: the follower connection could not be released")
 	}
 	vfs.Unregister(c.name)
 	c.db, c.file = nil, nil
-	return nil
+	return err
 }
 
 type snapshotVFS struct{ file *snapshotFile }

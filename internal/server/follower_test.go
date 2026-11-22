@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,14 +15,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ncruces/go-sqlite3/vfs"
+
 	"github.com/RandomCodeSpace/skylite/internal/engine"
 	"github.com/RandomCodeSpace/skylite/internal/storage"
+	"github.com/RandomCodeSpace/skylite/internal/wire"
 )
 
 type replicaStore struct {
 	storage.Store
-	pause atomic.Pointer[pollPause]
-	read  func(context.Context) error // optional fault on a page read
+	pause   atomic.Pointer[pollPause]
+	read    func(context.Context) error // optional fault on a page read
+	missing atomic.Bool                 // the manifest's Head answers not found
 }
 
 type pollPause struct {
@@ -30,6 +35,9 @@ type pollPause struct {
 }
 
 func (s *replicaStore) Head(ctx context.Context, key string) (storage.Info, error) {
+	if s.missing.Load() && strings.HasSuffix(key, "/manifest") {
+		return storage.Info{}, storage.ErrNotFound
+	}
 	if p := s.pause.Load(); p != nil && strings.HasSuffix(key, "/manifest") {
 		p.once.Do(func() { close(p.entered) })
 		select {
@@ -247,29 +255,56 @@ func (w replicaResponse) Write(p []byte) (int, error) {
 	return w.ResponseRecorder.Write(p)
 }
 
-func TestReplicaCompactedAfterRow(t *testing.T) {
+func TestReplicaFailureAfterRow(t *testing.T) {
 	leader := newQueryEnv(t, nil)
 	leader.exec(t, "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (2)")
-	var rowSent atomic.Bool
-	st := &replicaStore{read: func(context.Context) error {
-		if rowSent.Load() {
-			return engine.ErrCompacted
-		}
-		return nil
-	}}
-	replica := newReplicaEnv(t, leader, true, st)
-	waitReplica(t, replica.s.ready, 2*time.Second, "replica did not become ready")
-	req := httptest.NewRequest(http.MethodPost, "/v1/databases/d/query", strings.NewReader(q("SELECT 1 UNION ALL SELECT a FROM t")))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Content-Length", fmt.Sprint(req.ContentLength))
-	req.Header.Set("Authorization", "Bearer "+replica.sig.token(t, "reader"))
-	rec := httptest.NewRecorder()
-	replica.s.ServeHTTP(replicaResponse{rec, &rowSent}, req)
-	frames, err := parseFrames(rec.Body.Bytes())
-	a := answer{rec.Code, frames}
-	if err != nil || a.status != http.StatusOK || a.code() != "internal" || a.err()["not_executed"] != false || a.err()["final"] != false ||
-		len(a.frames) != 3 || !reflect.DeepEqual(a.rows(), []string{`[1]`}) {
-		t.Fatalf("compaction after first row: %d %v (%v)", a.status, a.frames, err)
+	for _, tc := range []struct {
+		name  string
+		fault func(context.Context) error
+		code  string
+		class string
+	}{
+		{"compacted", func(context.Context) error { return engine.ErrCompacted }, "internal", "compacted"},
+		{"storage", func(context.Context) error { return errors.New("injected read failure") }, "internal", "other"},
+		{"broken", func(context.Context) error { panic("injected engine panic") }, "internal", "broken"},
+		{"timeout", func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }, "timeout", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var rowSent atomic.Bool
+			st := &replicaStore{read: func(ctx context.Context) error {
+				if rowSent.CompareAndSwap(true, false) {
+					return tc.fault(ctx)
+				}
+				return nil
+			}}
+			replica := newReplicaEnv(t, leader, true, st)
+			waitReplica(t, replica.s.ready, 2*time.Second, "replica did not become ready")
+			body := `{"sql":"SELECT 1 UNION ALL SELECT a FROM t","timeout_ms":200}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/databases/d/query", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Content-Length", fmt.Sprint(req.ContentLength))
+			req.Header.Set("Authorization", "Bearer "+replica.sig.token(t, "reader"))
+			rec := httptest.NewRecorder()
+			defer func() {
+				if p := recover(); p != nil {
+					t.Errorf("handler panicked before writing the terminal frame: %v", p)
+				}
+			}()
+			replica.s.ServeHTTP(replicaResponse{rec, &rowSent}, req)
+			frames, err := parseFrames(rec.Body.Bytes())
+			a := answer{rec.Code, frames}
+			if err != nil || a.status != http.StatusOK || a.code() != tc.code || a.err()["not_executed"] != false || a.err()["final"] != false ||
+				len(a.frames) != 3 || !reflect.DeepEqual(a.rows(), []string{`[1]`}) {
+				t.Errorf("failure after first row: %d %v (%v)", a.status, a.frames, err)
+			}
+			if tc.class != "" && !strings.Contains(replica.logs.String(),
+				`"msg":"statement failed","request_id":"`+rec.Header().Get("Skylite-Request-Id")+`","class":"`+tc.class+`"`) {
+				t.Errorf("no internal error log with class %q", tc.class)
+			}
+			if next := replica.post(t, "query", "reader", q("SELECT 1")); next.done() == nil {
+				t.Errorf("read after failure: %d %v", next.status, next.frames)
+			}
+		})
 	}
 }
 
@@ -306,6 +341,126 @@ func TestReplicaReadinessAndWrites(t *testing.T) {
 	on.s.stopping.Store(true)
 	if on.s.ready() {
 		t.Error("stopping replica reports ready")
+	}
+}
+
+// A follower connection that broke, by a stack overflow or by exhausting
+// its memory, is released: the answer ends with its terminal frame, its VFS
+// is unregistered, and the next read works.
+func TestReplicaBrokenConnection(t *testing.T) {
+	leader := newQueryEnv(t, nil)
+	leader.exec(t, overflowViews())
+	replica := newReplicaEnv(t, leader, true, &replicaStore{})
+	waitReplica(t, replica.s.ready, 2*time.Second, "replica did not become ready")
+	for _, tc := range []struct{ name, sql string }{
+		{"stack overflow", "SELECT * FROM v4"},
+		// More than a follower connection's 64 MiB ceiling.
+		{"out of memory", "SELECT count(*) FROM (SELECT randomblob(1000000) AS b FROM generate_series(1, 80) ORDER BY b)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := replica.post(t, "query", "reader", q(tc.sql))
+			if a.status != http.StatusOK && a.status != http.StatusInternalServerError || a.code() != "internal" {
+				t.Fatalf("%d %v, want internal", a.status, a.frames)
+			}
+			if !strings.Contains(replica.logs.String(), fmt.Sprintf(`"request_id":"%v","class":"broken"`, a.err()["request_id"])) {
+				t.Errorf("the follower did not report the connection broken: %s", replica.logs.String())
+			}
+			for i := range 10000 {
+				if vfs.Find(fmt.Sprint("skylite-follow-", i)) != nil {
+					t.Errorf("skylite-follow-%d is still registered", i)
+				}
+			}
+			if a := replica.post(t, "query", "reader", q("SELECT 1")); !reflect.DeepEqual(a.rows(), []string{`[1]`}) {
+				t.Errorf("the next query: %d %v", a.status, a.frames)
+			}
+		})
+	}
+}
+
+// A follower whose manifest went missing refuses reads as internal and
+// logs them.
+func TestReplicaInvalidFollower(t *testing.T) {
+	leader := newQueryEnv(t, nil)
+	st := &replicaStore{}
+	replica := newReplicaEnv(t, leader, true, st)
+	waitReplica(t, replica.s.ready, 2*time.Second, "replica did not become ready")
+	f := replica.s.dbs["d"].loop.State().Follower
+	st.missing.Store(true)
+	waitReplica(t, func() bool { return !f.Fresh() }, 2*time.Second, "the follower did not notice the missing manifest")
+	a := replica.post(t, "query", "reader", q("SELECT 1"))
+	if a.status != http.StatusInternalServerError || a.code() != "internal" || a.err()["not_executed"] != true {
+		t.Errorf("read on an invalid follower: %d %v", a.status, a.frames)
+	}
+	if !strings.Contains(replica.logs.String(), fmt.Sprintf(`"request_id":"%v","class":"other"`, a.err()["request_id"])) {
+		t.Errorf("no internal error log: %s", replica.logs.String())
+	}
+}
+
+type pinDeadlineContext struct {
+	context.Context
+	atDeadline func()
+}
+
+func (c pinDeadlineContext) Deadline() (time.Time, bool) {
+	c.atDeadline()
+	return c.Context.Deadline()
+}
+
+func TestReplicaCatchUpDoesNotReserveConnection(t *testing.T) {
+	leader := newQueryEnv(t, nil)
+	replica := newReplicaEnv(t, leader, true, &replicaStore{})
+	waitReplica(t, replica.s.ready, 2*time.Second, "replica did not become ready")
+	replica.s.pool.mu.Lock()
+	replica.s.pool.capacity = 1
+	replica.s.pool.mu.Unlock()
+	f := replica.s.dbs["d"].loop.State().Follower
+	ctx, cancel := context.WithCancel(t.Context())
+	enter := make(chan struct{})
+	resume := make(chan struct{})
+	ctx = pinDeadlineContext{ctx, sync.OnceFunc(func() {
+		close(enter)
+		<-resume
+	})}
+	resumePin := sync.OnceFunc(func() {
+		cancel()
+		close(resume)
+	})
+	defer resumePin()
+	answer := make(chan *wire.Error, 1)
+	go func() {
+		_, e := replica.s.followerStatement(ctx, nil, f, &wire.Request{MinTxn: 1 << 40}, "waiting", replica.s.log)
+		answer <- e
+	}()
+	select {
+	case <-enter:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not reach the catch-up wait")
+	}
+	if a := replica.post(t, "query", "reader", q("SELECT 1")); a.done() == nil {
+		t.Errorf("catch-up request blocked the available slot: %d %v", a.status, a.frames)
+	}
+	resumePin()
+	if e := <-answer; e == nil || e.Code != wire.CodeNotServing {
+		t.Errorf("canceled catch-up: %v", e)
+	}
+}
+
+func TestReplicaExpiredRequest(t *testing.T) {
+	leader := newQueryEnv(t, nil)
+	replica := newReplicaEnv(t, leader, true, &replicaStore{})
+	waitReplica(t, replica.s.ready, 2*time.Second, "replica did not become ready")
+	f := replica.s.dbs["d"].loop.State().Follower
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	for _, minTxn := range []int64{0, 1, 1 << 40} {
+		want := wire.CodeTimeout
+		if minTxn == 1<<40 {
+			want = wire.CodeBehind
+		}
+		_, e := replica.s.followerStatement(ctx, &stream{}, f, &wire.Request{MinTxn: minTxn}, "reader", replica.s.log)
+		if e == nil || e.Code != want {
+			t.Errorf("expired request with min_txn=%d: %v, want %s", minTxn, e, want)
+		}
 	}
 }
 

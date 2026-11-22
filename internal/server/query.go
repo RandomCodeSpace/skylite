@@ -234,13 +234,6 @@ func (s *Server) statement(ctx context.Context, st *stream, d *database, leader 
 }
 
 func (s *Server) followerStatement(ctx context.Context, st *stream, f *engine.Follower, req *wire.Request, who string, log *slog.Logger) (*wire.Done, *wire.Error) {
-	// Follower connections use the same slots as leader connections. Each
-	// pin has its own SQLite connection and is discarded on release.
-	if _, e := s.reserve(nil, who); e != nil {
-		return nil, e
-	}
-	defer s.pool.release(who, nil, false)
-
 	remaining := engine.FollowerMaxWait
 	minTxn := uint64(req.MinTxn) //nolint:gosec // validated nonnegative by wire.Parse
 	for attempt := 0; ; attempt++ {
@@ -267,28 +260,26 @@ func (s *Server) followerStatement(ctx context.Context, st *stream, f *engine.Fo
 				return nil, e
 			}
 		}
-		done, e, err := s.runFollower(ctx, pin, req, st)
+		done, e, err := s.runFollower(ctx, pin, req, st, who)
 		switch {
 		case err == nil, errors.Is(err, errEnded):
 			return done, e
+		case errors.Is(err, engine.ErrCompacted) && st.started:
+			e = wire.NewError(wire.CodeInternal, "compaction ended the follower snapshot during the read")
 		case errors.Is(err, engine.ErrCompacted):
-			if st.started {
-				e := wire.NewError(wire.CodeInternal, "compaction ended the follower snapshot during the read")
-				e.NotExecuted = false
-				return nil, e
-			}
 			if attempt == 0 && ctx.Err() == nil && remaining > 0 {
 				minTxn = pin.Txn() + 1
 				continue
 			}
 			return nil, followerUnavailable()
 		case errors.Is(ctx.Err(), context.DeadlineExceeded):
-			return nil, timeoutError(0)
+			e = timeoutError(0)
 		default:
-			e := wire.NewError(wire.CodeInternal, "the follower read failed")
-			logInternal(ctx, log, e, err)
-			return nil, e
+			e = wire.NewError(wire.CodeInternal, "the follower read failed")
 		}
+		logInternal(ctx, log, e, err)
+		e.NotExecuted = !st.started
+		return nil, e
 	}
 }
 
@@ -296,7 +287,15 @@ func followerUnavailable() *wire.Error {
 	return wire.NewError(wire.CodeNotServing, "this server has no usable fresh follower snapshot for the database")
 }
 
-func (s *Server) runFollower(ctx context.Context, pin *engine.ReadPin, req *wire.Request, st *stream) (done *wire.Done, e *wire.Error, err error) {
+// runFollower serves the request on pin. A refusal for want of a SQLite
+// slot is returned as e with a nil err.
+func (s *Server) runFollower(ctx context.Context, pin *engine.ReadPin, req *wire.Request, st *stream, who string) (done *wire.Done, e *wire.Error, err error) {
+	// Follower connections use the same slots as leader connections. Each
+	// pin has its own SQLite connection and is discarded on release.
+	if _, e := s.reserve(nil, who); e != nil {
+		return nil, e, nil
+	}
+	defer s.pool.release(who, nil, false)
 	c, err := pin.Open(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -479,7 +478,7 @@ func engineClass(err error) string {
 	for _, c := range []struct {
 		err  error
 		name string
-	}{{engine.ErrBroken, "broken"}, {engine.ErrStopped, "stopped"}, {engine.ErrUnknown, "unknown"}, {engine.ErrNotCommitted, "not_committed"}} {
+	}{{engine.ErrBroken, "broken"}, {engine.ErrCompacted, "compacted"}, {engine.ErrStopped, "stopped"}, {engine.ErrUnknown, "unknown"}, {engine.ErrNotCommitted, "not_committed"}} {
 		if errors.Is(err, c.err) {
 			return c.name
 		}
