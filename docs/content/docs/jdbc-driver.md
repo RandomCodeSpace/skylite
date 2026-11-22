@@ -123,4 +123,3 @@ The rows from `busy` down answer channel requests, which this version never send
 - The Hibernate dialect, and a run of the Spring Data JPA acceptance suite in `clients/java/acceptance/` against skylite.
 - Catalog metadata (`DatabaseMetaData.getTables` and the like), streams and LOB parameters, and JDBC escape syntax, which is sent unprocessed.
 - Retries. A read refused before acceptance, such as `overloaded` or `not_serving`, is raised to the caller.
-- The server's statement deadline ends a running query by resetting the HTTP/2 stream rather than with its `timeout` frame, so a query the server stops reports `08S01` rather than `SQLTimeoutException`; the driver's own timeout, 2 seconds later, is never reached.

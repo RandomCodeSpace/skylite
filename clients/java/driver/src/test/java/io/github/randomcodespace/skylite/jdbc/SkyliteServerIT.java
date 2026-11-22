@@ -334,11 +334,9 @@ class SkyliteServerIT {
     }
 
     /**
-     * timeout_ms reaches the server and its deadline stops the query. ADR 0005 asks for a {@code timeout} terminal
-     * frame, which the driver raises as {@link java.sql.SQLTimeoutException} (DriverTest covers that). This server
-     * sets the statement deadline as the HTTP write deadline once the columns frame has started the response, and
-     * Go's HTTP/2 server resets the stream when it passes, so the frame never arrives and the driver reports the
-     * reset (08S01). Either way the query ends at the deadline, not at the driver's backstop 2 s later.
+     * timeout_ms reaches the server and its deadline stops the query with ADR 0005's {@code timeout} terminal frame,
+     * which the driver raises as {@link java.sql.SQLTimeoutException}. The query ends at the deadline, not at the
+     * driver's backstop 2 s later.
      */
     @Test
     void theStatementDeadlineReachesTheServer() throws Exception {
@@ -355,7 +353,7 @@ class SkyliteServerIT {
                 }
             });
             long ms = Duration.ofNanos(System.nanoTime() - t0).toMillis();
-            assertTrue(e instanceof java.sql.SQLTimeoutException || "08S01".equals(e.getSQLState()), e.toString());
+            assertTrue(e instanceof java.sql.SQLTimeoutException, e.toString());
             assertTrue(ms >= 900 && ms < 2_900, "ended after " + ms + " ms");
         }
     }
