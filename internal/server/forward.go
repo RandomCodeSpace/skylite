@@ -93,10 +93,13 @@ func newPeer(c *Peer) (*peer, error) {
 		// No proxy: a forwarded request carries the caller's bearer token,
 		// and goes only to a pod that proves it holds a peer certificate.
 		transport: &http.Transport{
-			TLSClientConfig:   &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, ServerName: c.ServerName, MinVersion: tls.VersionTLS13},
-			ForceAttemptHTTP2: true,
-			DialContext:       (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-			IdleConnTimeout:   idleTimeout,
+			TLSClientConfig:     &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, ServerName: c.ServerName, MinVersion: tls.VersionTLS13},
+			ForceAttemptHTTP2:   true,
+			DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+			TLSHandshakeTimeout: 5 * time.Second,
+			IdleConnTimeout:     idleTimeout,
+			// A peer that went silent is found by a ping, not by each hop's deadline.
+			HTTP2: &http.HTTP2Config{SendPingTimeout: 15 * time.Second},
 		},
 	}, nil
 }
@@ -202,14 +205,20 @@ func (s *Server) withdraw(key string, rec leaderRecord, version string, log *slo
 	}
 }
 
-// forward sends the request, of kind on database db with its parsed body
-// req and exact body (both nil for a GET), one hop to the pod that serves
-// it, and relays that pod's answer. It returns nil once it has relayed an
-// answer, even one cut short, and otherwise the refusal: no_leader or
-// owner_unreachable, not executed only when nothing reached the other pod,
-// or channel_lost when the records show the token's channel has ended. It
+// forward sends the request, a POST of kind on database db with its parsed
+// body req and exact body, one hop to the pod that serves it, and relays
+// that pod's answer. It returns nil once it has relayed an answer, even one
+// cut short, and otherwise the refusal: no_leader or owner_unreachable, not
+// executed only when no connection to the other pod was obtained, or
+// channel_lost when the records show the token's channel has ended. It
 // never sends a request twice.
 func (s *Server) forward(st *stream, r *http.Request, kind wire.Kind, db string, req *wire.Request, body []byte, id string, arrived time.Time, log *slog.Logger) *wire.Error {
+	// net/http resends a request with no body, or a GET, by itself after
+	// some connection failures; a POST with a body and no GetBody it never
+	// resends (Request.isReplayable, http2shouldRetryRequest).
+	if r.Method != http.MethodPost || len(body) == 0 {
+		return wire.NewError(wire.CodeInternal, "only a POST with a body is forwarded")
+	}
 	owner := kind == wire.KindChannel || kind == wire.KindCancel || kind == wire.KindClose
 	unreachable := func(why string) *wire.Error {
 		if owner {
@@ -256,24 +265,23 @@ func (s *Server) forward(st *stream, r *http.Request, kind wire.Kind, db string,
 	// The budget: what is left of the statement time, which the owner's
 	// own limits can only lower.
 	limit := s.statementTime
-	if req != nil && req.TimeoutMS > 0 {
+	if req.TimeoutMS > 0 {
 		limit = min(limit, time.Duration(req.TimeoutMS)*time.Millisecond)
 	}
 	remaining := max(limit-time.Since(arrived), time.Millisecond)
-	deadline := time.Now().Add(remaining + hopSlack + s.responseDeadline)
+	deadline := time.Now().Add(remaining + s.hopSlack + s.responseDeadline)
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	defer cancel()
-	// Once the headers may have gone, the other pod may have accepted it.
-	var sent atomic.Bool
-	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteHeaders: func() { sent.Store(true) }})
+	// Once a connection is obtained, part of the request may have gone
+	// before any trace event says so (HTTP/2 flushes its headers first), so
+	// the other pod may have accepted it.
+	var connected atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) { connected.Store(true) }})
 	var hopErr error
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(&url.URL{Scheme: "https", Host: addr})
-			pr.Out.Body, pr.Out.ContentLength, pr.Out.GetBody = nil, 0, nil // no GetBody: the transport never resends
-			if body != nil {
-				pr.Out.Body, pr.Out.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
-			}
+			pr.Out.Body, pr.Out.ContentLength, pr.Out.GetBody = io.NopCloser(bytes.NewReader(body)), int64(len(body)), nil
 			pr.Out.Header.Set(forwardedHeader, "1")
 			pr.Out.Header.Set(budgetHeader, strconv.FormatInt(max(remaining.Milliseconds(), 1), 10))
 			pr.Out.Header.Set(requestIDHeader, id)
@@ -304,8 +312,8 @@ func (s *Server) forward(st *stream, r *http.Request, kind wire.Kind, db string,
 	}
 	maps.Copy(h, own)
 	e := unreachable("the hop failed")
-	e.NotExecuted = !sent.Load()
-	log.LogAttrs(r.Context(), slog.LevelWarn, "forward failed", slog.Bool("sent", sent.Load()), slog.String("error", hopErr.Error()))
+	e.NotExecuted = !connected.Load()
+	log.LogAttrs(r.Context(), slog.LevelWarn, "forward failed", slog.Bool("connected", connected.Load()), slog.String("error", hopErr.Error()))
 	return e
 }
 

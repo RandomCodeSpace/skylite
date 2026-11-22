@@ -278,10 +278,10 @@ func (s *Server) openChannel(d *database, leader *engine.Leader, req *wire.Reque
 }
 
 // lookup returns the live channel that token names on t for who, with
-// s.chMu held, or the refusal: checks 7 to 9 of ADR 0005. A token naming
-// another server process matches no channel here and gets channel_lost: in
-// this version only the leader in office holds write channels, so that
-// process's channels ended when it left office.
+// s.chMu held, or the refusal: checks 7 to 9 of ADR 0005. With a peer
+// listener, handle sends a token naming another server process to that
+// process before this; without one, such a token matches no channel here
+// and gets channel_lost.
 func (s *Server) lookup(t *table, token, who string) (*channel, *wire.Error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 5 || parts[0] != channelTokenPrefix || parts[2] != hex.EncodeToString(t.office.DB[:]) {

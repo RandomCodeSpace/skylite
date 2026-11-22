@@ -202,7 +202,6 @@ func TestServeQueryOverHTTPS(t *testing.T) {
 	cert, key, roots := selfSigned(t, dir)
 	cfg, token := serveConfig(t, dir, map[string]any{
 		"plaintext": false, "tls": map[string]any{"cert_file": cert, "key_file": key}, "databases": []string{"e2e"},
-		"follower_reads": false, // the reads below wait for the leader
 	})
 	cmd, addr, log := serveChild(t, "TestServeQueryOverHTTPS", cfg)
 	c := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}, ForceAttemptHTTP2: true}}
@@ -283,7 +282,6 @@ func TestServeWritesOverHTTPS(t *testing.T) {
 	cert, key, roots := selfSigned(t, dir)
 	cfg, token := serveConfig(t, dir, map[string]any{
 		"plaintext": false, "tls": map[string]any{"cert_file": cert, "key_file": key}, "databases": []string{"e2e"},
-		"follower_reads": false, // the reads below wait for the leader
 	})
 	c := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}, ForceAttemptHTTP2: true}}
 	send := func(addr, method, path, body string) (int, []string) {

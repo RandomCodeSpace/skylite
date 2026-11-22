@@ -8,10 +8,10 @@
 // and cancel on leaders (see channel.go). Each configured database has an
 // office loop (internal/office). With a peer listener configured, a request
 // this server cannot serve is forwarded one hop to the pod that can (see
-// forward.go). resolve and GET status are authenticated, forwarded to the
-// leader if this server does not lead, and answered there with
-// not_serving. Of
-// the admission control of ADR 0005 decision 9, the bound
+// forward.go). resolve is authenticated, forwarded to the leader if this
+// server does not lead, and answered there with not_serving; GET status is
+// authenticated and answered with not_serving on every pod. Of the
+// admission control of ADR 0005 decision 9, the bound
 // on HTTP connections, the body share of the memory budget, the SQLite
 // connection limits and the channel bounds are implemented.
 package server
@@ -110,8 +110,7 @@ type Server struct {
 	// listener's in place of cfg.ProbeListen and cfg.Peer.Listen; tests set
 	// them to keep their ports bound.
 	probeLn, peerLn net.Listener
-	peer            *peer        // nil without cfg.Peer
-	peerSeen        atomic.Int64 // requests the peer listener received; tests read it
+	peer            *peer // nil without cfg.Peer
 	cfg             Config
 	log             *slog.Logger
 	guard           *auth.Guard
@@ -144,6 +143,7 @@ type Server struct {
 	// New; tests shorten them.
 	headerDeadline, bodyDeadline, responseDeadline time.Duration
 	idleTimeout, createTimeout, shutdownTimeout    time.Duration
+	hopSlack                                       time.Duration
 	maxConns                                       int
 }
 
@@ -198,7 +198,7 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 		policy: policy, pool: newPool(maxDatabases - len(cfg.Databases)), engine: engineConfig(), bodyShare: bodyShare, bodyBy: map[string]int64{}, statementTime: stmt,
 		instance: rand.Text(), chl: defaultChLimits(),
 		headerDeadline: headerDeadline, bodyDeadline: bodyDeadline, responseDeadline: time.Duration(l.ResponseMS) * time.Millisecond,
-		idleTimeout: idleTimeout, createTimeout: createTimeout, shutdownTimeout: shutdownTimeout, maxConns: maxConns,
+		idleTimeout: idleTimeout, createTimeout: createTimeout, shutdownTimeout: shutdownTimeout, hopSlack: hopSlack, maxConns: maxConns,
 	}
 	if cfg.TLS != nil {
 		c, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
@@ -376,10 +376,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			}
 		}
 		peerSrv = &http.Server{
-			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				s.peerSeen.Add(1)
-				s.serve(w, r, true)
-			}),
+			Handler:   http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.serve(w, r, true) }),
 			TLSConfig: s.peer.server.Clone(), ReadHeaderTimeout: s.headerDeadline, IdleTimeout: s.idleTimeout,
 			MaxHeaderBytes: int(s.limits.HeaderBlockBytes), HTTP2: srv.HTTP2, ErrorLog: srv.ErrorLog,
 		}
@@ -414,6 +411,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if err != nil {
 		_ = srv.Close()
 		err = fmt.Errorf("server: requests still running after %v were cut: %w", s.shutdownTimeout, err)
+	}
+	if s.peer != nil {
+		s.peer.transport.CloseIdleConnections()
 	}
 	if pe := <-perr; pe != nil && err == nil {
 		err = fmt.Errorf("server: forwarded requests still running after %v were cut: %w", s.shutdownTimeout, pe)
@@ -711,12 +711,10 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	forward := !hop && s.peer != nil && d != nil && kind != wire.KindPut && leader == nil
 	stateless := kind == wire.KindQuery || kind == wire.KindDescribe
 	switch {
-	case (kind == wire.KindResolve || kind == wire.KindStatus) && !forward:
+	case kind == wire.KindStatus || kind == wire.KindResolve && !forward:
 		return nil, wire.NewError(wire.CodeNotServing, "resolve and status are not served in this version"), false
 	case kind != wire.KindPut && leader == nil && !forward && (follower == nil || !stateless):
 		return nil, wire.NewError(wire.CodeNotServing, "this server does not lead the database or serve this request on a follower"), false
-	case kind == wire.KindStatus:
-		return nil, s.forward(st, r, kind, db, nil, nil, id, arrived, log), false
 	}
 	who := principal(p)
 	release, e := s.chargeBody(r, who)
@@ -746,6 +744,13 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 		if e := authorize(auth.RoleWrite); e != nil {
 			return nil, e, true
 		}
+	}
+	// Check 8 before the local lookup, on a leader too: a leader deposed
+	// without noticing yet must not answer channel_lost for a channel of
+	// the leader in office. A token naming another process goes there.
+	if !hop && s.peer != nil && leader != nil && (kind == wire.KindChannel || kind == wire.KindCancel || kind == wire.KindClose) {
+		inst, _, _ := strings.Cut(strings.TrimPrefix(req.Channel, channelTokenPrefix+"."), ".")
+		forward = inst != s.instance
 	}
 	if forward && (!stateless || follower == nil) {
 		return nil, s.forward(st, r, kind, db, req, body, id, arrived, log), true

@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -19,6 +20,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,8 +30,13 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+
 	"github.com/RandomCodeSpace/skylite/internal/auth"
+	"github.com/RandomCodeSpace/skylite/internal/office"
 	"github.com/RandomCodeSpace/skylite/internal/storage"
+	"github.com/RandomCodeSpace/skylite/internal/wire"
 )
 
 // peerConfig writes a self-signed peer certificate for skylite-peer, usable
@@ -197,14 +205,42 @@ func (e *env) peerURL(path string) string {
 
 func peerClient(e *env) *http.Client { return &http.Client{Transport: e.s.peer.transport} }
 
+// countHops puts a peer between the other pods and e, the leader in office,
+// which counts the requests forwarded to e: it records itself as e's
+// address and relays each request to e's peer listener.
+func countHops(t *testing.T, e *env) *atomic.Int64 {
+	t.Helper()
+	n := &atomic.Int64{}
+	rp := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(&url.URL{Scheme: "https", Host: e.s.peerLn.Addr().String()})
+		},
+		Transport:     e.s.peer.transport.Clone(),
+		FlushInterval: -1,
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		rp.ServeHTTP(w, r)
+	}))
+	srv.TLS = e.s.peer.server.Clone()
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	rec := waitRecord(t, e, func(r leaderRecord) bool { return r.Instance == e.s.instance && r.Address != "" })
+	rec.Address = srv.Listener.Addr().String()
+	e.writeRecord(t, rec)
+	return n
+}
+
 // Every request kind a pod without office gets goes to the leader in
-// office, which answers it, and a PUT stays where it arrived.
+// office, which answers it; a PUT and a GET status stay where they arrived.
 func TestForwardEachKind(t *testing.T) {
 	p := peerConfig(t)
 	leader, _ := newPeerLeader(t, p)
 	leader.exec(t, "CREATE TABLE t (a INTEGER)")
 	pod := newPod(t, leader, p, nil, false, nil)
-	seen := func() int64 { return leader.s.peerSeen.Load() }
+	hops := countHops(t, leader)
+	seen := hops.Load
 
 	if a := pod.post(t, "query", "reader", q("SELECT 7")); a.done() == nil || a.rows()[0] != "[7]" {
 		t.Fatalf("query: %d %v", a.status, a.frames)
@@ -235,13 +271,13 @@ func TestForwardEachKind(t *testing.T) {
 	if err != nil || a.code() != "not_serving" || h.Get("Skylite-Protocol") != "1" {
 		t.Errorf("status: %d %v %v", a.status, a.frames, err)
 	}
-	if got := seen(); got != 8 {
-		t.Errorf("the leader's peer listener got %d requests, want 8", got)
+	if got := seen(); got != 7 {
+		t.Errorf("the leader's peer listener got %d requests, want 7", got)
 	}
 	if r, _ := pod.put(t, h1Client(), "d", pod.sig.token(t, "admin")); r.StatusCode != http.StatusConflict {
 		t.Errorf("PUT: %d", r.StatusCode)
 	}
-	if got := seen(); got != 8 {
+	if got := seen(); got != 7 {
 		t.Errorf("a PUT was forwarded: %d", got)
 	}
 	if a := leader.post(t, "query", "reader", q("SELECT count(*) FROM t")); a.rows()[0] != "[1]" {
@@ -255,20 +291,21 @@ func TestForwardFollowerFallback(t *testing.T) {
 	p := peerConfig(t)
 	leader, _ := newPeerLeader(t, p)
 	leader.exec(t, "CREATE TABLE t (a INTEGER)")
+	hops := countHops(t, leader)
 	rs := &replicaStore{Store: leader.store}
 	pod := newPod(t, leader, p, rs, true, nil)
 	waitReplica(t, pod.s.ready, 5*time.Second, "follower not ready")
-	if a := pod.post(t, "query", "reader", q("SELECT 1")); a.done() == nil || leader.s.peerSeen.Load() != 0 {
-		t.Fatalf("local follower read: %d %v, forwarded %d", a.status, a.frames, leader.s.peerSeen.Load())
+	if a := pod.post(t, "query", "reader", q("SELECT 1")); a.done() == nil || hops.Load() != 0 {
+		t.Fatalf("local follower read: %d %v, forwarded %d", a.status, a.frames, hops.Load())
 	}
 	a := pod.post(t, "query", "reader", `{"sql":"SELECT 1","min_txn":1000000}`)
-	if a.code() != "behind" || leader.s.peerSeen.Load() != 1 || !strings.Contains(a.err()["message"].(string), "leader's head") && !strings.Contains(a.err()["message"].(string), "min_txn") {
-		t.Errorf("behind read: %d %v, forwarded %d", a.status, a.frames, leader.s.peerSeen.Load())
+	if a.code() != "behind" || hops.Load() != 1 || !strings.Contains(a.err()["message"].(string), "leader's head") && !strings.Contains(a.err()["message"].(string), "min_txn") {
+		t.Errorf("behind read: %d %v, forwarded %d", a.status, a.frames, hops.Load())
 	}
 	pauseReplica(t, rs)
 	waitReplica(t, func() bool { return !pod.s.dbs["d"].loop.State().Follower.Fresh() }, 5*time.Second, "follower stayed fresh")
-	if a := pod.post(t, "query", "reader", q("SELECT 2")); a.done() == nil || leader.s.peerSeen.Load() != 2 {
-		t.Errorf("stale follower read: %d %v, forwarded %d", a.status, a.frames, leader.s.peerSeen.Load())
+	if a := pod.post(t, "query", "reader", q("SELECT 2")); a.done() == nil || hops.Load() != 2 {
+		t.Errorf("stale follower read: %d %v, forwarded %d", a.status, a.frames, hops.Load())
 	}
 }
 
@@ -391,6 +428,7 @@ func TestForwardChannelLost(t *testing.T) {
 		{"own process", token(pod.s.instance, rec.DB, 500), "channel_lost"},
 		{"newer than the record", token("OTHER", rec.DB, 100), "owner_unreachable"},
 		{"another database", token("OTHER", strings.Repeat("0", 32), 99), "owner_unreachable"},
+		{"head not a number", "w1.OTHER." + rec.DB + ".x." + strings.Repeat("A", 43), "owner_unreachable"},
 		{"not a token", "w1.x", "invalid_request"},
 		{"another token version", "w9.OTHER." + rec.DB + ".99.AAAA", "invalid_request"},
 	} {
@@ -421,10 +459,9 @@ func (u *upstream) last() delivery {
 	return u.got[len(u.got)-1]
 }
 
-// fakeOwner starts a pod of "d" without office, a database that does not
-// exist, and a peer server that answers with h, and records it as the
-// leader.
-func fakeOwner(t *testing.T, p *Peer, h http.HandlerFunc) (*env, *upstream) {
+// podOf starts a pod of "d" without office, a database that does not
+// exist, with a peer transport; edit, if set, runs before it starts.
+func podOf(t *testing.T, p *Peer, edit func(*env)) *env {
 	t.Helper()
 	e := newEnv(t, nil)
 	e.s.cfg.Databases = []string{"d"}
@@ -432,7 +469,30 @@ func fakeOwner(t *testing.T, p *Peer, h http.HandlerFunc) (*env, *upstream) {
 	if err := e.s.addDatabases(); err != nil {
 		t.Fatal(err)
 	}
+	if edit != nil {
+		edit(e)
+	}
 	e.halt = e.start(t)
+	return e
+}
+
+// point records the peer at addr as the leader of "d".
+func point(t *testing.T, e *env, addr string) {
+	t.Helper()
+	e.writeRecord(t, leaderRecord{Instance: "FAKE", Address: addr, DB: strings.Repeat("ab", 16), Epoch: 2, Head: 1})
+}
+
+// fakeOwner starts podOf and a peer server that answers with h, and
+// records it as the leader.
+func fakeOwner(t *testing.T, p *Peer, h http.HandlerFunc) (*env, *upstream) {
+	t.Helper()
+	return fakeOwnerOf(t, podOf(t, p, nil), h, nil)
+}
+
+// fakeOwnerOf is fakeOwner for pod e; edit, if set, changes the peer server
+// before it starts.
+func fakeOwnerOf(t *testing.T, e *env, h http.HandlerFunc, edit func(*httptest.Server)) (*env, *upstream) {
+	t.Helper()
 	up := &upstream{}
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -444,9 +504,12 @@ func fakeOwner(t *testing.T, p *Peer, h http.HandlerFunc) (*env, *upstream) {
 	}))
 	srv.TLS = e.s.peer.server.Clone()
 	srv.EnableHTTP2 = true
+	if edit != nil {
+		edit(srv)
+	}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
-	e.writeRecord(t, leaderRecord{Instance: "FAKE", Address: srv.Listener.Addr().String(), DB: strings.Repeat("ab", 16), Epoch: 2, Head: 1})
+	point(t, e, srv.Listener.Addr().String())
 	return e, up
 }
 
@@ -486,6 +549,7 @@ func TestForwardRefusesForgedHop(t *testing.T) {
 func TestForwardOneHop(t *testing.T) {
 	p := peerConfig(t)
 	leader, _ := newPeerLeader(t, p)
+	hops := countHops(t, leader)
 	pod := newPod(t, leader, p, nil, false, nil)
 	tok := leader.open(t, "writer")
 	for _, tc := range []struct{ path, body string }{{"/channels", `{"mode":"write"}`}, {"/channel", ex(tok, 1, "SELECT 1")}, {"/query", q("SELECT 1")}} {
@@ -504,7 +568,7 @@ func TestForwardOneHop(t *testing.T) {
 	if a := pod.post(t, "resolve", "writer", fmt.Sprintf(`{"channel":%q,"seq":1}`, strings.Repeat("A", controlBodyBytes))); a.code() != "request_too_large" {
 		t.Errorf("large resolve: %d %v", a.status, a.frames)
 	}
-	if n := leader.s.peerSeen.Load(); n != 0 {
+	if n := hops.Load(); n != 0 {
 		t.Errorf("forwarded again: %d", n)
 	}
 }
@@ -514,10 +578,11 @@ func TestForwardOneHop(t *testing.T) {
 func TestForwardFinalPodChecks(t *testing.T) {
 	p := peerConfig(t)
 	leader, _ := newPeerLeader(t, p)
+	hops := countHops(t, leader)
 	pod := newPod(t, leader, p, nil, false, func(c *Config) {
 		c.Auth.Rules = append(append([]auth.Rule(nil), c.Auth.Rules...), auth.Rule{Issuer: testIssuer, Subject: "intruder", Database: "*", Role: auth.RoleWrite})
 	})
-	if a := pod.post(t, "channels", "intruder", `{"mode":"write"}`); a.status != http.StatusForbidden || a.code() != "forbidden" || leader.s.peerSeen.Load() != 1 {
+	if a := pod.post(t, "channels", "intruder", `{"mode":"write"}`); a.status != http.StatusForbidden || a.code() != "forbidden" || hops.Load() != 1 {
 		t.Errorf("role granted only by the forwarding pod: %d %v", a.status, a.frames)
 	}
 	if leader.s.nChans != 0 {
@@ -559,11 +624,12 @@ func TestForwardLeaderChange(t *testing.T) {
 	pod.leader(t)
 	rec := waitRecord(t, pod, func(r leaderRecord) bool { return r.Instance == pod.s.instance && r.Address != "" })
 	old, _ := leader.record(t)
+	hops := countHops(t, pod)
 	if a := pod.post(t, "channel", "writer", ex(tok, 2, "INSERT INTO t VALUES (2)")); a.code() != "channel_lost" {
 		t.Errorf("old channel on the new leader: %d %v", a.status, a.frames)
 	}
 	third := newPod(t, leader, p, nil, false, nil)
-	if a := third.post(t, "channel", "writer", ex(tok, 2, "INSERT INTO t VALUES (2)")); a.code() != "channel_lost" || pod.s.peerSeen.Load() != 0 {
+	if a := third.post(t, "channel", "writer", ex(tok, 2, "INSERT INTO t VALUES (2)")); a.code() != "channel_lost" || hops.Load() != 0 {
 		t.Errorf("old channel through a third pod: %d %v (record %+v, was %+v)", a.status, a.frames, rec, old)
 	}
 	if next := third.open(t, "writer"); !strings.HasPrefix(next, channelTokenPrefix+"."+pod.s.instance+".") {
@@ -612,6 +678,14 @@ func TestLeaderRecord(t *testing.T) {
 	leader.s.withdraw(keys.Leader(), rec, v, leader.s.log)
 	if got, _ := leader.record(t); got != newer {
 		t.Errorf("stale withdrawal changed %+v", got)
+	}
+	// The same office publishes again, as after a write whose outcome it did not learn.
+	newer.Address = "10.0.0.2:1"
+	if v, err := leader.s.publish(context.Background(), keys.Leader(), newer); err != nil || v == "" {
+		t.Errorf("same office publish: %q, %v", v, err)
+	}
+	if got, _ := leader.record(t); got != newer {
+		t.Errorf("same office publish left %+v", got)
 	}
 
 	// A standby publishes nothing.
@@ -672,5 +746,303 @@ func TestNewPeerRefuses(t *testing.T) {
 	c.CAFile = c.KeyFile
 	if _, err := newPeer(&c); err == nil {
 		t.Error("a CA file without a certificate was accepted")
+	}
+}
+
+// A GET status is answered where it arrives, and the forwarder refuses all
+// but a POST with a body: net/http resends the others by itself.
+func TestForwardOnlyPostsWithBodies(t *testing.T) {
+	p := peerConfig(t)
+	pod, up := fakeOwner(t, p, func(w http.ResponseWriter, r *http.Request) {})
+	a, _, err := call(h1Client(), http.MethodGet, "http://"+pod.addr+"/v1/databases/d", pod.sig.token(t, "reader"), "")
+	if err != nil || a.code() != "not_serving" {
+		t.Errorf("status: %d %v %v", a.status, a.frames, err)
+	}
+	for _, tc := range []struct {
+		method string
+		body   []byte
+	}{{http.MethodGet, nil}, {http.MethodPost, nil}, {http.MethodPost, []byte{}}, {http.MethodPut, []byte(`{}`)}} {
+		r := httptest.NewRequest(tc.method, "/v1/databases/d/query", nil)
+		if e := pod.s.forward(nil, r, wire.KindQuery, "d", &wire.Request{}, tc.body, "ID", time.Now(), pod.s.log); e == nil || e.Code != wire.CodeInternal || !e.NotExecuted {
+			t.Errorf("%s with body %q: %+v", tc.method, tc.body, e)
+		}
+	}
+	if up.n.Load() != 0 {
+		t.Errorf("%d deliveries", up.n.Load())
+	}
+}
+
+const notServingAnswer = `{"error":{"code":"not_serving","not_executed":true,"final":false,"message":"x"}}` + "\n"
+
+// HTTP/1.1 between pods: the upstream reads the forwarded request on a
+// reused connection and closes it without answering. The hop is not sent
+// again, and the answer is unsettled.
+func TestForwardNoResendHTTP1(t *testing.T) {
+	p := peerConfig(t)
+	var dropNext atomic.Bool
+	pod, up := fakeOwnerOf(t, podOf(t, p, nil), func(w http.ResponseWriter, r *http.Request) {
+		if dropNext.CompareAndSwap(true, false) {
+			c, _, _ := w.(http.Hijacker).Hijack() // received, never answered
+			_ = c.Close()
+			return
+		}
+		w.Header().Set("Skylite-Protocol", "1")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, notServingAnswer)
+	}, func(srv *httptest.Server) { srv.EnableHTTP2 = false })
+	tok := pod.sig.token(t, "reader")
+	for _, hdr := range [][]string{nil, {"Idempotency-Key", "k"}} {
+		// Warm the pooled connection, then make the upstream drop the next request.
+		if a := pod.post(t, "query", "reader", q("SELECT 1")); a.code() != "not_serving" {
+			t.Fatalf("relayed: %d %v", a.status, a.frames)
+		}
+		before := up.n.Load()
+		dropNext.Store(true)
+		a, _, err := call(h1Client(), http.MethodPost, "http://"+pod.addr+"/v1/databases/d/query", tok, q("SELECT 1"), hdr...)
+		time.Sleep(100 * time.Millisecond)
+		if d := up.n.Load() - before; err != nil || d != 1 || a.code() != "no_leader" || a.err()["not_executed"] != false {
+			t.Errorf("%v: %d deliveries, %d %v %v", hdr, d, a.status, a.frames, err)
+		}
+	}
+}
+
+// resetH2 is a raw HTTP/2 peer that resets the first reset streams with
+// code and answers the rest with not_serving.
+func resetH2(t *testing.T, cfg *tls.Config, code http2.ErrCode, reset int64) (string, *atomic.Int64) {
+	t.Helper()
+	cfg = cfg.Clone()
+	cfg.NextProtos = []string{"h2"}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	n := &atomic.Int64{}
+	serve := func(c net.Conn) {
+		defer func() { _ = c.Close() }()
+		pre := make([]byte, len(http2.ClientPreface))
+		if _, err := io.ReadFull(c, pre); err != nil {
+			return
+		}
+		fr := http2.NewFramer(c, c)
+		_ = fr.WriteSettings()
+		answer := func(id uint32) {
+			if n.Add(1) <= reset {
+				_ = fr.WriteRSTStream(id, code)
+				return
+			}
+			var b bytes.Buffer
+			enc := hpack.NewEncoder(&b)
+			for _, f := range []hpack.HeaderField{{Name: ":status", Value: "503"}, {Name: "skylite-protocol", Value: "1"}, {Name: "content-type", Value: "application/x-ndjson"}} {
+				_ = enc.WriteField(f)
+			}
+			_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: b.Bytes(), EndHeaders: true})
+			_ = fr.WriteData(id, true, []byte(notServingAnswer))
+		}
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				return
+			}
+			switch f := f.(type) {
+			case *http2.SettingsFrame:
+				if !f.IsAck() {
+					_ = fr.WriteSettingsAck()
+				}
+			case *http2.PingFrame:
+				if !f.IsAck() {
+					_ = fr.WritePing(true, f.Data)
+				}
+			case *http2.HeadersFrame:
+				if f.StreamEnded() {
+					answer(f.StreamID)
+				}
+			case *http2.DataFrame:
+				if f.StreamEnded() {
+					answer(f.StreamID)
+				}
+			}
+		}
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serve(c)
+		}
+	}()
+	return ln.Addr().String(), n
+}
+
+// HTTP/2 between pods, which two skylite pods negotiate: the upstream resets
+// the stream after it received the whole request, with codes the transport
+// may retry on. The hop is not sent again, and the answer is unsettled.
+func TestForwardNoResendHTTP2(t *testing.T) {
+	p := peerConfig(t)
+	pod := podOf(t, p, nil)
+	tok := pod.sig.token(t, "reader")
+	for _, code := range []http2.ErrCode{http2.ErrCodeProtocol, http2.ErrCodeRefusedStream} {
+		addr, n := resetH2(t, pod.s.peer.server, code, 1)
+		point(t, pod, addr)
+		a, _, err := call(h1Client(), http.MethodPost, "http://"+pod.addr+"/v1/databases/d/query", tok, q("SELECT 1"))
+		if err != nil || n.Load() != 1 || a.code() != "no_leader" || a.err()["not_executed"] != false {
+			t.Errorf("%v: %d deliveries, %d %v %v", code, n.Load(), a.status, a.frames, err)
+		}
+	}
+}
+
+// A hop that fails once a connection to the upstream was obtained is
+// unsettled, even when the request did not leave: here the transport
+// refuses it for the upstream's header list bound.
+func TestForwardUnsettledOnceConnected(t *testing.T) {
+	p := peerConfig(t)
+	pod, up := fakeOwnerOf(t, podOf(t, p, nil), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Skylite-Protocol", "1")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, notServingAnswer)
+	}, func(srv *httptest.Server) { srv.Config.MaxHeaderBytes = 1024 })
+	// The first hop learns the upstream's settings on the pooled connection.
+	if a := pod.post(t, "query", "reader", q("SELECT 1")); a.code() != "not_serving" || up.n.Load() != 1 {
+		t.Fatalf("relayed: %d %v", a.status, a.frames)
+	}
+	a, _, err := call(h1Client(), http.MethodPost, "http://"+pod.addr+"/v1/databases/d/query", pod.sig.token(t, "reader"), q("SELECT 1"), "X-Large", strings.Repeat("x", 4096))
+	if err != nil || a.code() != "no_leader" || a.err()["not_executed"] != false || up.n.Load() != 1 {
+		t.Errorf("%d deliveries, %d %v %v", up.n.Load(), a.status, a.frames, err)
+	}
+}
+
+// A peer that takes the request and never answers is cut at the hop's
+// deadline: the budget, the hop slack and the response deadline.
+func TestForwardHopDeadline(t *testing.T) {
+	p := peerConfig(t)
+	release := make(chan struct{})
+	pod, up := fakeOwnerOf(t, podOf(t, p, func(e *env) { e.s.hopSlack, e.s.responseDeadline = 0, 300*time.Millisecond }), func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}, nil)
+	defer close(release)
+	c := &http.Client{Transport: &http.Transport{}, Timeout: 10 * time.Second}
+	start := time.Now()
+	a, _, err := call(c, http.MethodPost, "http://"+pod.addr+"/v1/databases/d/query", pod.sig.token(t, "reader"), `{"sql":"SELECT 1","timeout_ms":200}`)
+	if took := time.Since(start); err != nil || a.code() != "no_leader" || a.err()["not_executed"] != false || up.n.Load() != 1 || took > 5*time.Second {
+		t.Errorf("%d deliveries, %d %v %v after %v", up.n.Load(), a.status, a.frames, err, took)
+	}
+}
+
+// foreignCert is a certificate for skylite-peer from a CA the pods do not trust.
+func foreignCert(t *testing.T) tls.Certificate {
+	t.Helper()
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3), Subject: pkix.Name{CommonName: "foreign"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		DNSNames: []string{"skylite-peer"}, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}, IsCA: true, BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, k.Public(), k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: k}
+}
+
+// The peer listener takes only TLS 1.3 from a pod with a certificate of the
+// peer CA, and a pod sends a hop only to an upstream that proves the same.
+func TestForwardPeerTrust(t *testing.T) {
+	p := peerConfig(t)
+	leader, _ := newPeerLeader(t, p)
+	tok := leader.sig.token(t, "writer")
+	foreign := foreignCert(t)
+	hop := func(tr *http.Transport) error {
+		_, _, err := call(&http.Client{Transport: tr}, http.MethodPost, leader.peerURL("/channels"), tok, `{"mode":"write"}`, "Skylite-Forwarded", "1", "Skylite-Budget-Ms", "1000")
+		return err
+	}
+	tr := leader.s.peer.transport.Clone()
+	// Sent whatever CAs the server names, as an attacker's client would.
+	tr.TLSClientConfig.Certificates = nil
+	tr.TLSClientConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &foreign, nil }
+	if hop(tr) == nil {
+		t.Error("the peer listener served a client certificate of another CA")
+	}
+	tr = leader.s.peer.transport.Clone()
+	tr.TLSClientConfig.MinVersion, tr.TLSClientConfig.MaxVersion = tls.VersionTLS12, tls.VersionTLS12
+	if hop(tr) == nil {
+		t.Error("the peer listener served TLS 1.2")
+	}
+	if leader.s.nChans != 0 {
+		t.Error("an untrusted client opened a channel")
+	}
+
+	// An upstream with a certificate of another CA, then one whose peer
+	// certificate lacks the configured name: the bearer token reaches neither.
+	for _, tc := range []struct {
+		name     string
+		pod      func(*env)
+		upstream func(*httptest.Server)
+	}{
+		{"foreign CA", nil, func(srv *httptest.Server) { srv.TLS.Certificates = []tls.Certificate{foreign} }},
+		{"wrong name", func(e *env) { e.s.peer.transport.TLSClientConfig.ServerName = "another-name" }, nil},
+	} {
+		pod, up := fakeOwnerOf(t, podOf(t, p, tc.pod), func(w http.ResponseWriter, r *http.Request) {}, tc.upstream)
+		a := pod.post(t, "channels", "writer", `{"mode":"write"}`)
+		if a.code() != "no_leader" || a.err()["not_executed"] != true || up.n.Load() != 0 {
+			t.Errorf("%s: %d deliveries, %d %v", tc.name, up.n.Load(), a.status, a.frames)
+		}
+	}
+}
+
+// A leader deposed without noticing yet gets a request on a channel of the
+// leader in office: it forwards it there, rather than answering
+// channel_lost.
+func TestForwardDeposedLeader(t *testing.T) {
+	p := peerConfig(t)
+	a, _ := newPeerLeader(t, p)
+	a.exec(t, "CREATE TABLE t (a INTEGER)")
+
+	// B's lease clock runs two hours ahead: it sees A's lease expired and
+	// takes office, as after A missed its renewals.
+	cfg := a.s.cfg
+	cfg.FollowerReads, cfg.Peer = false, nil
+	logs := &lockedBuffer{}
+	s, err := newServer(cfg, slog.New(slog.NewJSONHandler(logs, nil)), a.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &env{s: s, sig: a.sig, logs: logs, store: a.store}
+	addPeer(t, b, p)
+	if err := s.addDatabases(); err != nil {
+		t.Fatal(err)
+	}
+	keys, _ := cfg.Storage.keys("d")
+	holder, _ := office.NewHolder("usurper")
+	loop, err := office.New(office.Config{
+		Store: s.store, Keys: keys, Holder: holder, Dir: s.dir, Engine: s.engine, Logger: s.log,
+		Now: func() time.Time { return time.Now().Add(2 * time.Hour) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.dbs["d"] = &database{loop: loop}
+	b.halt = b.start(t)
+	b.leader(t)
+	waitRecord(t, b, func(r leaderRecord) bool { return r.Instance == b.s.instance && r.Address != "" })
+
+	tok := b.open(t, "writer")
+	if st := a.s.dbs["d"].loop.State(); st.Leader == nil || st.Leader.Err() != nil {
+		t.Skip("A already left office")
+	}
+	stale := a.post(t, "channel", "writer", ex(tok, 1, "INSERT INTO t VALUES (1)"))
+	if stale.done() == nil {
+		t.Fatalf("the deposed leader answered %d %v", stale.status, stale.frames)
+	}
+	if again := b.post(t, "channel", "writer", ex(tok, 1, "INSERT INTO t VALUES (1)")); again.done() == nil || num(again.done(), "txn") != num(stale.done(), "txn") {
+		t.Errorf("the leader in office: %d %v, after %v", again.status, again.frames, stale.frames)
 	}
 }

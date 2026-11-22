@@ -37,8 +37,9 @@ type Config struct {
 	// leads. A database need not exist yet; the server takes office once it
 	// does.
 	Databases []string `json:"databases"`
-	// FollowerReads enables stateless reads on fresh local followers. Load
-	// sets it to true when the file leaves it out.
+	// FollowerReads enables stateless reads on fresh local followers. When
+	// the file leaves it out, Load sets it to true if Peer is set: without
+	// a peer listener a ready standby could not deliver writes.
 	FollowerReads bool `json:"follower_reads"`
 	// Peer, if set, lets this server forward a request it cannot serve
 	// itself, one hop, to the pod that can (ADR 0005 decision 7).
@@ -135,7 +136,7 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	c := Config{FollowerReads: true}
+	var c Config
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&c); err != nil {
@@ -143,6 +144,13 @@ func Load(path string) (Config, error) {
 	}
 	if _, err := d.Token(); !errors.Is(err, io.EOF) {
 		return Config{}, fmt.Errorf("server: config %s: data after the configuration object", path)
+	}
+	var set struct {
+		FollowerReads *bool `json:"follower_reads"`
+	}
+	_ = json.Unmarshal(b, &set) // b decoded above
+	if set.FollowerReads == nil {
+		c.FollowerReads = c.Peer != nil
 	}
 	if err := c.Validate(); err != nil {
 		return Config{}, fmt.Errorf("server: config %s: %w", path, err)

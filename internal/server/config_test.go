@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -65,7 +66,12 @@ func TestLoad(t *testing.T) {
 	}
 	defaultReads := strings.Replace(goodConfig, "  \"follower_reads\": true,\n", "", 1)
 	if c, err := Load(writeConfig(t, defaultReads)); err != nil || !c.FollowerReads {
-		t.Errorf("default follower_reads = %t, %v", c.FollowerReads, err)
+		t.Errorf("default follower_reads with peer = %t, %v", c.FollowerReads, err)
+	}
+	// Without a peer listener a ready standby would refuse writes.
+	noPeer := regexp.MustCompile(`\n  "peer": [^\n]*`).ReplaceAllString(defaultReads, "")
+	if c, err := Load(writeConfig(t, noPeer)); err != nil || c.FollowerReads || c.Peer != nil {
+		t.Errorf("default follower_reads without peer = %t, %v", c.FollowerReads, err)
 	}
 	offReads := strings.Replace(goodConfig, `"follower_reads": true`, `"follower_reads": false`, 1)
 	if c, err := Load(writeConfig(t, offReads)); err != nil || c.FollowerReads {
