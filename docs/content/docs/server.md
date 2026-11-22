@@ -5,7 +5,7 @@ weight: 15
 status: current
 ---
 
-`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on the databases it leads, and runs autocommit writes and transactions on [write channels](#write-channels). It runs no batch or `resolve`. The [Go driver](/docs/go-driver/)'s read path uses `query` and `describe`; no driver sends writes yet.
+`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on the databases it leads, and runs autocommit writes and transactions on [write channels](#write-channels). It runs no batch or `resolve`. The [Go driver](/docs/go-driver/) sends `query`, `describe`, opens, channel requests, `cancel` and `close`.
 
 ## What it serves
 

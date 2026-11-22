@@ -13,11 +13,15 @@ import (
 	"github.com/RandomCodeSpace/skylite/internal/wire"
 )
 
-// conn is a database/sql connection. It holds no server state: each query
-// and describe is one stateless request.
+// conn is a database/sql connection. Each query and describe outside a
+// transaction is one stateless request; everything else goes on its write
+// channel.
 type conn struct {
 	c      *Connector
 	closed bool
+	ch     *channel // nil until a request needs one, and after it was abandoned
+	inTx   bool     // a transaction is open, or lost and not yet rolled back
+	lost   bool     // an outcome was unknown: the connection is discarded
 }
 
 var (
@@ -27,14 +31,32 @@ var (
 	_ driver.ConnBeginTx        = (*conn)(nil)
 	_ driver.Pinger             = (*conn)(nil)
 	_ driver.NamedValueChecker  = (*conn)(nil)
+	_ driver.Validator          = (*conn)(nil)
+	_ driver.SessionResetter    = (*conn)(nil)
 )
 
-func (cn *conn) Close() error { cn.closed = true; return nil }
+// Close closes the write channel, if any, waiting for the answer up to
+// abandonWait, so that the server releases it at once.
+func (cn *conn) Close() error {
+	cn.closed = true
+	if cn.ch != nil {
+		cn.c.abandon(cn.ch.token, 0)
+		cn.ch = nil
+	}
+	return nil
+}
 
-func (cn *conn) Begin() (driver.Tx, error) { return nil, ErrTransactionsUnsupported }
+// IsValid reports false for a connection that met an unknown outcome, so
+// that database/sql closes it instead of reusing it.
+func (cn *conn) IsValid() bool { return !cn.closed && !cn.lost }
 
-func (cn *conn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
-	return nil, ErrTransactionsUnsupported
+// ResetSession returns driver.ErrBadConn for a connection that met an
+// unknown outcome, so that database/sql discards it.
+func (cn *conn) ResetSession(context.Context) error {
+	if cn.lost {
+		return driver.ErrBadConn
+	}
+	return nil
 }
 
 // response is a response being read.
@@ -44,39 +66,55 @@ type response struct {
 }
 
 // send sends a stateless request and returns its response once its headers
-// have arrived. The only driver.ErrBadConn it returns is for a closed
-// connection, before anything is built or sent: that request was never
-// sent, so database/sql may run it on another connection (ADR 0005
+// have arrived. The only driver.ErrBadConn it returns is for a closed or
+// discarded connection, before anything is built or sent: that request was
+// never sent, so database/sql may run it on another connection (ADR 0005
 // decision 4, case 1). Every other failure returns the real error, because
 // a request whose bytes may have been written must not be run again by
 // database/sql.
 func (cn *conn) send(ctx context.Context, kind wire.Kind, call *wire.Call) (*response, error) {
-	if cn.closed {
+	if cn.closed || cn.lost {
 		return nil, driver.ErrBadConn
 	}
-	u, done := cn.c.query, wire.DoneQuery
+	done := wire.DoneQuery
 	if kind == wire.KindDescribe {
-		u, done = cn.c.describe, wire.DoneDescribe
+		done = wire.DoneDescribe
 	}
 	call.MinTxn = cn.c.watermark.Load()
 	body, err := wire.AppendCall(nil, kind, call)
 	if err != nil {
 		return nil, fmt.Errorf("skylite: %w", err)
 	}
-	token, err := cn.c.token.Token(ctx)
+	req, err := cn.c.request(ctx, kind, body)
+	if err != nil {
+		return nil, err
+	}
+	return cn.c.roundTrip(req, done)
+}
+
+// request builds a request of kind with body, and its bearer token. Its
+// failures come before anything is sent.
+func (c *Connector) request(ctx context.Context, kind wire.Kind, body []byte) (*http.Request, error) {
+	token, err := c.token.Token(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("skylite: token source: %w", err)
 	}
 	if !validBearer(token) {
 		return nil, errors.New("skylite: the token source returned an empty token or one with characters a bearer token cannot hold")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+wire.Path(kind, c.db), bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("skylite: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := cn.c.client.Do(req)
+	return req, nil
+}
+
+// roundTrip sends req and returns a reader of its response, whose done
+// frame is of kind done, once its headers have arrived.
+func (c *Connector) roundTrip(req *http.Request, done wire.DoneKind) (*response, error) {
+	resp, err := c.client.Do(req)
 	if err != nil {
 		if ue, ok := errors.AsType[*url.Error](err); ok {
 			err = ue.Err // its text holds the request URL
@@ -119,13 +157,23 @@ func (rs *response) next() (*wire.Frame, error) {
 	return f, nil
 }
 
+// QueryContext sends a query outside a transaction to the stateless query
+// endpoint, and on to the write channel when the server answers that it is
+// not a pure read. Inside a transaction it goes on the channel.
 func (cn *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if cn.inTx {
+		return cn.channelQuery(ctx, query, args)
+	}
 	rs, err := cn.send(ctx, wire.KindQuery, cn.call(query, args))
 	if err != nil {
 		return nil, err
 	}
 	f, err := rs.next()
 	if err == nil && f.Kind == wire.FrameError {
+		if f.Error.Code == CodeNeedsChannel { // refused before execution
+			_ = rs.body.Close()
+			return cn.channelQuery(ctx, query, args)
+		}
 		err = serverError(f.Error)
 	}
 	if err != nil {
@@ -141,21 +189,37 @@ func (cn *conn) QueryContext(ctx context.Context, query string, args []driver.Na
 	return r, nil
 }
 
+// ExecContext runs the statement on the write channel: an autocommit
+// write, or a statement of the open transaction.
 func (cn *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	dr, err := cn.QueryContext(ctx, query, args)
+	a, err := cn.do(ctx, cn.execute(query, args), wire.DoneExecute)
 	if err != nil {
 		return nil, err
 	}
-	r := dr.(*rows)
-	defer func() { _ = r.Close() }()
-	dest := make([]driver.Value, len(r.cols))
-	for {
-		if err := r.Next(dest); errors.Is(err, io.EOF) {
-			return result{r.done}, nil
-		} else if err != nil {
-			return nil, err
+	return result{a.done}, nil
+}
+
+// channelQuery runs a query on the write channel and returns its rows,
+// read whole: ADR 0005 decision 6 settles a channel request before any of
+// its rows reach database/sql.
+func (cn *conn) channelQuery(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	a, err := cn.do(ctx, cn.execute(query, args), wire.DoneExecute)
+	if err != nil {
+		return nil, err
+	}
+	if a.done.DataOmitted {
+		return nil, &Error{
+			Message: "the response was lost and its replay omits its rows", Seq: a.done.Seq, Txn: a.done.Txn,
+			committed: !cn.inTx && !a.done.ReadOnly, is: []error{ErrResultUnavailable},
 		}
 	}
+	return &rows{c: cn.c, cols: a.cols, buf: a.rows}, nil
+}
+
+func (cn *conn) execute(query string, args []driver.NamedValue) *wire.Call {
+	c := cn.call(query, args)
+	c.Op = wire.OpExecute
+	return c
 }
 
 // call builds a query's body from database/sql's arguments, which
@@ -174,8 +238,14 @@ func (cn *conn) call(query string, args []driver.NamedValue) *wire.Call {
 }
 
 // PrepareContext describes the statement: the server compiles it, executes
-// nothing, and reports its parameter count.
+// nothing, and reports its parameter count. Inside a transaction it sends
+// nothing and the count is unknown: a stateless describe cannot see the
+// transaction's schema changes, and the server does not describe on a
+// channel yet.
 func (cn *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if cn.inTx {
+		return &stmt{cn: cn, query: query, params: -1}, nil
+	}
 	rs, err := cn.send(ctx, wire.KindDescribe, &wire.Call{SQL: query})
 	if err != nil {
 		return nil, err
@@ -245,13 +315,15 @@ type result struct{ d *wire.Done }
 func (r result) LastInsertId() (int64, error) { return r.d.LastInsertRowID, nil }
 func (r result) RowsAffected() (int64, error) { return r.d.RowsAffected, nil }
 
-// rows streams a query's rows: each is decoded as its frame arrives, and
-// Close releases the response, whether or not it has been read to its end.
+// rows streams a stateless query's rows: each is decoded as its frame
+// arrives, and Close releases the response, whether or not it has been read
+// to its end. A channel query's rows are in buf, and rs is nil.
 type rows struct {
 	c    *Connector
 	rs   *response
 	cols []wire.Column
 	done *wire.Done // the terminal frame, once read
+	buf  [][]driver.Value
 }
 
 var _ driver.RowsColumnTypeDatabaseTypeName = (*rows)(nil)
@@ -264,7 +336,12 @@ func (r *rows) Columns() []string {
 	return names
 }
 
-func (r *rows) Close() error { return r.rs.body.Close() }
+func (r *rows) Close() error {
+	if r.rs == nil {
+		return nil
+	}
+	return r.rs.body.Close()
+}
 
 func (r *rows) end(d *wire.Done) {
 	r.done = d
@@ -272,6 +349,14 @@ func (r *rows) end(d *wire.Done) {
 }
 
 func (r *rows) Next(dest []driver.Value) error {
+	if r.rs == nil {
+		if len(r.buf) == 0 {
+			return io.EOF
+		}
+		copy(dest, r.buf[0])
+		r.buf = r.buf[1:]
+		return nil
+	}
 	if r.done != nil {
 		return io.EOF
 	}

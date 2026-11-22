@@ -48,6 +48,10 @@ type Call struct {
 	Named     []NamedArg // named values; not with Params
 	MinTxn    int64      // 0 is absent
 	TimeoutMS int64      // 0 is absent
+	Mode      Mode       // an open's
+	Channel   string     // the token, of a channel request, a cancel and a close
+	Seq       int64      // of a channel request and a cancel
+	Op        Op         // of a channel request
 }
 
 // NamedArg is a named parameter value. Name is the parameter's name without
@@ -57,28 +61,102 @@ type NamedArg struct {
 	Value any
 }
 
-// AppendCall appends the body of a request of kind k, a query or a
-// describe, which Parse accepts. It refuses a Call with fields k does not
-// allow, SQL that is empty, holds U+0000 or is not valid UTF-8, an empty,
-// invalid or repeated parameter name, and a value AppendValue refuses. Its
-// errors never hold a value.
+// AppendCall appends the body of a request of kind k, which Parse accepts:
+// a query, a describe, an open, a channel request with op begin, execute,
+// commit, rollback or ping, a cancel or a close. It refuses a Call with
+// fields k (and its op) does not allow, SQL that is empty, holds U+0000 or
+// is not valid UTF-8, an empty, invalid or repeated parameter name, and a
+// value AppendValue refuses. Its errors never hold a value or a token.
 func AppendCall(dst []byte, k Kind, c *Call) ([]byte, error) {
-	switch {
-	case k != KindQuery && k != KindDescribe:
+	// The fields each kind and op allows: sql (with params and named),
+	// min_txn, timeout_ms, mode, channel, seq and op.
+	var allow int
+	switch k {
+	case KindQuery:
+		allow = fSQL | fMinTxn | fTimeout
+	case KindDescribe:
+		allow = fSQL | fMinTxn
+	case KindOpen:
+		allow = fMode
+		if c.Mode == ModeReadOnly {
+			allow |= fMinTxn
+		}
+	case KindChannel:
+		allow = fChannel | fSeq | fOp
+		switch c.Op {
+		case OpBegin:
+			allow |= fMinTxn | fTimeout
+		case OpExecute:
+			allow |= fSQL | fMinTxn | fTimeout
+		case OpCommit:
+			allow |= fTimeout
+		case OpRollback, OpPing:
+		default:
+			return dst, fmt.Errorf("wire: AppendCall does not write op %d", c.Op)
+		}
+	case KindCancel:
+		allow = fChannel | fSeq
+	case KindClose:
+		allow = fChannel
+	default:
 		return dst, fmt.Errorf("wire: AppendCall does not write request kind %d", k)
-	case c.SQL == "" || strings.IndexByte(c.SQL, 0) >= 0 || !utf8.ValidString(c.SQL):
+	}
+	if allow&fSQL != 0 && k != KindDescribe {
+		allow |= fParams
+	}
+	has := 0
+	for _, m := range []struct {
+		f   int
+		set bool
+	}{
+		{fSQL, c.SQL != ""},
+		{fParams, len(c.Params) > 0 || len(c.Named) > 0},
+		{fMinTxn, c.MinTxn != 0},
+		{fTimeout, c.TimeoutMS != 0},
+		{fMode, c.Mode != 0},
+		{fChannel, c.Channel != ""},
+		{fSeq, c.Seq != 0},
+		{fOp, c.Op != 0},
+	} {
+		if m.set {
+			has |= m.f
+		}
+	}
+	need := allow &^ (fMinTxn | fTimeout | fParams)
+	switch {
+	case has&^allow != 0 || has&need != need:
+		return dst, fmt.Errorf("wire: a request of kind %d carries a field it does not allow or lacks one it needs", k)
+	case strings.IndexByte(c.SQL, 0) >= 0 || !utf8.ValidString(c.SQL):
 		return dst, errors.New("wire: sql must be non-empty valid UTF-8 without U+0000")
 	case len(c.Params) > 0 && len(c.Named) > 0:
 		return dst, errors.New("wire: a request uses params or named, not both")
-	case k == KindDescribe && (len(c.Params) > 0 || len(c.Named) > 0 || c.TimeoutMS != 0):
-		return dst, errors.New("wire: a describe carries sql and min_txn only")
 	case c.MinTxn < 0:
 		return dst, errors.New("wire: min_txn is negative")
 	case c.TimeoutMS < 0 || c.TimeoutMS > math.MaxInt32:
 		return dst, errors.New("wire: timeout_ms is outside 1 to 2^31-1")
+	case c.Seq < 0:
+		return dst, errors.New("wire: seq is outside 1 to 2^63-1")
+	case c.Mode != 0 && c.Mode != ModeWrite && c.Mode != ModeReadOnly:
+		return dst, errors.New("wire: mode is neither write nor read_only")
+	case c.Channel != "" && !validToken(c.Channel):
+		return dst, errors.New("wire: channel is not 1 to 256 characters from A-Z a-z 0-9 . _ -")
 	}
 	o := object{b: append(dst, '{')}
-	o.str("sql", c.SQL)
+	if c.Mode != 0 {
+		o.str("mode", c.Mode.String())
+	}
+	if c.Channel != "" {
+		o.str("channel", c.Channel)
+	}
+	o.optInt("seq", c.Seq)
+	for name, op := range opNames {
+		if op == c.Op {
+			o.str("op", name)
+		}
+	}
+	if c.SQL != "" {
+		o.str("sql", c.SQL)
+	}
 	var err error
 	if len(c.Params) > 0 {
 		o.key("params")
@@ -156,6 +234,11 @@ const (
 	dRowsAffected
 	dLastInsertRowID
 	dParamCount
+	dSeq
+	dTxnState
+	dChannel
+	dCommitted
+	dWrote
 )
 
 // doneRequired lists, for each done kind a Reader reads, the members it must
@@ -163,6 +246,11 @@ const (
 var doneRequired = map[DoneKind]int{
 	DoneQuery:    dTxn | dReadOnly | dRowsAffected | dLastInsertRowID,
 	DoneDescribe: dTxn | dParamCount,
+	DoneOpen:     dTxn | dChannel,
+	DoneBegin:    dSeq | dTxnState | dTxn,
+	DoneExecute:  dSeq | dTxnState | dTxn | dReadOnly | dRowsAffected | dLastInsertRowID,
+	DoneCommit:   dSeq | dTxnState | dTxn | dCommitted | dWrote,
+	DoneRollback: dSeq | dTxnState | dTxn,
 }
 
 // terminalFrameBytes bounds a terminal frame, newline included: ADR 0005
@@ -262,7 +350,7 @@ func (r *Reader) readLine() ([]byte, error) {
 func (r *Reader) frame(first byte) (skip bool, err error) {
 	d := r.p.d
 	if first == '[' {
-		if r.state != stateRows {
+		if r.state != stateRows || r.kind == DoneDescribe {
 			return false, malformed("a row outside the rows of a result")
 		}
 		return false, r.row()
@@ -286,6 +374,9 @@ func (r *Reader) frame(first byte) (skip bool, err error) {
 	case "columns":
 		if r.state != stateStart {
 			return false, malformed("a columns frame after other frames")
+		}
+		if r.kind != DoneQuery && r.kind != DoneExecute && r.kind != DoneDescribe {
+			return false, malformed("a columns frame in this response")
 		}
 		r.f.Kind, err = FrameColumns, r.columnsFrame()
 		r.state, r.columns = stateRows, len(r.f.Columns)
@@ -453,6 +544,9 @@ func (r *Reader) entries(next *int64, key string, entry func() error) error {
 			}
 			n = 0
 			for d.PeekKind() != ']' {
+				if n == maxFrameEntries { // before parsing an entry it would refuse
+					return false, malformed("an entries frame holds 1 to %d entries", maxFrameEntries)
+				}
 				if err := entry(); err != nil {
 					return false, err
 				}
@@ -504,6 +598,29 @@ func (r *Reader) done() error {
 		case "param_count":
 			d.ParamCount, ok, err = r.p.integer(0, math.MaxInt32)
 			seen |= dParamCount
+		case "seq":
+			d.Seq, ok, err = r.p.integer(1, math.MaxInt64)
+			seen |= dSeq
+		case "txn_state":
+			var s string
+			s, ok, err = r.p.str()
+			d.TxnState = TxnState(s)
+			ok = ok && (d.TxnState == TxnNone || d.TxnState == TxnOpen || d.TxnState == TxnAborted)
+			seen |= dTxnState
+		case "channel":
+			d.Channel = &Channel{}
+			ok, err = true, r.channel(d.Channel)
+			seen |= dChannel
+		case "committed":
+			var c bool
+			c, ok, err = r.boolean()
+			ok = ok && c
+			seen |= dCommitted
+		case "wrote":
+			d.Wrote, ok, err = r.boolean()
+			seen |= dWrote
+		case "data_omitted":
+			d.DataOmitted, ok, err = r.boolean()
 		default:
 			return r.skip()
 		}
@@ -521,6 +638,33 @@ func (r *Reader) done() error {
 	}
 	r.f.Done = d
 	return nil
+}
+
+// channel reads an open answer's channel object; it requires the token and
+// the identifier, and skips the limits.
+func (r *Reader) channel(c *Channel) error {
+	err := r.members("channel", func(n string) (ok bool, err error) {
+		switch n {
+		case "token":
+			c.Token, ok, err = r.p.str()
+			ok = ok && validToken(c.Token)
+		case "id":
+			c.ID, ok, err = r.p.str()
+		case "mode":
+			var s string
+			s, ok, err = r.p.str()
+			c.Mode = map[string]Mode{"write": ModeWrite, "read_only": ModeReadOnly}[s]
+		case "epoch":
+			c.Epoch, ok, err = r.p.integer(1, math.MaxInt64)
+		default:
+			return r.skip()
+		}
+		return ok, err
+	})
+	if err == nil && (c.Token == "" || c.ID == "") {
+		err = malformed("the channel lacks its token or id")
+	}
+	return err
 }
 
 func (r *Reader) errorObject() error {
