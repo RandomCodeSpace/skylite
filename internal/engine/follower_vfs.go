@@ -40,6 +40,9 @@ func openReadConn(ctx context.Context, r Reader) (*ReadConn, error) {
 	if err == nil {
 		err = ctx.Err()
 	}
+	if f.readErr != nil {
+		err = f.readErr // SQLite reports a failed read as a bare I/O error
+	}
 	if err != nil {
 		_ = db.Close()
 		vfs.Unregister(name)

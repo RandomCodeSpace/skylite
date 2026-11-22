@@ -35,7 +35,8 @@ type Follower struct {
 
 // Follow starts polling the database under keys' prefix. Before closing
 // the store, cancel ctx, wait on Done and close its ReadConns. Open waits
-// for the initial walk if the follower is still starting. cache may be nil.
+// at most 500 ms for the initial walk, then returns ErrBehind. cache may be
+// nil.
 func Follow(ctx context.Context, st storage.Store, keys format.Keys, cache *Cache) *Follower {
 	f := newFollower(ctx)
 	go f.follow(st, keys, cache)

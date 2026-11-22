@@ -539,3 +539,58 @@ func TestFollowerRefreshFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestFollowerOpenCompacted: an open whose page-1 read meets a compacted
+// pin reports ErrCompacted, not SQLite's bare I/O error.
+func TestFollowerOpenCompacted(t *testing.T) {
+	ctx := t.Context()
+	st, keys, h := corruptFixture(t)
+	f := newFollower(ctx)
+	if err := f.poll(st, keys, nil); err != nil {
+		t.Fatal(err)
+	}
+	pin, err := f.pin(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.commit(12, map[uint32][]byte{1: h.bytes(512), 2: h.bytes(512)})
+	h.compact(7)
+	h.retireAll()
+	h.collect()
+	c, err := openReadConn(ctx, pin)
+	if c != nil {
+		err = c.Run(ctx, func(db *sqlite3.Conn) error { return db.Exec("SELECT count(*) FROM sqlite_schema") })
+		_ = c.Close()
+	}
+	if !errors.Is(err, ErrCompacted) {
+		t.Fatalf("open on a compacted pin lost its cause: %T %v", err, err)
+	}
+}
+
+// TestFollowerShrinkKeepsPin: a published shrink does not rewrite the
+// floors of a reader pinned before it.
+func TestFollowerShrinkKeepsPin(t *testing.T) {
+	ctx := t.Context()
+	st, keys := newStore(t)
+	h := newHistory(t, st.Store, keys, 1, 512, 4)
+	pages := map[uint32][]byte{}
+	for p := uint32(1); p <= 8; p++ {
+		pages[p] = h.bytes(512)
+	}
+	h.commit(8, pages)
+	f := newFollower(ctx)
+	if err := f.poll(st, keys, nil); err != nil {
+		t.Fatal(err)
+	}
+	pin, err := f.pin(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.commit(2, map[uint32][]byte{1: h.bytes(512)})
+	if err := f.poll(st, keys, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.checkReader(ctx, &pin, false); err != nil {
+		t.Fatalf("pin at %d after a published shrink: %v", pin.Txn(), err)
+	}
+}
