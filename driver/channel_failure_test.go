@@ -676,10 +676,10 @@ func frames(write func(*wire.Writer) error) (*http.Response, error) {
 	return &http.Response{StatusCode: 200, Header: http.Header{"Skylite-Protocol": {"1"}}, Body: io.NopCloser(&b)}, nil
 }
 
-// omitted answers every execute after delay with a read-only done frame
-// whose rows were omitted, reporting rows affected, and counts them. A
+// omitted answers every execute after delay with a done frame, read-only
+// as given, whose rows were omitted, reporting rows affected, and counts them. A
 // query is refused with needs_channel.
-func omitted(executes *atomic.Int32, delay time.Duration, state wire.TxnState, rowsAffected int64) roundTripper {
+func omitted(executes *atomic.Int32, delay time.Duration, state wire.TxnState, rowsAffected int64, readOnly bool) roundTripper {
 	return func(r *http.Request) (*http.Response, error) {
 		if strings.HasSuffix(r.URL.Path, "/query") {
 			return frames(func(ww *wire.Writer) error {
@@ -701,7 +701,7 @@ func omitted(executes *atomic.Int32, delay time.Duration, state wire.TxnState, r
 		case <-time.After(delay):
 		}
 		return frames(func(ww *wire.Writer) error {
-			return ww.Done(&wire.Done{Kind: wire.DoneExecute, Seq: int64(n), TxnState: state, Txn: 1, ReadOnly: true, DataOmitted: true, RowsAffected: rowsAffected})
+			return ww.Done(&wire.Done{Kind: wire.DoneExecute, Seq: int64(n), TxnState: state, Txn: 1, ReadOnly: readOnly, DataOmitted: true, RowsAffected: rowsAffected})
 		})
 	}
 }
@@ -719,11 +719,13 @@ func TestReadOnlyReissue(t *testing.T) {
 		rowsAffected int64
 		executes     int32
 		want         error
+		write        bool // the server reports the statement not read-only
 	}{
-		{"after_needs_channel", false, time.Second, 0, 1, ErrResultUnavailable},
-		{"rows_affected", true, time.Second, 1, 1, ErrOutcomeUnknown},
-		{"bounded", true, 0, 0, 1 + reissues, ErrResultUnavailable},
-		{"window", true, resendWindow - 50*time.Millisecond, 0, 1, ErrResultUnavailable},
+		{"after_needs_channel", false, time.Second, 0, 1, ErrResultUnavailable, false},
+		{"rows_affected", true, time.Second, 1, 1, ErrOutcomeUnknown, false},
+		{"bounded", true, 0, 0, 1 + reissues, ErrResultUnavailable, false},
+		{"window", true, resendWindow - 50*time.Millisecond, 0, 1, ErrResultUnavailable, false},
+		{"not_read_only", true, 0, 0, 1, ErrResultUnavailable, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -733,7 +735,7 @@ func TestReadOnlyReissue(t *testing.T) {
 				if tc.inTx {
 					state = wire.TxnOpen
 				}
-				cn := channelConn(t, omitted(&executes, tc.delay, state, tc.rowsAffected))
+				cn := channelConn(t, omitted(&executes, tc.delay, state, tc.rowsAffected, !tc.write))
 				cn.inTx, cn.ch.state = tc.inTx, state
 				start := time.Now()
 				_, err := cn.QueryContext(context.Background(), "insert into t values(1) returning id", nil)
@@ -825,5 +827,9 @@ func TestBackgroundAbandonBounded(t *testing.T) {
 		if n, a := running.Load(), answered.Load(); n != 0 || a != peak.Load() || time.Since(start) > time.Second {
 			t.Fatalf("after Close at %s: %d closes running, %d of %d answered", time.Since(start), n, a, peak.Load())
 		}
+		if n := len(first.c.abandons); n != 0 {
+			t.Fatalf("Close kept %d abandon slots", n)
+		}
+		_ = first.c.Close() // a second Close returns too
 	})
 }

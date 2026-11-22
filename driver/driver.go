@@ -187,7 +187,9 @@ func NewConnector(cfg Config) (*Connector, error) {
 // those channels hold at once, and closes the idle connections of the
 // driver's own HTTP client, never those of a Config.HTTPClient. sql.DB.Close
 // calls it. An HTTP/2 connection a query still uses then closes after its
-// idle timeout, 90 seconds by default.
+// idle timeout, 90 seconds by default. An abandon that starts while Close
+// waits sends nothing. Close must not be called from the token source: an
+// abandon waiting on it holds a slot, so Close would never return.
 func (c *Connector) Close() error {
 	c.closing.Lock()
 	for range abandonLimit { // holding every slot, no abandon runs

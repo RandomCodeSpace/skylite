@@ -38,7 +38,7 @@ func open() (*sql.DB, error) {
 }
 ```
 
-`db.Close()` closes the connector, which waits for the background cancels and closes of abandoned channels still running, up to 5 seconds, so that the server rolls back what those channels hold at once, and closes the idle connections of the driver's own HTTP client. It never closes those of a client passed as `HTTPClient`.
+`db.Close()` closes the connector, which waits for the background cancels and closes of abandoned channels still running, up to 5 seconds when the token source honours its context, so that the server rolls back what those channels hold at once, and closes the idle connections of the driver's own HTTP client. It never closes those of a client passed as `HTTPClient`. An abandon that starts while `Close` waits sends nothing; the server rolls that channel back at its idle limit. A token source must not call `db.Close()`: a `Close` from inside a background abandon never returns.
 
 `db.QueryContext(ctx, "SELECT id, title FROM books WHERE id > ?", 10)`, `db.ExecContext` and `db.BeginTx` then work as with any driver.
 
