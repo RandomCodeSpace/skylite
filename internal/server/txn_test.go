@@ -579,8 +579,9 @@ func TestInvalidRollbackKeepsInvalidCommitEnds(t *testing.T) {
 }
 
 // TestCancelWaiterVsNextRequest: a cancel that waits for its running
-// request answers stale_sequence if the next request is accepted before it
-// takes the channel again. The interleaving is set by hand.
+// request answers with that request's receipt even if the next request is
+// accepted, or has finished, before it takes the channel again. The
+// interleaving is set by hand.
 func TestCancelWaiterVsNextRequest(t *testing.T) {
 	for _, nextFinished := range []bool{false, true} {
 		e, _, tok := newTxnEnv(t, nil)
@@ -588,7 +589,7 @@ func TestCancelWaiterVsNextRequest(t *testing.T) {
 		waiting, fin := make(chan struct{}), make(chan struct{})
 		s.chMu.Lock()
 		ch := d.chans.chans[tok]
-		ch.last, ch.running, ch.receipt, ch.finished = 2, true, nil, fin
+		ch.last, ch.running, ch.receipt, ch.run = 2, true, nil, &completion{finished: fin}
 		ch.cancel = func(error) { close(waiting) }
 		s.chMu.Unlock()
 		type res struct {
@@ -605,17 +606,20 @@ func TestCancelWaiterVsNextRequest(t *testing.T) {
 		<-waiting
 		s.chMu.Lock() // the cancel waits for fin with chMu released
 		ch.running, ch.receipt = false, &wire.Receipt{Done: &wire.Done{Kind: wire.DoneCommit, Seq: 2, Txn: 7, Wrote: true}}
+		ch.run.receipt, ch.run.state = ch.receipt, wire.TxnNone
 		close(fin)
-		ch.last, ch.running, ch.receipt, ch.finished = 3, true, nil, make(chan struct{}) // 3 accepted
+		ch.last, ch.running, ch.receipt, ch.run = 3, true, nil, &completion{finished: make(chan struct{})} // 3 accepted
 		if nextFinished {
 			te := wire.NewError(wire.CodeTimeout, "x").Recorded(false)
 			te.Seq = 3
-			ch.running, ch.receipt = false, &wire.Receipt{Error: te}
+			ch.running, ch.receipt, ch.run.receipt = false, &wire.Receipt{Error: te}, &wire.Receipt{Error: te}
+			close(ch.run.finished)
 		}
 		s.chMu.Unlock()
 		r := <-got
-		if r.p != nil || r.done != nil || r.e == nil || r.e.Code != wire.CodeStaleSequence || r.e.Seq != 2 {
-			t.Errorf("nextFinished=%v: cancel(2) answered %+v, %+v, panic %v; want stale_sequence", nextFinished, r.done, r.e, r.p)
+		if r.p != nil || r.e != nil || r.done == nil || r.done.Kind != wire.DoneCancel || r.done.Seq != 2 || r.done.TxnState != wire.TxnNone ||
+			r.done.Outcome == nil || r.done.Outcome.Done == nil || r.done.Outcome.Done.Kind != wire.DoneCommit || r.done.Outcome.Done.Txn != 7 {
+			t.Errorf("nextFinished=%v: cancel(2) answered %+v, %+v, panic %v; want commit 2's receipt", nextFinished, r.done, r.e, r.p)
 		}
 		s.chMu.Lock()
 		ch.running = false // nothing runs 3
@@ -624,30 +628,41 @@ func TestCancelWaiterVsNextRequest(t *testing.T) {
 }
 
 // TestCloseJoinsRunningTxn: a close that joins a request running in a
-// transaction answers only once the transaction is rolled back; a cancel
-// that joins it answers txn_state none, and a cancel of another number is
-// refused. The running request is set by hand and recorded through record,
+// transaction, and a second close and a cancel that join it too, answer
+// only once the transaction is rolled back and the write lock released; the
+// cancel answers txn_state none, and a cancel of another number is refused. The running request is set by hand and recorded through record,
 // with the pool held so that the rollback cannot finish early.
 func TestCloseJoinsRunningTxn(t *testing.T) {
 	e, _, tok := newTxnEnv(t, nil)
 	s, d, leader := e.s, e.s.dbs["d"], e.leader(t)
 	e.post(t, "channel", "writer", sq(tok, 2, "begin"))
-	interrupted := make(chan struct{}, 2)
+	interrupted := make(chan struct{}, 3)
 	s.chMu.Lock()
 	ch := d.chans.chans[tok]
-	ch.last, ch.running, ch.receipt, ch.finished = 3, true, nil, make(chan struct{})
+	ch.last, ch.running, ch.receipt, ch.run = 3, true, nil, &completion{finished: make(chan struct{})}
 	ch.cancel = func(error) { interrupted <- struct{}{} }
 	s.chMu.Unlock()
 	type res struct {
 		done *wire.Done
 		e    *wire.Error
 	}
-	closed, cancelled := make(chan res, 1), make(chan res, 1)
-	go func() {
+	lockHeld := func() bool {
+		s.chMu.Lock()
+		defer s.chMu.Unlock()
+		return d.chans.lock.held
+	}
+	closed, cancelled := make(chan res, 2), make(chan res, 1)
+	closeChannel := func() {
 		var r res
 		r.done, r.e = s.closeChannel(d, leader, &wire.Request{Channel: tok}, ch.who)
+		if lockHeld() {
+			t.Error("the write lock is held after a close answered")
+		}
 		closed <- r
-	}()
+	}
+	go closeChannel()
+	<-interrupted
+	go closeChannel()
 	<-interrupted
 	if _, er := s.cancelRequest(d, leader, &wire.Request{Channel: tok, Seq: 4}, ch.who, "id"); er == nil || er.Code != wire.CodeChannelLost {
 		t.Errorf("cancel of the next on a closing channel: %+v, want channel_lost", er)
@@ -664,20 +679,21 @@ func TestCloseJoinsRunningTxn(t *testing.T) {
 	s.record(ch, &wire.Receipt{Error: ce}, nil, nil, false, wire.TxnOpen)
 	select {
 	case r := <-closed:
-		t.Errorf("the close answered %+v before the transaction's connection was released", r.done)
+		t.Errorf("a close answered %+v before the transaction's connection was released", r.done)
 		closed <- r
+	case r := <-cancelled:
+		t.Errorf("the joined cancel answered %+v before the transaction's connection was released", r.done)
+		cancelled <- r
 	case <-time.After(200 * time.Millisecond):
 	}
 	s.pool.mu.Unlock()
-	if r := <-cancelled; r.done == nil || r.done.TxnState != wire.TxnNone {
-		t.Errorf("cancel that joined a close: %+v, %+v; want txn_state none", r.done, r.e)
+	if r := <-cancelled; r.done == nil || r.done.TxnState != wire.TxnNone || r.done.Outcome == nil || r.done.Outcome.Error.Code != wire.CodeCancelled || lockHeld() {
+		t.Errorf("cancel that joined a close: %+v, %+v, lock held %t; want txn_state none with 3's receipt, lock released", r.done, r.e, lockHeld())
 	}
-	<-closed
-	s.chMu.Lock()
-	h := d.chans.lock.held
-	s.chMu.Unlock()
-	if h {
-		t.Error("the write lock is held after the close answered")
+	for range 2 {
+		if r := <-closed; r.done == nil || r.done.LastSeq != 3 || r.done.Outcome == nil || r.done.Outcome.Error.Code != wire.CodeCancelled {
+			t.Errorf("close: %+v, %+v; want last_seq 3 with its cancelled receipt", r.done, r.e)
+		}
 	}
 	e.writes(t)
 }
