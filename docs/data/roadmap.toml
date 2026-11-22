@@ -15,7 +15,7 @@ gate = "The storage architecture that follows from it is recorded in decision re
 [[items]]
 title = "Storage interface and four backends"
 status = "planned"
-detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators. So far the interface, its conformance suite, the local filesystem backend, the S3 backend, the Google Cloud Storage backend and the Azure Blob backend exist, each tested against an emulator only: the S3 backend against RustFS, the Google Cloud Storage backend against fake-gcs-server and the Azure Blob backend against Azurite. `skylite serve` can use the local filesystem, S3 and Google Cloud Storage backends; the Azure Blob backend is not wired into the server yet."
+detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators. So far the interface, its conformance suite, the local filesystem backend, the S3 backend, the Google Cloud Storage backend and the Azure Blob backend exist, each tested against an emulator only: the S3 backend against RustFS, the Google Cloud Storage backend against fake-gcs-server and the Azure Blob backend against Azurite. `skylite serve` can use all four backends (local filesystem, S3, Google Cloud Storage and Azure Blob Storage with a shared key; Entra ID is not wired into the server yet)."
 
 [[items]]
 title = "Storage engine: commit log, paged reads, compaction"
@@ -40,7 +40,7 @@ detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio
 [[items]]
 title = "Clients: Go driver, JDBC driver and Hibernate dialect"
 status = "planned"
-detail = "A Go database/sql driver (target: works with GORM) and a JDBC driver with a Hibernate dialect (target: works with Spring Data JPA). Exists now: the Go driver, with queries, prepared statements through describe and ping, autocommit writes and transactions on write channels, resends under the same sequence number, and unknown outcomes reported as such, with a GORM acceptance test against the real server (AutoMigrate, CRUD, associations, transactions, batch create, errors). Not yet: nested GORM transactions (the server refuses savepoints on a channel), read-only transactions, resolve, the JDBC driver and the Hibernate dialect."
+detail = "A Go database/sql driver (target: works with GORM) and a JDBC driver with a Hibernate dialect (target: works with Spring Data JPA). Exists now: the Go driver, with queries, prepared statements through describe and ping, autocommit writes and transactions on write channels, resends under the same sequence number, and unknown outcomes reported as such, with a GORM acceptance test against the real server (AutoMigrate, CRUD, associations, transactions, batch create, errors); and the JDBC driver's read path (queries, prepared statements, result set and parameter metadata, cancel and query timeout), tested against an in-process fake server and against skylite serve with constant SQL. Not yet: nested GORM transactions (the server refuses savepoints on a channel), read-only transactions, resolve, JDBC writes and transactions, the Hibernate dialect, and the Spring Data JPA acceptance suite against skylite."
 
 [[items]]
 title = "Endpoint auth and SQL lockdown"
