@@ -272,8 +272,8 @@ func (s *Server) followerStatement(ctx context.Context, st *stream, f *engine.Fo
 				continue
 			}
 			return nil, followerUnavailable()
-		case errors.Is(ctx.Err(), context.Canceled):
-			return nil, followerUnavailable() // the client went away; not a server fault
+		case errors.Is(ctx.Err(), context.Canceled) && !errors.Is(err, engine.ErrBroken):
+			return nil, followerUnavailable() // the request was cut off: not a fault of this read
 		case errors.Is(ctx.Err(), context.DeadlineExceeded):
 			e = timeoutError(0)
 		default:
