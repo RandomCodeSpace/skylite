@@ -20,6 +20,7 @@ import (
 
 	"github.com/RandomCodeSpace/skylite/internal/engine"
 	"github.com/RandomCodeSpace/skylite/internal/format"
+	"github.com/RandomCodeSpace/skylite/internal/sqlpolicy"
 	"github.com/RandomCodeSpace/skylite/internal/storage"
 )
 
@@ -614,9 +615,17 @@ func TestReplayDataOmitted(t *testing.T) {
 	if r := post(ex(tok, 4, "INSERT INTO t VALUES (1)")); r.done()["data_omitted"] != nil {
 		t.Errorf("replay without frames %v", r.frames)
 	}
-	post(ex(tok, 5, "INSERT INTO nope VALUES (1)"))
-	if r := post(ex(tok, 5, "INSERT INTO nope VALUES (1)")); r.code() != "sql_error" || r.err()["data_omitted"] != nil {
+	// A failure's receipt keeps its message within the error message bound.
+	failed := ex(tok, 5, "INSERT INTO nope"+strings.Repeat("x", 3000)+" VALUES (1)")
+	post(failed)
+	if r := post(failed); r.code() != "sql_error" || r.err()["data_omitted"] != nil {
 		t.Errorf("failure replay %v", r.frames)
+	}
+	e.s.chMu.Lock()
+	m := e.s.dbs["d"].chans.chans[tok].receipt.Error.Message
+	e.s.chMu.Unlock()
+	if len(m) > 1024 || !strings.Contains(m, "no such table") {
+		t.Errorf("recorded message of %d bytes: %.40q", len(m), m)
 	}
 	// The pod's replay budget full: dropped too.
 	e.s.chMu.Lock()
@@ -638,6 +647,9 @@ func TestBehindOnDeposedLeader(t *testing.T) {
 	e, _ := newChanEnv(t, nil)
 	tok := e.open(t, "writer")
 	e.post(t, "channel", "writer", ex(tok, 1, "CREATE TABLE t (a)"))
+	if a := e.post(t, "channel", "writer", ex(tok, 2, "UPDATE t SET a = 1 WHERE 0", "min_txn", e.leader(t).Head())); a.done() == nil {
+		t.Errorf("min_txn at the head: %d %v, want served", a.status, a.frames)
+	}
 	keys, _ := e.s.cfg.Storage.keys("d")
 	// The usurper's clock is past the lease, so it takes office; this
 	// server learns it only at its next renewal.
@@ -648,7 +660,7 @@ func TestBehindOnDeposedLeader(t *testing.T) {
 	if e.s.dbs["d"].leader() == nil {
 		t.Fatal("the server already left office")
 	}
-	body := ex(tok, 2, "UPDATE t SET a = 1 WHERE 0", "min_txn", o.Head)
+	body := ex(tok, 3, "UPDATE t SET a = 1 WHERE 0", "min_txn", o.Head)
 	before, _ := e.chState(tok)
 	a := e.post(t, "channel", "writer", body)
 	if a.status != http.StatusServiceUnavailable || a.code() != "behind" || a.err()["not_executed"] != true || a.err()["final"] != false {
@@ -658,7 +670,7 @@ func TestBehindOnDeposedLeader(t *testing.T) {
 		t.Errorf("behind changed the channel: %+v", after)
 	}
 	// The same number is still free; a write on the deposed leader is fenced.
-	a = e.post(t, "channel", "writer", ex(tok, 2, "INSERT INTO t VALUES (1)"))
+	a = e.post(t, "channel", "writer", ex(tok, 3, "INSERT INTO t VALUES (1)"))
 	if a.status != 200 || a.code() != "commit_failed" || a.err()["final"] != true || a.err()["not_executed"] != true {
 		t.Errorf("fenced write: %d %v, want a recorded commit_failed", a.status, a.frames)
 	}
@@ -930,7 +942,7 @@ func TestUnsupportedOpsAndPing(t *testing.T) {
 }
 
 func TestIdleChannelEnds(t *testing.T) {
-	e, _ := newChanEnv(t, func(e *env) { e.s.limits.ChannelIdleMS, e.s.chl.sweep = 1000, 20*time.Millisecond })
+	e, hs := newChanEnv(t, func(e *env) { e.s.limits.ChannelIdleMS, e.s.chl.sweep = 1000, 20*time.Millisecond })
 	a := e.post(t, "channels", "writer", `{"mode":"write"}`)
 	c, _ := a.done()["channel"].(map[string]any)
 	if l, _ := c["limits"].(map[string]any); num(l, "channel_idle_ms") != 1000 {
@@ -938,15 +950,40 @@ func TestIdleChannelEnds(t *testing.T) {
 	}
 	tok := c["token"].(string)
 	tk := e.sig.token(t, "writer")
-	for range 3 { // a request in time keeps it
-		time.Sleep(300 * time.Millisecond)
-		if a, err := e.send("channel", tk, fmt.Sprintf(`{"channel":%q,"seq":1,"op":"ping"}`, tok)); err != nil || a.status != 200 {
-			t.Fatalf("%d %v %v", a.status, a.frames, err)
+	// Any request in time keeps it: the first is accepted, then replays and
+	// refusals.
+	for i := range 6 {
+		time.Sleep(400 * time.Millisecond)
+		seq, status := 1, 200
+		if i%2 == 1 {
+			seq, status = 3, http.StatusConflict
 		}
+		if a, err := e.send("channel", tk, fmt.Sprintf(`{"channel":%q,"seq":%d,"op":"ping"}`, tok, seq)); err != nil || a.status != status {
+			t.Fatalf("request %d: %d %v %v", i, a.status, a.frames, err)
+		}
+	}
+	// A request running past the idle limit keeps its channel.
+	e.post(t, "channel", "writer", fmt.Sprintf(`{"channel":%q,"seq":2,"op":"execute","sql":"CREATE TABLE t (a)"}`, tok))
+	g, release := hs.hold()
+	defer release()
+	run := e.postAsync(t, "channel", "writer", ex(tok, 3, "INSERT INTO t VALUES (1)"))
+	g.wait(t)
+	time.Sleep(1300 * time.Millisecond)
+	release()
+	if r := <-run; r.done() == nil {
+		t.Fatalf("the long write: %v", r.frames)
+	}
+	if _, ok := e.chState(tok); !ok {
+		t.Fatal("the channel ended while its request ran")
 	}
 	e.waitChan(t, tok, func(_ state, ok bool) bool { return !ok })
 	if a := e.post(t, "channel", "writer", fmt.Sprintf(`{"channel":%q,"seq":1,"op":"ping"}`, tok)); a.code() != "channel_lost" {
 		t.Errorf("after the idle limit: %v", a.frames)
+	}
+	e.s.chMu.Lock()
+	defer e.s.chMu.Unlock()
+	if e.s.nChans != 0 {
+		t.Errorf("%d channels counted after the idle end", e.s.nChans)
 	}
 }
 
@@ -1080,5 +1117,153 @@ func stopInUpload(t *testing.T, e *env, hs *holdStore, unknown bool) {
 	defer e.s.chMu.Unlock()
 	if tb.chans[a] != nil || e.s.nChans != 0 {
 		t.Errorf("channels left: %d; want none once the request ended", e.s.nChans)
+	}
+}
+
+// TestCommittedThenFailed: a write that fails after its commit is answered
+// with that commit, and a panic after acceptance ends the channel with
+// channel_lost, not_executed false, leaving nothing running, held or
+// locked.
+func TestCommittedThenFailed(t *testing.T) {
+	var mode atomic.Int32
+	e, _ := newChanEnv(t, func(e *env) {
+		e.s.afterCommit = func() error {
+			switch mode.Load() {
+			case 1:
+				return fmt.Errorf("%w: injected after COMMIT", sqlpolicy.ErrBroken)
+			case 2:
+				panic("injected after COMMIT")
+			}
+			return nil
+		}
+	})
+	db := e.dbID(t)
+	tok := e.open(t, "writer")
+	e.post(t, "channel", "writer", ex(tok, 1, "CREATE TABLE t (a)"))
+	head := int64(e.leader(t).Head()) //nolint:gosec // small
+	mode.Store(1)
+	body := ex(tok, 2, "INSERT INTO t VALUES (1) RETURNING a")
+	a := e.post(t, "channel", "writer", body)
+	if a.status != 200 || num(a.done(), "txn") != head+1 || len(a.rows()) != 1 {
+		t.Fatalf("committed, then failed: %d %v, want done at %d with its row", a.status, a.frames, head+1)
+	}
+	if r := e.post(t, "channel", "writer", body); frameText(r) != frameText(a) {
+		t.Errorf("replay %v, want %v", r.frames, a.frames)
+	}
+	if c := e.post(t, "channel/close", "writer", closeBody(tok)); c.status != 200 || num(c.done(), "last_seq") != 2 {
+		t.Errorf("close: %d %v", c.status, c.frames)
+	}
+	mode.Store(2)
+	tok2 := e.open(t, "writer")
+	a = e.post(t, "channel", "writer", ex(tok2, 1, "INSERT INTO t VALUES (2)"))
+	mode.Store(0)
+	if a.status != 200 || a.code() != "channel_lost" || a.err()["not_executed"] != false || num(a.err(), "seq") != 1 {
+		t.Errorf("panic after the commit: %d %v, want channel_lost, not_executed false", a.status, a.frames)
+	}
+	if _, ok := e.chState(tok2); ok {
+		t.Error("the channel stayed in the table")
+	}
+	if c := e.post(t, "channel/close", "writer", closeBody(tok2)); c.code() != "channel_lost" {
+		t.Errorf("close after the panic: %v", c.frames)
+	}
+	// The write lock was released: another channel writes.
+	tok3 := e.open(t, "writer")
+	if r := e.post(t, "channel", "writer", ex(tok3, 1, "INSERT INTO t VALUES (3)")); r.done() == nil {
+		t.Errorf("a write after the panic: %v", r.frames)
+	}
+	hdrs := e.commits(t, db)
+	if n, m := withID(hdrs, wantID(tok, 2)), withID(hdrs, wantID(tok2, 1)); n != 1 || m != 1 {
+		t.Errorf("commits %d and %d, want one each", n, m)
+	}
+	if got := e.count(t, "SELECT group_concat(a) FROM t"); got != `["1,2,3"]` {
+		t.Errorf("rows %s", got)
+	}
+	e.s.chMu.Lock()
+	defer e.s.chMu.Unlock()
+	if e.s.held != 0 || e.s.nChans != 1 || e.s.dbs["d"].chans.lock.held {
+		t.Errorf("held %d, channels %d, lock held %v; want 0, 1, false", e.s.held, e.s.nChans, e.s.dbs["d"].chans.lock.held)
+	}
+}
+
+// TestRacingFirstDeliveries: copies of one request that arrive together
+// execute once.
+func TestRacingFirstDeliveries(t *testing.T) {
+	e, _ := newChanEnv(t, nil)
+	db := e.dbID(t)
+	tok := e.open(t, "writer")
+	e.post(t, "channel", "writer", ex(tok, 1, "CREATE TABLE t (a)"))
+	tk := e.sig.token(t, "writer")
+	for seq := int64(2); seq <= 6; seq++ {
+		body := ex(tok, seq, "INSERT INTO t VALUES (1)")
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Go(func() {
+				r, err := e.send("channel", tk, body)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if r.done() == nil && r.code() != "in_flight" && r.code() != "overloaded" {
+					t.Errorf("seq %d: %d %v", seq, r.status, r.frames)
+				}
+			})
+		}
+		wg.Wait()
+		if n := withID(e.commits(t, db), wantID(tok, uint64(seq))); n != 1 { //nolint:gosec // small
+			t.Fatalf("seq %d: %d commits, want one", seq, n)
+		}
+	}
+	if got := e.count(t, "SELECT count(*) FROM t"); got != "[5]" {
+		t.Errorf("rows %s, want 5", got)
+	}
+}
+
+func TestChannelTimeoutMS(t *testing.T) {
+	e, _ := newChanEnv(t, nil)
+	tok := e.open(t, "writer")
+	e.post(t, "channel", "writer", ex(tok, 1, "CREATE TABLE t (a)"))
+	start := time.Now()
+	a := e.post(t, "channel", "writer", ex(tok, 2, "INSERT INTO t "+cpuBound, "timeout_ms", 300))
+	if d := time.Since(start); a.status != 200 || a.code() != "timeout" || a.err()["final"] != true || a.err()["not_executed"] != true || d > 5*time.Second {
+		t.Errorf("%d %v after %v, want a recorded timeout after 300 ms", a.status, a.frames, d)
+	}
+}
+
+// TestLockGrantedAsWaitEnds: a waiter granted the write lock as its wait
+// ends passes the lock on.
+func TestLockGrantedAsWaitEnds(t *testing.T) {
+	s := &Server{chl: defaultChLimits()}
+	tb := &table{lock: writeLock{by: map[string]int{}}}
+	queued := func() bool {
+		s.chMu.Lock()
+		if len(tb.lock.queue) == 1 {
+			return true // chMu stays held
+		}
+		s.chMu.Unlock()
+		return false
+	}
+	for range 50 {
+		if err := s.acquire(context.Background(), tb, "a"); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		got := make(chan error, 1)
+		go func() { got <- s.acquire(ctx, tb, "b") }()
+		for !queued() {
+			time.Sleep(time.Millisecond)
+		}
+		// Grant the lock and end the wait together.
+		cancel()
+		s.releaseLocked(tb)
+		s.chMu.Unlock()
+		if err := <-got; err == nil {
+			s.release(tb) // the waiter took the lock
+		}
+		s.chMu.Lock()
+		held, n := tb.lock.held, len(tb.lock.queue)
+		s.chMu.Unlock()
+		if held || n != 0 {
+			t.Fatalf("lock held %v with %d waiting after the waiter left", held, n)
+		}
 	}
 }

@@ -125,6 +125,7 @@ type Server struct {
 	nChans       int   // channels on this server, ended but unsettled ones included
 	held, replay int64 // held result rows, retained replay data
 	chl          chLimits
+	afterCommit  func() error // nil; a test sets it to fail a write after its COMMIT
 
 	bodyMu              sync.Mutex
 	bodyUsed, bodyShare int64            // request bodies' share of the memory budget, charged at 8 × Content-Length

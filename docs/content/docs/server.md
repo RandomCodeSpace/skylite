@@ -99,7 +99,7 @@ Then the request is accepted: its sequence number and the SHA-256 digest of its 
 
 ### An autocommit write
 
-An `execute` waits for the database's write lock, then runs on its own fresh connection: `BEGIN IMMEDIATE`, the statement under [0007's SQL policy](/docs/decisions/0007-sql-policy/), then `COMMIT`, or `ROLLBACK` after any failure, so that a failed write leaves nothing, also under SQLite's `FAIL` conflict action. The connection is closed after it. Transaction control is refused as for `query`. Every `execute` takes the write lock, a read included; `read_only` in its answer is SQLite's read-only test.
+An `execute` waits for the database's write lock, then runs on its own fresh connection: `BEGIN IMMEDIATE`, the statement under [0007's SQL policy](/docs/decisions/0007-sql-policy/), then `COMMIT`, or `ROLLBACK` after any failure, so that a failed write leaves nothing, also under SQLite's `FAIL` conflict action. The connection is closed after it. Transaction control is refused as for `query`. Every `execute` takes the write lock, a read included; `read_only` in its answer is SQLite's read-only test. A read's rows are held like a write's, so a read on a channel returns at most the held-result bound, 1 MiB, and larger results need `query`.
 
 The write's commit carries the commit identifier of 0005: the first 16 bytes of SHA-256 of the whole channel token, then the sequence number as 8 bytes, big-endian. The bearer token never enters it. A write that changes no page, such as an update that matches no rows, creates no commit, and its `txn` is the head it ran on.
 
@@ -107,7 +107,7 @@ The write's commit carries the commit identifier of 0005: the first 16 bytes of 
 |---|---|
 | Write lock wait, first in, first out (recorded `busy`) | 5 seconds |
 | Writers waiting for the lock, per database, and per database and principal (recorded `busy`) | 64 and 16 |
-| Statement time, from acceptance's last check to the commit point, the lock wait included (recorded `timeout`) | 30 seconds; `timeout_ms` lowers it |
+| Statement time, from before check 5 (the watermark and the fresh connection) to the commit point, the lock wait included (recorded `timeout`) | 30 seconds; `timeout_ms` lowers it |
 | Held result: the columns and rows of a write, kept back until its commit has an outcome, per request and per server (recorded `result_too_large`, nothing committed) | 1 MiB and 64 MiB |
 
 No row of a write reaches the client before its commit has an outcome. A write's outcome maps to its answer like this; every recorded failure has `final: true` and `not_executed: true`:
@@ -120,18 +120,19 @@ No row of a write reaches the client before its commit has an outcome. A write's
 | The connection broke (stack overflow, its memory ceiling) | Recorded `internal`; the engine discards the connection |
 | Unknown | `commit_outcome_unknown`, `not_executed: false`, not recorded; the server stops serving the database |
 | The leader stopped under the write without committing it | `channel_lost`, `not_executed: false`, not recorded; the channel has ended |
+| The server failed after acceptance (a defect: a panic in its own code) | `channel_lost`, `not_executed: false`, not recorded; the channel has ended, and its write lock and held rows are released |
 
 A client that drops its connection cancels nothing: the write runs on, and its outcome is recorded for a resend to replay.
 
 ### Receipts and replay
 
-Each channel keeps the receipt of its last request: its terminal frame, with an error's own request id. A resend of that request with an identical body gets the frames its response had before the terminal one, if they were kept, then the receipt. They are kept only for a success, up to 64 KiB, and while the server's and the database's retained data, 32 MiB each, have room; otherwise the replay is the receipt alone, with `data_omitted: true` when the response had frames. Kept data is released when the channel accepts its next request or ends.
+Each channel keeps the receipt of its last request: its terminal frame, with an error's own request id. A resend of that request with an identical body gets the frames its response had before the terminal one, if they were kept, then the receipt. They are kept only for a success, up to 64 KiB, and while the server's and the database's retained data, 32 MiB each, have room (0005 allows 256 MiB per server when the memory budget has room; this server keeps 32 MiB, within its channel share); otherwise the replay is the receipt alone, with `data_omitted: true` when the response had frames. Kept data is released when the channel accepts its next request or ends. A recorded error keeps at most 1,024 bytes of its message, the error message bound.
 
 ### Closing and ending
 
 A close needs the `read` role and the channel's principal. A channel with nothing running ends at once. One with a request running becomes closing: the request is interrupted through its connection, which before its commit point records `cancelled`, and the close is answered once the request has finished and its outcome is recorded, so a close never answers before a running commit's outcome. A second close joins the first. The answer carries `last_seq` and that request's receipt.
 
-A channel also ends when it has been idle for 10 minutes (the channel idle limit, checked every second), and when its leader stops or leaves office. A request that runs when the leader stops keeps its channel in the table, ended but unsettled, until it has finished. Every request on an ended channel gets `channel_lost`.
+A channel also ends when it has been idle for 10 minutes (the channel idle limit, checked every second; idle time runs from the end of one request to the arrival of the next, a replay or a refusal included, and never while a request runs), and when its leader stops or leaves office. A request that runs when the leader stops keeps its channel in the table, ended but unsettled, until it has finished. Every request on an ended channel gets `channel_lost`.
 
 ### Maintenance, the tail bound and a stopping leader
 

@@ -304,7 +304,7 @@ func replayed(ch *channel) (*wire.Done, *wire.Error, []byte) {
 
 // channelRequest serves a sequenced request on d, which leader leads; body
 // is its exact body and id its request id.
-func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, leader *engine.Leader, req *wire.Request, body []byte, who, id string, log *slog.Logger) (*wire.Done, *wire.Error) {
+func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, leader *engine.Leader, req *wire.Request, body []byte, who, id string, log *slog.Logger) (_ *wire.Done, lostErr *wire.Error) {
 	t := s.table(d, leader)
 	if t == nil {
 		return nil, wire.NewError(wire.CodeNotServing, "the leader stopped serving the database")
@@ -314,10 +314,11 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 	// s.chMu held, or the refusal.
 	check := func() (*channel, verdict, *wire.Error) {
 		ch, e := s.lookup(t, req.Channel, who)
-		switch {
-		case e != nil:
+		if e != nil {
 			return nil, refuse, e
-		case ch.closing:
+		}
+		ch.idle = time.Now() // idle time runs to the next request's arrival (ADR 0005)
+		if ch.closing {
 			return nil, refuse, owned(wire.NewError(wire.CodeChannelLost, "the channel is closing"), ch, seq)
 		}
 		switch req.Op {
@@ -393,16 +394,38 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 	ch.cancel = cancel
 	s.chMu.Unlock()
 	defer cancel(nil)
+	// A panic after acceptance must not leave the channel running: it ends
+	// it, as a request whose outcome is not known here.
+	settled := false
+	defer func() {
+		if settled {
+			return
+		}
+		p := recover()
+		if p == nil {
+			return
+		}
+		log.LogAttrs(ctx, slog.LevelError, "channel request panicked", slog.Any("panic", p))
+		l := owned(wire.NewError(wire.CodeChannelLost, "the request failed after acceptance and may have committed; the channel has ended"), ch, seq)
+		l.NotExecuted = false
+		s.record(ch, nil, l, nil)
+		e := *l
+		lostErr = &e
+	}()
 	st.start() // accepted: status 200 whatever follows
 
 	var rec *wire.Receipt
 	var lost *wire.Error
 	var held *heldRows
+	if req.Op == wire.OpExecute {
+		held = &heldRows{s: s, limit: s.limits.HeldResultBytes}
+	}
+	defer held.free()
 	switch e := req.Validate(); {
 	case e != nil:
 		rec = &wire.Receipt{Error: e.Recorded(false)}
 	case req.Op == wire.OpExecute:
-		rec, held, lost = s.execute(rctx, d, t, c, req, deadline, limit, who, log)
+		rec, lost = s.execute(rctx, d, t, c, req, held, deadline, limit, who, log)
 		c = nil
 	case req.Op == wire.OpPing:
 		rec = &wire.Receipt{Done: &wire.Done{Kind: wire.DoneRollback, Txn: int64(leader.Head())}} //nolint:gosec // as in openChannel
@@ -412,7 +435,6 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 	if c != nil {
 		s.pool.release(who, c, false)
 	}
-	defer held.free()
 	var data []byte
 	if held != nil {
 		data = held.b.Bytes()
@@ -426,6 +448,7 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 		owned(rec.Error, ch, seq).RequestID = id
 	}
 	s.record(ch, rec, lost, data)
+	settled = true
 	if lost != nil {
 		e := *lost
 		return nil, &e
@@ -450,6 +473,9 @@ func (s *Server) record(ch *channel, rec *wire.Receipt, lost *wire.Error, data [
 		ch.lost = lost
 		ch.ended = true
 	} else {
+		if rec.Error != nil {
+			rec.Error.Message = wire.CutMessage(rec.Error.Message, int(s.limits.ErrorMessageBytes))
+		}
 		ch.receipt, ch.frames = rec, len(data) > 0
 		n := int64(len(data))
 		t := ch.t
@@ -626,9 +652,10 @@ func (h *heldRows) free() {
 }
 
 // execute runs an accepted execute as an autocommit write on c, a fresh
-// connection it closes, within limit from now. It returns the receipt and
-// the held frames, or the unrecorded error that ends the channel.
-func (s *Server) execute(ctx context.Context, d *database, t *table, c *pconn, req *wire.Request, deadline time.Time, limit time.Duration, who string, log *slog.Logger) (*wire.Receipt, *heldRows, *wire.Error) {
+// connection it closes, within limit from now, holding its frames in held,
+// which it empties unless the write committed or changed nothing. It
+// returns the receipt, or the unrecorded error that ends the channel.
+func (s *Server) execute(ctx context.Context, d *database, t *table, c *pconn, req *wire.Request, held *heldRows, deadline time.Time, limit time.Duration, who string, log *slog.Logger) (*wire.Receipt, *wire.Error) {
 	defer s.pool.release(who, c, false) // never reused after a write (ADR 0005 decision 6)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -639,16 +666,15 @@ func (s *Server) execute(ctx context.Context, d *database, t *table, c *pconn, r
 	switch {
 	case err == nil:
 	case errors.Is(context.Cause(ctx), errClosed):
-		return recorded(wire.NewError(wire.CodeCancelled, "cancelled by close before it ran")), nil, nil
+		return recorded(wire.NewError(wire.CodeCancelled, "cancelled by close before it ran")), nil
 	case ctx.Err() != nil:
-		return recorded(timeoutError(limit)), nil, nil
+		return recorded(timeoutError(limit)), nil
 	case errors.Is(err, errWaiters):
-		return recorded(wire.NewError(wire.CodeBusy, "too many writers are waiting for the write lock")), nil, nil
+		return recorded(wire.NewError(wire.CodeBusy, "too many writers are waiting for the write lock")), nil
 	default:
-		return recorded(wire.NewError(wire.CodeBusy, fmt.Sprintf("the write lock was not granted within %d ms", s.limits.LockWaitMS))), nil, nil
+		return recorded(wire.NewError(wire.CodeBusy, fmt.Sprintf("the write lock was not granted within %d ms", s.limits.LockWaitMS))), nil
 	}
 	defer s.release(t)
-	held := &heldRows{s: s, limit: s.limits.HeldResultBytes}
 	var done *wire.Done
 	var e *wire.Error
 	var snap uint64
@@ -664,39 +690,39 @@ func (s *Server) execute(ctx context.Context, d *database, t *table, c *pconn, r
 			log.LogAttrs(ctx, slog.LevelWarn, "write committed, then failed", slog.String("class", engineClass(err)))
 		}
 		done.Txn = int64(txn) //nolint:gosec // as in openChannel
-		return &wire.Receipt{Done: done}, held, nil
+		return &wire.Receipt{Done: done}, nil
 	case err == nil:
 		done.Txn = int64(snap) //nolint:gosec // as above; the write changed no page
-		return &wire.Receipt{Done: done}, held, nil
+		return &wire.Receipt{Done: done}, nil
 	}
 	held.free() // nothing committed: no row is sent
 	switch {
 	case errors.Is(err, engine.ErrUnknown):
 		log.LogAttrs(ctx, slog.LevelError, "write outcome unknown", slog.String("class", engineClass(err)))
-		return nil, nil, wire.NewError(wire.CodeCommitOutcomeUnknown, "the commit's outcome is unknown; the server stopped serving the database; resolve the request")
+		return nil, wire.NewError(wire.CodeCommitOutcomeUnknown, "the commit's outcome is unknown; the server stopped serving the database; resolve the request")
 	case errors.Is(err, engine.ErrTooLarge):
-		return recorded(wire.NewError(wire.CodeCommitFailed, "the transaction is too large for one commit or for the leader's local WAL bound")), nil, nil
+		return recorded(wire.NewError(wire.CodeCommitFailed, "the transaction is too large for one commit or for the leader's local WAL bound")), nil
 	case errors.Is(err, engine.ErrFenced):
-		return recorded(wire.NewError(wire.CodeCommitFailed, "the leader was fenced by another leader's epoch")), nil, nil
+		return recorded(wire.NewError(wire.CodeCommitFailed, "the leader was fenced by another leader's epoch")), nil
 	case errors.Is(err, engine.ErrTailBound), errors.Is(err, engine.ErrRetry):
-		return recorded(s.engineError(d, t.leader, err)), nil, nil
+		return recorded(s.engineError(d, t.leader, err)), nil
 	case errors.Is(err, engine.ErrBroken):
 		log.LogAttrs(ctx, slog.LevelError, "write failed", slog.String("class", engineClass(err)))
-		return recorded(wire.NewError(wire.CodeInternal, "the connection broke and was discarded")), nil, nil
+		return recorded(wire.NewError(wire.CodeInternal, "the connection broke and was discarded")), nil
 	case errors.Is(err, engine.ErrStopped), t.leader.Err() != nil:
 		// The leader stopped: the channel has ended, and nothing is recorded.
 		l := wire.NewError(wire.CodeChannelLost, "the leader stopped serving the database while the request ran; it did not commit")
 		l.NotExecuted = false
-		return nil, nil, l
+		return nil, l
 	case errors.Is(context.Cause(ctx), errClosed):
-		return recorded(wire.NewError(wire.CodeCancelled, "cancelled by close before its commit point")), nil, nil
+		return recorded(wire.NewError(wire.CodeCancelled, "cancelled by close before its commit point")), nil
 	case e != nil:
-		return recorded(e), nil, nil
+		return recorded(e), nil
 	case ctx.Err() != nil:
-		return recorded(timeoutError(limit)), nil, nil
+		return recorded(timeoutError(limit)), nil
 	}
 	log.LogAttrs(ctx, slog.LevelError, "write failed", slog.String("class", engineClass(err)))
-	return recorded(wire.NewError(wire.CodeInternal, "the write failed")), nil, nil
+	return recorded(wire.NewError(wire.CodeInternal, "the write failed")), nil
 }
 
 // write runs inside the Run of an execute: BEGIN IMMEDIATE, the client's
@@ -749,6 +775,9 @@ func (s *Server) write(db *sqlite3.Conn, c *pconn, leader *engine.Leader, req *w
 	if err == nil {
 		err = c.pc.Privileged(func(db *sqlite3.Conn) error { return db.Exec("COMMIT") })
 	}
+	if err == nil && s.afterCommit != nil {
+		err = s.afterCommit()
+	}
 	if err == nil {
 		return done, nil, nil
 	}
@@ -764,7 +793,7 @@ func (s *Server) write(db *sqlite3.Conn, c *pconn, leader *engine.Leader, req *w
 		berr = fmt.Errorf("%w: rollback failed", engine.ErrBroken)
 	}
 	if berr != nil {
-		return nil, e, berr
+		return done, e, berr
 	}
-	return nil, e, errEnded
+	return done, e, errEnded
 }
