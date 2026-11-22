@@ -173,3 +173,10 @@ java-fault-check:
 .PHONY: java-config-check
 java-config-check:
 	python3 clients/java/acceptance/config-check.py
+
+# JDBC driver (clients/java/driver): unit tests against an in-process fake server, then
+# the integration test, which builds cmd/skylite with Go and queries a real skylite serve.
+# Needs a JDK, Maven and Go.
+.PHONY: jdbc-driver
+jdbc-driver:
+	mvn -B -ntp -f clients/java/driver/pom.xml verify

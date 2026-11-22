@@ -55,6 +55,7 @@ targets select Go 1.26.11 unless `GOTOOLCHAIN` is already set.
 | `make integration-gcs`  | fake-gcs-server in Docker, then the `gcs` backend's tests, its conformance suite and the server's tests against it |
 | `make java-acceptance`  | JPA acceptance suite against sqlite-jdbc (needs a JDK and Maven)                        |
 | `make java-fault-check` | checks that the acceptance suite catches injected driver faults (needs a JDK and Maven) |
+| `make jdbc-driver`      | the JDBC driver's unit tests, then its integration test against `skylite serve` built with Go (needs a JDK, Maven and Go) |
 
 Run `make check` before opening a pull request. `make integration` needs
 Docker; it picks a free local port and removes its Azurite container when it
