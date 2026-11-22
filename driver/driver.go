@@ -2,10 +2,15 @@
 // client protocol of ADR 0005 (docs/content/docs/decisions/0005-client-protocol.md)
 // over HTTPS, with bearer tokens as ADR 0006 requires.
 //
-// This version serves reads only: statements outside a transaction that
-// the server's stateless query endpoint accepts as pure reads. A statement
-// that needs a write channel fails with ErrWritesUnsupported, and BeginTx
-// fails with ErrTransactionsUnsupported. Nothing is retried.
+// A query outside a transaction goes to the server's stateless query
+// endpoint; one the server refuses there as not a pure read, every Exec,
+// and every statement of a transaction go on the connection's write
+// channel, which the driver opens on first use. A request on a channel
+// whose response is lost is sent again with the same sequence number and
+// the same body, which the server answers from its record: that is the
+// protocol's replay, and the driver retries nothing else. An outcome the
+// driver cannot learn is an error matching ErrOutcomeUnknown, never a
+// success, and the connection is then discarded.
 //
 // Open a database with a Connector, which carries the token source:
 //
@@ -32,6 +37,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -102,12 +108,14 @@ func refuseRedirect(*http.Request, []*http.Request) error { return errRedirect }
 // watermark of ADR 0005 decision 5, shared by every connection of the
 // sql.DB that uses it.
 type Connector struct {
-	query, describe string // request URLs
-	token           TokenSource
-	client          *http.Client
-	timeoutMS       int64
-	own             bool         // client is the driver's own, not Config.HTTPClient
-	watermark       atomic.Int64 // the highest txn seen
+	base, db  string // the endpoint, without a trailing /, and the database
+	token     TokenSource
+	client    *http.Client
+	timeoutMS int64
+	own       bool          // client is the driver's own, not Config.HTTPClient
+	watermark atomic.Int64  // the highest txn seen
+	abandons  chan struct{} // abandonLater's slots
+	closing   sync.Mutex    // serialises Close's wait for every slot
 }
 
 // NewConnector validates cfg and returns a Connector. It sends nothing.
@@ -163,10 +171,10 @@ func NewConnector(cfg Config) (*Connector, error) {
 		client.Transport = t
 	}
 	client.CheckRedirect = refuseRedirect
-	base := strings.TrimRight(u.Scheme+"://"+u.Host+u.EscapedPath(), "/")
 	return &Connector{
-		query:     base + wire.Path(wire.KindQuery, cfg.Database),
-		describe:  base + wire.Path(wire.KindDescribe, cfg.Database),
+		abandons:  make(chan struct{}, abandonLimit),
+		base:      strings.TrimRight(u.Scheme+"://"+u.Host+u.EscapedPath(), "/"),
+		db:        cfg.Database,
 		token:     cfg.Token,
 		client:    &client,
 		timeoutMS: cfg.StatementTimeout.Milliseconds(),
@@ -174,10 +182,23 @@ func NewConnector(cfg Config) (*Connector, error) {
 	}, nil
 }
 
-// Close closes the idle connections of the driver's own HTTP client, never
-// those of a Config.HTTPClient. sql.DB.Close calls it. An HTTP/2 connection
-// a query still uses then closes after its idle timeout, 90 seconds by default.
+// Close waits for the cancels and closes of abandoned channels still
+// running, each bounded by abandonWait, so that the server releases what
+// those channels hold at once, and closes the idle connections of the
+// driver's own HTTP client, never those of a Config.HTTPClient. sql.DB.Close
+// calls it. An HTTP/2 connection a query still uses then closes after its
+// idle timeout, 90 seconds by default. An abandon that starts while Close
+// waits sends nothing. Close must not be called from the token source: an
+// abandon waiting on it holds a slot, so Close would never return.
 func (c *Connector) Close() error {
+	c.closing.Lock()
+	for range abandonLimit { // holding every slot, no abandon runs
+		c.abandons <- struct{}{}
+	}
+	for range abandonLimit {
+		<-c.abandons
+	}
+	c.closing.Unlock()
 	if c.own {
 		c.client.CloseIdleConnections()
 	}
@@ -185,7 +206,8 @@ func (c *Connector) Close() error {
 }
 
 // Connect returns a connection. It sends nothing: every request is a
-// separate HTTP request on the Connector's client.
+// separate HTTP request on the Connector's client, and the connection's
+// write channel is opened by its first request that needs one.
 func (c *Connector) Connect(context.Context) (driver.Conn, error) { return &conn{c: c}, nil }
 
 // Driver returns Driver{}.
@@ -211,15 +233,30 @@ var ErrNoDSN = errors.New("skylite: a DSN cannot carry a token source; use NewCo
 // Open returns ErrNoDSN. It never echoes the DSN.
 func (Driver) Open(string) (driver.Conn, error) { return nil, ErrNoDSN }
 
-// ErrWritesUnsupported is matched, with errors.Is, by the error of a
-// statement the server refused with needs_channel: one that is not a pure
-// read. This driver version has no write channels. It wraps
-// errors.ErrUnsupported.
-var ErrWritesUnsupported = fmt.Errorf("skylite: writes are not supported in this driver version: %w", errors.ErrUnsupported)
+// ErrOutcomeUnknown is matched, with errors.Is, by the *Error of a request
+// on a write channel whose outcome the driver could not learn: it may or
+// may not have taken effect, a commit included. Do not run it again
+// without checking. The error also matches the context's error when the
+// caller's context ended, and ErrTransactionLost when the request was a
+// statement inside a transaction. It never matches driver.ErrBadConn.
+var ErrOutcomeUnknown = errors.New("skylite: the outcome of the request is unknown")
 
-// ErrTransactionsUnsupported is BeginTx's error: this driver version has no
-// channels, so no transactions. It wraps errors.ErrUnsupported.
-var ErrTransactionsUnsupported = fmt.Errorf("skylite: transactions are not supported in this driver version: %w", errors.ErrUnsupported)
+// ErrTransactionLost is matched by the *Error of every statement and the
+// commit of a transaction whose channel was lost or abandoned: nothing is
+// sent for them, the transaction never commits, and its Rollback succeeds.
+var ErrTransactionLost = errors.New("skylite: the transaction was lost with its channel and will not commit")
+
+// ErrResultUnavailable is matched by the *Error of a request whose
+// response was lost and whose rows the server could not keep for its
+// replay. Committed reports whether it was an autocommit write, which
+// committed; inside a transaction, the statement's effects are in the
+// transaction, which stays open.
+var ErrResultUnavailable = errors.New("skylite: the request ran but its result is unavailable")
+
+// ErrReadOnlyUnsupported is BeginTx's error for a read-only transaction:
+// the server serves no read-only channels yet. It wraps
+// errors.ErrUnsupported.
+var ErrReadOnlyUnsupported = fmt.Errorf("skylite: read-only transactions are not supported by this server version: %w", errors.ErrUnsupported)
 
 // Code is an ADR 0005 error code. The list is closed in protocol version 1;
 // an Error may still carry a code outside it from a newer server.
@@ -260,33 +297,61 @@ const (
 	CodeInternal             = wire.CodeInternal
 )
 
-// Error is an error the server answered: ADR 0005's error object. Use
-// errors.As to read it. Zero fields were absent.
+// Error is an error the server answered, ADR 0005's error object, or the
+// driver's error for an outcome it could not learn (ErrOutcomeUnknown),
+// a lost transaction (ErrTransactionLost) or a lost result
+// (ErrResultUnavailable), which errors.Is matches. Use errors.As to read
+// it. Zero fields were absent; Code is empty when no server answer gave one.
 type Error struct {
 	Code               Code
 	NotExecuted        bool // this delivery had no effect
 	Final              bool // this answer is the request's settled outcome
 	Message            string
 	RequestID          string
+	ChannelID          string // the write channel's identifier, not its token
+	Seq                int64  // the request's sequence number on the channel
 	SQLiteCode         int64
 	SQLiteExtendedCode int64
 	Txn                int64
 	Epoch              int64
+	Cause              string // "maintenance" on a transaction_aborted that maintenance caused
+
+	committed bool
+	is        []error // the sentinels and the context's error it matches
 }
 
 func (e *Error) Error() string {
-	return fmt.Sprintf("skylite: %s: %s (request %s)", e.Code, e.Message, e.RequestID)
+	s := "skylite: "
+	if e.Code != "" {
+		s += string(e.Code) + ": "
+	}
+	s += e.Message
+	if e.RequestID != "" {
+		s += " (request " + e.RequestID + ")"
+	}
+	if e.ChannelID != "" {
+		s += fmt.Sprintf(" (channel %s, seq %d)", e.ChannelID, e.Seq)
+	}
+	return s
 }
 
-// serverError converts an error frame. needs_channel also matches
-// ErrWritesUnsupported.
-func serverError(we *wire.Error) error {
-	e := &Error{
+// Unwrap returns the sentinels and the context's error that e matches.
+func (e *Error) Unwrap() []error { return e.is }
+
+// Committed reports, for an error matching ErrResultUnavailable, whether
+// the request committed.
+func (e *Error) Committed() bool { return e.committed }
+
+// Retryable reports whether the transaction can be run again from its
+// start: maintenance ended it, and nothing of it committed (ADR 0005
+// decision 9).
+func (e *Error) Retryable() bool { return e.Code == CodeTransactionAborted && e.Cause == "maintenance" }
+
+// serverError converts an error frame.
+func serverError(we *wire.Error) *Error {
+	return &Error{
 		Code: we.Code, NotExecuted: we.NotExecuted, Final: we.Final, Message: we.Message, RequestID: we.RequestID,
-		SQLiteCode: we.SQLiteCode, SQLiteExtendedCode: we.SQLiteExtendedCode, Txn: we.Txn, Epoch: we.Epoch,
+		ChannelID: we.ChannelID, Seq: we.Seq, SQLiteCode: we.SQLiteCode, SQLiteExtendedCode: we.SQLiteExtendedCode,
+		Txn: we.Txn, Epoch: we.Epoch, Cause: we.Cause,
 	}
-	if e.Code == CodeNeedsChannel {
-		return fmt.Errorf("%w: %w", ErrWritesUnsupported, e)
-	}
-	return e
 }

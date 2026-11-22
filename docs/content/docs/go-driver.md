@@ -1,13 +1,13 @@
 ---
 title: Go driver
-description: The Go database/sql driver's read path, which is all it has in this version, how to configure it, and what it does not do yet.
+description: The Go database/sql driver, which reads through the stateless query endpoint and writes and runs transactions on write channels, how to configure it, how it reports outcomes it cannot learn, and what it does not do yet.
 weight: 20
 status: current
 ---
 
-Package `github.com/RandomCodeSpace/skylite/driver`, whose package name is `skylite`, is a Go `database/sql` driver that speaks the protocol of [0005: Client protocol](/docs/decisions/0005-client-protocol/) over HTTPS. This version has the read path only: statements outside a transaction that the server accepts as pure reads.
+Package `github.com/RandomCodeSpace/skylite/driver`, whose package name is `skylite`, is a Go `database/sql` driver that speaks the protocol of [0005: Client protocol](/docs/decisions/0005-client-protocol/) over HTTPS. Queries outside a transaction go to the stateless `query` endpoint; writes and transactions go on a [write channel](/docs/server/#write-channels) that each connection opens on first use.
 
-The [server](/docs/server/) answers `query` and `describe` on the databases it leads, and now accepts autocommit writes and transactions on write channels, but this driver does not send them yet: its write path is a separate piece of work. The driver's own tests run against an in-process fake server built from the protocol's codec, and no test yet runs the driver against the real server.
+The driver's unit tests run against an in-process fake server built from the protocol's codec. An acceptance test, the module `driver/acceptance`, runs GORM through its sqlite dialector on this driver against `skylite serve` built from the same tree; CI runs it on every pull request.
 
 ## Usage
 
@@ -38,9 +38,23 @@ func open() (*sql.DB, error) {
 }
 ```
 
-`db.Close()` closes the connector, which closes the idle connections of the driver's own HTTP client. It never closes those of a client passed as `HTTPClient`.
+`db.Close()` closes the connector, which waits for the background cancels and closes of abandoned channels still running, up to 5 seconds when the token source honours its context, so that the server rolls back what those channels hold at once, and closes the idle connections of the driver's own HTTP client. It never closes those of a client passed as `HTTPClient`. An abandon that starts while `Close` waits sends nothing; the server rolls that channel back at its idle limit. A token source must not call `db.Close()`: a `Close` from inside a background abandon never returns.
 
-`db.QueryContext(ctx, "SELECT id, title FROM books WHERE id > ?", 10)` then works as with any driver.
+`db.QueryContext(ctx, "SELECT id, title FROM books WHERE id > ?", 10)`, `db.ExecContext` and `db.BeginTx` then work as with any driver.
+
+### GORM
+
+GORM's sqlite dialector accepts an existing `*sql.DB`, so GORM runs on this driver unchanged:
+
+```go
+db, err := gorm.Open(sqlite.Dialector{Conn: sqlDB}, &gorm.Config{})
+```
+
+The acceptance test runs `gorm.io/gorm` v1.31.2 with `gorm.io/driver/sqlite` v1.6.0, built without cgo, so the dialector's own SQLite driver is never used. It covers `AutoMigrate`, create, read, update, soft and hard delete, associations (has one, has many, belongs to, many to many, preloading and joins), `Transaction` commit and rollback, a nested `Transaction` rolled back to its savepoint, `Begin` and `Rollback`, `CreateInBatches` and errors: a unique violation, a missing record, a missing table, a statement the SQL policy forbids.
+
+GORM's error translation does not know skylite's errors: with `TranslateError` on, a unique violation stays a `*skylite.Error` (code `sql_error`, SQLite code 19) rather than `gorm.ErrDuplicatedKey`, and an unknown outcome passes through untranslated.
+
+**A cancelled `Create` can lose `ErrOutcomeUnknown` in GORM.** GORM runs `Create` in a transaction of its own unless `SkipDefaultTransaction` is set. When the context ends after the `INSERT` was sent, the driver returns an error matching `skylite.ErrOutcomeUnknown` and `context.Canceled`, and `database/sql` rolls the transaction back because the context ended. If that rollback runs before GORM's cleanup, GORM's own `Rollback` gets `sql.ErrTxDone` from `database/sql`, and GORM v1.31.2 joins the two errors with `fmt.Errorf("%v; %w")`: the unknown outcome survives only in the error's text, and `errors.Is` matches `sql.ErrTxDone` alone. The driver cannot prevent it, because `database/sql` returns `sql.ErrTxDone` without calling the driver. The acceptance test `TestCancelledCreate` forces that ordering and checks this behaviour, so a GORM upgrade that changes it fails the test. To keep `errors.Is(err, skylite.ErrOutcomeUnknown)` on a cancelled create, set `SkipDefaultTransaction: true`, which makes a single-row `Create` one autocommit write; the same test checks that it then matches both `skylite.ErrOutcomeUnknown` and `context.Canceled`.
 
 ## Configuration
 
@@ -61,11 +75,34 @@ The driver is registered for `sql.Open` as `"skylite"`, but a DSN cannot carry a
 
 ## What works
 
-- **Queries.** `QueryContext`, `QueryRowContext` and `ExecContext` send the statement to the stateless `query` endpoint. Rows are decoded as their frames arrive, never buffered whole. `Rows.Close` before the end releases the response, and a cancelled context aborts the request. `ExecContext` of a read returns the server's row count and last row id.
-- **Prepared statements.** `PrepareContext` sends `describe`: the server compiles the statement, executes nothing and reports its parameter count, which `database/sql` then checks. Each execution of the statement sends its SQL again; there are no server-side handles.
+- **Queries.** `QueryContext` and `QueryRowContext` outside a transaction send the statement to the stateless `query` endpoint. Rows are decoded as their frames arrive, never buffered whole. `Rows.Close` before the end releases the response, and a cancelled context aborts the request. A statement the server answers with `needs_channel`, because it is not a pure read, such as an `INSERT ... RETURNING`, is sent on the write channel instead; the server executed nothing the first time.
+- **Writes.** `ExecContext` runs the statement on the connection's write channel: outside a transaction, an autocommit write of one statement. `RowsAffected` and `LastInsertId` are the server's `rows_affected` and `last_insert_rowid`. An `ExecContext` of a read also goes on the channel, and takes the database's write lock there.
+- **Transactions.** `BeginTx` sends `begin` on the write channel; every statement of the transaction, queries included, then goes on the channel, and `Commit` and `Rollback` send `commit` and `rollback`. Every isolation level that SQLite's serializable isolation satisfies is accepted and served at serializable; `sql.LevelLinearizable` and values outside `database/sql`'s levels are refused, and so is a read-only transaction, with `skylite.ErrReadOnlyUnsupported`, because the server has no read-only channels yet. Nothing is sent for a refused `BeginTx`. `Commit` and `Rollback` take no context, so the driver bounds each by 60 seconds. A statement that fails inside a transaction leaves it as the server reports it: open, or aborted, in which case every request but `rollback` fails with `transaction_aborted`. When `Commit` or `Rollback` ends with the server's transaction possibly still open or aborted, because the request failed before it was sent (a token source error, say) or the commit was answered `transaction_aborted`, the driver closes the channel, waiting up to 5 seconds, which rolls back what the server holds, and discards the connection, so that the next borrower never runs inside that transaction. `Commit` and `Rollback` return the original error.
+- **Channel results.** A request on a channel is settled before any of its rows reach `database/sql`: the driver reads the whole answer before it returns, up to the `result_bytes` limit the channel's open answer advertised; an answer above it is treated as malformed. An autocommit `execute` returns at most the server's held-result bound, 1 MiB, of rows. `ExecContext` reads and drops the rows of its answer. A request body above the channel's advertised `request_body_bytes` is refused before it is sent or given a sequence number.
+- **Prepared statements.** `PrepareContext` outside a transaction sends `describe`: the server compiles the statement, executes nothing and reports its parameter count, which `database/sql` then checks. Inside a transaction it sends nothing and the count is unknown, because a stateless describe cannot see the transaction's schema changes. Each execution of the statement sends its SQL again; there are no server-side handles.
 - **Ping.** `PingContext` describes `SELECT 1`, the cheapest request any pod serves without a channel. It checks the endpoint, the token and the database. Because a describe is refused during maintenance, a ping then fails with `maintenance`, which is not `driver.ErrBadConn`.
 - **Parameters.** Positional (`?`) or named (`sql.Named("t", v)` for `:t`, `@t` or `$t`), not both in one statement.
-- **Read-your-writes.** Each `sql.DB` keeps the highest transaction number its answers have reported and sends it as `min_txn` with every request.
+- **Read-your-writes.** Each `sql.DB` keeps the highest transaction number its answers have reported and sends it as `min_txn` with every stateless request, every `begin` and every autocommit `execute`.
+
+## Write channels
+
+Each connection holds at most one write channel. It opens it with its first write, `begin`, or query that the server sends on, and closes it in `Close`, which waits up to 5 seconds for the close's answer. An open answer must carry a write channel: its identifier, mode, epoch and limits; otherwise the request fails before anything is sent on it. A channel that has had no answer for more than 60 seconds, or whose next sequence number would pass 2^62, is replaced before its next use outside a transaction, as [0005's reopening rule](/docs/decisions/0005-client-protocol/#resolving-a-request-after-its-channel-is-lost) and its sequence bound ask; the old channel is closed in the background, so its close never holds up the request. The server ends a channel idle for 10 minutes.
+
+Every request on the channel carries the next sequence number. When a delivery gets no settled answer, because of a transport error, a cut or malformed response, a response without the protocol marker, an answer for another sequence number, or a refusal before acceptance such as `in_flight` or `overloaded`, the driver sends the same body again with the same sequence number, after 100 ms, then doubling up to 2 s. That is the protocol's replay: the server runs a sequence number at most once and answers a resend with the recorded outcome. One bound of 60 seconds covers the whole request, even with a context that has no deadline: the token source, every delivery and the reading of every response body. A caller's context that ends before the first delivery returns the context's error, and nothing is sent.
+
+A `begin` or autocommit `execute` refused with `behind` is the one request the driver moves: it closes the channel, and when the close's answer shows a last accepted sequence number below the request's, which proves it was never accepted, it opens a new channel and sends the request there, within the same 60 seconds. A close that proves nothing leaves the request on its channel, resent as above. A caller's context that ends before the move returns the context's error. The driver retries nothing else.
+
+| Answer | What the driver returns |
+|---|---|
+| A `done` frame | The result |
+| An error with `final: true`, the request's recorded outcome, naming the request's channel and sequence number | The `*skylite.Error`. `NotExecuted` says whether it had no effect; inside a transaction a failed statement has `NotExecuted` false, whatever its code |
+| `channel_lost` or `commit_outcome_unknown`, even marked final; the caller's context ending after the request may have been sent; 60 seconds without a settled answer; or a receipt that contradicts the request: a `done` whose `txn_state` is not the one the operation leaves (`open` after `begin` and a statement in a transaction, `none` otherwise), or a final error without the request's sequence number and channel identifier or with a `txn_state` the operation cannot leave; or a read-only `done` with rows affected | A `*skylite.Error` matching `skylite.ErrOutcomeUnknown` |
+| A replay whose rows the server could not keep, for a read-only statement of a transaction with no rows affected | Nothing: the driver sends the statement again under a new sequence number, after 100 ms, then 200 ms and 400 ms, at most 3 times within the same 60 seconds, and returns that answer. When the tries run out, a pause would pass the 60 seconds or the caller's context ends, a `*skylite.Error` matching `skylite.ErrResultUnavailable`, and the context's error when it ended; the transaction stays open |
+| A replay whose rows the server could not keep, for a write, or for a statement outside a transaction (one the `query` endpoint refused with `needs_channel`) | A `*skylite.Error` matching `skylite.ErrResultUnavailable`; nothing is sent again. `Committed()` is true for an autocommit write and false otherwise |
+
+An unknown outcome is never reported as a success and never as `driver.ErrBadConn`. Its error carries the code of the last answer, if any, the channel's identifier (never its token), the sequence number and the epoch, and also matches the context's error when the caller's context ended, and `skylite.ErrTransactionLost` when the request was a statement inside a transaction. The driver then abandons the channel: in the background it sends `cancel` for the request, within 2.5 seconds, and `close` for the channel, within the rest of 5 seconds, and nothing but `db.Close()` waits for them. At most 8 such abandons run at once per connector; with none free the driver sends nothing, and the server ends the channel, rolling back what it holds, at its idle limit. The connection is discarded: `IsValid` returns false and `ResetSession` returns `driver.ErrBadConn`, so `database/sql` closes it instead of reusing it, and any later use of it through a `*sql.Conn` fails before anything is sent. The server's `resolve` does not exist yet, so the driver cannot settle a lost write after the fact.
+
+**A lost transaction.** After an unknown outcome inside a transaction, every later statement of it and its `Commit` fail at once with an error matching `skylite.ErrTransactionLost`, and nothing is sent; the transaction never commits, because its `commit` is never sent and the server rolls it back when the channel closes or the transaction's idle limit, 30 seconds, passes. Its `Rollback` returns nil, as does a `Rollback` whose own outcome is unknown, for the same reason. A `Commit` whose outcome is unknown matches `skylite.ErrOutcomeUnknown`: it may have committed.
 
 ## Values
 
@@ -83,18 +120,19 @@ A column's type name is its declared type as SQLite reads it: without the argume
 
 ## Errors
 
-An error the server answered is a `*skylite.Error`, read with `errors.As`. It carries the protocol's `Code` (constants `skylite.CodeBusy` and so on), the `NotExecuted` and `Final` flags, the message, the request ID and, when SQLite produced the error, its codes.
+An error the server answered is a `*skylite.Error`, read with `errors.As`. It carries the protocol's `Code` (constants `skylite.CodeBusy` and so on), the `NotExecuted` and `Final` flags, the message, the request ID, the `Cause` and, when SQLite produced the error, its codes. `Retryable()` is true for a `transaction_aborted` with cause `maintenance`: maintenance ended the transaction, nothing of it committed, and it can be run again from its start.
 
 | Error | When |
 |---|---|
-| `skylite.ErrWritesUnsupported` | The server answered `needs_channel`: the statement is not a pure read. The error also matches the `*skylite.Error` and `errors.ErrUnsupported`. |
-| `skylite.ErrTransactionsUnsupported` | `BeginTx`, read-only transactions included. Nothing is sent. |
-| `driver.ErrBadConn` | Only a connection that was already closed, before anything is sent. Every failure after a request may have been sent returns the real error, so `database/sql` never runs a request again on its own. |
+| `skylite.ErrOutcomeUnknown`, `skylite.ErrTransactionLost`, `skylite.ErrResultUnavailable` | See [Write channels](#write-channels). Each is matched by a `*skylite.Error` |
+| `skylite.ErrReadOnlyUnsupported` | `BeginTx` of a read-only transaction. Nothing is sent. It also matches `errors.ErrUnsupported`. |
+| `driver.ErrBadConn` | Only a connection that was already closed or discarded, before anything is sent. Every failure after a request may have been sent returns the real error, so `database/sql` never runs a request again on its own. A failed channel open returns the real error too. |
 | A body that ends early | An error wrapping `io.ErrUnexpectedEOF`, never a short result. |
 | A frame above the driver's bound | An error. The driver reads a frame of at most 64 MiB plus its newline, the default result limit, and a terminal frame of at most 4 KiB. A server configured with a larger result limit can send a row the driver refuses. |
 
 ## Not yet
 
-- Writes and transactions. The server has write channels with replay for autocommit writes and transactions; the driver does not use them yet, and the server's `resolve` does not exist yet.
-- Retries. The driver sends each request once; a read refused before acceptance, such as `overloaded` or `not_serving`, is returned to the caller.
-- GORM. No GORM test has been run.
+- `resolve`. The server does not serve it, so a write or commit whose channel was lost stays unknown. The driver does not settle a request it gave up on through the `close` answer either: it reports it unknown. Only a `behind` refusal is settled through a close.
+- Batches, read-only transactions and describe inside a transaction: the server does not serve them on a channel yet.
+- Retries of stateless requests. The driver sends each `query` and `describe` once; one refused before acceptance, such as `overloaded` or `not_serving`, is returned to the caller.
+- The reopening rule on the open head, which replaces a channel opened too far below the pool's watermark: it matters only to `resolve`.
