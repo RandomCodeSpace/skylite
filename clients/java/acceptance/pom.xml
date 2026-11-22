@@ -18,11 +18,12 @@
   <name>skylite JPA acceptance suite</name>
 
   <properties>
-    <java.version>25</java.version>
+    <java.version>21</java.version>
     <flight-sql-jdbc.version>19.0.0</flight-sql-jdbc.version>
     <!-- Overridable with -Djdbc.url=... -Djdbc.driver=... -Djdbc.dialect=... -->
     <jdbc.dialect>org.hibernate.community.dialect.SQLiteDialect</jdbc.dialect>
     <jdbc.argLine></jdbc.argLine>
+    <unsafe.argLine></unsafe.argLine>
   </properties>
 
   <dependencies>
@@ -66,6 +67,18 @@
   </build>
 
   <profiles>
+    <!-- On Java 25 the Flight SQL driver's shaded Netty otherwise refuses sun.misc.Unsafe and the allocator
+         fails. Java 21 does not know the flag and will not start with it, so it is set from Java 23 only. -->
+    <profile>
+      <id>unsafe-memory-access</id>
+      <activation>
+        <jdk>[23,)</jdk>
+      </activation>
+      <properties>
+        <unsafe.argLine>--sun-misc-unsafe-memory-access=allow</unsafe.argLine>
+      </properties>
+    </profile>
+
     <!-- Baseline: the reference SQLite JDBC driver on a file in target/. -->
     <profile>
       <id>sqlite</id>
@@ -91,9 +104,8 @@
       <properties>
         <jdbc.url>jdbc:arrow-flight-sql://127.0.0.1:31337?useEncryption=false</jdbc.url>
         <jdbc.driver>org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver</jdbc.driver>
-        <!-- The driver documents the first flag. The second is needed on Java 25, where the
-             driver's shaded Netty otherwise refuses sun.misc.Unsafe and the allocator fails. -->
-        <jdbc.argLine>--add-opens=java.base/java.nio=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow</jdbc.argLine>
+        <!-- The driver documents this flag; unsafe-memory-access adds the one Java 25 needs. -->
+        <jdbc.argLine>--add-opens=java.base/java.nio=ALL-UNNAMED ${unsafe.argLine}</jdbc.argLine>
       </properties>
       <dependencies>
         <dependency>
