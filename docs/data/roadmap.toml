@@ -35,12 +35,12 @@ detail = "Followers read pages from object storage on demand through a read-only
 [[items]]
 title = "HTTPS query API and sessions"
 status = "planned"
-detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, database creation (PUT), the stateless query and describe requests on the leader for pure reads, and write channels on the leader: open, close, and autocommit writes and ping on a channel, with sequence numbers, receipts and replay, so that a resent write never runs twice. Not yet: transactions, cancel, batch, read-only channels, resolve, admission control, forwarding."
+detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, database creation (PUT), the stateless query and describe requests on the leader for pure reads, and write channels on the leader: open, close, cancel, autocommit writes, ping and transactions (begin, commit, rollback, the aborted state and the transaction timers) on a channel, with sequence numbers, receipts and replay, so that a resent write never runs twice. Not yet: batch, read-only channels, resolve, admission control, forwarding."
 
 [[items]]
 title = "Clients: Go driver, JDBC driver and Hibernate dialect"
 status = "planned"
-detail = "A Go database/sql driver (target: works with GORM) and a JDBC driver with a Hibernate dialect (target: works with Spring Data JPA). Exists now: the Go driver's read path (queries, prepared statements through describe, ping), tested against an in-process fake server only; the server now answers queries and accepts writes on channels, but no test runs the driver against it yet, and the driver sends no writes. Not yet: writes, transactions, GORM, the JDBC driver and the Hibernate dialect."
+detail = "A Go database/sql driver (target: works with GORM) and a JDBC driver with a Hibernate dialect (target: works with Spring Data JPA). Exists now: the Go driver's read path (queries, prepared statements through describe, ping), tested against an in-process fake server only; the server now answers queries and accepts writes and transactions on channels, but no test runs the driver against it yet, and the driver sends no writes. Not yet: writes, transactions, GORM, the JDBC driver and the Hibernate dialect."
 
 [[items]]
 title = "Endpoint auth and SQL lockdown"

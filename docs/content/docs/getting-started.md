@@ -1,11 +1,11 @@
 ---
 title: Getting started
-description: Install the skylite binary, check its version, and run the server, which creates databases, answers queries and runs autocommit writes on channels.
+description: Install the skylite binary, check its version, and run the server, which creates databases, answers queries and runs autocommit writes and transactions on channels.
 weight: 10
 status: current
 ---
 
-skylite is pre-alpha. The binary prints its version and its help text, and `skylite serve` runs a server that authenticates requests, creates databases in object storage, answers read-only SQL queries on the databases it leads, and runs autocommit writes sent on write channels. It has no transactions yet. This page covers everything that works today.
+skylite is pre-alpha. The binary prints its version and its help text, and `skylite serve` runs a server that authenticates requests, creates databases in object storage, answers read-only SQL queries on the databases it leads, and runs autocommit writes and transactions sent on write channels. This page covers everything that works today.
 
 ## Install with Go
 
@@ -38,7 +38,7 @@ make build
 
 ## Run the server
 
-`skylite serve -config skylite.json` starts the server. The [server page](/docs/server/) describes the configuration file, the requests it serves (creating a database, `query` and `describe` for pure reads, and write channels for autocommit writes) and how to try it on a local directory.
+`skylite serve -config skylite.json` starts the server. The [server page](/docs/server/) describes the configuration file, the requests it serves (creating a database, `query` and `describe` for pure reads, and write channels for autocommit writes and transactions) and how to try it on a local directory.
 
 ## What comes next
 

@@ -283,7 +283,7 @@ func (s *Server) run(db *sqlite3.Conn, c *pconn, req *wire.Request, st *stream) 
 			return nil
 		}
 		st.start() // the statement started executing: status 200
-		if err := bind(req, stmt); err != nil {
+		if err := bind(req, req.Args, stmt); err != nil {
 			return err
 		}
 		if len(cols) > 0 {
@@ -402,13 +402,13 @@ func columns(stmt *sqlite3.Stmt) []wire.Column {
 	return cols
 }
 
-// bind binds the request's arguments, every parameter exactly once.
-func bind(req *wire.Request, stmt *sqlite3.Stmt) error {
+// bind binds a's arguments of req, every parameter exactly once.
+func bind(req *wire.Request, a wire.Args, stmt *sqlite3.Stmt) error {
 	names := make([]string, stmt.BindCount())
 	for i := range names {
 		names[i] = stmt.BindName(i + 1)
 	}
-	return req.Bind(req.Args, names, func(i int, v any) error {
+	return req.Bind(a, names, func(i int, v any) error {
 		switch v := v.(type) {
 		case nil:
 			return stmt.BindNull(i)

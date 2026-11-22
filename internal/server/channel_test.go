@@ -926,7 +926,7 @@ func TestUnsupportedOpsAndPing(t *testing.T) {
 	op := func(seq int64, op string) answer {
 		return e.post(t, "channel", "writer", fmt.Sprintf(`{"channel":%q,"seq":%d,"op":%q}`, tok, seq, op))
 	}
-	for _, o := range []string{"begin", "describe"} {
+	for _, o := range []string{"batch", "describe"} {
 		if a := op(1, o); a.status != http.StatusServiceUnavailable || a.code() != "not_serving" {
 			t.Errorf("%s: %d %v", o, a.status, a.frames)
 		}
@@ -942,10 +942,11 @@ func TestUnsupportedOpsAndPing(t *testing.T) {
 	if a := op(3, "ping"); a.status != 200 || num(a.done(), "txn") != int64(e.leader(t).Head()) || a.done()["txn_state"] != "none" || num(a.done(), "seq") != 3 { //nolint:gosec // small
 		t.Errorf("ping: %d %v", a.status, a.frames)
 	}
-	for _, path := range []string{"channel/cancel", "resolve"} {
-		if a := e.post(t, path, "writer", fmt.Sprintf(`{"channel":%q,"seq":4}`, tok)); a.code() != "not_serving" {
-			t.Errorf("%s: %v", path, a.frames)
-		}
+	if a := e.post(t, "resolve", "writer", fmt.Sprintf(`{"channel":%q,"seq":4}`, tok)); a.code() != "not_serving" {
+		t.Errorf("resolve: %v", a.frames)
+	}
+	if a := e.post(t, "channel/cancel", "writer", fmt.Sprintf(`{"channel":%q,"seq":1,"x":%q}`, tok, strings.Repeat("a", 4100))); a.status != http.StatusRequestEntityTooLarge {
+		t.Errorf("a cancel body over 4 KiB: %d %v", a.status, a.frames)
 	}
 	if a := e.post(t, "channel/close", "writer", fmt.Sprintf(`{"channel":%q,"x":%q}`, tok, strings.Repeat("a", 4100))); a.status != http.StatusRequestEntityTooLarge {
 		t.Errorf("a close body over 4 KiB: %d %v", a.status, a.frames)
