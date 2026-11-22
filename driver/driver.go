@@ -37,6 +37,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -111,11 +112,10 @@ type Connector struct {
 	token     TokenSource
 	client    *http.Client
 	timeoutMS int64
-	own       bool         // client is the driver's own, not Config.HTTPClient
-	watermark atomic.Int64 // the highest txn seen
-	ctx       context.Context
-	stop      context.CancelFunc // ends ctx, and with it every cancel and close abandon sends
-	abandons  chan struct{}      // abandonLater's slots
+	own       bool          // client is the driver's own, not Config.HTTPClient
+	watermark atomic.Int64  // the highest txn seen
+	abandons  chan struct{} // abandonLater's slots
+	closing   sync.Mutex    // serialises Close's wait for every slot
 }
 
 // NewConnector validates cfg and returns a Connector. It sends nothing.
@@ -171,9 +171,8 @@ func NewConnector(cfg Config) (*Connector, error) {
 		client.Transport = t
 	}
 	client.CheckRedirect = refuseRedirect
-	ctx, stop := context.WithCancel(context.Background())
 	return &Connector{
-		ctx: ctx, stop: stop, abandons: make(chan struct{}, abandonLimit),
+		abandons:  make(chan struct{}, abandonLimit),
 		base:      strings.TrimRight(u.Scheme+"://"+u.Host+u.EscapedPath(), "/"),
 		db:        cfg.Database,
 		token:     cfg.Token,
@@ -183,12 +182,21 @@ func NewConnector(cfg Config) (*Connector, error) {
 	}, nil
 }
 
-// Close ends the cancels and closes of abandoned channels still running,
-// and closes the idle connections of the driver's own HTTP client, never
-// those of a Config.HTTPClient. sql.DB.Close calls it. An HTTP/2 connection
-// a query still uses then closes after its idle timeout, 90 seconds by default.
+// Close waits for the cancels and closes of abandoned channels still
+// running, each bounded by abandonWait, so that the server releases what
+// those channels hold at once, and closes the idle connections of the
+// driver's own HTTP client, never those of a Config.HTTPClient. sql.DB.Close
+// calls it. An HTTP/2 connection a query still uses then closes after its
+// idle timeout, 90 seconds by default.
 func (c *Connector) Close() error {
-	c.stop()
+	c.closing.Lock()
+	for range abandonLimit { // holding every slot, no abandon runs
+		c.abandons <- struct{}{}
+	}
+	for range abandonLimit {
+		<-c.abandons
+	}
+	c.closing.Unlock()
 	if c.own {
 		c.client.CloseIdleConnections()
 	}

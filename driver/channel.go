@@ -348,11 +348,11 @@ func (c *Connector) abandonLater(token string, seq int64) {
 
 // abandon cancels sequence number seq of the channel of token, unless seq
 // is 0, then closes the channel. The cancel may take half of abandonWait,
-// and the close the rest; Connector.Close ends both. Their answers change
-// nothing the driver reports, so they are not read.
+// and the close the rest; Connector.Close waits for both. Their answers
+// change nothing the driver reports, so they are not read.
 func (c *Connector) abandon(token string, seq int64) {
 	post := func(kind wire.Kind, call *wire.Call, by time.Time) {
-		ctx, cancel := context.WithDeadline(c.ctx, by)
+		ctx, cancel := context.WithDeadline(context.Background(), by)
 		defer cancel()
 		body, err := wire.AppendCall(nil, kind, call)
 		if err != nil {

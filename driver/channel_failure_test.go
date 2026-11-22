@@ -779,11 +779,12 @@ func TestCancelAfterProvenBehind(t *testing.T) {
 }
 
 // TestBackgroundAbandonBounded replaces many idle channels against a server
-// whose close never answers: at most abandonLimit closes run at once, and
-// Connector.Close ends them.
+// whose close answers after a second: at most abandonLimit closes run at
+// once, and Connector.Close waits for them to be answered instead of
+// cancelling them, which would leave the server holding what they hold.
 func TestBackgroundAbandonBounded(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		var running, peak atomic.Int32
+		var running, peak, answered atomic.Int32
 		first := channelConn(t, func(r *http.Request) (*http.Response, error) {
 			switch {
 			case strings.HasSuffix(r.URL.Path, "/close"):
@@ -791,8 +792,13 @@ func TestBackgroundAbandonBounded(t *testing.T) {
 				defer running.Add(-1)
 				for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
 				}
-				<-r.Context().Done()
-				return nil, r.Context().Err()
+				select {
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				case <-time.After(time.Second):
+				}
+				answered.Add(1)
+				return frames(func(ww *wire.Writer) error { return ww.Done(&wire.Done{Kind: wire.DoneClose}) })
 			case strings.HasSuffix(r.URL.Path, "/channel"):
 				return frames(func(ww *wire.Writer) error {
 					return ww.Done(&wire.Done{Kind: wire.DoneExecute, Seq: 1, TxnState: wire.TxnNone, Txn: 1})
@@ -816,9 +822,8 @@ func TestBackgroundAbandonBounded(t *testing.T) {
 			t.Fatalf("%d closes ran at once; want at most %d", p, abandonLimit)
 		}
 		_ = first.c.Close()
-		synctest.Wait()
-		if n := running.Load(); n != 0 || time.Since(start) >= abandonWait {
-			t.Fatalf("%d closes still running after %s", n, time.Since(start))
+		if n, a := running.Load(), answered.Load(); n != 0 || a != peak.Load() || time.Since(start) > time.Second {
+			t.Fatalf("after Close at %s: %d closes running, %d of %d answered", time.Since(start), n, a, peak.Load())
 		}
 	})
 }
