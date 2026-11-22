@@ -1,11 +1,15 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -96,6 +100,7 @@ func TestLoadRefuses(t *testing.T) {
 		"azure bad account":       withStorage(`"storage": {"azure": {"account": "u:hunter2@evil", "container": "c", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
 		"azure bad container":     withStorage(`"storage": {"azure": {"account": "acct", "container": "a/b", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
 		"azure container dotdot":  withStorage(`"storage": {"azure": {"account": "acct", "container": "..", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
+		"azure container escape":  withStorage(`"storage": {"azure": {"account": "acct", "container": "sales%2Farchive", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
 		"azure container query":   withStorage(`"storage": {"azure": {"account": "acct", "container": "c?sig=hunter2", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
 		"azure key as env name":   withStorage(`"storage": {"azure": {"account": "acct", "container": "c", "shared_key_env": "aHVudGVyMg=="}}`),
 		"bad prefix":              edit(`"prod/skylite"`, `"prod//skylite"`),
@@ -180,7 +185,8 @@ func TestNewAzureSharedKey(t *testing.T) {
 	goodFile := filepath.Join(dir, "good.key")
 	emptyFile := filepath.Join(dir, "empty.key")
 	badFile := filepath.Join(dir, "bad.key")
-	for p, content := range map[string]string{goodFile: validKey + "\n", emptyFile: " \n", badFile: badKey} {
+	bigFile := filepath.Join(dir, "big.key")
+	for p, content := range map[string]string{goodFile: validKey + "\n", emptyFile: " \n", badFile: badKey, bigFile: validKey + strings.Repeat(" ", 4097)} {
 		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -211,6 +217,8 @@ func TestNewAzureSharedKey(t *testing.T) {
 		"missing file": {Account: "acct", Container: "c", SharedKeyFile: filepath.Join(dir, "absent.key")},
 		"empty file":   {Account: "acct", Container: "c", SharedKeyFile: emptyFile},
 		"bad file key": {Account: "acct", Container: "c", SharedKeyFile: badFile},
+		"big file":     {Account: "acct", Container: "c", SharedKeyFile: bigFile},
+		"key as path":  {Account: "acct", Container: "c", SharedKeyFile: filepath.Join(dir, "aHVudGVyMg==")},
 		"unset env":    {Account: "acct", Container: "c", SharedKeyEnv: "SKYLITE_TEST_AZURE_UNSET"},
 		"empty env":    {Account: "acct", Container: "c", SharedKeyEnv: "SKYLITE_TEST_AZURE_EMPTY"},
 		"bad env key":  {Account: "acct", Container: "c", SharedKeyEnv: "SKYLITE_TEST_AZURE_BAD"},
@@ -222,8 +230,37 @@ func TestNewAzureSharedKey(t *testing.T) {
 			t.Errorf("%s: New succeeded, want error", name)
 			continue
 		}
-		if strings.Contains(err.Error(), "hunter2") {
+		if strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "aHVudGVyMg") {
 			t.Errorf("%s: error %q leaked key", name, err)
 		}
+		if az.SharedKeyFile != "" && strings.Contains(err.Error(), az.SharedKeyFile) {
+			t.Errorf("%s: error %q names the key file", name, err)
+		}
+	}
+}
+
+func TestAzureRefusesRedirect(t *testing.T) {
+	var elsewhere atomic.Int32
+	dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		elsewhere.Add(1)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer dst.Close()
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", dst.URL+r.URL.Path)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer src.Close()
+	t.Setenv("SKYLITE_TEST_AZURE_KEY", "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==")
+	st, err := openAzure(&Azure{Account: "devstoreaccount1", Container: "c", Endpoint: src.URL + "/devstoreaccount1", SharedKeyEnv: "SKYLITE_TEST_AZURE_KEY"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.(io.Closer).Close() }()
+	if _, err := st.Create(context.Background(), "k", strings.NewReader("database bytes")); err == nil {
+		t.Error("a create answered with a redirect succeeded")
+	}
+	if n := elsewhere.Load(); n != 0 {
+		t.Errorf("the redirect target got %d requests, want 0", n)
 	}
 }

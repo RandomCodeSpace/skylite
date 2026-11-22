@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -209,6 +210,9 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 // intermediate proxy closes them; see package azureblob's documentation.
 const azureIdleConnTimeout = 2 * time.Second
 
+// maxAzureKeyFile bounds the shared key file; a key is 88 bytes of base64.
+const maxAzureKeyFile = 4096
+
 // azureStore wraps an azureblob.Store so closing the store closes the HTTP
 // transport's idle connections.
 type azureStore struct {
@@ -247,12 +251,16 @@ func openAzure(a *Azure) (storage.Store, error) {
 	if err != nil {
 		return nil, errors.New("server: azure shared key is not valid base64")
 	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	dt, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("server: azure client: http.DefaultTransport is not an *http.Transport")
+	}
+	tr := dt.Clone()
 	tr.IdleConnTimeout = azureIdleConnTimeout
+	// A redirect would resend a signed request, body included, elsewhere.
+	hc := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	c, err := container.NewClientWithSharedKeyCredential(a.containerURL(), cred, &container.ClientOptions{
-		ClientOptions: azcore.ClientOptions{
-			Transport: &http.Client{Transport: tr},
-		},
+		ClientOptions: azcore.ClientOptions{Transport: hc},
 	})
 	if err != nil {
 		tr.CloseIdleConnections()
@@ -263,13 +271,26 @@ func openAzure(a *Azure) (storage.Store, error) {
 
 func readAzureSharedKey(a *Azure) (string, error) {
 	if a.SharedKeyFile != "" {
-		b, err := os.ReadFile(a.SharedKeyFile) //nolint:gosec // the operator names the file
+		// The errors leave out the path: a key pasted in its place would be logged.
+		f, err := os.Open(a.SharedKeyFile) //nolint:gosec // the operator names the file
 		if err != nil {
-			return "", fmt.Errorf("server: azure shared key: %w", err)
+			var pe *fs.PathError
+			if errors.As(err, &pe) {
+				err = pe.Err
+			}
+			return "", fmt.Errorf("server: azure shared key file: %w", err)
+		}
+		defer func() { _ = f.Close() }()
+		b, err := io.ReadAll(io.LimitReader(f, maxAzureKeyFile+1))
+		if err != nil {
+			return "", errors.New("server: azure shared key file could not be read")
+		}
+		if len(b) > maxAzureKeyFile {
+			return "", fmt.Errorf("server: azure shared key file is larger than %d bytes", maxAzureKeyFile)
 		}
 		key := strings.TrimSpace(string(b))
 		if key == "" {
-			return "", fmt.Errorf("server: azure shared key file %s is empty", a.SharedKeyFile)
+			return "", errors.New("server: azure shared key file is empty")
 		}
 		return key, nil
 	}

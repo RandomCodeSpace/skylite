@@ -212,7 +212,7 @@ func validAzureAccount(s string) bool {
 }
 
 func validAzureContainer(s string) bool {
-	return s != "" && s != "." && s != ".." && !strings.ContainsAny(s, "/\\?# \t\r\n") && validEndpoint("https://example.invalid/"+s)
+	return s != "" && s != "." && s != ".." && !strings.ContainsAny(s, "/\\?#% \t\r\n") && validEndpoint("https://example.invalid/"+s)
 }
 
 // validEnvName reports whether s is a POSIX environment variable name
