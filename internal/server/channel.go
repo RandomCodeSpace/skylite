@@ -94,13 +94,23 @@ type channel struct {
 	receipt          *wire.Receipt // the outcome of last; nil while it runs, or if last is 0
 	frames           bool          // last's response had frames before its terminal frame
 	data             []byte        // last's retained replay data, charged
-	lost             *wire.Error   // the unrecorded end of a running request, for waiting closes
-	finished         chan struct{} // closed when the running request has finished
+	run              *completion   // the completion of the last accepted request; nil if none was
+	shut             chan struct{} // closed once a closing channel's transaction is rolled back and its lock released
 	cancel           context.CancelCauseFunc
 	idle             time.Time     // when the channel last became idle
 	state            wire.TxnState // the transaction state after the last recorded request
 	cause            string        // causeMaintenance if the engine aborted the transaction
 	tx               *txn          // the open transaction; nil when none is open
+}
+
+// completion is the outcome of one accepted request, for the closes and
+// cancels that wait for it. It is set before finished is closed and does
+// not change after.
+type completion struct {
+	finished chan struct{} // closed when the request has finished
+	receipt  *wire.Receipt // its receipt; nil if it ended with lost
+	lost     *wire.Error   // its unrecorded end, which ended the channel
+	state    wire.TxnState // the channel's transaction state after it
 }
 
 // txn is a channel's open write transaction. It holds its connection and
@@ -436,7 +446,7 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 		return done, e
 	}
 	ch.last, ch.sum, ch.precancelled, ch.running, ch.receipt, ch.frames = seq, sum, false, true, nil, false
-	ch.finished, ch.lost = make(chan struct{}), nil
+	ch.run = &completion{finished: make(chan struct{})}
 	s.dropData(ch)
 	state, cause, tx := ch.state, ch.cause, ch.tx
 	// A dropped HTTP connection cancels nothing (ADR 0005 decision 6); a
@@ -569,7 +579,6 @@ func (s *Server) record(ch *channel, rec *wire.Receipt, lost *wire.Error, data [
 		ch.cause = ""
 	}
 	if lost != nil {
-		ch.lost = lost
 		ch.ended = true
 	} else {
 		if rec.Error != nil {
@@ -592,7 +601,11 @@ func (s *Server) record(ch *channel, rec *wire.Receipt, lost *wire.Error, data [
 	if ch.ended || ch.closing {
 		s.end(ch)
 	}
-	close(ch.finished)
+	ch.run.receipt, ch.run.lost, ch.run.state = rec, lost, ch.state
+	if ch.ended {
+		ch.run.state = wire.TxnNone
+	}
+	close(ch.run.finished)
 }
 
 // closed reports whether c is closed.
@@ -653,7 +666,8 @@ func (s *Server) watch(ch *channel, tx *txn) {
 // cancelRequest serves a cancel (ADR 0005 decision 6 and the channel state
 // machine). A cancel of the next sequence number records it as cancelled
 // before it arrived; one of the running request interrupts it before its
-// commit point and answers once it has finished, with its receipt.
+// commit point and answers once it has finished, with its receipt, and on a
+// closing channel once the close has rolled back its transaction.
 func (s *Server) cancelRequest(d *database, leader *engine.Leader, req *wire.Request, who, id string) (*wire.Done, *wire.Error) {
 	t := s.table(d, leader)
 	if t == nil {
@@ -683,25 +697,25 @@ func (s *Server) cancelRequest(d *database, leader *engine.Leader, req *wire.Req
 		s.dropData(ch)
 	case ch.running:
 		ch.cancel(errCancelled) // a close's interruption, if one came first, stands
-		fin := ch.finished
+		r := ch.run             // the next request may be accepted before this wakes
 		s.chMu.Unlock()
-		<-fin
+		<-r.finished
 		s.chMu.Lock()
-		if ch.last != seq { // the next request was accepted while this waited
-			return nil, owned(wire.NewError(wire.CodeStaleSequence, fmt.Sprintf("the sequence number is below the last accepted, %d", ch.last)), ch, seq)
+		if shut := ch.shut; shut != nil {
+			s.chMu.Unlock()
+			<-shut
+			s.chMu.Lock()
 		}
-		if ch.lost != nil {
-			e := *ch.lost
+		if r.lost != nil {
+			e := *r.lost
 			e.Seq = seq
 			return nil, &e
 		}
-	}
-	state := ch.state
-	if ch.ended {
-		state = wire.TxnNone
+		o := *r.receipt
+		return &wire.Done{Kind: wire.DoneCancel, Seq: seq, TxnState: r.state, Outcome: &o}, nil
 	}
 	r := *ch.receipt
-	return &wire.Done{Kind: wire.DoneCancel, Seq: seq, TxnState: state, Outcome: &r}, nil
+	return &wire.Done{Kind: wire.DoneCancel, Seq: seq, TxnState: ch.state, Outcome: &r}, nil
 }
 
 // streamed writes a transaction's frames to the response as they are
@@ -743,7 +757,8 @@ func (s *Server) send(st *stream, data []byte) {
 }
 
 // closeChannel serves a close. A channel with a request running is closing
-// until that request has finished; the answer waits for it.
+// until that request has finished and the first close has rolled back its
+// transaction; every close and cancel that joined it answers after that.
 func (s *Server) closeChannel(d *database, leader *engine.Leader, req *wire.Request, who string) (*wire.Done, *wire.Error) {
 	t := s.table(d, leader)
 	if t == nil {
@@ -756,21 +771,26 @@ func (s *Server) closeChannel(d *database, leader *engine.Leader, req *wire.Requ
 		return nil, e
 	}
 	if ch.running {
-		if !ch.closing {
-			ch.closing = true
-			ch.cancel(errClosed)
+		r, shut, owner := ch.run, ch.shut, ch.shut == nil
+		if owner { // this close rolls back the transaction, then wakes the other waiters
+			shut = make(chan struct{})
+			ch.closing, ch.shut = true, shut
+			defer close(shut) // after drop
 		}
-		fin := ch.finished
+		ch.cancel(errClosed) // the first interruption stands
 		s.chMu.Unlock()
-		<-fin
+		<-r.finished
+		if !owner {
+			<-shut
+		}
 		s.chMu.Lock()
 	}
 	drop := s.dropTxn(ch) // an open transaction is rolled back before the answer
 	defer drop()
 	defer s.chMu.Unlock()
 	s.end(ch)
-	if ch.lost != nil {
-		e := *ch.lost
+	if r := ch.run; r != nil && r.lost != nil {
+		e := *r.lost
 		e.Seq = 0 // a close names no sequence number
 		return nil, &e
 	}
@@ -954,9 +974,11 @@ func (s *Server) begin(ctx context.Context, d *database, t *table, ch *channel, 
 	var done *wire.Done
 	var e *wire.Error
 	var snap uint64
+	auto := false
 	_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
 		var ferr error
 		done, e, ferr = s.write(db, c, req, req.Execute, true, false, w, &snap)
+		auto = db.GetAutocommit()
 		return ferr
 	})
 	if err != nil {
@@ -967,6 +989,11 @@ func (s *Server) begin(ctx context.Context, d *database, t *table, ch *channel, 
 		done = &wire.Done{Kind: wire.DoneBegin}
 	}
 	done.Txn = int64(snap) //nolint:gosec // as in openChannel
+	if auto {
+		// The first statement ran but the transaction is gone (ADR 0007
+		// requirement 8); the deferred release frees c and the lock.
+		return &wire.Receipt{Done: done}, nil, wire.TxnAborted
+	}
 	tx := &txn{c: c, snap: snap, began: began}
 	s.chMu.Lock()
 	ch.tx = tx
@@ -993,9 +1020,19 @@ func (s *Server) inTxn(ctx context.Context, d *database, t *table, ch *channel, 
 		auto = db.GetAutocommit() // SQLite rolls back the whole transaction after some errors
 		return ferr
 	})
-	if err == nil {
+	if err == nil && !auto {
 		done.Txn = int64(tx.snap) //nolint:gosec // as in openChannel
 		return &wire.Receipt{Done: done}, nil, wire.TxnOpen
+	}
+	if err == nil {
+		// The statement ran but the transaction is gone (ADR 0007
+		// requirement 8): what it did is not the client's to commit.
+		done.Txn = int64(tx.snap) //nolint:gosec // as above
+		s.chMu.Lock()
+		drop := s.dropTxn(ch)
+		s.chMu.Unlock()
+		drop()
+		return &wire.Receipt{Done: done}, nil, wire.TxnAborted
 	}
 	rec, lost := s.failure(ctx, d, t, err, e, limit, true, log)
 	maint := errors.Is(err, engine.ErrRetry) || errors.Is(err, engine.ErrTailBound)
@@ -1141,7 +1178,7 @@ func (s *Server) write(db *sqlite3.Conn, c *pconn, req *wire.Request, stmt *wire
 		var out *wire.Writer
 		out, err = wire.NewWriter(w, wire.DefaultFrameBytes, s.limits)
 		if err == nil {
-			done, err = statementOn(db, c, ictx, req, stmt, out)
+			done, err = statementOn(db, c, ictx, req, stmt, out, !commit)
 		}
 	}
 	if err == nil && commit {
@@ -1174,11 +1211,13 @@ func (s *Server) write(db *sqlite3.Conn, c *pconn, req *wire.Request, stmt *wire
 }
 
 // statementOn runs the client's statement stmt of req under the policy on
-// c, writing its result to out.
-func statementOn(db *sqlite3.Conn, c *pconn, ictx context.Context, req *wire.Request, stmt *wire.Statement, out *wire.Writer) (done *wire.Done, err error) {
+// c, writing its result to out; inTxn says it runs in the client's transaction.
+func statementOn(db *sqlite3.Conn, c *pconn, ictx context.Context, req *wire.Request, stmt *wire.Statement, out *wire.Writer, inTxn bool) (done *wire.Done, err error) {
 	total := db.TotalChanges()
 	err = c.pc.Run(ictx, stmt.SQL, func(st *sqlite3.Stmt) error {
-		if txnControl(stmt.SQL) {
+		// SAVEPOINT, RELEASE and ROLLBACK TO run inside the client's
+		// transaction only (0007), not inside an autocommit write's own.
+		if txnControl(stmt.SQL) && (!inTxn || !savepointSQL(stmt.SQL)) {
 			return wire.NewError(wire.CodeInvalidRequest, "transaction control is not SQL in this protocol; use a channel's begin, commit and rollback")
 		}
 		if err := bind(req, stmt.Args, st); err != nil {

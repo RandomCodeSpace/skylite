@@ -472,6 +472,20 @@ func terms(t int, op string) string { return rep(" "+op+" SELECT 1", t-1) }
 // TestStackOverflowDiscardsOrFailStops sends ADR 0007's overflow shapes.
 // The broken connection must never be pooled again: either the engine
 // discarded it and the leader serves on, or the leader stopped.
+// overflowViews creates views whose bodies nest subqueries in FROM; SELECT *
+// FROM v4 overflows SQLite's stack.
+func overflowViews() string {
+	views := "CREATE VIEW v0 AS SELECT 1 AS a;"
+	for i := 1; i <= 4; i++ {
+		s := fmt.Sprintf("SELECT * FROM v%d%s", i-1, terms(4, "INTERSECT"))
+		for range 12 {
+			s = "SELECT * FROM (" + s + ")" + terms(4, "INTERSECT")
+		}
+		views += fmt.Sprintf("CREATE VIEW v%d AS %s;", i, s)
+	}
+	return views
+}
+
 func TestStackOverflowDiscardsOrFailStops(t *testing.T) {
 	// Each generated column reads the next, and CREATE TABLE compiles a
 	// SELECT * of the new table itself.
@@ -483,15 +497,7 @@ func TestStackOverflowDiscardsOrFailStops(t *testing.T) {
 		}
 		gen = append(gen, fmt.Sprintf("c%d AS (%s%s%s)", i, rep("0 BETWEEN ", 17), next, rep(" AND 9", 17)))
 	}
-	// Views whose bodies nest subqueries in FROM.
-	views := "CREATE VIEW v0 AS SELECT 1 AS a;"
-	for i := 1; i <= 4; i++ {
-		s := fmt.Sprintf("SELECT * FROM v%d%s", i-1, terms(4, "INTERSECT"))
-		for range 12 {
-			s = "SELECT * FROM (" + s + ")" + terms(4, "INTERSECT")
-		}
-		views += fmt.Sprintf("CREATE VIEW v%d AS %s;", i, s)
-	}
+	views := overflowViews()
 	// Flattening copies each level's expression into the next.
 	plus := "a" + rep(" + 1", 16)
 	flat := "CREATE TABLE fq(a);CREATE VIEW f0 AS SELECT a FROM fq;"
