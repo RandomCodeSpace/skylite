@@ -169,6 +169,11 @@ class FrameReaderTest {
         "{\"error\":{\"code\":\"\\ud800\",\"not_executed\":true,\"final\":true,\"message\":\"m\",\"request_id\":\"r\"}}\n",
         "{\"columns\":[{\"decltype\":\"INT\"}]}\n", // a column without a name
         "{\"columns\":[]} junk\n", // not one JSON value
+        "{\"columns\":[]} \r\n", // white space after the value
+        "{\"future\":\"\\ud800\"}\n", // a lone surrogate in a skipped frame
+        "{\"future\":{\"\\udc00\":1}}\n", // a lone surrogate in a skipped name
+        "{\"columns\":[]}\n" + "{\"done\":{\"txn\":1,\"read_only\":true,\"rows_affected\":0,\"last_insert_rowid\":0,"
+                + "\"x\":\"\\ud800x\"}}\n", // a high surrogate without its low half in a skipped member
     })
     void framesThatBreakTheProtocolAreRefused(String body) {
         refused(Kind.QUERY, body);
@@ -181,9 +186,41 @@ class FrameReaderTest {
         "{\"columns\":[]}\n{\"params\":{\"from\":0,\"names\":[]}}\n", // no names
         "{\"columns\":[]}\n{\"params\":{\"from\":0,\"names\":[null]}}\n{\"done\":{\"txn\":1,\"param_count\":2}}\n",
         "{\"done\":{\"txn\":1,\"param_count\":0}}\n", // no columns frame
+        "{\"columns\":[{\"name\":\"a\"}]}\n[1]\n{\"done\":{\"txn\":1,\"param_count\":0}}\n", // a row
     })
     void describeAnswersThatBreakTheProtocolAreRefused(String body) {
         refused(Kind.DESCRIBE, body);
+    }
+
+    @Test
+    void surrogatePairsAndEscapedBackslashesInSkippedValuesAreRead() throws Exception {
+        String body = "{\"future\":\"\\ud83d\\ude00 \\\\ud800 \\\\\\\\\"}\n" + COLS + "\n" + DONE + "\n";
+        assertEquals(2, readAll(Kind.QUERY, body).size());
+    }
+
+    @Test
+    void aColumnsFrameAboveTheFrameSizeIsRefused() throws Exception {
+        String head = "{\"columns\":[{\"name\":\"";
+        String tail = "\"}]}";
+        int fill = FrameReader.MAX_COLUMNS_FRAME - 1 - head.length() - tail.length(); // 1 MiB with the newline
+        String atBound = head + "a".repeat(fill) + tail + "\n";
+        assertInstanceOf(FrameReader.Columns.class, reader(Kind.QUERY, FrameReader.MAX_FRAME, atBound).next());
+        String above = head + "a".repeat(fill + 1) + tail + "\n";
+        Values.Malformed e = assertThrows(Values.Malformed.class,
+                () -> reader(Kind.QUERY, FrameReader.MAX_FRAME, above).next());
+        assertTrue(e.getMessage().contains("columns frame exceeds"), e.getMessage());
+    }
+
+    @Test
+    void aParamsFrameHoldsAtMost1024Names() throws Exception {
+        String names1024 = String.join(",", java.util.Collections.nCopies(1024, "null"));
+        String ok = "{\"columns\":[]}\n{\"params\":{\"from\":0,\"names\":[" + names1024 + "]}}\n"
+                + FakeServer.describeDone(1, 1024) + "\n";
+        assertEquals(3, readAll(Kind.DESCRIBE, ok).size());
+        String over = "{\"columns\":[]}\n{\"params\":{\"from\":0,\"names\":[" + names1024 + ",null]}}\n"
+                + FakeServer.describeDone(1, 1025) + "\n";
+        Values.Malformed e = assertThrows(Values.Malformed.class, () -> readAll(Kind.DESCRIBE, over));
+        assertTrue(e.getMessage().contains("more than 1024"), e.getMessage());
     }
 
     @Test

@@ -57,8 +57,12 @@ final class SkyliteConnection implements Connection {
         statements.remove(s);
     }
 
-    private <T extends SkyliteStatement> T track(T s) {
+    private <T extends SkyliteStatement> T track(T s) throws SQLException {
         statements.add(s);
+        if (closed) { // closed while s was made, perhaps after close() went through the statements
+            s.close();
+            throw Errors.closed("connection");
+        }
         return s;
     }
 
@@ -397,7 +401,10 @@ final class SkyliteConnection implements Connection {
         close();
     }
 
-    /** Bounds the wait for each response's headers; 0 means the driver's default of 60 s. */
+    /**
+     * Bounds the wait for each response's headers, whatever the query timeout, and each wait for more of its body. 0
+     * means the driver's default: 60 s, or more for a longer query timeout, for the headers, and no bound on the body.
+     */
     @Override
     public void setNetworkTimeout(Executor executor, int milliseconds) throws SQLException {
         checkOpen();
@@ -415,14 +422,14 @@ final class SkyliteConnection implements Connection {
 
     @Override
     public <T> T unwrap(Class<T> iface) throws SQLException {
-        if (iface.isInstance(this)) {
+        if (iface != null && iface.isInstance(this)) {
             return iface.cast(this);
         }
-        throw new SQLNonTransientException("skylite: not a wrapper for " + iface.getName(), "HY000");
+        throw new SQLNonTransientException("skylite: not a wrapper for " + (iface == null ? null : iface.getName()), "HY000");
     }
 
     @Override
     public boolean isWrapperFor(Class<?> iface) {
-        return iface.isInstance(this);
+        return iface != null && iface.isInstance(this);
     }
 }

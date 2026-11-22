@@ -94,7 +94,7 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
 
     @Override
     public int executeUpdate() throws SQLException {
-        return Math.toIntExact(executeLargeUpdate());
+        return count(executeLargeUpdate());
     }
 
     @Override
@@ -123,6 +123,8 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
         Session s = conn.session();
         List<Column> cols = List.of();
         int params = 0;
+        Exchange open = running; // an open result set's, which cancel reaches again after the describe
+        cancelRequested = false;
         try (Exchange ex = Exchange.send(
                 s, FrameReader.Kind.DESCRIBE, Request.describe(sql, s.watermark()), getQueryTimeout(), this)) {
             Frame f;
@@ -135,6 +137,8 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
                     default -> throw Errors.transport("malformed response: a row in a describe answer", null);
                 }
             }
+        } finally {
+            running = open;
         }
         describedColumns = cols;
         describedParams = params;
@@ -144,7 +148,7 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
     @Override
     public ResultSetMetaData getMetaData() throws SQLException {
         ResultSet rs = getResultSet();
-        if (rs != null) {
+        if (rs != null && !rs.isClosed()) {
             return rs.getMetaData();
         }
         describe();

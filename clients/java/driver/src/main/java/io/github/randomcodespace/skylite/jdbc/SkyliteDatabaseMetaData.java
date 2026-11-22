@@ -15,7 +15,7 @@ import java.sql.Statement;
  */
 final class SkyliteDatabaseMetaData implements DatabaseMetaData {
     private final SkyliteConnection conn;
-    private String productVersion;
+    private volatile String productVersion;
 
     SkyliteDatabaseMetaData(SkyliteConnection conn) {
         this.conn = conn;
@@ -40,7 +40,11 @@ final class SkyliteDatabaseMetaData implements DatabaseMetaData {
                 if (!rs.next()) {
                     throw new SQLNonTransientException("skylite: sqlite_version() returned no row", "HY000");
                 }
-                productVersion = rs.getString(1);
+                String v = rs.getString(1);
+                if (v == null) {
+                    throw new SQLNonTransientException("skylite: sqlite_version() returned NULL", "HY000");
+                }
+                productVersion = v;
             }
         }
         return productVersion;
@@ -291,14 +295,14 @@ final class SkyliteDatabaseMetaData implements DatabaseMetaData {
 
     @Override
     public <T> T unwrap(Class<T> iface) throws SQLException {
-        if (iface.isInstance(this)) {
+        if (iface != null && iface.isInstance(this)) {
             return iface.cast(this);
         }
-        throw new SQLNonTransientException("skylite: not a wrapper for " + iface.getName(), "HY000");
+        throw new SQLNonTransientException("skylite: not a wrapper for " + (iface == null ? null : iface.getName()), "HY000");
     }
 
     @Override
     public boolean isWrapperFor(Class<?> iface) {
-        return iface.isInstance(this);
+        return iface != null && iface.isInstance(this);
     }
 }

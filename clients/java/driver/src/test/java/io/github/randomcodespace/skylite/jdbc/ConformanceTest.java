@@ -78,6 +78,11 @@ class ConformanceTest {
         assertTrue(vectors().size() > 100, "values.ndjson has its vectors");
     }
 
+    @Test
+    void aByteOrderMarkIsRefused() {
+        assertThrows(Values.Malformed.class, () -> Values.decode(new byte[] {(byte) 0xEF, (byte) 0xBB, (byte) 0xBF, '1'}));
+    }
+
     @TestFactory
     Stream<DynamicTest> decode() throws Exception {
         return vectors().stream().map(v -> DynamicTest.dynamicTest(v.name(), () -> {

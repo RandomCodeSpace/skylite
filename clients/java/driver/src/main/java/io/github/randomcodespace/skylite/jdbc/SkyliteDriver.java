@@ -63,9 +63,9 @@ public final class SkyliteDriver implements Driver {
             return null; // another driver's URL, as the Driver contract requires
         }
         Properties p = info == null ? new Properties() : info;
-        boolean plaintext = Boolean.parseBoolean(String.valueOf(p.getOrDefault("allowPlaintext", "false")));
+        boolean plaintext = Boolean.parseBoolean(String.valueOf(property(p, "allowPlaintext")));
         Endpoint endpoint = Endpoint.parse(url, plaintext);
-        Object providerValue = p.get("tokenProvider");
+        Object providerValue = property(p, "tokenProvider");
         String tokenFile = p.getProperty("tokenFile");
         if ((providerValue == null) == (tokenFile == null)) {
             throw config("set exactly one of the properties tokenProvider and tokenFile");
@@ -75,6 +75,12 @@ public final class SkyliteDriver implements Driver {
         AtomicLong watermark = WATERMARKS.computeIfAbsent(endpoint.key(), k -> new AtomicLong());
         Session s = new Session(endpoint, provider, tokenFile == null ? null : Path.of(tokenFile), http, watermark);
         return new SkyliteConnection(s, url);
+    }
+
+    /** A property that may be an object put into p, or a string in p or its defaults. */
+    private static Object property(Properties p, String name) {
+        Object v = p.get(name);
+        return v != null ? v : p.getProperty(name);
     }
 
     private static TokenProvider provider(Object v) throws SQLException {
@@ -111,6 +117,10 @@ public final class SkyliteDriver implements Driver {
         String key;
         try {
             key = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(pem));
+            HttpClient cached = CLIENTS.get(key);
+            if (cached != null) {
+                return cached;
+            }
             KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
             ks.load(null, null);
             int i = 0;

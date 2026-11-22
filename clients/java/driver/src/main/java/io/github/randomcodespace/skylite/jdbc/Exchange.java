@@ -4,6 +4,7 @@ import io.github.randomcodespace.skylite.jdbc.FrameReader.Failure;
 import io.github.randomcodespace.skylite.jdbc.FrameReader.Frame;
 import io.github.randomcodespace.skylite.jdbc.Values.Malformed;
 import java.io.EOFException;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.http.HttpRequest;
@@ -48,32 +49,43 @@ final class Exchange implements AutoCloseable {
     private volatile InputStream body;
     private volatile FrameReader reader;
     private volatile ScheduledFuture<?> timer;
-    private volatile boolean cancelled, timedOut, closed;
+    private volatile boolean cancelled, timedOut, stalled, closed;
     private final int timeoutSeconds;
+    private final int networkMillis;
 
-    private Exchange(int timeoutSeconds) {
+    private Exchange(int timeoutSeconds, int networkMillis) {
         this.timeoutSeconds = timeoutSeconds;
+        this.networkMillis = networkMillis;
     }
 
     /**
      * Sends a request and waits for its headers. With a query timeout, the server's statement time is lowered to it
      * through the body's timeout_ms, and the response is abandoned {@link #CANCEL_WAIT} later if the server has not
-     * ended it: a read leaves no unknown outcome, so that is a {@link SQLTimeoutException}.
+     * ended it: a read leaves no unknown outcome, so that is a {@link SQLTimeoutException}. A describe carries no
+     * timeout_ms, so it is abandoned at the timeout itself. A network timeout bounds the wait for the headers and
+     * each wait for body bytes, as a socket read timeout would.
      */
     static Exchange send(Session s, FrameReader.Kind kind, byte[] body, int timeoutSeconds, Owner owner)
             throws SQLException {
-        Exchange ex = new Exchange(timeoutSeconds);
+        int network = s.networkTimeoutMillis();
+        Exchange ex = new Exchange(timeoutSeconds, network);
         if (owner != null) {
             owner.started(ex);
         }
         String token = s.token(); // before the timer, so a failing token source leaves nothing scheduled
-        Duration wait = RESPONSE_HEADER_TIMEOUT;
-        if (s.networkTimeoutMillis() > 0) {
-            wait = Duration.ofMillis(s.networkTimeoutMillis());
+        if (ex.stopping()) { // cancelled or closed while the token was read: nothing is sent
+            ex.close();
+            throw ex.stopped(null);
         }
+        Duration wait = network > 0 ? Duration.ofMillis(network) : RESPONSE_HEADER_TIMEOUT;
         if (timeoutSeconds > 0) {
-            Duration t = Duration.ofSeconds(timeoutSeconds).plus(CANCEL_WAIT);
-            wait = t.compareTo(wait) > 0 ? t : wait;
+            Duration t = Duration.ofSeconds(timeoutSeconds);
+            if (kind == FrameReader.Kind.QUERY) {
+                t = t.plus(CANCEL_WAIT);
+            }
+            if (network == 0 && t.compareTo(wait) > 0) {
+                wait = t;
+            }
             ex.timer = Timer.INSTANCE.schedule(ex::timeOut, t.toMillis(), TimeUnit.MILLISECONDS);
         }
         HttpRequest req = HttpRequest.newBuilder(s.endpoint().uri(kind == FrameReader.Kind.QUERY ? "query" : "describe"))
@@ -85,7 +97,9 @@ final class Exchange implements AutoCloseable {
         HttpResponse<InputStream> resp;
         try {
             ex.future = s.http().sendAsync(req, HttpResponse.BodyHandlers.ofInputStream());
-            if (ex.cancelled) {
+            // A response that arrives after a stop, or after this thread stopped waiting, is released here.
+            ex.future.thenAccept(r -> ex.arrived(r.body()));
+            if (ex.stopping()) {
                 ex.future.cancel(true);
             }
             resp = ex.future.get();
@@ -104,8 +118,7 @@ final class Exchange implements AutoCloseable {
             // The cause's text can name the host and port, never the token.
             throw Errors.transport("the request failed: " + e.getCause(), e.getCause());
         }
-        ex.body = resp.body();
-        if (ex.closed) {
+        if (!ex.arrived(resp.body())) {
             ex.close();
             throw ex.stopped(null);
         }
@@ -120,8 +133,25 @@ final class Exchange implements AutoCloseable {
             throw Errors.transport("the answer (HTTP status " + status
                     + ") has no Skylite-Protocol: 1 header, so it is not from a skylite server", null);
         }
-        ex.reader = new FrameReader(ex.body, kind, FrameReader.MAX_FRAME);
+        ex.reader = new FrameReader(network > 0 ? ex.new Watched(ex.body) : ex.body, kind, FrameReader.MAX_FRAME);
         return ex;
+    }
+
+    private boolean stopping() {
+        return cancelled || timedOut || closed;
+    }
+
+    /**
+     * Keeps the response's body so that a stop can release it, and releases it at once if the exchange was already
+     * stopped: one of this and {@link #abort} always sees the other's write. False when it was stopped.
+     */
+    private boolean arrived(InputStream b) {
+        body = b;
+        if (stopping()) {
+            closeBody();
+            return false;
+        }
+        return true;
     }
 
     /** The next frame, or null after the terminal frame. An error frame is returned, not thrown. */
@@ -133,7 +163,7 @@ final class Exchange implements AutoCloseable {
             }
             return f;
         } catch (IOException e) {
-            boolean stopped = cancelled || timedOut || closed; // before close() sets closed
+            boolean stopped = cancelled || timedOut || stalled || closed; // before close() sets closed
             close();
             if (stopped) {
                 throw stopped(e);
@@ -155,11 +185,19 @@ final class Exchange implements AutoCloseable {
         if (cancelled) {
             return new SQLNonTransientException("skylite: the statement was cancelled", "57014", cause);
         }
+        if (stalled) {
+            return Errors.transport("no response bytes within the network timeout of " + networkMillis + " ms", cause);
+        }
         return Errors.closed("result set");
     }
 
     private void timeOut() {
         timedOut = true;
+        abort();
+    }
+
+    private void stall() {
+        stalled = true;
         abort();
     }
 
@@ -202,6 +240,23 @@ final class Exchange implements AutoCloseable {
                 b.close(); // before the end of the body, this resets the stream or closes the connection
             } catch (IOException ignored) {
                 // nothing more to release
+            }
+        }
+    }
+
+    /** The body, each read of which the network timeout bounds. */
+    private final class Watched extends FilterInputStream {
+        Watched(InputStream in) {
+            super(in);
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            ScheduledFuture<?> w = Timer.INSTANCE.schedule(Exchange.this::stall, networkMillis, TimeUnit.MILLISECONDS);
+            try {
+                return in.read(b, off, len);
+            } finally {
+                w.cancel(false);
             }
         }
     }

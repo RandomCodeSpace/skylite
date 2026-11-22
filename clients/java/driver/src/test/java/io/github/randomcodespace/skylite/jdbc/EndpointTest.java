@@ -58,6 +58,20 @@ class EndpointTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"https://db.example:0/library", "https://db.example:65536/library"})
+    void refusesAPortOutsideTheTcpRange(String url) {
+        SQLException e = assertThrows(SQLException.class, () -> Endpoint.parse(Endpoint.PREFIX + url, false));
+        assertTrue(e.getMessage().contains("port"), e.getMessage());
+    }
+
+    @org.junit.jupiter.api.Test
+    void aNonAsciiCharacterIsNotADotSegment() throws SQLException {
+        // U+012E's low byte is that of '.', which a byte-wise decode would mistake for it
+        assertEquals("https://db.example/\u012E", Endpoint.parse(Endpoint.PREFIX + "https://db.example/\u012E/library", false).base());
+        assertEquals("https://db.example/%C4%AE", Endpoint.parse(Endpoint.PREFIX + "https://db.example/%c4%ae/library", false).base());
+    }
+
+    @ParameterizedTest
     @CsvSource({
         "http://db.example:80/library, http://db.example",
         "http://db.example/library, http://db.example",

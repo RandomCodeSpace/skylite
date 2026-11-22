@@ -27,8 +27,8 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     private boolean poolable;
     private boolean closeOnCompletion;
     private volatile boolean closed;
-    private volatile Exchange running;
-    private volatile boolean cancelRequested;
+    volatile Exchange running;
+    volatile boolean cancelRequested;
 
     SkyliteStatement(SkyliteConnection conn) {
         this.conn = conn;
@@ -46,6 +46,8 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         running = ex;
         if (cancelRequested) {
             ex.cancel();
+        } else if (closed || conn.isClosed()) {
+            ex.close();
         }
     }
 
@@ -69,7 +71,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         }
         switch (f) {
             case Columns c -> {
-                result = new SkyliteResultSet(this, ex, c.columns(), maxRows);
+                result = new SkyliteResultSet(this, ex, c.columns(), maxRows, fetchSize);
                 return true;
             }
             case Done d -> {
@@ -91,14 +93,26 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         }
     }
 
-    /** Called by the result set when it ends or closes. */
+    /** Called by the result set when its response ends or is released. */
     void resultDone(SkyliteResultSet rs) {
         if (rs == result) {
             running = null;
-            if (closeOnCompletion) {
-                close();
-            }
         }
+    }
+
+    /** Called by the result set when it closes: with closeOnCompletion, that closes this statement. */
+    void resultClosed(SkyliteResultSet rs) {
+        if (rs == result && closeOnCompletion) {
+            close();
+        }
+    }
+
+    /** An update count as an int, for the methods that return one. */
+    static int count(long n) throws SQLException {
+        if (n > Integer.MAX_VALUE) {
+            throw Errors.data("the update count " + n + " exceeds the range of int; use the Large method", "22003");
+        }
+        return (int) n;
     }
 
     private void closeResult() {
@@ -121,7 +135,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     /** A write is refused by the server with needs_channel; a read without result columns returns its count, 0. */
     @Override
     public int executeUpdate(String sql) throws SQLException {
-        return Math.toIntExact(executeLargeUpdate(sql));
+        return count(executeLargeUpdate(sql));
     }
 
     @Override
@@ -320,7 +334,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
 
     @Override
     public int getUpdateCount() throws SQLException {
-        return Math.toIntExact(getLargeUpdateCount());
+        return count(getLargeUpdateCount());
     }
 
     @Override
@@ -449,14 +463,14 @@ class SkyliteStatement implements Statement, Exchange.Owner {
 
     @Override
     public <T> T unwrap(Class<T> iface) throws SQLException {
-        if (iface.isInstance(this)) {
+        if (iface != null && iface.isInstance(this)) {
             return iface.cast(this);
         }
-        throw new SQLNonTransientException("skylite: not a wrapper for " + iface.getName(), "HY000");
+        throw new SQLNonTransientException("skylite: not a wrapper for " + (iface == null ? null : iface.getName()), "HY000");
     }
 
     @Override
     public boolean isWrapperFor(Class<?> iface) {
-        return iface.isInstance(this);
+        return iface != null && iface.isInstance(this);
     }
 }

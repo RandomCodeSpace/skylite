@@ -9,6 +9,7 @@ import io.github.randomcodespace.skylite.jdbc.Values.TextBytes;
 import java.io.InputStream;
 import java.io.Reader;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -36,6 +37,7 @@ import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.Calendar;
 import java.util.List;
 import java.util.Locale;
@@ -55,13 +57,16 @@ final class SkyliteResultSet implements ResultSet {
     private final long maxRows;
     private Object[] row;
     private long rowNumber;
-    private boolean done, closed, wasNull;
+    private boolean done, wasNull;
+    private volatile boolean closed;
+    private int fetchSize;
 
-    SkyliteResultSet(SkyliteStatement stmt, Exchange ex, List<Column> columns, long maxRows) {
+    SkyliteResultSet(SkyliteStatement stmt, Exchange ex, List<Column> columns, long maxRows, int fetchSize) {
         this.stmt = stmt;
         this.ex = ex;
         this.columns = columns;
         this.maxRows = maxRows;
+        this.fetchSize = fetchSize;
     }
 
     private void checkOpen() throws SQLException {
@@ -125,6 +130,7 @@ final class SkyliteResultSet implements ResultSet {
             if (!done) {
                 finish();
             }
+            stmt.resultClosed(this);
         }
     }
 
@@ -504,6 +510,18 @@ final class SkyliteResultSet implements ResultSet {
             r = getBoolean(i);
         } else if (type == BigDecimal.class) {
             r = getBigDecimal(i);
+        } else if (type == BigInteger.class) {
+            try {
+                r = getBigDecimal(i).toBigIntegerExact();
+            } catch (ArithmeticException e) {
+                throw Errors.data("this " + storageClass(v) + " is not an integer", "22018");
+            }
+        } else if (type == Character.class) {
+            String s = getString(i);
+            if (s.length() != 1) {
+                throw Errors.data("text of " + s.length() + " chars is not one character", "22018");
+            }
+            r = s.charAt(0);
         } else if (type == byte[].class) {
             r = getBytes(i);
         } else if (type == LocalDate.class) {
@@ -516,6 +534,8 @@ final class SkyliteResultSet implements ResultSet {
             r = instant(i);
         } else if (type == OffsetDateTime.class) {
             r = instant(i).atOffset(ZoneOffset.UTC);
+        } else if (type == ZonedDateTime.class) {
+            r = instant(i).atZone(ZoneOffset.UTC);
         } else if (type == Date.class) {
             r = getDate(i);
         } else if (type == Time.class) {
@@ -761,15 +781,20 @@ final class SkyliteResultSet implements ResultSet {
         return FETCH_FORWARD;
     }
 
+    /** A hint only, as on the statement, whose fetch size it starts with. */
     @Override
     public void setFetchSize(int rows) throws SQLException {
         checkOpen();
+        if (rows < 0) {
+            throw new SQLNonTransientException("skylite: negative fetch size", "HY092");
+        }
+        fetchSize = rows;
     }
 
     @Override
     public int getFetchSize() throws SQLException {
         checkOpen();
-        return 0;
+        return fetchSize;
     }
 
     @Override
@@ -816,15 +841,15 @@ final class SkyliteResultSet implements ResultSet {
 
     @Override
     public <T> T unwrap(Class<T> iface) throws SQLException {
-        if (iface.isInstance(this)) {
+        if (iface != null && iface.isInstance(this)) {
             return iface.cast(this);
         }
-        throw new SQLNonTransientException("skylite: not a wrapper for " + iface.getName(), "HY000");
+        throw new SQLNonTransientException("skylite: not a wrapper for " + (iface == null ? null : iface.getName()), "HY000");
     }
 
     @Override
     public boolean isWrapperFor(Class<?> iface) {
-        return iface.isInstance(this);
+        return iface != null && iface.isInstance(this);
     }
 
     // ---- not supported: streams, LOB types other than Blob, and every update method ----

@@ -5,7 +5,7 @@ weight: 21
 status: current
 ---
 
-`clients/java/driver` is a JDBC driver, artifact `io.github.randomcodespace:skylite-jdbc`, that speaks the protocol of [0005: Client protocol](/docs/decisions/0005-client-protocol/) over HTTPS, as [0003: JDBC transport](/docs/decisions/0003-jdbc-transport/) decided. It needs Java 25. This version has the read path only: statements outside a transaction that the server accepts as pure reads. It is not published to a Maven repository; build it with `mvn -f clients/java/driver/pom.xml verify`.
+`clients/java/driver` is a JDBC driver, artifact `io.github.randomcodespace:skylite-jdbc`, that speaks the protocol of [0005: Client protocol](/docs/decisions/0005-client-protocol/) over HTTPS, as [0003: JDBC transport](/docs/decisions/0003-jdbc-transport/) decided. It needs Java 21 or later. This version has the read path only: statements outside a transaction that the server accepts as pure reads. It is not published to a Maven repository; build it with `mvn -f clients/java/driver/pom.xml verify`.
 
 Its tests run against an in-process fake server that checks every request against 0005, and against a real `skylite serve` built from this repository. That server has no write channels yet, so the integration test queries constant SQL only. Nothing has been run through Hibernate, Spring or a connection pool.
 
@@ -49,7 +49,7 @@ The driver registers itself through `META-INF/services/java.sql.Driver`; its cla
 
 ## Configuration
 
-The URL is `jdbc:skylite:https://host[:port][/base]/<database>`: the server's base URL, then the database name as the last path segment. The name is 1 to 63 characters from `a-z`, `0-9` and `-`, starting with a letter or digit. User information, a query, a fragment, an empty host and `.` or `..` path segments are refused, as by the [Go driver](/docs/go-driver/), and the error does not repeat the URL.
+The URL is `jdbc:skylite:https://host[:port][/base]/<database>`: the server's base URL, then the database name as the last path segment. The name is 1 to 63 characters from `a-z`, `0-9` and `-`, starting with a letter or digit. User information, a query, a fragment, an empty host and `.` or `..` path segments are refused, as by the [Go driver](/docs/go-driver/), and so is a port outside 1 to 65535; the error does not repeat the URL.
 
 | Property | Meaning |
 |---|---|
@@ -58,16 +58,16 @@ The URL is `jdbc:skylite:https://host[:port][/base]/<database>`: the server's ba
 | `tlsRootCertificates` | A PEM file of the certificates to trust, such as a private CA, instead of the JVM's trust store. The file is read when a connection is made. |
 | `allowPlaintext` | `true` permits an `http://` URL. Without it only `https://` is accepted. |
 
-Exactly one of `tokenProvider` and `tokenFile` is required. Connection properties are trusted configuration: whoever sets them chooses the class the driver instantiates and the file whose contents it sends, as a bearer token, to the URL's host, so never build them from untrusted input. `user` and `password` are ignored. No secret goes in the URL. The driver never logs; its exceptions never hold the token or the request URL, though an exception from the network or TLS can name the host and port it could not reach. A token that is empty or holds characters a bearer token cannot hold, such as a space, is refused before anything is sent.
+Exactly one of `tokenProvider` and `tokenFile` is required. Each property is read from the `Properties` object or, failing that, its defaults. Connection properties are trusted configuration: whoever sets them chooses the class the driver instantiates and the file whose contents it sends, as a bearer token, to the URL's host, so never build them from untrusted input. `user` and `password` are ignored. No secret goes in the URL. The driver never logs; its exceptions never hold the token or the request URL, though an exception from the network or TLS can name the host and port it could not reach. A token that is empty or holds characters a bearer token cannot hold, such as a space, is refused before anything is sent.
 
-The driver uses HTTP/2 when the server offers it, and refuses every redirect, so a request and its token go only to the URL's host. It waits up to 60 seconds for the headers of each response, or `Connection.setNetworkTimeout`'s value when that is set. HTTP clients are shared by connections with the same trust settings.
+The driver uses HTTP/2 when the server offers it, and refuses every redirect, so a request and its token go only to the URL's host. It waits up to 60 seconds for the headers of each response, or longer for a query timeout above that. `Connection.setNetworkTimeout` replaces that wait, whatever the query timeout, and also bounds each wait for more of a response's body, as a socket read timeout would; when it passes, the driver raises `SQLNonTransientConnectionException` with SQLState `08S01`. HTTP clients are shared by connections with the same trust settings.
 
 ## What works
 
 - **Queries.** `Statement` and `PreparedStatement` send each `executeQuery` and `execute` to the stateless `query` endpoint, with the SQL and its parameters. Rows are decoded as their frames arrive, never buffered whole; `ResultSet` is forward-only and read-only. Closing a result set, its statement or its connection before the end releases the HTTP response. A response that ends before its terminal frame is an error, never a short result.
 - **Prepared statements.** Preparing sends nothing. `getParameterMetaData()` and, before an execution, `getMetaData()` send one `describe`, whose answer the statement keeps. Parameters bind by index: `?`, `?NNN` and named parameters such as `:t` alike. Each execution sends its SQL again; there are no server-side handles.
 - **Metadata.** `ResultSetMetaData` from the result columns; `ParameterMetaData` with the parameter count; `DatabaseMetaData` with the product name `SQLite`, the server's `sqlite_version()` as the product version, the driver version and the capabilities of this version. Catalog queries such as `getTables` and `getColumns` are not supported yet.
-- **Validity.** `Connection.isValid` describes `SELECT 1`, as the Go driver's ping does.
+- **Validity.** `Connection.isValid` describes `SELECT 1`, as the Go driver's ping does, and `isValid(n)` returns `false` after *n* seconds without an answer.
 - **Cancel and timeout.** `Statement.cancel()` abandons the running request, or its response: a stateless read needs no cancel request, because the server stops streaming when the response is dropped. The exception has SQLState `57014`. `setQueryTimeout(n)` sends `timeout_ms` so that the server's statement time is at most *n* seconds, and abandons a response that has not ended 2 seconds after that, the driver's cancel wait in 0005. Either way the driver raises `SQLTimeoutException`, which is safe for a read: it leaves no unknown outcome.
 - **Read-your-writes.** One watermark per database, keyed by the canonical base URL and the database name and kept for the driver class's life, is raised from each answer's `txn` and sent as `min_txn`, so connections and URLs that differ only in canonicalisation share it.
 
@@ -76,13 +76,13 @@ The driver uses HTTP/2 when the server offers it, and refuses every redirect, so
 | Storage class | `getObject` | Also readable as |
 |---|---|---|
 | NULL | `null` | 0, `false` or `null` from the typed getters, with `wasNull()` true |
-| INTEGER | `Long` | `getInt`, `getShort` and `getByte` within their range, otherwise SQLState `22003`; `getDouble`, `getBigDecimal`, `getString`; `getBoolean` for 0 and 1 only |
+| INTEGER | `Long` | `getInt`, `getShort` and `getByte` within their range, otherwise SQLState `22003`; `getDouble`, `getBigDecimal`, `getObject(i, BigInteger.class)`, `getString`; `getBoolean` for 0 and 1 only |
 | REAL | `Double`, infinities included | `getLong` for an integral value within range; `getBigDecimal` for a finite value; `getString` |
-| TEXT | `String` | `getBytes` (its UTF-8 bytes); `getLong`, `getDouble` and `getBigDecimal` when the text is a number; the temporal getters below |
+| TEXT | `String` | `getBytes` (its UTF-8 bytes); `getLong`, `getDouble` and `getBigDecimal` when the text is a number; `getObject(i, Character.class)` for one character; the temporal getters below |
 | TEXT that is not valid UTF-8 | an error | `getBytes` returns its own bytes; `getString` raises SQLState `22021` |
 | BLOB | `byte[]` | `getBytes`, `getBlob` |
 
-Temporal values are TEXT ([0005 decision 8](/docs/decisions/0005-client-protocol/#8-values-and-shared-conventions)). `getObject(i, LocalDate.class)`, `LocalDateTime.class` and `LocalTime.class` read the text's fields; text with an offset is refused as a local value. `Instant.class` and `OffsetDateTime.class` read text with an offset by it, and text without one as UTC. `getTimestamp` reads text without an offset as a local timestamp in the JVM's zone, or the calendar's, and text with one as the instant it names. Only the forms 0005 lists are read, with years 0001 to 9999.
+Temporal values are TEXT ([0005 decision 8](/docs/decisions/0005-client-protocol/#8-values-and-shared-conventions)). `getObject(i, LocalDate.class)`, `LocalDateTime.class` and `LocalTime.class` read the text's fields; text with an offset is refused as a local value. `Instant.class`, `OffsetDateTime.class` and `ZonedDateTime.class` read text with an offset by it, and text without one as UTC; the last two are in UTC. `getTimestamp` reads text without an offset as a local timestamp in the JVM's zone, or the calendar's, and text with one as the instant it names. Only the forms 0005 lists are read, with years 0001 to 9999.
 
 A column's type name is its declared type without the arguments in parentheses, trimmed, in upper case, as in the Go driver: `datetime(6)` is `DATETIME`. In a column named `DATE`, `DATETIME` or `TIMESTAMP`, `getObject` returns TEXT in a date or timestamp form as `java.sql.Timestamp`, or as `java.sql.Date` for a date alone in a `DATE` column. `getColumnType` reports `DATE`, `TIMESTAMP` for the other two, and otherwise follows SQLite's affinity rules: `BIGINT` for a name containing `INT`; `VARCHAR` for `CHAR`, `CLOB` or `TEXT`; `BLOB` for `BLOB` or no type; `DOUBLE` for `REAL`, `FLOA` or `DOUB`; `NUMERIC` otherwise; `OTHER` for an expression. Nullability, precision and scale are reported as unknown.
 

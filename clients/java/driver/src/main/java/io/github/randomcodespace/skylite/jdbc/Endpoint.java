@@ -2,7 +2,6 @@ package io.github.randomcodespace.skylite.jdbc;
 
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
 import java.util.Locale;
@@ -48,6 +47,9 @@ record Endpoint(String base, String database) {
         }
         StringBuilder canon = new StringBuilder(scheme).append("://").append(u.getHost().toLowerCase(Locale.ROOT));
         int port = u.getPort();
+        if (port == 0 || port > 65535) {
+            throw invalid("has a port outside 1 to 65535");
+        }
         if (port >= 0 && !(port == 443 && scheme.equals("https")) && !(port == 80 && scheme.equals("http"))) {
             canon.append(':').append(port);
         }
@@ -87,19 +89,19 @@ record Endpoint(String base, String database) {
         return sb.toString();
     }
 
+    /** Decodes each percent-encoded octet to the char of that value: enough to find a "." or ".." segment. */
     private static String decodeSegment(String seg) throws SQLException {
-        byte[] out = new byte[seg.length()];
-        int n = 0;
+        StringBuilder out = new StringBuilder(seg.length());
         for (int i = 0; i < seg.length(); i++) {
             char c = seg.charAt(i);
             if (c == '%') {
-                out[n++] = (byte) hexOctet(seg, i);
+                out.append((char) hexOctet(seg, i));
                 i += 2;
             } else {
-                out[n++] = (byte) c; // only . matters, and it is ASCII
+                out.append(c);
             }
         }
-        return new String(out, 0, n, StandardCharsets.ISO_8859_1);
+        return out.toString();
     }
 
     private static int hexOctet(String s, int i) throws SQLException {

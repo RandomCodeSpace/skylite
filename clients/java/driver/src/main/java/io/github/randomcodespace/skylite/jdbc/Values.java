@@ -135,10 +135,21 @@ final class Values {
         } catch (IllegalArgumentException e) {
             throw new Malformed("invalid base64");
         }
-        if (!Base64.getEncoder().encodeToString(b).equals(s)) {
+        if (!canonicalBase64(s)) {
             throw new Malformed("base64 that is not canonical: missing padding or non-zero unused bits");
         }
         return b;
+    }
+
+    private static final String BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /** Padded, and the bits the padding leaves unused zero: checked without encoding the bytes again. */
+    private static boolean canonicalBase64(String s) {
+        if (s.length() % 4 != 0) {
+            return false;
+        }
+        int pad = s.endsWith("==") ? 2 : s.endsWith("=") ? 1 : 0;
+        return pad == 0 || (BASE64.indexOf(s.charAt(s.length() - pad - 1)) & (pad == 2 ? 0xF : 0x3)) == 0;
     }
 
     /** Refuses a string holding a lone surrogate, which a JSON escape can produce. */
@@ -152,6 +163,48 @@ final class Values {
             }
         }
         return s;
+    }
+
+    /**
+     * Refuses an escape of a lone surrogate, U+D800 to U+DFFF unpaired, anywhere in JSON text: in a value or member
+     * name that is skipped as well as one that is read. In valid JSON every backslash is in a string and starts an
+     * escape.
+     */
+    static void checkEscapes(byte[] b, int off, int len) throws Malformed {
+        int end = off + len;
+        for (int i = off; i < end - 1; i++) {
+            if (b[i] != '\\' || b[++i] != 'u') {
+                continue; // an escape of one character ends at i
+            }
+            int c = hex4(b, i + 1, end);
+            i += 4;
+            if (c >= 0xDC00 && c <= 0xDFFF) {
+                throw new Malformed("a string holds a lone surrogate");
+            }
+            if (c >= 0xD800 && c <= 0xDBFF) {
+                int lo = i + 2 < end && b[i + 1] == '\\' && b[i + 2] == 'u' ? hex4(b, i + 3, end) : -1;
+                if (lo < 0xDC00 || lo > 0xDFFF) {
+                    throw new Malformed("a string holds a lone surrogate");
+                }
+                i += 6;
+            }
+        }
+    }
+
+    /** The four hexadecimal digits at b[at], or -1. */
+    private static int hex4(byte[] b, int at, int end) {
+        if (at + 4 > end) {
+            return -1;
+        }
+        int v = 0;
+        for (int k = 0; k < 4; k++) {
+            int d = Character.digit(b[at + k] & 0xFF, 16);
+            if (d < 0) {
+                return -1;
+            }
+            v = v << 4 | d;
+        }
+        return v;
     }
 
     static boolean validUtf8(byte[] b, int off, int len) {
@@ -194,7 +247,11 @@ final class Values {
         if (wire.length == 0 || isSpace(wire[0]) || isSpace(wire[wire.length - 1])) {
             throw new Malformed("a value with white space around it, or no value");
         }
+        if (wire[0] == (byte) 0xEF) { // a byte order mark, which Jackson would skip; no JSON value starts with it
+            throw new Malformed("a value starts with a byte order mark");
+        }
         checkUtf8(wire, 0, wire.length);
+        checkEscapes(wire, 0, wire.length);
         try (JsonParser p = parser(wire, 0, wire.length)) {
             p.nextToken();
             Object v = read(p);

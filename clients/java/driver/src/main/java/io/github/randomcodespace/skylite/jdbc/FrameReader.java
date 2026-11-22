@@ -23,6 +23,8 @@ final class FrameReader {
     static final int MAX_FRAME = (64 << 20) + 1;
     /** ADR 0005 reserves 4 KiB for the terminal frame, newline included; no configuration makes one larger. */
     static final int MAX_TERMINAL = 4 << 10;
+    /** ADR 0005's frame size, newline included: a columns frame is never larger. */
+    static final int MAX_COLUMNS_FRAME = 1 << 20;
     /** The most entries in one params frame. */
     private static final int MAX_FRAME_ENTRIES = 1024;
 
@@ -82,6 +84,7 @@ final class FrameReader {
         while (state != State.ENDED) {
             readLine();
             Values.checkUtf8(line, 0, lineLen);
+            Values.checkEscapes(line, 0, lineLen);
             Frame f;
             try (JsonParser p = Values.parser(line, 0, lineLen)) {
                 f = frame(p);
@@ -148,8 +151,12 @@ final class FrameReader {
     }
 
     private Frame frame(JsonParser p) throws Malformed {
+        byte last = line[lineLen - 1];
+        if (last != '}' && last != ']') {
+            throw new Malformed("bytes follow a frame's JSON value");
+        }
         if (line[0] == '[') {
-            if (state != State.ROWS) {
+            if (state != State.ROWS || kind == Kind.DESCRIBE) {
                 throw new Malformed("a row outside the rows of a result");
             }
             return row(p);
@@ -172,6 +179,9 @@ final class FrameReader {
             case "columns" -> {
                 if (state != State.START) {
                     throw new Malformed("a columns frame after other frames");
+                }
+                if (lineLen + 1 > MAX_COLUMNS_FRAME) {
+                    throw new Malformed("a columns frame exceeds " + MAX_COLUMNS_FRAME + " bytes");
                 }
                 List<Column> cols = columnsFrame(p);
                 state = State.ROWS;
@@ -266,6 +276,9 @@ final class FrameReader {
                     }
                     names = new ArrayList<>();
                     while (p.nextToken() != JsonToken.END_ARRAY) {
+                        if (names.size() == MAX_FRAME_ENTRIES) { // before reading an entry it would refuse
+                            throw new Malformed("a params frame holds more than " + MAX_FRAME_ENTRIES + " names");
+                        }
                         names.add(nullStr(p, "a parameter name"));
                     }
                 }

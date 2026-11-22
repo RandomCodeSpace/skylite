@@ -14,6 +14,7 @@ import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,17 +37,23 @@ import java.sql.SQLTransactionRollbackException;
 import java.sql.Statement;
 import java.sql.Timestamp;
 import java.sql.Types;
+import java.sql.Wrapper;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.List;
 import java.util.Properties;
+import java.util.TimeZone;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -55,6 +62,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /** The driver end to end against {@link FakeServer}, over HTTPS unless a test says otherwise. */
 class DriverTest {
@@ -756,5 +764,282 @@ class DriverTest {
         c.close();
         fails(SQLException.class, c::createStatement);
         assertEquals(0, fake.requests.size());
+    }
+
+    // ---- statement and result set lifecycle ----
+
+    static final String COLUMN_X = "{\"columns\":[{\"name\":\"x\"}]}";
+
+    @Test
+    void closeOnCompletionClosesTheStatementWhenItsResultSetCloses() throws Exception {
+        answer(COLUMN_X, "[1]", FakeServer.done(1));
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            s.closeOnCompletion();
+            ResultSet first = s.executeQuery("SELECT 1");
+            ResultSet rs = s.executeQuery("SELECT 1"); // closes the first, which leaves the statement open
+            assertTrue(first.isClosed());
+            assertFalse(s.isClosed());
+            assertTrue(rs.next());
+            assertFalse(rs.next());
+            assertFalse(rs.isClosed(), "the end of the rows does not close the result set");
+            assertTrue(rs.isAfterLast());
+            assertFalse(s.isClosed());
+            rs.close();
+            assertTrue(s.isClosed());
+        }
+    }
+
+    @Test
+    void getMoreResultsClosesTheResultSet() throws Exception {
+        answer(COLUMN_X, "[1]", FakeServer.done(1));
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            ResultSet rs = s.executeQuery("SELECT 1");
+            assertFalse(s.getMoreResults());
+            assertTrue(rs.isClosed());
+            assertNull(s.getResultSet());
+            assertEquals(-1, s.getUpdateCount());
+        }
+    }
+
+    @Test
+    void aPreparedStatementDescribesItsColumnsOnceItsResultSetIsClosed() throws Exception {
+        String cols = "{\"columns\":[{\"name\":\"a\",\"decltype\":\"INTEGER\"}]}";
+        fake.responder = (r, ex) -> {
+            if (r.path().endsWith("/describe")) {
+                FakeServer.send(ex, 200, cols, FakeServer.describeDone(1, 0));
+            } else {
+                FakeServer.send(ex, 200, cols, "[1]", FakeServer.done(1));
+            }
+        };
+        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement("SELECT 1 AS a")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals("a", ps.getMetaData().getColumnName(1));
+            }
+            assertEquals(1, fake.requests.size(), "the open result set's columns needed no describe");
+            assertEquals("a", ps.getMetaData().getColumnName(1));
+            assertEquals("/v1/databases/" + db + "/describe", fake.last().path());
+        }
+    }
+
+    @Test
+    void aCancelWithNothingRunningDoesNotReachALaterDescribe() throws Exception {
+        answer("{\"columns\":[{\"name\":\"a\"}]}", FakeServer.describeDone(1, 0));
+        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement("SELECT 1 AS a")) {
+            ps.cancel();
+            assertEquals(0, ps.getParameterMetaData().getParameterCount());
+            assertEquals("a", ps.getMetaData().getColumnName(1));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aStatementStoppedWhileItsTokenIsReadSendsNothing(boolean cancel) throws Exception {
+        CountDownLatch inToken = new CountDownLatch(1);
+        CountDownLatch proceed = new CountDownLatch(1);
+        Properties p = props();
+        p.put("tokenProvider", (TokenProvider) () -> {
+            inToken.countDown();
+            proceed.await(10, TimeUnit.SECONDS);
+            return TOKEN;
+        });
+        answer(COLUMN_X, "[1]", FakeServer.done(1));
+        try (Connection c = connect(p)) {
+            Statement s = c.createStatement();
+            CompletableFuture<Throwable> failed = new CompletableFuture<>();
+            Thread.ofVirtual().start(() -> {
+                try {
+                    s.executeQuery("SELECT 1");
+                    failed.complete(null);
+                } catch (Throwable e) {
+                    failed.complete(e);
+                }
+            });
+            assertTrue(inToken.await(10, TimeUnit.SECONDS));
+            if (cancel) {
+                s.cancel();
+            } else {
+                s.close();
+            }
+            proceed.countDown();
+            SQLException e = assertInstanceOf(SQLException.class, failed.get(10, TimeUnit.SECONDS));
+            seen.add(e);
+            assertEquals(cancel ? "57014" : "HY010", e.getSQLState());
+        }
+        assertEquals(0, fake.requests.size());
+    }
+
+    @Test
+    void aResultSetStartsWithItsStatementsFetchSize() throws Exception {
+        answer(COLUMN_X, "[1]", FakeServer.done(1));
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            s.setFetchSize(10);
+            try (ResultSet rs = s.executeQuery("SELECT 1")) {
+                assertEquals(10, rs.getFetchSize());
+                rs.setFetchSize(25);
+                assertEquals(25, rs.getFetchSize());
+                assertEquals("HY092", fails(SQLNonTransientException.class, () -> rs.setFetchSize(-1)).getSQLState());
+            }
+        }
+    }
+
+    @Test
+    void anUpdateCountAboveIntIsADataError() throws Exception {
+        answer("{\"done\":{\"txn\":1,\"read_only\":true,\"rows_affected\":2147483648,\"last_insert_rowid\":0}}");
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            assertEquals(2147483648L, s.executeLargeUpdate("SELECT 1 WHERE 0"));
+            assertEquals("22003", fails(SQLDataException.class, s::getUpdateCount).getSQLState());
+            fails(SQLDataException.class, () -> s.executeUpdate("SELECT 1 WHERE 0"));
+        }
+    }
+
+    @Test
+    void wrappersRefuseANullInterface() throws Exception {
+        answer(COLUMN_X, "[1]", FakeServer.done(1));
+        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement("SELECT 1"); ResultSet rs = ps.executeQuery()) {
+            for (Wrapper w : List.of(c, ps, rs, rs.getMetaData(), c.getMetaData(), new SkyliteParameterMetaData(0))) {
+                assertFalse(w.isWrapperFor(null));
+                fails(SQLNonTransientException.class, () -> w.unwrap(null));
+                assertSame(w, w.unwrap(w.getClass()));
+            }
+        }
+    }
+
+    @Test
+    void aNullProductVersionIsAnError() throws Exception {
+        answer("{\"columns\":[{\"name\":\"sqlite_version()\"}]}", "[null]", FakeServer.done(1));
+        try (Connection c = connect()) {
+            fails(SQLNonTransientException.class, () -> c.getMetaData().getDatabaseMajorVersion());
+        }
+    }
+
+    // ---- values ----
+
+    @Test
+    void getObjectReadsTheTypesSetObjectSends() throws Exception {
+        answer("{\"columns\":[{\"name\":\"i\"},{\"name\":\"t\"},{\"name\":\"c\"},{\"name\":\"r\"},{\"name\":\"big\"},"
+                + "{\"name\":\"huge\"},{\"name\":\"b\"},{\"name\":\"local\"}]}",
+                "[42,\"2026-11-16 10:20:30Z\",\"x\",1.5e0,1e19,1e300,{\"blob\":\"AQI=\"},\"2026-11-16 12:20:30\"]",
+                FakeServer.done(1));
+        try (Connection c = connect(); Statement s = c.createStatement(); ResultSet rs = s.executeQuery("SELECT *")) {
+            assertTrue(rs.next());
+            assertEquals(BigInteger.valueOf(42), rs.getObject(1, BigInteger.class));
+            assertEquals(ZonedDateTime.of(2026, 11, 16, 10, 20, 30, 0, ZoneOffset.UTC), rs.getObject(2, ZonedDateTime.class));
+            assertEquals('x', rs.getObject(3, Character.class));
+            fails(SQLDataException.class, () -> rs.getObject(2, Character.class));
+            fails(SQLDataException.class, () -> rs.getObject(4, BigInteger.class));
+            assertEquals("22003", fails(SQLDataException.class, () -> rs.getLong(5)).getSQLState());
+            assertEquals("22003", fails(SQLDataException.class, () -> rs.getFloat(6)).getSQLState());
+            byte[] b = rs.getBytes(7);
+            b[0] = 9;
+            assertArrayEquals(new byte[] {1, 2}, rs.getBytes(7), "getBytes returns a copy");
+            Calendar plus2 = Calendar.getInstance(TimeZone.getTimeZone("GMT+02:00"));
+            assertEquals(Instant.parse("2026-11-16T10:20:30Z"), rs.getTimestamp(8, plus2).toInstant());
+        }
+    }
+
+    @Test
+    void parametersAreCopiedWhenSetAndRemovedByClearParameters() throws Exception {
+        answer(COLUMN_X, FakeServer.done(1));
+        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement("SELECT ?")) {
+            byte[] b = {1, 2};
+            ps.setBytes(1, b);
+            b[0] = 9;
+            ps.executeQuery().close();
+            assertTrue(fake.last().bodyText().contains("\"params\":[{\"blob\":\"AQI=\"}]"), fake.last().bodyText());
+            Calendar plus2 = Calendar.getInstance(TimeZone.getTimeZone("GMT+02:00"));
+            ps.setTimestamp(1, Timestamp.from(Instant.parse("2026-11-16T10:20:30Z")), plus2);
+            ps.executeQuery().close();
+            assertTrue(fake.last().bodyText().contains("\"params\":[\"2026-11-16 12:20:30"), fake.last().bodyText());
+            ps.clearParameters();
+            ps.executeQuery().close();
+            assertFalse(fake.last().bodyText().contains("params"), fake.last().bodyText());
+        }
+    }
+
+    // ---- timeouts ----
+
+    @Test
+    void isValidReturnsWithinItsTimeout() throws Exception {
+        fake.responder = (r, ex) -> release.await(30, TimeUnit.SECONDS);
+        try (Connection c = connect()) {
+            long t0 = System.nanoTime();
+            assertFalse(c.isValid(1));
+            long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+            assertTrue(ms >= 900 && ms < 1900, "isValid(1) took " + ms + " ms");
+        }
+    }
+
+    @Test
+    void aDescribeAnswerWithARowIsInvalid() throws Exception {
+        answer("{\"columns\":[{\"name\":\"1\"}]}", "[1]", FakeServer.describeDone(1, 0));
+        try (Connection c = connect()) {
+            assertFalse(c.isValid(2));
+        }
+    }
+
+    @Test
+    void theNetworkTimeoutBoundsEachWaitForTheBody() throws Exception {
+        stallAfterOneRow();
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            c.setNetworkTimeout(Runnable::run, 500);
+            s.setQueryTimeout(30);
+            try (ResultSet rs = s.executeQuery("SELECT x")) {
+                assertTrue(rs.next());
+                long t0 = System.nanoTime();
+                SQLException e = fails(SQLNonTransientConnectionException.class, rs::next);
+                long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+                assertEquals("08S01", e.getSQLState());
+                assertTrue(e.getMessage().contains("network timeout of 500 ms"), e.getMessage());
+                assertTrue(ms >= 400 && ms < 5000, "gave up after " + ms + " ms");
+            }
+        }
+    }
+
+    @Test
+    void aQueryTimeoutDoesNotRaiseTheNetworkTimeout() throws Exception {
+        fake.responder = (r, ex) -> release.await(30, TimeUnit.SECONDS);
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            c.setNetworkTimeout(Runnable::run, 300);
+            s.setQueryTimeout(2);
+            long t0 = System.nanoTime();
+            fails(SQLNonTransientConnectionException.class, () -> s.executeQuery("SELECT 1"));
+            long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+            assertTrue(ms < 1900, "gave up after " + ms + " ms, past the 300 ms network timeout");
+        }
+    }
+
+    // ---- connection properties ----
+
+    /** Set when NotAProvider's static code runs; kept outside that class so reading it initialises nothing. */
+    static final AtomicBoolean NOT_A_PROVIDER_INITIALISED = new AtomicBoolean();
+
+    /** Not a TokenProvider. */
+    public static final class NotAProvider {
+        static {
+            NOT_A_PROVIDER_INITIALISED.set(true);
+        }
+    }
+
+    @Test
+    void neverRunsTheStaticCodeOfATokenProviderClassThatIsNotOne() {
+        Properties p = props();
+        p.setProperty("tokenProvider", NotAProvider.class.getName());
+        SQLException e = fails(SQLNonTransientConnectionException.class, () -> connect(p));
+        assertTrue(e.getMessage().contains("does not implement"), e.getMessage());
+        assertFalse(NOT_A_PROVIDER_INITIALISED.get(), "the class was initialised");
+    }
+
+    @Test
+    void readsPropertiesFromTheDefaults() throws Exception {
+        answer(COLUMN_X, "[1]", FakeServer.done(1));
+        Properties defaults = new Properties();
+        defaults.setProperty("tokenProvider", NamedProvider.class.getName());
+        defaults.setProperty("tlsRootCertificates", certs.certPem.toString());
+        try (Connection c = connect(new Properties(defaults)); Statement s = c.createStatement()) {
+            s.executeQuery("SELECT 1").close();
+        }
+        defaults.setProperty("allowPlaintext", "true");
+        new SkyliteDriver().connect("jdbc:skylite:http://db.example/library", new Properties(defaults)).close();
     }
 }
