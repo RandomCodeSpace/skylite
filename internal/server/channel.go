@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -405,7 +406,7 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 		if p == nil {
 			return
 		}
-		log.LogAttrs(ctx, slog.LevelError, "channel request panicked", slog.Any("panic", p))
+		log.LogAttrs(ctx, slog.LevelError, "channel request panicked", slog.Any("panic", p), slog.String("stack", string(debug.Stack())))
 		l := owned(wire.NewError(wire.CodeChannelLost, "the request failed after acceptance and may have committed; the channel has ended"), ch, seq)
 		l.NotExecuted = false
 		s.record(ch, nil, l, nil)

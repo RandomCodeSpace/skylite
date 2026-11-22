@@ -969,7 +969,7 @@ func TestMemoryBudgetHolds(t *testing.T) {
 }
 
 // TestSlowReaderBounded: a client that stops reading a query's rows holds
-// its SQLite connection only until the statement time ends.
+// its SQLite connection only until a second after the statement time ends.
 func TestSlowReaderBounded(t *testing.T) {
 	e := newQueryEnv(t, func(e *env) { e.s.shutdownTimeout = time.Second })
 	body := fmt.Sprintf(`{"sql":%q,"timeout_ms":1000}`, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 200000) SELECT printf('%200d', x) FROM c")
@@ -978,11 +978,16 @@ func TestSlowReaderBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = c.Close() }()
+	start := time.Now()
 	if _, err := fmt.Fprintf(c, "POST /v1/databases/d/query HTTP/1.1\r\nHost: skylite\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", e.sig.token(t, "reader"), len(body), body); err != nil {
 		t.Fatal(err)
 	}
 	e.running(t, 1)
 	e.running(t, 0) // the client never reads
+	// The statement time of 1 s, the terminal margin of 1 s, and slack.
+	if d := time.Since(start); d > 3500*time.Millisecond {
+		t.Errorf("the connection came back after %v, want about 2 s", d)
+	}
 }
 
 // TestTransientMaintenance: maintenance for the local WAL bound ends a
