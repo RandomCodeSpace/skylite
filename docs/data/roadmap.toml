@@ -25,17 +25,17 @@ detail = "A storage layer under SQLite (ncruces/go-sqlite3) that uploads each co
 [[items]]
 title = "Leader lease and failover"
 status = "planned"
-detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader. So far the takeover, the lease and a loop that takes office, renews the lease, steps down when deposed or stopped, and drains and releases on shutdown exist, and skylite serve runs the loop for each database it is configured for. Only the server in office serves a database; there is no failover test of the server yet."
+detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader. So far the takeover, the lease and a loop that takes office, renews the lease, steps down when deposed or stopped, and drains and releases on shutdown exist, and skylite serve runs the loop for each database it is configured for. The server in office serves writes. A standby can serve stateless reads when enabled."
 
 [[items]]
 title = "Read replicas"
 status = "planned"
-detail = "The engine follower polls the durable log and pins each read-only SQLite connection to one transaction. It fetches pages on demand and supports a bounded page cache. The server still serves reads only on the leader."
+detail = "The engine follower polls the durable log and pins each read-only SQLite connection to one transaction. It fetches pages on demand and supports a bounded page cache. With `follower_reads` enabled, a standby serves stateless query and describe requests while its snapshot is fresh. Forwarding and follower-owned read channels are planned."
 
 [[items]]
 title = "HTTPS query API and sessions"
 status = "planned"
-detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, database creation (PUT), the stateless query and describe requests on the leader for pure reads, and write channels on the leader: open, close, and autocommit writes and ping on a channel, with sequence numbers, receipts and replay, so that a resent write never runs twice. Not yet: transactions, cancel, batch, read-only channels, resolve, admission control, forwarding."
+detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, database creation (PUT), the stateless query and describe requests on leaders and opt-in followers, and write channels on the leader: open, close, and autocommit writes and ping on a channel, with sequence numbers, receipts and replay, so that a resent write never runs twice. Not yet: transactions, cancel, batch, read-only channels, resolve, admission control, forwarding."
 
 [[items]]
 title = "Clients: Go driver, JDBC driver and Hibernate dialect"

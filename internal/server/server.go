@@ -3,12 +3,10 @@
 // authentication of ADR 0006.
 //
 // This version serves PUT /v1/databases/{db}, which creates a database, the
-// stateless query and describe requests on the databases it leads (see
-// query.go), and write channels with autocommit writes on them (see
-// channel.go). For each configured database the server runs an office loop
-// (internal/office); only the pod in office serves the database, and every
-// other pod answers not_serving: there are no followers, no forwarding and
-// no cluster membership yet. Every other path of the protocol (cancel,
+// stateless query and describe requests on leaders and opt-in followers
+// (see query.go), and write channels with autocommit writes on leaders
+// (see channel.go). Each configured database has an office loop
+// (internal/office). Every other path of the protocol (cancel,
 // resolve and GET status) is authenticated and then answered with
 // not_serving. Of the admission control of ADR 0005 decision 9, the bound
 // on HTTP connections, the body share of the memory budget, the SQLite
@@ -391,10 +389,17 @@ func (d *database) leader() *engine.Leader {
 	if d == nil {
 		return nil
 	}
-	if l := d.loop.State().Leader; l != nil && l.Err() == nil {
-		return l
+	l, _ := d.serving()
+	return l
+}
+
+// serving reads the leader and follower from the same office state.
+func (d *database) serving() (*engine.Leader, *engine.Follower) {
+	state := d.loop.State()
+	if state.Leader != nil && state.Leader.Err() != nil {
+		return nil, nil
 	}
-	return nil
+	return state.Leader, state.Follower
 }
 
 // addDatabases creates an office loop for each configured database, on the
@@ -419,7 +424,7 @@ func (s *Server) addDatabases() error {
 		keys, err := s.cfg.Storage.keys(name)
 		var loop *office.Loop
 		if err == nil {
-			loop, err = office.New(office.Config{Store: s.store, Keys: keys, Holder: holder, Dir: s.dir, Engine: s.engine, Logger: s.log.With(slog.String("database", name))})
+			loop, err = office.New(office.Config{Store: s.store, Keys: keys, Holder: holder, Dir: s.dir, Engine: s.engine, FollowerReads: s.cfg.FollowerReads, Logger: s.log.With(slog.String("database", name))})
 		}
 		if err != nil {
 			return fmt.Errorf("server: database %s: %w", name, err)
@@ -446,22 +451,21 @@ func (s *Server) startOffice() (stop func()) {
 	}
 }
 
-// ready reports whether this server leads one of its databases and serves
-// it: not while shutting down, and not while a database it leads is at the
-// engine's tail bound and cannot compact past it.
+// ready reports whether this server serves any database, unless it is
+// shutting down or a leader is at a tail bound it cannot compact past.
 func (s *Server) ready() bool {
 	if s.stopping.Load() {
 		return false
 	}
-	leads := false
+	serves := false
 	for _, d := range s.dbs {
-		l := d.leader()
+		l, f := d.serving()
 		if l != nil && d.tail.Load() == l {
 			return false
 		}
-		leads = leads || l != nil
+		serves = serves || l != nil || f != nil && f.Fresh()
 	}
-	return leads
+	return serves
 }
 
 // readyz answers the readiness probe.
@@ -623,12 +627,15 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	case wire.KindCancel, wire.KindResolve, wire.KindStatus:
 		return nil, wire.NewError(wire.CodeNotServing, "cancel, resolve and status are not served in this version"), false
 	}
-	// Routing comes before the body here: a pod that does not lead the
-	// database cannot serve it, whatever the body holds.
+	// Route before reading the body. Only stateless reads can use a follower.
 	d := s.dbs[db]
-	leader := d.leader()
-	if kind != wire.KindPut && leader == nil {
-		return nil, wire.NewError(wire.CodeNotServing, "this server does not lead the database; in this version only its leader serves it"), false
+	var leader *engine.Leader
+	var follower *engine.Follower
+	if d != nil {
+		leader, follower = d.serving()
+	}
+	if kind != wire.KindPut && leader == nil && (follower == nil || kind != wire.KindQuery && kind != wire.KindDescribe) {
+		return nil, wire.NewError(wire.CodeNotServing, "this server does not lead the database or serve this request on a follower"), false
 	}
 	who := principal(p)
 	release, e := s.chargeBody(r, who)
@@ -666,7 +673,7 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	case wire.KindClose:
 		done, e = s.closeChannel(d, leader, req, who)
 	default:
-		done, e = s.statement(r.Context(), st, d, leader, req, who, log)
+		done, e = s.statement(r.Context(), st, d, leader, follower, req, who, log)
 	}
 	return done, e, true
 }
