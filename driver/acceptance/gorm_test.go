@@ -346,20 +346,6 @@ func TestTransactions(t *testing.T) {
 	}
 
 	t.Run("nested savepoints", func(t *testing.T) {
-		// GORM's sqlite dialector ignores the errors of SAVEPOINT and
-		// ROLLBACK TO, so a server that refuses them would make a nested
-		// Transaction's rollback a silent no-op: probe the server first.
-		tx := db.Begin()
-		err := tx.Exec("SAVEPOINT probe").Error
-		_ = tx.Rollback()
-		var se *skylite.Error
-		if errors.As(err, &se) && se.Code == skylite.CodeInvalidRequest && strings.Contains(se.Message, "transaction control") {
-			t.Skip("the server refuses SAVEPOINT inside a channel transaction (" + se.Message + "); " +
-				"GORM's nested Transaction then commits the inner work it was told to roll back, because the dialector ignores the error")
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
 		if err := db.Transaction(func(tx *gorm.DB) error {
 			if err := tx.Create(&Author{Name: "Outer"}).Error; err != nil {
 				return err
