@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import org.hibernate.annotations.OnDeleteAction;
 import org.hibernate.boot.Metadata;
 import org.hibernate.boot.model.relational.SqlStringGenerationContext;
 import org.hibernate.community.dialect.SQLiteDialect;
@@ -63,6 +64,10 @@ public class SkyliteDialect extends SQLiteDialect {
                 buf.append(", constraint ").append(fk.getName()).append(" foreign key (")
                         .append(names(fk.getColumns())).append(") references ")
                         .append(target.getQuotedName(dialect)).append(" (").append(names(to)).append(')');
+                OnDeleteAction onDelete = fk.getOnDeleteAction();
+                if (onDelete != null && onDelete != OnDeleteAction.NO_ACTION) {
+                    buf.append(" on delete ").append(onDelete.toSqlString());
+                }
             }
         }
 
