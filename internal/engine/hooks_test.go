@@ -480,15 +480,15 @@ func TestLookupFirstBumpAbove(t *testing.T) {
 			t.Fatalf("Lookup above %d: bump %d, head %d, %v; want bump %d, head %d", tc.above, bump, head, ok, tc.bump, o3.Head)
 		}
 	}
-	// A manifest above a number leaves the headers below it out.
+	// An index that starts above a number leaves the headers below it out.
 	l3.cmu.Lock()
-	l3.manifestTxn = o.Head
+	l3.indexFloor = o.Head
 	l3.cmu.Unlock()
 	if _, _, _, ok := l3.Lookup(nil, o.Head-1); ok {
-		t.Fatal("Lookup below the manifest's transaction reported its range covered")
+		t.Fatal("Lookup below the index reported its range covered")
 	}
 	if _, _, _, ok := l3.Lookup(nil, o.Head); !ok {
-		t.Fatal("Lookup at the manifest's transaction reported its range not covered")
+		t.Fatal("Lookup at the start of the index reported its range not covered")
 	}
 }
 

@@ -136,15 +136,15 @@ A channel also ends when it has been idle for 10 minutes (the channel idle limit
 
 ### Maintenance, the tail bound and a stopping leader
 
-While the leader is in maintenance, a query or describe gets `503` `maintenance`, and a running one ends with `maintenance` as its terminal frame. When the database's log reaches the engine's tail bound, 32,768 commits above the manifest, the engine refuses every read and write for good, because this version has no compaction: a query then gets `maintenance` with a message that names the bound, and the server reports itself not ready for as long as it leads that database. A query running when the leader stops, on shutdown, step-down or fail-stop, is interrupted and ends with `not_serving`. A write interrupted that way gets `channel_lost` (see [Write channels](#write-channels)). At the tail bound, a write refused before acceptance gets `maintenance` without naming the bound: the engine refuses its fresh connection as it does in any maintenance.
+While the leader is in maintenance, a query or describe gets `503` `maintenance`, and a running one ends with `maintenance` as its terminal frame. The leader compacts the database's log in the background. When the log still reaches the engine's tail bound, 32,768 commits above the manifest, the engine refuses reads and writes until a compaction clears it: a query then gets `maintenance` with a message that names the bound and asks for a retry, and the server stays ready. If the leader cannot compact, because the new manifest would pass its size limit, the refusal lasts: the message says the leader cannot compact, and the server reports itself not ready for as long as it leads that database. A query running when the leader stops, on shutdown, step-down or fail-stop, is interrupted and ends with `not_serving`. A write interrupted that way gets `channel_lost` (see [Write channels](#write-channels)). At the tail bound, a write refused before acceptance gets `maintenance` without naming the bound: the engine refuses its fresh connection as it does in any maintenance.
 
 ### Readiness
 
-With `probe_listen` set, the server answers `GET /readyz` on that address, in plain HTTP and without authentication: `200` while it leads at least one database of `databases` and none it leads is at its tail bound, and `503` otherwise and from the start of shutdown. A server whose databases do not exist yet is not ready, so a Service that sends traffic only to ready pods never delivers the first `PUT`. Send it through a second Kubernetes Service over the same pods with `publishNotReadyAddresses: true`, or through `kubectl port-forward` to one pod.
+With `probe_listen` set, the server answers `GET /readyz` on that address, in plain HTTP and without authentication: `200` while it leads at least one database of `databases` and none it leads is at a tail bound it cannot compact past, and `503` otherwise and from the start of shutdown. A server whose databases do not exist yet is not ready, so a Service that sends traffic only to ready pods never delivers the first `PUT`. Send it through a second Kubernetes Service over the same pods with `publishNotReadyAddresses: true`, or through `kubectl port-forward` to one pod.
 
 Known limits of readiness in this version:
 
-- Readiness is per pod, not per database. One database at its tail bound makes the pod not ready for every database it leads.
+- Readiness is per pod, not per database. One database at a tail bound its leader cannot compact past makes the pod not ready for every database it leads.
 - Each database's office loop runs on its own, so the databases of a set of pods can be led by different pods, and readiness cannot steer a request to the pod that leads its database; the others answer `not_serving`. List each database on one set of active pods, or run one active pod.
 
 ## Configuration
@@ -239,7 +239,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 - `database_not_found` for a query: a server that does not lead the database answers `not_serving`, whether or not it exists.
 - Keepalive frames during a long query or a write's lock wait, and the compiled-statement cache: every query and write compiles its statement.
 - 0005's commit point is not visible to the server, so a close cannot tell a write before it from one in its upload; it interrupts the connection, and the engine reports what happened.
-- The tail bound is noticed when a request meets it, so a server that takes office at the bound reports itself ready until its first query.
+- A tail bound the leader cannot compact past is noticed when a request meets it, so a server that takes office there reports itself ready until its first query.
 - The header block deadline on HTTP/2 streams: there, only the idle timeout bounds a header block that never ends. The 431 answer is tested on HTTP/1.1 only.
 - Reloading a rotated TLS certificate without a restart.
 - Running behind a real mesh or ingress has not been tested.

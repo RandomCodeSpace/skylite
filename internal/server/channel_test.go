@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -30,6 +31,14 @@ type holdStore struct {
 	mu      sync.Mutex
 	gate    *gate
 	unknown atomic.Bool // a held create whose context ended has an unknown outcome
+	frozen  atomic.Bool // manifest replaces fail, so no compaction publishes
+}
+
+func (s *holdStore) Replace(ctx context.Context, key, version string, body io.Reader) (string, error) {
+	if s.frozen.Load() && strings.HasSuffix(key, "/manifest") {
+		return "", errors.New("manifest frozen by the test")
+	}
+	return s.Store.Replace(ctx, key, version, body)
 }
 
 // gate is one hold: entered is closed when a create arrives, and the
@@ -677,8 +686,10 @@ func TestBehindOnDeposedLeader(t *testing.T) {
 }
 
 func TestTailBoundRefusal(t *testing.T) {
-	// Creation and the epoch bump take two of the eight.
-	e, _ := newChanEnv(t, func(e *env) { e.s.engine.TailBound = 8 })
+	// Creation and the epoch bump take two of the eight. No compaction
+	// publishes, so the bound stays.
+	e, hs := newChanEnv(t, func(e *env) { e.s.engine.TailBound = 8 })
+	hs.frozen.Store(true)
 	tok := e.open(t, "writer")
 	seq := int64(0)
 	var last answer

@@ -273,6 +273,7 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 		l.cmu.Lock()
 		l.head, l.headSize = h.Txn, h.DBSize
 		l.tailPages += int(h.PageCount)
+		l.tailBytes += h.Size()
 		pc := &commit{key: b.key, version: version, h: b.h, entries: b.entries}
 		if retired {
 			pc.entries = nil
@@ -284,6 +285,7 @@ func (l *Leader) commit(w *walFile, cp *capture) error {
 		if l.tailFullLocked() {
 			l.startMaintenance()
 		}
+		l.wakeLocked()
 		l.cmu.Unlock()
 		if l.afterUpload != nil {
 			l.afterUpload()
