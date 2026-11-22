@@ -758,3 +758,87 @@ func TestTxnGoneAfterStatement(t *testing.T) {
 		t.Errorf("rows %s, want none", got)
 	}
 }
+
+// quiet fails the test if the database lock or the pool still holds anything.
+func (e *env) quiet(t *testing.T, what string) {
+	t.Helper()
+	e.s.chMu.Lock()
+	h, q := e.s.dbs["d"].chans.lock.held, len(e.s.dbs["d"].chans.lock.queue)
+	e.s.chMu.Unlock()
+	e.s.pool.mu.Lock()
+	busy, open := len(e.s.pool.busy), e.s.pool.open
+	neg := false
+	for _, n := range e.s.pool.busy {
+		neg = neg || n < 0
+	}
+	e.s.pool.mu.Unlock()
+	if h || q != 0 || busy != 0 || neg || open < 0 {
+		t.Errorf("%s: lock held=%v queue=%d pool busy=%d negative=%v open=%d", what, h, q, busy, neg, open)
+	}
+}
+
+// A request that ends lost (panic guard) with a close, a second close and a
+// cancel waiting: every waiter gets the lost error after the rollback.
+func TestLostReachesEveryWaiter(t *testing.T) {
+	e, _, tok := newTxnEnv(t, nil)
+	s, d, leader := e.s, e.s.dbs["d"], e.leader(t)
+	e.post(t, "channel", "writer", sq(tok, 2, "begin"))
+	interrupted := make(chan struct{}, 3)
+	s.chMu.Lock()
+	ch := d.chans.chans[tok]
+	ch.last, ch.running, ch.receipt, ch.run = 3, true, nil, &completion{finished: make(chan struct{})}
+	ch.cancel = func(error) { interrupted <- struct{}{} }
+	s.chMu.Unlock()
+	got := make(chan *wire.Error, 3)
+	closer := func() {
+		_, er := s.closeChannel(d, leader, &wire.Request{Channel: tok}, ch.who)
+		e.quiet(t, "close answered")
+		got <- er
+	}
+	go closer()
+	<-interrupted
+	go closer()
+	<-interrupted
+	go func() {
+		_, er := s.cancelRequest(d, leader, &wire.Request{Channel: tok, Seq: 3}, ch.who, "id")
+		e.quiet(t, "cancel answered")
+		got <- er
+	}()
+	<-interrupted
+	l := wire.NewError(wire.CodeChannelLost, "lost")
+	l.Seq = 3
+	s.record(ch, nil, l, nil, false, wire.TxnNone)
+	seqs := map[int64]int{}
+	for range 3 {
+		er := <-got
+		if er == nil || er.Code != wire.CodeChannelLost {
+			t.Fatalf("waiter got %+v, want channel_lost", er)
+		}
+		seqs[er.Seq]++
+	}
+	if seqs[0] != 2 || seqs[3] != 1 {
+		t.Errorf("seqs %v, want two closes with 0 and a cancel with 3", seqs)
+	}
+	e.writes(t)
+}
+
+func TestSavepointSQL(t *testing.T) {
+	for sql, want := range map[string]bool{
+		"EXPLAIN QUERY PLAN ROLLBACK TO s":             true,
+		"explain query plan rollback transaction to s": true,
+		"EXPLAIN ROLLBACK TO SAVEPOINT s":              true,
+		"EXPLAIN RELEASE s":                            true,
+		"EXPLAIN ROLLBACK":                             false,
+		"EXPLAIN QUERY PLAN ROLLBACK":                  false,
+		"EXPLAIN QUERY PLAN COMMIT":                    false,
+		"EXPLAIN EXPLAIN SAVEPOINT s":                  false,
+		"EXPLAIN":                                      false,
+	} {
+		if got := savepointSQL(sql); got != want {
+			t.Errorf("savepointSQL(%q) = %v, want %v", sql, got, want)
+		}
+		if !txnControl(sql) && sql != "EXPLAIN" && sql != "EXPLAIN EXPLAIN SAVEPOINT s" {
+			t.Errorf("txnControl(%q) = false", sql)
+		}
+	}
+}

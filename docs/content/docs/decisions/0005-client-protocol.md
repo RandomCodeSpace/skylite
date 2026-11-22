@@ -714,7 +714,7 @@ The [checks before acceptance](#checks-before-acceptance) come first. The owner 
 | idle | `execute`, `batch` | Accept; a write takes the lock and a fresh connection | running | When it finishes |
 | idle | `describe`, `ping` | Accept | running | When it finishes |
 | idle | `commit`, `rollback` | Accept, record `invalid_state` | idle | `invalid_state` |
-| running | `begin` succeeds, with its first statement if any | Record | open | `done` |
+| running | `begin` succeeds, with its first statement if any | Record | open, or aborted if SQLite ended the transaction | `done` |
 | running | `begin` fails after starting the SQLite transaction: its snapshot or its first statement | Roll back, close the connection, record the error | idle | The error, `not_executed: true`, `txn_state: "none"` |
 | running | `begin` not granted the lock in time, or a waiting-writer bound reached | Record `busy` | idle | `busy` |
 | running | autocommit write reaches its commit point | none | durable wait | none yet |
