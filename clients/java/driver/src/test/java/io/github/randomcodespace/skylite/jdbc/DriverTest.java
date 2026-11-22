@@ -577,6 +577,18 @@ class DriverTest {
         }
     }
 
+    @Test
+    void theHeaderWaitOutlastsTheStopTimer() { // else the JDK's own timeout could end it as a transport failure
+        for (int t = 1; t <= 120; t++) {
+            long query = (t + Exchange.CANCEL_WAIT.toSeconds()) * 1000, describe = t * 1000L;
+            for (long stop : new long[] {query, describe}) {
+                assertTrue(Exchange.headerWait(0, stop).toMillis() > stop, t + " s, stop at " + stop + " ms");
+            }
+        }
+        assertEquals(Exchange.RESPONSE_HEADER_TIMEOUT, Exchange.headerWait(0, 0));
+        assertEquals(250, Exchange.headerWait(250, 5000).toMillis()); // the network timeout bounds the headers
+    }
+
     // ---- errors ----
 
     @ParameterizedTest

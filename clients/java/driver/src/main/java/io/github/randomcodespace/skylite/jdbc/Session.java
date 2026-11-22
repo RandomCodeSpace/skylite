@@ -64,6 +64,9 @@ final class Session {
         try {
             t = provider != null ? provider.token() : Files.readString(tokenFile, StandardCharsets.UTF_8).strip();
         } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             throw new SQLInvalidAuthorizationSpecException(
                     "skylite: the token source failed (" + e.getClass().getName() + ")", "28000");
         }

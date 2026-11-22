@@ -3,7 +3,6 @@ package io.github.randomcodespace.skylite.jdbc;
 import io.github.randomcodespace.skylite.jdbc.FrameReader.Columns;
 import io.github.randomcodespace.skylite.jdbc.FrameReader.Done;
 import io.github.randomcodespace.skylite.jdbc.FrameReader.Failure;
-import io.github.randomcodespace.skylite.jdbc.FrameReader.Frame;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;

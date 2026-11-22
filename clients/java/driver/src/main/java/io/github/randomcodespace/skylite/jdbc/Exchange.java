@@ -10,6 +10,7 @@ import java.io.InputStream;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
+import java.nio.ByteBuffer;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientException;
 import java.sql.SQLTimeoutException;
@@ -17,6 +18,7 @@ import java.time.Duration;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Flow;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -49,7 +51,10 @@ final class Exchange implements AutoCloseable {
     private final Owner owner;
     private final Object lock;
     // Written under lock, so that a stop and the submission or the arrival of the response each see the other.
-    private volatile CompletableFuture<HttpResponse<InputStream>> future;
+    private volatile CompletableFuture<HttpResponse<InputStream>> future; // the JDK's
+    private volatile CompletableFuture<HttpResponse<InputStream>> waited; // its copy, which a stop cancels at once
+    // Done when the JDK subscribes to the request body, or when its future completes without that.
+    private final CompletableFuture<Void> subscribed = new CompletableFuture<>();
     private volatile InputStream body;
     private volatile FrameReader reader;
     private volatile ScheduledFuture<?> timer;
@@ -75,19 +80,27 @@ final class Exchange implements AutoCloseable {
             throws SQLException {
         int network = s.networkTimeoutMillis();
         String token = s.token();
-        Duration wait = network > 0 ? Duration.ofMillis(network) : RESPONSE_HEADER_TIMEOUT;
         long stop = 0;
         if (timeoutSeconds > 0) {
             Duration t = Duration.ofSeconds(timeoutSeconds);
             if (kind == FrameReader.Kind.QUERY) {
                 t = t.plus(CANCEL_WAIT);
             }
-            if (network == 0 && t.compareTo(wait) > 0) {
-                wait = t;
-            }
             stop = t.toMillis();
         }
-        return start(s, kind, body, token, owner, timeoutSeconds, network, stop, wait);
+        return start(s, kind, body, token, owner, timeoutSeconds, network, stop, headerWait(network, stop));
+    }
+
+    /**
+     * The JDK's wait for the headers: the network timeout, or else long enough that the stop timer, not the JDK's
+     * own timeout, ends a statement with a query timeout.
+     */
+    static Duration headerWait(int networkMillis, long stopMillis) {
+        if (networkMillis > 0) {
+            return Duration.ofMillis(networkMillis);
+        }
+        Duration past = Duration.ofMillis(stopMillis).plus(CANCEL_WAIT);
+        return stopMillis > 0 && past.compareTo(RESPONSE_HEADER_TIMEOUT) > 0 ? past : RESPONSE_HEADER_TIMEOUT;
     }
 
     /**
@@ -112,11 +125,23 @@ final class Exchange implements AutoCloseable {
     private static Exchange start(Session s, FrameReader.Kind kind, byte[] body, String token, Owner owner,
             int timeoutSeconds, int network, long stopMillis, Duration wait) throws SQLException {
         Exchange ex = new Exchange(owner, timeoutSeconds, network);
+        HttpRequest.BodyPublisher bytes = HttpRequest.BodyPublishers.ofByteArray(body);
         HttpRequest req = HttpRequest.newBuilder(s.endpoint().uri(kind == FrameReader.Kind.QUERY ? "query" : "describe"))
                 .timeout(wait)
                 .header("Authorization", "Bearer " + token)
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                .POST(new HttpRequest.BodyPublisher() {
+                    @Override
+                    public long contentLength() {
+                        return bytes.contentLength();
+                    }
+
+                    @Override
+                    public void subscribe(Flow.Subscriber<? super ByteBuffer> subscriber) {
+                        bytes.subscribe(subscriber);
+                        ex.subscribed.complete(null);
+                    }
+                })
                 .build();
         // The owner's stop check, the submission and the registration are one step: a stop that completes first
         // sends nothing, and a later one finds the request to cancel. The headers are awaited outside it.
@@ -129,12 +154,15 @@ final class Exchange implements AutoCloseable {
                 ex.timer = Timer.INSTANCE.schedule(ex::timeOut, stopMillis, TimeUnit.MILLISECONDS);
             }
             ex.future = s.http().sendAsync(req, HttpResponse.BodyHandlers.ofInputStream());
+            ex.waited = ex.future.copy();
         }
         HttpResponse<InputStream> resp;
         try {
+            // A request that ends before its body is subscribed leaves no cancel waiting for that.
+            ex.future.whenComplete((r, e) -> ex.subscribed.complete(null));
             // A response that arrives after a stop, or after this thread stopped waiting, is released here.
             ex.future.thenAccept(r -> ex.arrived(r.body()));
-            resp = ex.future.get();
+            resp = ex.waited.get();
         } catch (CancellationException e) {
             ex.close();
             throw ex.stopped(e);
@@ -263,14 +291,17 @@ final class Exchange implements AutoCloseable {
     }
 
     private void abort() {
-        CompletableFuture<HttpResponse<InputStream>> f;
+        CompletableFuture<HttpResponse<InputStream>> f, w;
         InputStream b;
         synchronized (lock) {
             f = future;
+            w = waited;
             b = body;
         }
-        if (f != null) {
-            f.cancel(true);
+        if (f != null && !f.isDone()) {
+            w.cancel(false); // the waiting thread returns at once
+            // The JDK leaks an HTTP/2 stream slot when the request is cancelled before its body is subscribed.
+            subscribed.thenRunAsync(() -> f.cancel(true), Timer.INSTANCE);
         }
         close(b);
     }

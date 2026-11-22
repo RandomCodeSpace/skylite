@@ -39,6 +39,11 @@ import java.time.LocalDateTime;
 import java.util.Base64;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
@@ -49,8 +54,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * The driver against a real {@code skylite serve}, built from this repository with Go, over HTTPS with a test OIDC
- * issuer: a JWKS file and an ES256 token signed here. The database is created with a PUT; the server has no write
- * channels yet, so the queries are constant SQL.
+ * issuer: a JWKS file and an ES256 token signed here. The database is created with a PUT; the driver sends no
+ * writes yet, so the queries are constant SQL.
  */
 class SkyliteServerIT {
     static final String ISSUER = "https://issuer.skylite.test";
@@ -355,6 +360,61 @@ class SkyliteServerIT {
             long ms = Duration.ofNanos(System.nanoTime() - t0).toMillis();
             assertTrue(e instanceof java.sql.SQLTimeoutException, e.toString());
             assertTrue(ms >= 900 && ms < 2_900, "ended after " + ms + " ms");
+        }
+    }
+    /**
+     * A statement stopped just after its request is submitted gives the HTTP/2 stream back. The JDK client leaks a
+     * stream slot when sendAsync's future is cancelled before the request body is subscribed; after the server's 16
+     * it refuses every request. Distinct roots give this test its own HttpClient, so that a leak stays here.
+     */
+    @Test
+    void aStopJustAfterTheSubmissionGivesTheStreamBack(@TempDir Path dir) throws Exception {
+        String forever = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT i FROM n";
+        Path pem = dir.resolve("roots.pem");
+        Files.writeString(pem, Files.readString(certs.certPem) + "\n");
+        Properties p = props();
+        p.setProperty("tlsRootCertificates", pem.toString());
+        ExecutorService pool = Executors.newCachedThreadPool();
+        try (Connection c = DriverManager.getConnection(url, p)) {
+            try (Statement s = c.createStatement(); ResultSet rs = s.executeQuery("SELECT 1")) {
+                assertTrue(rs.next()); // the HTTP/2 connection exists before the races
+            }
+            for (int i = 0; i < 400; i++) {
+                boolean close = i % 2 == 1;
+                try (Statement s = c.createStatement()) {
+                    CountDownLatch go = new CountDownLatch(1);
+                    Future<?> query = pool.submit(() -> {
+                        go.await();
+                        try (ResultSet rs = s.executeQuery(forever)) {
+                            rs.next();
+                        } catch (SQLException e) { // cancelled or closed; never out of streams
+                            assertFalse(String.valueOf(e.getMessage()).contains("concurrent streams"), e.toString());
+                        }
+                        return null;
+                    });
+                    Future<?> stop = pool.submit(() -> {
+                        go.await();
+                        long t = System.nanoTime(), w = ThreadLocalRandom.current().nextLong(2_000_000);
+                        while (System.nanoTime() - t < w) {
+                            Thread.onSpinWait();
+                        }
+                        if (close) {
+                            s.close();
+                        } else {
+                            s.cancel();
+                        }
+                        return null;
+                    });
+                    go.countDown();
+                    query.get(30, TimeUnit.SECONDS);
+                    stop.get(30, TimeUnit.SECONDS);
+                }
+            }
+            try (Statement s = c.createStatement(); ResultSet rs = s.executeQuery("SELECT 1")) {
+                assertTrue(rs.next());
+            }
+        } finally {
+            pool.shutdownNow();
         }
     }
 }

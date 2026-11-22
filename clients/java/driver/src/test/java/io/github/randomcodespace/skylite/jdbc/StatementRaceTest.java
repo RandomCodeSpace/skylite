@@ -38,15 +38,16 @@ class StatementRaceTest {
 
     @Test
     void aCloseThatCompletesBeforeTheSubmissionSendsNothing() throws Exception {
-        SkyliteStatement s = new SkyliteStatement(conn) {
+        try (SkyliteStatement s = new SkyliteStatement(conn) {
             @Override
             public SQLException admit(Exchange ex) {
                 close(); // the last moment before the request is sent
                 return super.admit(ex);
             }
-        };
-        assertEquals("HY010", assertThrows(SQLException.class, () -> s.executeQuery("SELECT 1")).getSQLState());
-        assertEquals(0, fake.requests.size());
+        }) {
+            assertEquals("HY010", assertThrows(SQLException.class, () -> s.executeQuery("SELECT 1")).getSQLState());
+            assertEquals(0, fake.requests.size());
+        }
     }
 
     @Test
@@ -56,7 +57,7 @@ class StatementRaceTest {
             closed.await(10, TimeUnit.SECONDS);
             FakeServer.send(ex, 200, DriverTest.COLUMN_X, "[1]", FakeServer.done(1));
         };
-        SkyliteStatement s = new SkyliteStatement(conn) {
+        try (SkyliteStatement s = new SkyliteStatement(conn) {
             @Override
             public SQLException admit(Exchange ex) {
                 SQLException r = super.admit(ex);
@@ -71,25 +72,27 @@ class StatementRaceTest {
                 }
                 return r;
             }
-        };
-        assertEquals("HY010", assertThrows(SQLException.class, () -> s.executeQuery("SELECT 1")).getSQLState());
-        assertTrue(closed.await(10, TimeUnit.SECONDS));
+        }) {
+            assertEquals("HY010", assertThrows(SQLException.class, () -> s.executeQuery("SELECT 1")).getSQLState());
+            assertTrue(closed.await(10, TimeUnit.SECONDS));
+        }
     }
 
     @Test
     void aCloseBeforeThePublicationReleasesTheResultSet() throws Exception {
         SkyliteResultSet[] made = new SkyliteResultSet[1];
-        SkyliteStatement s = new SkyliteStatement(conn) {
+        try (SkyliteStatement s = new SkyliteStatement(conn) {
             @Override
             SkyliteResultSet publish(SkyliteResultSet rs) throws SQLException {
                 made[0] = rs;
                 close(); // after the columns are decoded, before the result set is the statement's
                 return super.publish(rs);
             }
-        };
-        assertEquals("HY010", assertThrows(SQLException.class, () -> s.executeQuery("SELECT 1")).getSQLState());
-        assertTrue(s.isClosed());
-        assertNotNull(made[0]);
-        assertTrue(made[0].isClosed(), "a closed statement left its result set open");
+        }) {
+            assertEquals("HY010", assertThrows(SQLException.class, () -> s.executeQuery("SELECT 1")).getSQLState());
+            assertTrue(s.isClosed());
+            assertNotNull(made[0]);
+            assertTrue(made[0].isClosed(), "a closed statement left its result set open");
+        }
     }
 }
