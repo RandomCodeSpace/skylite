@@ -787,12 +787,15 @@ class DriverTest {
     @org.junit.jupiter.params.provider.ValueSource(strings = {"channel_lost", "commit_outcome_unknown", "sequence_conflict",
         "drop"})
     void anUnknownOutcomeIs08007AndTheChannelIsGivenUp(String code) throws Exception {
-        String lost = code.equals("drop") ? "drop" : FakeServer.channelError(code, false, false, "none");
+        // The flags the server sends with each code (internal/wire/error.go NewError).
+        String lost = code.equals("drop") ? "drop" : FakeServer.channelError(code,
+                !code.equals("commit_outcome_unknown"), code.equals("sequence_conflict"), "none");
         channel(lost, lost, lost);
         try (Connection c = connect(); Statement s = c.createStatement()) {
             SQLNonTransientConnectionException e = fails(SQLNonTransientConnectionException.class,
                     () -> s.executeUpdate("INSERT INTO t VALUES (1)"));
             assertEquals("08007", e.getSQLState(), e.toString());
+            assertTrue(c.isClosed());
             assertFalse(c.isValid(5));
             assertEquals("08003", fails(SQLNonTransientConnectionException.class,
                     () -> s.executeUpdate("INSERT INTO t VALUES (2)")).getSQLState());
@@ -827,8 +830,9 @@ class DriverTest {
     }
 
     @Test
-    void aTransactionLostWithItsChannelFailsUntilRolledBackAndTheConnectionIsGivenUp() throws Exception {
-        channel(FakeServer.executed(1, "open", 1, 1), FakeServer.channelError("channel_lost", true, false, "none"));
+    void aTransactionLostWithItsChannelFailsUntilRolledBackThenUsesANewChannel() throws Exception {
+        channel(FakeServer.executed(1, "open", 1, 1), FakeServer.channelError("channel_lost", true, false, "none"),
+                FakeServer.executed(1, "open", 1, 2));
         try (Connection c = connect(); Statement s = c.createStatement()) {
             c.setAutoCommit(false);
             s.executeUpdate("INSERT INTO t VALUES (1)");
@@ -841,11 +845,12 @@ class DriverTest {
             assertEquals("SKR03", fails(SQLException.class, c::commit).getSQLState());
             assertEquals("SKR03", fails(SQLException.class, () -> c.setAutoCommit(true)).getSQLState());
             c.rollback(); // locally: nothing is sent
-            assertFalse(c.isValid(1));
-            assertEquals("08003", fails(SQLNonTransientConnectionException.class,
-                    () -> s.executeQuery("SELECT 1")).getSQLState());
+            assertEquals(2, channelBodies().size());
+            assertFalse(c.isClosed());
+            assertEquals(1, s.executeUpdate("INSERT INTO t VALUES (4)"));
         }
-        assertEquals(2, channelBodies().size());
+        assertEquals(2, fake.requests.stream().filter(r -> r.path().endsWith("/channels")).count());
+        assertTrue(channelBodies().get(2).contains("\"seq\":1,\"op\":\"begin\""), channelBodies().get(2));
     }
 
     @Test

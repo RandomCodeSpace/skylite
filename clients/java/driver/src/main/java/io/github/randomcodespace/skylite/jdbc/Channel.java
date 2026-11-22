@@ -22,10 +22,11 @@ import java.util.concurrent.TimeUnit;
  * been accepted is never sent on another channel.
  *
  * <p>When the outcome of a sent request cannot be learnt, the driver raises {@code 08007} and gives the channel up,
- * closing it without waiting; the server does not serve {@code resolve} yet, so nothing settles it. The connection is
- * then given up too (ADR 0005 decision 4): with a transaction open, its later statements and its commit fail with
- * {@code SKR03} and send nothing, and its rollback succeeds locally; after that, and outside a transaction, every use
- * of the connection fails with {@code 08003}.
+ * closing it without waiting; the server does not serve {@code resolve} yet, so nothing settles it (ADR 0005 decision
+ * 4). An autocommit write's or a commit's loss closes the connection, and every later use of it fails with
+ * {@code 08003}. A statement's or a rollback's loss inside a transaction loses the transaction: its later statements
+ * and its commit fail with {@code SKR03} and send nothing, its rollback succeeds locally, and the next statement after
+ * that opens a new channel.
  *
  * <p>The channel's state is read and changed under this object's lock, which a request holds while it runs. Close
  * waits for it; cancel does not take it.
@@ -49,8 +50,8 @@ final class Channel {
     private long last; // the last sequence number sent and settled; guarded by this
     private long answered; // System.nanoTime() of the channel's last answer; guarded by this
     private String state = "none"; // txn_state after the last settled request; guarded by this
-    private volatile boolean lost; // written under this: the channel was given up after an unknown outcome
-    private volatile boolean dead; // written under this: and a transaction was open, which rollback ends
+    private volatile boolean lost; // written under this: the connection was discarded after an unknown outcome
+    private volatile boolean dead; // written under this: the transaction was lost with its channel; rollback ends it
 
     Channel(SkyliteConnection conn) {
         this.conn = conn;
@@ -97,41 +98,36 @@ final class Channel {
         return state;
     }
 
-    boolean lost() {
-        return lost;
-    }
-
-    /** Why the connection may not be used, or null: its transaction was lost, or the channel was given up. */
+    /** Why the connection may not be used, or null: it was discarded, or its transaction was lost. */
     SQLException refusal() {
+        if (lost) {
+            return discarded();
+        }
         if (dead) {
             return new SQLException("skylite: the transaction was lost with its write channel after an unknown "
                     + "outcome, and nothing more of it is sent; roll it back", "SKR03", 0);
         }
-        if (lost) {
-            return new SQLNonTransientConnectionException("skylite: the connection was given up after an unknown "
-                    + "outcome on its write channel; open a new connection", "08003");
-        }
         return null;
     }
 
-    private void usable() throws SQLException {
-        if (conn.isClosed()) {
-            throw Errors.closed("connection");
-        }
-        SQLException refused = refusal();
-        if (refused != null) {
-            throw refused;
-        }
+    /** The error for any use of a connection discarded after an unknown outcome, or null if it was not. */
+    SQLException discarded() {
+        return lost ? new SQLNonTransientConnectionException("skylite: the connection was closed after an unknown "
+                + "outcome on its write channel; open a new connection", "08003") : null;
     }
 
     /**
      * Runs one statement on the channel. With auto-commit off, the first statement after a transaction ended is sent
      * as a begin's first statement, so that a transaction starts with its first statement; otherwise it is an execute,
-     * which outside a transaction is an autocommit write. Returns every frame of the answer, its done last.
+     * which outside a transaction is an autocommit write. Returns every frame of the answer, its done last, or null,
+     * sending nothing, when the connection became read-only after the statement chose the channel.
      */
     synchronized List<Frame> execute(String sql, List<Object> params, int timeoutSeconds, SkyliteStatement stmt)
             throws SQLException {
-        usable();
+        conn.checkOpen();
+        if (conn.readOnly()) { // setReadOnly holds this lock, so no transaction is open
+            return null;
+        }
         boolean transaction = !conn.autoCommit();
         open();
         boolean txnStatement = !state.equals("none");
@@ -143,25 +139,26 @@ final class Channel {
 
     /** Commits the open transaction; with none open, nothing is sent. */
     synchronized void commit() throws SQLException {
-        usable();
+        conn.checkOpen();
         if (!state.equals("none")) {
-            step("commit");
+            step("commit", false);
         }
     }
 
     /**
-     * Rolls back the open or aborted transaction; with none, nothing is sent. A channel given up rolls back locally:
-     * its transaction can no longer commit.
+     * Rolls back the open or aborted transaction; with none, nothing is sent. A transaction lost with its channel,
+     * or whose rollback's outcome is unknown, rolls back locally: its commit is never sent, so it cannot commit, and
+     * the next statement opens a new channel.
      */
     synchronized void rollback() throws SQLException {
         if (conn.isClosed()) {
-            throw Errors.closed("connection");
+            throw conn.closedError();
         }
-        if (!lost && !state.equals("none")) {
+        if (!dead && !state.equals("none")) {
             try {
-                step("rollback");
+                step("rollback", true);
             } catch (SQLException e) {
-                if (!lost) {
+                if (!dead) {
                     throw e;
                 }
             }
@@ -169,10 +166,10 @@ final class Channel {
         dead = false;
     }
 
-    private void step(String op) throws SQLException {
+    private void step(String op, boolean transaction) throws SQLException {
         open();
         long seq = last + 1;
-        send(seq, Kind.STEP, Request.step(token, seq, op), 0, null, false, false);
+        send(seq, Kind.STEP, Request.step(token, seq, op), 0, null, false, transaction);
     }
 
     private void open() throws SQLException {
@@ -202,7 +199,8 @@ final class Channel {
      * Sends seq's body, and again with the same bytes while its answer is lost in transport or the server reports it
      * in_flight. stmt, if any, is the statement whose cancel reaches this request. txnStatement: an execute sent while
      * a transaction is open, whose recorded failure is its outcome. transaction: an application transaction is open,
-     * from its begin, which an unknown outcome loses.
+     * from its begin, which an unknown outcome loses; otherwise, an autocommit write or a commit, an unknown outcome
+     * discards the connection.
      */
     private List<Frame> send(long seq, Kind kind, byte[] body, long timeoutMillis, SkyliteStatement stmt,
             boolean txnStatement, boolean transaction) throws SQLException {
@@ -323,17 +321,22 @@ final class Channel {
     }
 
     /**
-     * The request's outcome cannot be learnt: the channel is given up, and with it the transaction, if one is open.
-     * The channel is closed without waiting, unless the connection is closing, whose close sends it and waits.
+     * The request's outcome cannot be learnt: the channel is given up, and with it the transaction, if one is open;
+     * otherwise the connection is discarded (ADR 0005 decision 4). The channel is closed without waiting, unless the
+     * connection is closing, whose close sends it and waits.
      */
     private SQLException unknown(long seq, SQLException cause, boolean transaction) {
-        lost = true;
-        dead = transaction;
         state = "none";
         if (!conn.isClosed()) {
             String t = token;
             token = null;
             CompletableFuture.runAsync(() -> closeQuietly(t));
+        }
+        if (transaction) {
+            dead = true;
+        } else {
+            lost = true;
+            conn.discard();
         }
         return new SQLNonTransientConnectionException("skylite: the outcome of request " + seq
                 + " on the write channel is unknown; it may have committed (" + cause.getMessage() + ")", "08007", cause);

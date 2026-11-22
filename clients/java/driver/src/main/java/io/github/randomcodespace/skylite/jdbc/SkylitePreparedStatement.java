@@ -474,6 +474,7 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
             try {
                 counts[i] = update(run(sql, sets.get(i), !conn.readOnly(), keyLabel) != null);
             } catch (SQLException e) {
+                generatedKeys(keys); // the keys of the entries before it, as its update counts are
                 throw batchFailed(e, Arrays.copyOf(counts, i));
             }
             keys.addAll(generatedKeys());

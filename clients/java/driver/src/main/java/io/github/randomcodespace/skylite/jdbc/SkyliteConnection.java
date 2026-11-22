@@ -77,15 +77,21 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         return url;
     }
 
-    /** Refuses every use of a closed connection, and of one given up after an unknown outcome (ADR 0005). */
+    /** Refuses every use of a closed connection, and of one whose transaction was lost (ADR 0005). */
     void checkOpen() throws SQLException {
         if (closed) {
-            throw Errors.closed("connection");
+            throw closedError();
         }
         SQLException refused = channel.refusal();
         if (refused != null) {
             throw refused;
         }
+    }
+
+    /** The error for a use of the closed connection: 08003 when it was discarded after an unknown outcome. */
+    SQLException closedError() {
+        SQLException discarded = channel.discarded();
+        return discarded != null ? discarded : Errors.closed("connection");
     }
 
     void forget(SkyliteStatement s) {
@@ -239,12 +245,12 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
 
     /**
      * Rolls back the open or aborted transaction; with none, nothing is sent. A transaction lost with its channel
-     * rolls back locally.
+     * rolls back locally. After an unknown commit the connection is closed, and rollback raises {@code 08003}.
      */
     @Override
     public void rollback() throws SQLException {
         if (closed) {
-            throw Errors.closed("connection");
+            throw closedError();
         }
         synchronized (channel) {
             if (autoCommit) {
@@ -269,6 +275,14 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     void closeLater() {
         release();
         CompletableFuture.runAsync(channel::close);
+    }
+
+    /**
+     * Closes the connection after an unknown outcome (ADR 0005 decision 4), on the thread that learnt it, which holds
+     * the channel's lock and has detached its token: nothing more is sent, and every later use raises {@code 08003}.
+     */
+    void discard() {
+        release();
     }
 
     /** Marks the connection closed and closes its statements and validations, none of which waits. */
@@ -468,7 +482,7 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         if (timeout < 0) {
             throw new SQLNonTransientException("skylite: negative timeout", "HY092");
         }
-        if (closed || channel.lost()) {
+        if (closed) {
             return false;
         }
         long network = session.networkTimeoutMillis();

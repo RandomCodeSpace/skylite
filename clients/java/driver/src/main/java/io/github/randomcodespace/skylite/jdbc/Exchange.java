@@ -47,6 +47,14 @@ final class Exchange implements FrameReader.Frames {
             t.setRemoveOnCancelPolicy(true);
             return t;
         }
+
+        /**
+         * Runs task after millis on another thread: a stop takes its owner's lock, which a submission on another
+         * statement can hold while the JDK selects a proxy, and the timer must never wait.
+         */
+        static ScheduledFuture<?> later(Runnable task, long millis) {
+            return INSTANCE.schedule(() -> CompletableFuture.runAsync(task), millis, TimeUnit.MILLISECONDS);
+        }
     }
 
     private final Owner owner;
@@ -94,14 +102,17 @@ final class Exchange implements FrameReader.Frames {
     }
 
     /**
-     * Sends a request of a channel to path. No timer stops it: a write's answer is its outcome, and the server ends
-     * the statement at its timeout_ms. The network timeout, or else waitMillis, bounds the wait for the headers.
+     * Sends a request of a channel to path. No timer stops a request that carries an outcome: a write's answer is its
+     * outcome, and the server ends the statement at its timeout_ms. The network timeout, or else waitMillis, bounds
+     * the wait for the headers. A cancel or a close, whose answer the driver only waits for, is stopped waitMillis
+     * after it is sent, body included.
      */
     static Exchange channel(Session s, String path, FrameReader.Kind kind, byte[] body, long waitMillis, Owner owner)
             throws SQLException {
         int network = s.networkTimeoutMillis();
         String token = s.token();
-        return start(s, path, kind, body, token, owner, 0, network, 0,
+        boolean bounded = kind == FrameReader.Kind.CANCEL || kind == FrameReader.Kind.CLOSE;
+        return start(s, path, kind, body, token, owner, 0, network, bounded ? waitMillis : 0,
                 Duration.ofMillis(network > 0 ? network : waitMillis));
     }
 
@@ -165,7 +176,7 @@ final class Exchange implements FrameReader.Frames {
                 throw refused;
             }
             if (stopMillis > 0) {
-                ex.timer = Timer.INSTANCE.schedule(ex::timeOut, stopMillis, TimeUnit.MILLISECONDS);
+                ex.timer = Timer.later(ex::timeOut, stopMillis);
             }
             ex.future = s.http().sendAsync(req, HttpResponse.BodyHandlers.ofInputStream());
             ex.waited = ex.future.copy();
@@ -289,8 +300,8 @@ final class Exchange implements FrameReader.Frames {
     }
 
     /**
-     * The network timeout passed: like a socket timeout, that ends the logical connection and all it holds. It may
-     * run on the timer thread, which must never block: the connection's close, which waits, runs elsewhere.
+     * The network timeout passed: like a socket timeout, that ends the logical connection and all it holds. The
+     * connection's close, which waits for its channel's answer, runs on another thread.
      */
     private void stall() {
         synchronized (lock) {
@@ -359,7 +370,7 @@ final class Exchange implements FrameReader.Frames {
 
         @Override
         public int read(byte[] b, int off, int len) throws IOException {
-            ScheduledFuture<?> w = Timer.INSTANCE.schedule(Exchange.this::stall, networkMillis, TimeUnit.MILLISECONDS);
+            ScheduledFuture<?> w = Timer.later(Exchange.this::stall, networkMillis);
             try {
                 return in.read(b, off, len);
             } finally {

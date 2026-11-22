@@ -54,7 +54,8 @@ class SkyliteStatement implements Statement, Exchange.Owner {
 
     void checkOpen() throws SQLException {
         if (closed) {
-            throw Errors.closed("statement");
+            SQLException discarded = conn.channel().discarded(); // closed with its connection after an unknown outcome
+            throw discarded != null ? discarded : Errors.closed("statement");
         }
         conn.checkOpen();
     }
@@ -136,12 +137,17 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     SkyliteResultSet run(String sql, List<Object> params, boolean update, String keyLabel) throws SQLException {
         checkOpen();
         closeResult();
+        closeKeys();
         begin();
         generatedKeys = List.of();
         this.keyLabel = keyLabel;
         if (!statelessOnly && conn.onChannel(update)) {
             return onChannel(sql, params, keyLabel);
         }
+        return stateless(sql, params, keyLabel);
+    }
+
+    private SkyliteResultSet stateless(String sql, List<Object> params, String keyLabel) throws SQLException {
         Session s = conn.session();
         byte[] body = Request.query(sql, params, s.watermark(), queryTimeout * 1000L);
         Exchange ex = Exchange.send(s, FrameReader.Kind.QUERY, body, queryTimeout, this);
@@ -169,12 +175,23 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         }
     }
 
+    /** Runs on the channel, or as a stateless read when the connection became read-only after it was chosen. */
     private SkyliteResultSet onChannel(String sql, List<Object> params, String keyLabel) throws SQLException {
         List<Frame> frames = conn.execute(sql, params, queryTimeout, this);
+        if (frames == null) {
+            return stateless(sql, params, keyLabel);
+        }
         Done d = (Done) frames.get(frames.size() - 1);
         if (d.dataOmitted() && d.readOnly()) { // changed nothing: sent again as a new request (ADR 0005 decision 3)
             frames = conn.execute(sql, params, queryTimeout, this);
+            if (frames == null) {
+                return stateless(sql, params, keyLabel);
+            }
             d = (Done) frames.get(frames.size() - 1);
+            if (d.dataOmitted() && d.readOnly()) {
+                throw Errors.transport("the read's answer was lost in transport again, and its replay has no rows; "
+                        + "it changed nothing", null);
+            }
         }
         if (d.dataOmitted()) {
             // ADR 0005 decision 3: the base class, which Spring and Hibernate treat as non-transient.
@@ -668,10 +685,34 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         rows.add(END);
         Column c = new Column(keyLabel != null ? keyLabel : ROWID_LABEL, "INTEGER", null, null, null);
         SkyliteResultSet rs = new SkyliteResultSet(this, FrameReader.Frames.of(rows), List.of(c), 0, 0);
+        SkyliteResultSet old;
         synchronized (lock) {
-            keys = rs;
+            if (closed) {
+                old = rs;
+            } else {
+                old = keys;
+                keys = rs;
+            }
+        }
+        if (old != null) {
+            old.close();
+        }
+        if (old == rs) {
+            throw Errors.closed("statement");
         }
         return rs;
+    }
+
+    /** Closes the last getGeneratedKeys result set, which a new execution replaces. */
+    private void closeKeys() {
+        SkyliteResultSet k;
+        synchronized (lock) {
+            k = keys;
+            keys = null;
+        }
+        if (k != null) {
+            k.close();
+        }
     }
 
     @Override
