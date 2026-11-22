@@ -1,11 +1,11 @@
 ---
 title: Server
-description: What `skylite serve` does in this version, which is authenticate requests, create databases, lead the databases it is configured for, answer read-only queries on them and run autocommit writes on write channels, and how to configure it.
+description: What `skylite serve` does in this version, which is authenticate requests, create databases, lead the databases it is configured for, answer read-only queries on them and run autocommit writes and transactions on write channels, and how to configure it.
 weight: 15
 status: current
 ---
 
-`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on leaders and [opt-in followers](#reading-on-a-follower), and runs autocommit writes on [write channels](#write-channels) on leaders. It runs no transaction, batch or `resolve`. The [Go driver](/docs/go-driver/)'s read path uses `query` and `describe`; no driver sends writes yet.
+`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on leaders and [opt-in followers](#reading-on-a-follower), and runs autocommit writes and transactions on [write channels](#write-channels) on leaders. It runs no batch or `resolve`. The [Go driver](/docs/go-driver/)'s read path uses `query` and `describe`; no driver sends writes yet.
 
 ## What it serves
 
@@ -15,13 +15,14 @@ status: current
 | `POST /v1/databases/{db}/query` with `sql` and optionally `params` or `named`, `min_txn` and `timeout_ms` | One pure read on the leader or on an enabled follower: a `columns` frame, one frame per row, then `done` with `txn`, `read_only`, `rows_affected` and `last_insert_rowid`. See [Queries](#queries) |
 | `POST /v1/databases/{db}/describe` with `sql` and optionally `min_txn` | The statement's result columns and parameter names, without running it: a `columns` frame, `params` frames, then `done` with `txn` and `param_count` |
 | `POST /v1/databases/{db}/channels` with `{"mode":"write"}` | Opens a write channel: `done` with `txn`, the leader's head, and `channel` with `token`, `id`, `mode`, `epoch` and `limits`. See [Write channels](#write-channels). A read-only open gets `503` `not_serving` |
-| `POST /v1/databases/{db}/channel` with `channel`, `seq` and `op` `execute` (with `sql`, optionally `params` or `named`, `min_txn` and `timeout_ms`) or `ping` | An autocommit write, or a ping, on the channel |
+| `POST /v1/databases/{db}/channel` with `channel`, `seq` and `op`: `begin` (optionally with a first statement in `execute`, `min_txn` and `timeout_ms`), `execute` (with `sql`, optionally `params` or `named`, `min_txn` and `timeout_ms`), `commit` (optionally `timeout_ms`), `rollback` or `ping` | A request on the channel: an autocommit write, or a step of a [transaction](#transactions) |
+| `POST /v1/databases/{db}/channel/cancel` with `channel` and `seq` | Cancels that request: `done` with `seq`, `txn_state` and the request's receipt. See [Cancel](#cancel) |
 | `POST /v1/databases/{db}/channel/close` with `channel` | Closes the channel: `done` with `last_seq` and the receipt of that request |
 | Channel requests on a database this server does not lead, or stateless reads with neither a local leader nor an enabled local follower | `503` `not_serving`. The body is not read |
-| `channel/cancel`, `resolve` and `GET` status | After authentication, and authorisation at the `read` role on the name, `503` `not_serving`. The body is not read |
+| `resolve` and `GET` status | After authentication, and authorisation at the `read` role on the name, `503` `not_serving`. The body is not read |
 | Anything else, or a path with a query string | `400` `invalid_request` |
 
-`{db}` is 1 to 63 characters from `a-z`, `0-9` and `-`, starting with a letter or a digit. A `PUT` needs the `admin` role on the name; a write open and every request on a write channel need the `write` role, checked again on each request because a new token's claims can differ; every other request, a close included, needs the `read` role. Every answer is a sequence of NDJSON frames ending in one terminal frame, and a refusal is one error frame, with the headers `Skylite-Protocol: 1`, `Skylite-Request-Id`, `Content-Type: application/x-ndjson` and `Cache-Control: no-store`; a `401` also carries `WWW-Authenticate: Bearer`. The error object and its codes are those of [0005's errors](/docs/decisions/0005-client-protocol/#errors).
+`{db}` is 1 to 63 characters from `a-z`, `0-9` and `-`, starting with a letter or a digit. A `PUT` needs the `admin` role on the name; a write open and every request on a write channel need the `write` role, checked again on each request because a new token's claims can differ; every other request, a close and a cancel included, needs the `read` role. Every answer is a sequence of NDJSON frames ending in one terminal frame, and a refusal is one error frame, with the headers `Skylite-Protocol: 1`, `Skylite-Request-Id`, `Content-Type: application/x-ndjson` and `Cache-Control: no-store`; a `401` also carries `WWW-Authenticate: Bearer`. The error object and its codes are those of [0005's errors](/docs/decisions/0005-client-protocol/#errors).
 
 A new database has 4,096-byte pages and base groups of 256 pages. When the store cannot tell whether a create landed, the answer is `500` `internal`, never `database_exists`: the database may or may not exist, and a `PUT` sent again answers which.
 
@@ -87,7 +88,7 @@ A connection is reset before every reuse, [as 0007 requires](/docs/decisions/000
 
 ## Write channels
 
-A write channel is [0005's channel](/docs/decisions/0005-client-protocol/#2-channels) on the leader. In this version it carries two requests, each a sequenced request with `channel`, `seq` and `op`: `execute`, an autocommit write of one statement, and `ping`. A channel holds no SQLite connection while it is idle.
+A write channel is [0005's channel](/docs/decisions/0005-client-protocol/#2-channels) on the leader. In this version it carries the sequenced requests `begin`, `execute`, `commit`, `rollback` and `ping`, each with `channel`, `seq` and `op`: an `execute` with no transaction open is an autocommit write of one statement, and the others run [transactions](#transactions). A channel holds a SQLite connection only while a request runs or a transaction is open.
 
 ### Opening
 
@@ -99,11 +100,11 @@ After the checks above, a request on a channel goes through these, in order:
 
 1. The token names this database (`400` `invalid_request`).
 2. It names this server process and a channel of the leader in office, of this principal, that has not ended (`410` `channel_lost`). A token of another process gets `channel_lost`: only the leader in office holds write channels in this version, so another process's channels ended when it left office. A request of another principal leaves the channel untouched.
-3. The channel is not closing (`channel_lost`); the operation is `execute`, `ping`, `commit` or `rollback` (`begin`, `batch` and `describe` get `503` `not_serving`, and take no sequence number).
-4. The sequence number, by [0005's table](/docs/decisions/0005-client-protocol/#2-channels): the next number with nothing running is accepted; the next with a request running gets `409` `channel_busy`; the last, with the same body digest, gets `409` `in_flight` while it runs and its recorded outcome after; the last with another body, `409` `sequence_conflict` (`final: true`); a lower number `409` `stale_sequence`, a higher `409` `sequence_gap`. A refusal changes nothing.
-5. For an `execute`: `min_txn` is at most the leader's head (`503` `behind`), and a SQLite connection is reserved and opened fresh for it (`429` `overloaded`, or `503` `maintenance` while the leader is in maintenance).
+3. The channel is not closing (`channel_lost`); the operation is not `batch` or `describe`, which get `503` `not_serving` and take no sequence number.
+4. The sequence number, by [0005's table](/docs/decisions/0005-client-protocol/#2-channels): the last, recorded as cancelled before it arrived, gets that `cancelled` receipt whatever the body; the next number with nothing running is accepted; the next with a request running gets `409` `channel_busy`; the last, with the same body digest, gets `409` `in_flight` while it runs and its recorded outcome after; the last with another body, `409` `sequence_conflict` (`final: true`); a lower number `409` `stale_sequence`, a higher `409` `sequence_gap`. A refusal changes nothing.
+5. For a `begin` or `execute` with no transaction open: `min_txn` is at most the leader's head (`503` `behind`), and a SQLite connection is reserved and opened fresh for it (`429` `overloaded`, or `503` `maintenance` while the leader is in maintenance).
 
-Then the request is accepted: its sequence number and the SHA-256 digest of its exact body are recorded, the answer is `200`, and its outcome is recorded whatever it is. A field the request may not have, or a bad value, is a recorded `invalid_request`. `commit` and `rollback` are accepted and record `invalid_state`, since a channel never has a transaction open in this version. `ping` records `txn`, the leader's head.
+Then the request is accepted: its sequence number and the SHA-256 digest of its exact body are recorded, the answer is `200`, and its outcome is recorded whatever it is. A field the request may not have, or a bad value, is a recorded `invalid_request`. `ping` records `txn`: the snapshot inside a transaction, otherwise the leader's head.
 
 ### An autocommit write
 
@@ -132,15 +133,50 @@ No row of a write reaches the client before its commit has an outcome. A write's
 
 A client that drops its connection cancels nothing: the write runs on, and its outcome is recorded for a resend to replay.
 
+### Transactions
+
+A transaction follows [0005's channel state machine](/docs/decisions/0005-client-protocol/#channel-state-machine). Every answer on a channel carries `txn_state`: `none`, `open` or `aborted`.
+
+- **`begin`** waits for the write lock like an autocommit write, then runs `BEGIN IMMEDIATE` on a fresh connection, and the first statement in `execute`, if any. Its `txn` is the transaction's snapshot: the head when `BEGIN IMMEDIATE` returned. The transaction then holds its connection and the database's write lock across requests until it ends, so every other writer waits, and after the lock wait gets `busy`. A `begin` that fails, in its first statement too, rolls back, closes the connection and leaves no transaction, with `not_executed: true` and `txn_state: "none"`: a first statement under SQLite's `FAIL` conflict action leaves nothing either. A `begin` inside a transaction records `invalid_state`.
+- **`execute`** inside a transaction runs on the transaction's connection; its rows stream as they are produced, and up to 64 KiB of them are kept for replay. Its recorded failure has `not_executed: false`, whatever the code, because SQLite's semantics apply inside the transaction. After it, the server reads SQLite's autocommit state: when SQLite rolled the whole transaction back, as an `INSERT OR ROLLBACK` does, the answer says `aborted`, and the connection and the lock are released at once. `SAVEPOINT`, `RELEASE` and `ROLLBACK TO` run as statements inside a transaction ([0007](/docs/decisions/0007-sql-policy/)); outside one, and in an autocommit write, they are refused like other transaction control.
+- **`commit`** runs `COMMIT` under the commit identifier of its own sequence number. It ends the transaction whatever happens: committed (`committed: true`, `wrote: true`, `txn` the new transaction), committed with nothing to write (`wrote: false`, `txn` the snapshot), or failed, which rolls back and records the error with `not_executed: true`. A deferred foreign key that fails at `COMMIT` is such a failure, although SQLite itself would keep the transaction open. A commit's outcome maps to its answer as an autocommit write's does.
+- **`rollback`** rolls back, closes the connection and releases the lock; its `txn` is the leader's head. Without a transaction it records `invalid_state`. A `rollback` that fails its validation after acceptance, one with a `sql` member for example, records `invalid_request` and leaves the state as it was: an open transaction keeps its connection and the lock, an aborted channel holds neither and stays aborted, until a valid `rollback`, a close or a limit ends it. A statement that succeeds after SQLite's transaction has gone underneath it answers with `txn_state: aborted`, and the lock is released ([0007](/docs/decisions/0007-sql-policy/) requirement 8).
+- **Aborted**: a channel whose transaction SQLite, a limit or the engine rolled back holds nothing, and records `transaction_aborted` (`not_executed: true`) for every request but `rollback`, which returns it to `none`. When the engine ended the transaction, as maintenance does, the error carries `cause: "maintenance"`.
+
+| Limit | Value |
+|---|---|
+| Statement time, per request, from before check 5 to the commit point for a `commit` (recorded `timeout`). Inside a transaction an interrupted write statement makes SQLite roll back, and the answer is `aborted`; an interrupted read leaves the transaction open | 30 seconds; `timeout_ms` lowers it |
+| Write transaction idle limit, from the end of one response to the arrival of the next request; the transaction is rolled back and the channel aborted, checked every second | 30 seconds |
+| Write transaction lifetime, from the `begin`'s acceptance. An idle transaction is aborted, a running statement is interrupted and recorded `timeout` with the transaction aborted, and a running `commit` before its commit point fails with `timeout` | 5 minutes |
+
+No timer acts on a commit past its commit point: a commit in its upload when its lifetime passes completes, and its answer is the commit. While a transaction is open the channel idle limit does not run.
+
+The engine tells the server through the connection when it ends an open transaction on its own, as maintenance rolls one back ([0005, requirement 15](/docs/decisions/0005-client-protocol/#requirements-on-the-engine-and-the-format)); the server then releases the write lock and aborts the channel without waiting for its next request. A statement or commit that maintenance interrupts records `maintenance`, and its transaction is aborted or, for a commit, ended.
+
+### Cancel
+
+A `cancel` names a channel and a sequence number, needs the `read` role and the channel's principal, has a 4 KiB body limit, and takes no sequence number of its own:
+
+| The named request | Answer |
+|---|---|
+| The last, finished | `done` with its receipt, changing nothing |
+| The last, running | Interrupts it through its connection unless it is past its commit point, then answers once it has finished, with its receipt: `cancelled` if the interrupt came first, the commit if it did not. A commit in its upload is never interrupted |
+| The next, with nothing running | Records it as cancelled before it arrived (`cancelled`, `not_executed: true`, `final: true`), with no body digest: every later delivery of that number gets that receipt, whatever its body, and nothing runs. An open transaction stays open |
+| The next, with a request running | `409` `channel_busy` |
+| Lower, or higher than the next | `409` `stale_sequence` or `sequence_gap` |
+| Any but the last, on a closing channel | `410` `channel_lost` |
+
+A cancel that joins a closing channel's wait answers with the same receipt and `txn_state: "none"`.
+
 ### Receipts and replay
 
 Each channel keeps the receipt of its last request: its terminal frame, with an error's own request id. A resend of that request with an identical body gets the frames its response had before the terminal one, if they were kept, then the receipt. They are kept only for a success, up to 64 KiB, and while the server's and the database's retained data, 32 MiB each, have room (0005 allows 256 MiB per server when the memory budget has room; this server keeps 32 MiB, within its channel share); otherwise the replay is the receipt alone, with `data_omitted: true` when the response had frames. Kept data is released when the channel accepts its next request or ends. A recorded error keeps at most 1,024 bytes of its message, the error message bound.
 
 ### Closing and ending
 
-A close needs the `read` role and the channel's principal. A channel with nothing running ends at once. One with a request running becomes closing: the request is interrupted through its connection, which before its commit point records `cancelled`, and the close is answered once the request has finished and its outcome is recorded, so a close never answers before a running commit's outcome. A second close joins the first. The answer carries `last_seq` and that request's receipt.
+A close needs the `read` role and the channel's principal. A channel with nothing running ends at once, and an open transaction is rolled back before the answer. One with a request running becomes closing: the request is interrupted through its connection, which before its commit point records `cancelled`, and the close is answered once the request has finished, its outcome is recorded, and an open transaction is rolled back and the write lock released, so a close never answers before a running commit's outcome. A second close, or a cancel of the running request, joins the first and answers after that too. The answer carries `last_seq` and that request's receipt.
 
-A channel also ends when it has been idle for 10 minutes (the channel idle limit, checked every second; idle time runs from the end of one request to the arrival of the next, a replay or a refusal included, and never while a request runs), and when its leader stops or leaves office. A request that runs when the leader stops keeps its channel in the table, ended but unsettled, until it has finished. Every request on an ended channel gets `channel_lost`.
+A channel also ends when it has been idle for 10 minutes (the channel idle limit, checked every second; idle time runs from the end of one request to the arrival of the next, a replay or a refusal included, and never while a request runs or a transaction is open), and when its leader stops or leaves office, which rolls back an open transaction. A request that runs when the leader stops keeps its channel in the table, ended but unsettled, until it has finished. Every request on an ended channel gets `channel_lost`.
 
 ### Maintenance, the tail bound and a stopping leader
 
@@ -246,10 +282,11 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 ## Not built yet, and not verified
 
 - Admission control of [0005 decision 9](/docs/decisions/0005-client-protocol/#9-limits-and-defaults): request and per-principal request bounds. The memory budget is fixed at 2 GiB rather than taken from the container's limit, and response frames are not charged to it.
-- Transactions (`begin`, `commit` and `rollback` with a transaction), `cancel` and the transaction timers; `batch`, `describe` on a channel and read-only channels; `resolve`, so a write whose channel was lost stays unknown to its driver; `GET` status; forwarding between pods and cluster membership.
+- `batch`, `describe` on a channel and read-only channels; `resolve`, so a write whose channel was lost stays unknown to its driver; `GET` status; forwarding between pods and cluster membership.
 - `database_not_found` for a query: a server that does not lead the database and has no enabled follower for it answers `not_serving`, whether or not it exists.
 - Keepalive frames during a long query or a write's lock wait, and the compiled-statement cache: every query and write compiles its statement.
-- 0005's commit point is not visible to the server, so a close cannot tell a write before it from one in its upload; it interrupts the connection, and the engine reports what happened.
+- 0005's commit point is not visible to the server, so a close or a cancel cannot tell a write or commit before it from one in its upload; it interrupts the connection, and the engine reports what happened.
+- Maintenance starts only from a commit or a write of the writer that holds the write lock, so it never meets another channel's idle open transaction in this version; the server's handling of the engine ending an idle transaction is tested by closing its engine connection, not by maintenance.
 - A tail bound the leader cannot compact past is noticed when a request meets it, so a server that takes office there reports itself ready until its first query.
 - The header block deadline on HTTP/2 streams: there, only the idle timeout bounds a header block that never ends. The 431 answer is tested on HTTP/1.1 only.
 - Reloading a rotated TLS certificate without a restart.

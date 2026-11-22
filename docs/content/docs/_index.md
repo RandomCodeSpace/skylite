@@ -8,7 +8,7 @@ listChildren: false
 
 skylite aims to be a SQL database server where object storage is the source of truth. It is a Go project, and the plan is to build it on SQLite. It is meant to run in Kubernetes pods that have no persistent volumes. In the design, all durable state lives in object storage, and pod disk is only a cache.
 
-The project is pre-alpha. The binary prints its version and help, and its server authenticates requests, creates databases, answers read-only SQL queries on the databases it leads and runs autocommit writes sent on write channels; it has no transactions yet, and no driver sends writes. Most of these pages describe design direction rather than behaviour. Pages that describe goals say so at the top.
+The project is pre-alpha. The binary prints its version and help, and its server authenticates requests, creates databases, answers read-only SQL queries on the databases it leads and runs autocommit writes and transactions sent on write channels; no driver sends writes yet. Most of these pages describe design direction rather than behaviour. Pages that describe goals say so at the top.
 
 ## Where to start
 

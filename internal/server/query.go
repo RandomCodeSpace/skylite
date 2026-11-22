@@ -377,7 +377,7 @@ func (s *Server) run(db *sqlite3.Conn, pc *sqlpolicy.Conn, snapshot func(func() 
 			return nil
 		}
 		st.start() // the statement started executing: status 200
-		if err := bind(req, stmt); err != nil {
+		if err := bind(req, req.Args, stmt); err != nil {
 			return err
 		}
 		if len(cols) > 0 {
@@ -496,13 +496,13 @@ func columns(stmt *sqlite3.Stmt) []wire.Column {
 	return cols
 }
 
-// bind binds the request's arguments, every parameter exactly once.
-func bind(req *wire.Request, stmt *sqlite3.Stmt) error {
+// bind binds a's arguments of req, every parameter exactly once.
+func bind(req *wire.Request, a wire.Args, stmt *sqlite3.Stmt) error {
 	names := make([]string, stmt.BindCount())
 	for i := range names {
 		names[i] = stmt.BindName(i + 1)
 	}
-	return req.Bind(req.Args, names, func(i int, v any) error {
+	return req.Bind(a, names, func(i int, v any) error {
 		switch v := v.(type) {
 		case nil:
 			return stmt.BindNull(i)
@@ -540,16 +540,39 @@ func value(stmt *sqlite3.Stmt, i int) any {
 // a transaction, and a stateless request runs inside the server's own read
 // transaction.
 func txnControl(sql string) bool {
+	w, _ := leadWord(sql)
+	switch strings.ToUpper(w) {
+	case "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE":
+		return true
+	}
+	return false
+}
+
+// leadWord returns sql's first keyword after EXPLAIN [QUERY PLAN], and the
+// rest of sql.
+func leadWord(sql string) (word, rest string) {
 	w, rest := firstWord(sql)
 	if strings.EqualFold(w, "EXPLAIN") {
 		if w, rest = firstWord(rest); strings.EqualFold(w, "QUERY") {
 			_, rest = firstWord(rest) // PLAN
-			w, _ = firstWord(rest)
+			w, rest = firstWord(rest)
 		}
 	}
+	return w, rest
+}
+
+// savepointSQL reports whether sql is SAVEPOINT, RELEASE or ROLLBACK
+// [TRANSACTION] TO by its first keywords, after EXPLAIN [QUERY PLAN].
+func savepointSQL(sql string) bool {
+	w, rest := leadWord(sql)
 	switch strings.ToUpper(w) {
-	case "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE":
+	case "SAVEPOINT", "RELEASE":
 		return true
+	case "ROLLBACK":
+		if w, rest = firstWord(rest); strings.EqualFold(w, "TRANSACTION") {
+			w, _ = firstWord(rest)
+		}
+		return strings.EqualFold(w, "TO")
 	}
 	return false
 }

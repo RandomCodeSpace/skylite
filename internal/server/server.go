@@ -4,11 +4,11 @@
 //
 // This version serves PUT /v1/databases/{db}, which creates a database, the
 // stateless query and describe requests on leaders and opt-in followers
-// (see query.go), and write channels with autocommit writes on leaders
-// (see channel.go). Each configured database has an office loop
-// (internal/office). Every other path of the protocol (cancel,
-// resolve and GET status) is authenticated and then answered with
-// not_serving. Of the admission control of ADR 0005 decision 9, the bound
+// (see query.go), and write channels with autocommit writes, transactions
+// and cancel on leaders (see channel.go). Each configured database has an
+// office loop (internal/office). Every other path of the protocol (resolve
+// and GET status) is authenticated and then answered with not_serving. Of
+// the admission control of ADR 0005 decision 9, the bound
 // on HTTP connections, the body share of the memory budget, the SQLite
 // connection limits and the channel bounds are implemented.
 package server
@@ -624,8 +624,8 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 		return nil, e, false
 	}
 	switch kind {
-	case wire.KindCancel, wire.KindResolve, wire.KindStatus:
-		return nil, wire.NewError(wire.CodeNotServing, "cancel, resolve and status are not served in this version"), false
+	case wire.KindResolve, wire.KindStatus:
+		return nil, wire.NewError(wire.CodeNotServing, "resolve and status are not served in this version"), false
 	}
 	// Route before reading the body. Only stateless reads can use a follower.
 	d := s.dbs[db]
@@ -644,7 +644,7 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	}
 	defer release()
 	limit := s.limits.RequestBodyBytes
-	if kind == wire.KindClose {
+	if kind == wire.KindClose || kind == wire.KindCancel {
 		limit = controlBodyBytes
 	}
 	body, e := s.readBody(r, limit)
@@ -656,8 +656,8 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 		return nil, e, true
 	}
 	// Writes need the write role (ADR 0006): a write open, and every
-	// request on a write channel but close, checked again on each, since a
-	// token's claims can change.
+	// request on a write channel but close and cancel, which only stop
+	// work, checked again on each, since a token's claims can change.
 	if kind == wire.KindChannel || kind == wire.KindOpen && req.Mode == wire.ModeWrite {
 		if e := authorize(auth.RoleWrite); e != nil {
 			return nil, e, true
@@ -672,6 +672,8 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 		done, e = s.channelRequest(r.Context(), st, d, leader, req, body, who, id, log)
 	case wire.KindClose:
 		done, e = s.closeChannel(d, leader, req, who)
+	case wire.KindCancel:
+		done, e = s.cancelRequest(d, leader, req, who, id)
 	default:
 		done, e = s.statement(r.Context(), st, d, leader, follower, req, who, log)
 	}
