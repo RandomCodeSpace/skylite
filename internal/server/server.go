@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -34,6 +35,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"golang.org/x/net/netutil"
 
@@ -42,6 +45,7 @@ import (
 	"github.com/RandomCodeSpace/skylite/internal/office"
 	"github.com/RandomCodeSpace/skylite/internal/sqlpolicy"
 	"github.com/RandomCodeSpace/skylite/internal/storage"
+	"github.com/RandomCodeSpace/skylite/internal/storage/azureblob"
 	"github.com/RandomCodeSpace/skylite/internal/storage/gcs"
 	"github.com/RandomCodeSpace/skylite/internal/storage/localfs"
 	"github.com/RandomCodeSpace/skylite/internal/storage/s3"
@@ -140,8 +144,10 @@ type Server struct {
 }
 
 // New validates cfg, loads the TLS certificate and the JWKS files, and opens
-// the storage backend. A cloud backend takes its credentials from its SDK's default
-// credential chain. A nil log discards log records. New sends no request.
+// the storage backend. S3 and GCS take their credentials from their SDKs'
+// default credential chains; Azure reads its shared key from the configured
+// file or environment variable. A nil log discards log records. New sends no
+// request.
 func New(cfg Config, log *slog.Logger) (*Server, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -200,6 +206,25 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 	return s, nil
 }
 
+// azureIdleConnTimeout drops idle connections before Azurite (5 s) or an
+// intermediate proxy closes them; see package azureblob's documentation.
+const azureIdleConnTimeout = 2 * time.Second
+
+// maxAzureKeyFile bounds the shared key file; a key is 88 bytes of base64.
+const maxAzureKeyFile = 4096
+
+// azureStore wraps an azureblob.Store so closing the store closes the HTTP
+// transport's idle connections.
+type azureStore struct {
+	storage.Store
+	close func()
+}
+
+func (s azureStore) Close() error {
+	s.close()
+	return nil
+}
+
 func openStore(ctx context.Context, c Storage) (storage.Store, error) {
 	switch {
 	case c.LocalFS != nil:
@@ -210,9 +235,74 @@ func openStore(ctx context.Context, c Storage) (storage.Store, error) {
 			return nil, fmt.Errorf("server: s3 credentials: %w", err)
 		}
 		return s3.New(s3.Config{Bucket: c.S3.Bucket, Region: c.S3.Region, Credentials: aws.Credentials, Endpoint: c.S3.Endpoint, UsePathStyle: c.S3.PathStyle})
-	default:
+	case c.GCS != nil:
 		return gcs.Open(ctx, gcs.Config{Bucket: c.GCS.Bucket, Endpoint: c.GCS.Endpoint})
+	default:
+		return openAzure(c.Azure)
 	}
+}
+
+func openAzure(a *Azure) (storage.Store, error) {
+	key, err := readAzureSharedKey(a)
+	if err != nil {
+		return nil, err
+	}
+	cred, err := container.NewSharedKeyCredential(a.Account, key)
+	if err != nil {
+		return nil, errors.New("server: azure shared key is not valid base64")
+	}
+	dt, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("server: azure client: http.DefaultTransport is not an *http.Transport")
+	}
+	tr := dt.Clone()
+	tr.IdleConnTimeout = azureIdleConnTimeout
+	// A redirect would resend a signed request, body included, elsewhere.
+	hc := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	c, err := container.NewClientWithSharedKeyCredential(a.containerURL(), cred, &container.ClientOptions{
+		ClientOptions: azcore.ClientOptions{Transport: hc},
+	})
+	if err != nil {
+		tr.CloseIdleConnections()
+		return nil, fmt.Errorf("server: azure client: %w", err)
+	}
+	return azureStore{Store: azureblob.New(c, ""), close: tr.CloseIdleConnections}, nil
+}
+
+func readAzureSharedKey(a *Azure) (string, error) {
+	if a.SharedKeyFile != "" {
+		// The errors leave out the path: a key pasted in its place would be logged.
+		f, err := os.Open(a.SharedKeyFile) //nolint:gosec // the operator names the file
+		if err != nil {
+			var pe *fs.PathError
+			if errors.As(err, &pe) {
+				err = pe.Err
+			}
+			return "", fmt.Errorf("server: azure shared key file: %w", err)
+		}
+		defer func() { _ = f.Close() }()
+		b, err := io.ReadAll(io.LimitReader(f, maxAzureKeyFile+1))
+		if err != nil {
+			var pe *fs.PathError
+			if errors.As(err, &pe) {
+				err = pe.Err
+			}
+			return "", fmt.Errorf("server: azure shared key file: %w", err)
+		}
+		if len(b) > maxAzureKeyFile {
+			return "", fmt.Errorf("server: azure shared key file is larger than %d bytes", maxAzureKeyFile)
+		}
+		key := strings.TrimSpace(string(b))
+		if key == "" {
+			return "", errors.New("server: azure shared key file is empty")
+		}
+		return key, nil
+	}
+	key := strings.TrimSpace(os.Getenv(a.SharedKeyEnv))
+	if key == "" {
+		return "", fmt.Errorf("server: azure shared key: environment variable %s is empty or unset", a.SharedKeyEnv)
+	}
+	return key, nil
 }
 
 // Serve serves at most 1,024 connections at a time from ln until ctx is

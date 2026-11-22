@@ -16,8 +16,9 @@ import (
 )
 
 // Config is the server's configuration, read from a JSON file by Load. It
-// holds no secret: the cloud backends take their credentials from their
-// SDKs' default credential chains.
+// holds no secret: S3 and GCS take their credentials from their SDKs' default
+// credential chains, and Azure reads its shared key from a file or environment
+// variable named in the configuration.
 type Config struct {
 	// Listen is the TCP address to listen on, for example ":8443".
 	Listen string `json:"listen"`
@@ -49,7 +50,7 @@ type TLS struct {
 }
 
 // Storage selects one backend and the key prefix the databases live under.
-// Exactly one of LocalFS, S3 and GCS must be set.
+// Exactly one of LocalFS, S3, GCS and Azure must be set.
 type Storage struct {
 	// Prefix is prepended, with a "/", to every database's keys. Empty means
 	// the databases' keys start at the root of the store.
@@ -57,6 +58,7 @@ type Storage struct {
 	LocalFS *LocalFS `json:"localfs"`
 	S3      *S3      `json:"s3"`
 	GCS     *GCS     `json:"gcs"`
+	Azure   *Azure   `json:"azure"`
 }
 
 // LocalFS is a directory on a local file system.
@@ -76,6 +78,27 @@ type S3 struct {
 type GCS struct {
 	Bucket   string `json:"bucket"`
 	Endpoint string `json:"endpoint"`
+}
+
+// Azure is an Azure Blob Storage container.
+type Azure struct {
+	// Account is the storage account name, used to sign requests with a shared
+	// key and, when Endpoint is empty, to form the account URL
+	// https://<account>.blob.core.windows.net.
+	Account string `json:"account"`
+	// Container is the name of an existing container.
+	Container string `json:"container"`
+	// Endpoint, if set, is the blob service account URL, for example
+	// "http://127.0.0.1:10000/devstoreaccount1" for Azurite. If empty,
+	// https://<account>.blob.core.windows.net is used.
+	Endpoint string `json:"endpoint"`
+	// SharedKeyFile is the path of a file holding the base64-encoded account
+	// shared key. Exactly one of SharedKeyFile and SharedKeyEnv must be set.
+	SharedKeyFile string `json:"shared_key_file"`
+	// SharedKeyEnv names an environment variable holding the base64-encoded
+	// account shared key. Exactly one of SharedKeyFile and SharedKeyEnv must
+	// be set.
+	SharedKeyEnv string `json:"shared_key_env"`
 }
 
 // Load reads and validates the configuration file at path. Unknown fields
@@ -128,14 +151,14 @@ func (c Config) Validate() error {
 
 func (s Storage) validate() error {
 	n := 0
-	for _, set := range []bool{s.LocalFS != nil, s.S3 != nil, s.GCS != nil} {
+	for _, set := range []bool{s.LocalFS != nil, s.S3 != nil, s.GCS != nil, s.Azure != nil} {
 		if set {
 			n++
 		}
 	}
 	switch {
 	case n != 1:
-		return errors.New("storage needs exactly one of localfs, s3 and gcs")
+		return errors.New("storage needs exactly one of localfs, s3, gcs and azure")
 	case s.LocalFS != nil && s.LocalFS.Path == "":
 		return errors.New("storage.localfs.path is empty")
 	case s.S3 != nil && (s.S3.Bucket == "" || s.S3.Region == ""):
@@ -146,12 +169,68 @@ func (s Storage) validate() error {
 		return errors.New("storage.s3.endpoint " + endpointRule)
 	case s.GCS != nil && !validEndpoint(s.GCS.Endpoint):
 		return errors.New("storage.gcs.endpoint " + endpointRule)
+	case s.Azure != nil:
+		if err := s.Azure.validate(); err != nil {
+			return err
+		}
 	}
 	// The longest database name must still leave room for every key.
 	if _, err := s.keys(strings.Repeat("a", 63)); err != nil {
 		return fmt.Errorf("storage.prefix: %w", err)
 	}
 	return nil
+}
+
+func (a Azure) validate() error {
+	switch {
+	case a.Account == "" || a.Container == "":
+		return errors.New("storage.azure needs account and container")
+	case !validAzureAccount(a.Account):
+		return errors.New("storage.azure.account must not contain /, ?, #, @, : or white space")
+	case !validAzureContainer(a.Container):
+		return errors.New("storage.azure.container must be a single path segment with no /, ?, # or white space")
+	case !validEndpoint(a.Endpoint):
+		return errors.New("storage.azure.endpoint " + endpointRule)
+	case (a.SharedKeyFile == "") == (a.SharedKeyEnv == ""):
+		return errors.New("storage.azure needs exactly one of shared_key_file and shared_key_env")
+	case a.SharedKeyEnv != "" && !validEnvName(a.SharedKeyEnv):
+		return errors.New("storage.azure.shared_key_env must be an environment variable name")
+	}
+	return nil
+}
+
+func (a Azure) containerURL() string {
+	base := strings.TrimRight(a.Endpoint, "/")
+	if base == "" {
+		base = "https://" + a.Account + ".blob.core.windows.net"
+	}
+	return base + "/" + a.Container
+}
+
+func validAzureAccount(s string) bool {
+	return s != "" && !strings.ContainsAny(s, "/\\?#@: \t\r\n") && validEndpoint("https://"+s+".blob.core.windows.net")
+}
+
+func validAzureContainer(s string) bool {
+	return s != "" && s != "." && s != ".." && !strings.ContainsAny(s, "/\\?#% \t\r\n") && validEndpoint("https://example.invalid/"+s)
+}
+
+// validEnvName reports whether s is a POSIX environment variable name
+// ([A-Za-z_][A-Za-z0-9_]*), so a pasted key (which holds =, / or +) is refused
+// without repeating it.
+func validEnvName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := range len(s) {
+		c := s[i]
+		letter := 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || c == '_'
+		digit := '0' <= c && c <= '9'
+		if i == 0 && !letter || i > 0 && !letter && !digit {
+			return false
+		}
+	}
+	return true
 }
 
 const endpointRule = "must be an http or https URL with a host and no user information, query or fragment"
