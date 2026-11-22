@@ -681,3 +681,32 @@ func TestCloseJoinsRunningTxn(t *testing.T) {
 	}
 	e.writes(t)
 }
+
+// TestSavepointsInTxn: SAVEPOINT, RELEASE and ROLLBACK TO run inside a
+// transaction (0007); outside one they are refused, and so is a plain
+// ROLLBACK inside one.
+func TestSavepointsInTxn(t *testing.T) {
+	e, _, tok := newTxnEnv(t, nil)
+	post := func(body string) answer { return e.post(t, "channel", "writer", body) }
+	if r := post(ex(tok, 2, "SAVEPOINT s")); r.code() == "" {
+		t.Errorf("a savepoint outside a transaction: %v, want refused", r.frames)
+	}
+	post(sq(tok, 3, "begin", "execute", map[string]any{"sql": "INSERT INTO t VALUES (1)"}))
+	for i, sql := range []string{"SAVEPOINT s", "INSERT INTO t VALUES (2)", "ROLLBACK TO s", "SAVEPOINT r", "INSERT INTO t VALUES (3)", "RELEASE r", "rollback transaction to s", "RELEASE s"} {
+		if r := post(ex(tok, int64(4+i), sql)); r.code() != "" || r.done()["txn_state"] != "open" {
+			t.Fatalf("%s: %v", sql, r.frames)
+		}
+	}
+	if r := post(ex(tok, 12, "ROLLBACK")); r.code() != "invalid_request" {
+		t.Errorf("a plain ROLLBACK in a transaction: %v, want invalid_request", r.frames)
+	}
+	if st, open := e.txState(tok); st != wire.TxnOpen || !open {
+		t.Errorf("state %q, open %v after the refused ROLLBACK", st, open)
+	}
+	if r := post(sq(tok, 13, "commit")); r.code() != "" {
+		t.Fatalf("commit: %v", r.frames)
+	}
+	if got := e.count(t, "SELECT count(*) FROM t"); got != "[1]" {
+		t.Errorf("rows %s, want only the first insert", got)
+	}
+}

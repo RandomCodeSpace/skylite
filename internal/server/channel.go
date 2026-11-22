@@ -1141,7 +1141,7 @@ func (s *Server) write(db *sqlite3.Conn, c *pconn, req *wire.Request, stmt *wire
 		var out *wire.Writer
 		out, err = wire.NewWriter(w, wire.DefaultFrameBytes, s.limits)
 		if err == nil {
-			done, err = statementOn(db, c, ictx, req, stmt, out)
+			done, err = statementOn(db, c, ictx, req, stmt, out, !commit)
 		}
 	}
 	if err == nil && commit {
@@ -1174,11 +1174,13 @@ func (s *Server) write(db *sqlite3.Conn, c *pconn, req *wire.Request, stmt *wire
 }
 
 // statementOn runs the client's statement stmt of req under the policy on
-// c, writing its result to out.
-func statementOn(db *sqlite3.Conn, c *pconn, ictx context.Context, req *wire.Request, stmt *wire.Statement, out *wire.Writer) (done *wire.Done, err error) {
+// c, writing its result to out; inTxn says it runs in the client's transaction.
+func statementOn(db *sqlite3.Conn, c *pconn, ictx context.Context, req *wire.Request, stmt *wire.Statement, out *wire.Writer, inTxn bool) (done *wire.Done, err error) {
 	total := db.TotalChanges()
 	err = c.pc.Run(ictx, stmt.SQL, func(st *sqlite3.Stmt) error {
-		if txnControl(stmt.SQL) {
+		// SAVEPOINT, RELEASE and ROLLBACK TO run inside the client's
+		// transaction only (0007), not inside an autocommit write's own.
+		if txnControl(stmt.SQL) && (!inTxn || !savepointSQL(stmt.SQL)) {
 			return wire.NewError(wire.CodeInvalidRequest, "transaction control is not SQL in this protocol; use a channel's begin, commit and rollback")
 		}
 		if err := bind(req, stmt.Args, st); err != nil {

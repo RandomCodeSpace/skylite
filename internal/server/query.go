@@ -460,6 +460,22 @@ func txnControl(sql string) bool {
 	return false
 }
 
+// savepointSQL reports whether sql is SAVEPOINT, RELEASE or ROLLBACK
+// [TRANSACTION] TO by its first keywords.
+func savepointSQL(sql string) bool {
+	w, rest := firstWord(sql)
+	switch strings.ToUpper(w) {
+	case "SAVEPOINT", "RELEASE":
+		return true
+	case "ROLLBACK":
+		if w, rest = firstWord(rest); strings.EqualFold(w, "TRANSACTION") {
+			w, _ = firstWord(rest)
+		}
+		return strings.EqualFold(w, "TO")
+	}
+	return false
+}
+
 // firstWord returns the identifier characters at the start of s after white
 // space, comments and semicolons, as SQLite's parser reads them, and the
 // rest of s. SQLite's tokenizer reads a UTF-8 byte order mark as white space,
