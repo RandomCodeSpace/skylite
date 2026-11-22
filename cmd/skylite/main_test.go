@@ -269,6 +269,96 @@ func TestServeQueryOverHTTPS(t *testing.T) {
 	}
 }
 
+// TestServeWritesOverHTTPS runs serve over TLS in a child process with a
+// signed token: it creates a database, opens a write channel, writes
+// through it and closes it, kills the process with SIGKILL, starts a new
+// one on the same store and reads the writes back from object storage.
+func TestServeWritesOverHTTPS(t *testing.T) {
+	if cfg := os.Getenv("SKYLITE_SERVE_CHILD"); cfg != "" {
+		os.Exit(run([]string{"serve", "-config", cfg}, os.Stdout, os.Stderr))
+	}
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", t.TempDir()) // the leaders' local files, which a kill leaves behind
+	cert, key, roots := selfSigned(t, dir)
+	cfg, token := serveConfig(t, dir, map[string]any{
+		"plaintext": false, "tls": map[string]any{"cert_file": cert, "key_file": key}, "databases": []string{"e2e"},
+	})
+	c := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}, ForceAttemptHTTP2: true}}
+	send := func(addr, method, path, body string) (int, []string) {
+		t.Helper()
+		req, err := http.NewRequest(method, "https://"+addr+"/v1/databases/e2e"+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.ProtoMajor != 2 || resp.Header.Get("Skylite-Protocol") != "1" {
+			t.Fatalf("%s %s: %s, protocol marker %q", method, path, resp.Proto, resp.Header.Get("Skylite-Protocol"))
+		}
+		return resp.StatusCode, strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+	}
+	// served sends a request until the server leads the database.
+	served := func(addr, path, body string) (int, []string) {
+		t.Helper()
+		for deadline := time.Now().Add(120 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+			code, frames := send(addr, http.MethodPost, path, body)
+			if code != http.StatusServiceUnavailable || time.Now().After(deadline) {
+				return code, frames
+			}
+		}
+	}
+	cmd, addr, first := serveChild(t, "TestServeWritesOverHTTPS", cfg)
+	if code, frames := send(addr, http.MethodPut, "", "{}"); code != http.StatusOK {
+		t.Fatalf("PUT: %d %v", code, frames)
+	}
+	code, frames := served(addr, "/channels", `{"mode":"write"}`)
+	var open struct {
+		Done struct {
+			Channel struct{ Token string }
+		}
+	}
+	if err := json.Unmarshal([]byte(frames[0]), &open); code != http.StatusOK || err != nil || open.Done.Channel.Token == "" {
+		t.Fatalf("open: %d %v", code, frames)
+	}
+	tok := open.Done.Channel.Token
+	for i, w := range []struct{ sql, last string }{
+		{"CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)", `{"done":{"seq":1,"txn_state":"none","txn":3,"read_only":false,"rows_affected":0,"last_insert_rowid":0}}`},
+		{"INSERT INTO books (title) VALUES ('Dune') RETURNING id", `{"done":{"seq":2,"txn_state":"none","txn":4,"read_only":false,"rows_affected":1,"last_insert_rowid":1}}`},
+		{"INSERT INTO books (title) VALUES ('Emma')", `{"done":{"seq":3,"txn_state":"none","txn":5,"read_only":false,"rows_affected":1,"last_insert_rowid":2}}`},
+	} {
+		body, _ := json.Marshal(map[string]any{"channel": tok, "seq": i + 1, "op": "execute", "sql": w.sql})
+		if code, frames := send(addr, http.MethodPost, "/channel", string(body)); code != http.StatusOK || frames[len(frames)-1] != w.last {
+			t.Fatalf("execute %d: %d %v, want %s", i+1, code, frames, w.last)
+		}
+	}
+	if code, frames := send(addr, http.MethodPost, "/channel/close", `{"channel":"`+tok+`"}`); code != http.StatusOK || !strings.HasPrefix(frames[0], `{"done":{"last_seq":3,"outcome":{"seq":3,"ok":true,`) {
+		t.Fatalf("close: %d %v", code, frames)
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	// A new process: it takes office once the killed one's lease expires.
+	_, addr, log := serveChild(t, "TestServeWritesOverHTTPS", cfg)
+	code, frames = served(addr, "/query", `{"sql":"SELECT id, title FROM books ORDER BY id"}`)
+	if code != http.StatusOK || strings.Join(frames[1:], "\n") != "[1,\"Dune\"]\n[2,\"Emma\"]\n"+`{"done":{"txn":6,"read_only":true,"rows_affected":0,"last_insert_rowid":0}}` {
+		t.Fatalf("query after the restart: %d %v", code, frames)
+	}
+	if l := first.String() + log.String(); strings.Contains(l, token) || strings.Contains(l, tok) || strings.Contains(l, "Dune") || strings.Contains(l, "INSERT") {
+		t.Errorf("the log holds a token or SQL: %s", l)
+	}
+}
+
 // selfSigned writes a certificate for 127.0.0.1 and its key into dir, and
 // returns their paths and a pool that trusts the certificate.
 func selfSigned(t *testing.T, dir string) (cert, key string, roots *x509.CertPool) {
