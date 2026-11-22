@@ -74,7 +74,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
             return Errors.closed("statement");
         }
         if (conn.isClosed()) {
-            return Errors.closed("connection");
+            return conn.closedError();
         }
         live.add(ex);
         return null;
@@ -92,7 +92,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
             return Errors.closed("statement");
         }
         if (conn.isClosed()) {
-            return Errors.closed("connection");
+            return conn.closedError();
         }
         live.add(ex);
         runningSeq = seq;

@@ -18,6 +18,8 @@ import java.time.Duration;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -37,6 +39,13 @@ final class Exchange implements FrameReader.Frames {
 
     private static final class Timer {
         static final ScheduledExecutorService INSTANCE = timer();
+        // The driver's own threads for stops and channel closes, which can wait on a token provider or a lock: the
+        // common pool has only as many threads as CPUs, and blocked closes there would hold back every stop.
+        static final ExecutorService WORK = Executors.newCachedThreadPool(r -> {
+            Thread th = new Thread(r, "skylite-jdbc-work");
+            th.setDaemon(true);
+            return th;
+        });
 
         private static ScheduledExecutorService timer() {
             ScheduledThreadPoolExecutor t = new ScheduledThreadPoolExecutor(1, r -> {
@@ -53,8 +62,13 @@ final class Exchange implements FrameReader.Frames {
          * statement can hold while the JDK selects a proxy, and the timer must never wait.
          */
         static ScheduledFuture<?> later(Runnable task, long millis) {
-            return INSTANCE.schedule(() -> CompletableFuture.runAsync(task), millis, TimeUnit.MILLISECONDS);
+            return INSTANCE.schedule(() -> async(task), millis, TimeUnit.MILLISECONDS);
         }
+    }
+
+    /** Runs task on one of the driver's own threads, never the timer's or the common pool's. */
+    static void async(Runnable task) {
+        CompletableFuture.runAsync(task, Timer.WORK);
     }
 
     private final Owner owner;
@@ -285,7 +299,8 @@ final class Exchange implements FrameReader.Frames {
         if (stalled) {
             return Errors.transport("no response bytes within the network timeout of " + networkMillis + " ms", cause);
         }
-        return Errors.closed("result set");
+        SkyliteConnection c = owner.connection();
+        return c.isClosed() ? c.closedError() : Errors.closed("result set");
     }
 
     static SQLException cancelled(Throwable cause) {

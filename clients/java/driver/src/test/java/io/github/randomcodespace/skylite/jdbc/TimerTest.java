@@ -107,4 +107,33 @@ class TimerTest {
             exec.shutdownNow();
         }
     }
+
+    /**
+     * Work the driver hands off, such as a channel close waiting in a token provider, never holds back a stop: more
+     * blocked tasks than the common pool has threads still leave a later task to run at once.
+     */
+    @Test
+    void blockedHandOffsDoNotHoldBackAStop() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        int blocked = Runtime.getRuntime().availableProcessors() + 2;
+        CountDownLatch started = new CountDownLatch(blocked);
+        try {
+            for (int i = 0; i < blocked; i++) {
+                Exchange.async(() -> {
+                    started.countDown();
+                    try {
+                        release.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+            }
+            assertTrue(started.await(5, TimeUnit.SECONDS), "the blocked tasks did not all start");
+            CountDownLatch ran = new CountDownLatch(1);
+            Exchange.async(ran::countDown);
+            assertTrue(ran.await(2, TimeUnit.SECONDS), "a stop waited behind blocked hand-offs");
+        } finally {
+            release.countDown();
+        }
+    }
 }

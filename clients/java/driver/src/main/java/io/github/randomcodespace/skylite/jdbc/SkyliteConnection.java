@@ -21,7 +21,6 @@ import java.sql.Struct;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 
@@ -102,7 +101,7 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         statements.add(s);
         if (closed) { // closed while s was made, perhaps after close() went through the statements
             s.close();
-            throw Errors.closed("connection");
+            throw closedError();
         }
         return s;
     }
@@ -274,7 +273,7 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     /** {@link #close}, except that the channel's close, which waits for its answer, runs on another thread. */
     void closeLater() {
         release();
-        CompletableFuture.runAsync(channel::close);
+        Exchange.async(channel::close);
     }
 
     /**

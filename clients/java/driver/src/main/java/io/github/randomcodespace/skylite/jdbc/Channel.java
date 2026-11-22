@@ -9,7 +9,6 @@ import java.sql.SQLNonTransientConnectionException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
@@ -176,7 +175,7 @@ final class Channel {
         if (token != null && state.equals("none") && System.nanoTime() - answered > reopenAfterNanos) {
             String t = token; // idle too long: the server may end it at its idle limit before the next request
             token = null;
-            CompletableFuture.runAsync(() -> closeQuietly(t));
+            Exchange.async(() -> closeQuietly(t));
         }
         if (token != null) {
             return;
@@ -330,7 +329,7 @@ final class Channel {
         if (!conn.isClosed()) {
             String t = token;
             token = null;
-            CompletableFuture.runAsync(() -> closeQuietly(t));
+            Exchange.async(() -> closeQuietly(t));
         }
         if (transaction) {
             dead = true;
