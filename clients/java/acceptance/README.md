@@ -5,7 +5,8 @@ that exercise what an ORM does to a database. The JDBC URL, driver class and
 Hibernate dialect come from configuration, so the same tests can run against
 any JDBC driver. It was written to decide how skylite's JDBC support should be
 built (decision record 0003, `docs/content/docs/decisions/0003-jdbc-transport.md`)
-and is meant to run later against skylite's own endpoint.
+and now runs against skylite too, through skylite's JDBC driver and Hibernate
+dialect (see "Running against skylite" below).
 
 Build tool: Maven, because the Spring Boot parent POM pins every plugin and
 library version in one place and Dependabot updates it directly.
@@ -57,8 +58,9 @@ before the check rejects the run, as in the `SPRING_APPLICATION_JSON` row with
 
 Connections the tests open outside the pool, to check what another connection
 sees, are opened by `ConnectionReport.openOutsidePool()` with the requested
-driver class and URL, the values the check verified, and with the pool's user
-name and password if it has any. They do not use `spring.datasource.*`, which
+driver class and URL, the values the check verified, and with the pool's
+driver properties (`spring.datasource.hikari.data-source-properties.*`, such as
+skylite's `tokenFile`), user name and password, if it has any. They do not use `spring.datasource.*`, which
 can differ from what the pool uses (see the `hikari.jdbc-url` row below).
 
 The check certifies that the URL, the driver class and the dialect in use are
@@ -85,6 +87,44 @@ driver against the server in `internal/spike/flightsql`:
 (cd internal/spike/flightsql && go run . -db /tmp/flightsql.db) &
 mvn -f clients/java/acceptance/pom.xml test -Pflightsql
 ```
+
+### Running against skylite
+
+From the repository root, with a JDK, Maven and Go:
+
+```sh
+make java-acceptance-skylite
+```
+
+It installs `clients/java/driver` and `clients/java/hibernate` into the local
+Maven repository, then runs the suite with the `skylite` profile:
+`io.github.randomcodespace.skylite.jdbc.SkyliteDriver` with
+`io.github.randomcodespace.skylite.hibernate.SkyliteDialect`. Before any test,
+`SkyliteServer`, a JUnit launcher session listener that does nothing without
+`-Dskylite.serve=true`, builds `cmd/skylite` from this repository and starts
+`skylite serve` on a free port of 127.0.0.1, as the driver's integration test
+does: HTTPS with a self-signed certificate, JWT authentication by a test
+issuer whose ES256 token it signs, and storage on the local file system under
+`target/skylite/`. It creates the database `acceptance` with a `PUT`, waits
+until the server leads it, and sets the system properties `jdbc.url` and
+`spring.datasource.hikari.data-source-properties.tokenFile` and
+`.tlsRootCertificates`, which the pool passes to the driver. The server stops
+when the run ends; its log is in `target/skylite/run-*/skylite.log`.
+
+28 tests pass and one is skipped, with its reason printed:
+
+```text
+SKIPPED TransactionTest.rollbackToSavepointKeepsEarlierWrites: the driver reports no savepoint support; skylite's server refuses SAVEPOINT, RELEASE and ROLLBACK TO on a write channel
+```
+
+That test is skipped wherever the verified connection's driver reports
+`DatabaseMetaData.supportsSavepoints()` false; sqlite-jdbc supports them, so it
+runs on the baseline and in the fault check. The baseline's five known
+failures pass on skylite: its dialect declares foreign keys and takes
+generated keys from the driver, and its driver reports `BIGINT` for an
+`integer` column, implements `getBlob`, and raises
+`SQLIntegrityConstraintViolationException` with SQL state `23000` for
+`SQLITE_CONSTRAINT`.
 
 ### Tests skipped on the baseline
 

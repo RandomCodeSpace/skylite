@@ -9,6 +9,7 @@ import java.sql.Savepoint;
 import java.util.List;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledIf;
 import org.springframework.beans.factory.annotation.Autowired;
 
 /**
@@ -38,6 +39,9 @@ class TransactionTest extends AcceptanceTestBase {
         assertThat(authors.findByEmail("octavia@example.com")).isEmpty();
     }
 
+    // Skipped where the driver reports no savepoints: see README.md, "Running against skylite".
+    @DisabledIf(value = Baseline.NO_SAVEPOINTS, disabledReason = "the driver reports no savepoint support; skylite's"
+            + " server refuses SAVEPOINT, RELEASE and ROLLBACK TO on a write channel")
     @Test
     void rollbackToSavepointKeepsEarlierWrites() throws Exception {
         try (Connection c = dataSource.getConnection()) {

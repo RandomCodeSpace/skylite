@@ -117,6 +117,46 @@
       </dependencies>
     </profile>
 
+    <!-- skylite: its JDBC driver and Hibernate dialect against a skylite serve that the test run builds from this
+         repository and starts (SkyliteServer), which also sets jdbc.url. Install the driver and the dialect first:
+         make java-acceptance-skylite. -->
+    <profile>
+      <id>skylite</id>
+      <properties>
+        <jdbc.url>set-by-SkyliteServer</jdbc.url>
+        <jdbc.driver>io.github.randomcodespace.skylite.jdbc.SkyliteDriver</jdbc.driver>
+        <jdbc.dialect>io.github.randomcodespace.skylite.hibernate.SkyliteDialect</jdbc.dialect>
+      </properties>
+      <dependencies>
+        <dependency>
+          <groupId>io.github.randomcodespace</groupId>
+          <artifactId>skylite-jdbc</artifactId>
+          <version>0.0.0-SNAPSHOT</version>
+          <scope>runtime</scope>
+        </dependency>
+        <dependency>
+          <groupId>io.github.randomcodespace</groupId>
+          <artifactId>skylite-hibernate</artifactId>
+          <version>0.0.0-SNAPSHOT</version>
+          <scope>runtime</scope>
+        </dependency>
+      </dependencies>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <systemPropertyVariables>
+                <skylite.serve>true</skylite.serve>
+                <skylite.repo>${project.basedir}/../../..</skylite.repo>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
     <!-- Checks the suite itself: runs it once per injected driver fault (selfcheck/FaultCheck). Use with sqlite. -->
     <profile>
       <id>fault-check</id>
