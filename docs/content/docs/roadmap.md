@@ -6,7 +6,7 @@ weight: 30
 status: current
 ---
 
-skylite is pre-alpha. The binary's server authenticates requests, creates databases, leads the databases it is configured for and answers read-only SQL queries on them; it runs no writes yet. Leading a database includes compacting its commit log. The milestones below are in planned order. Only the first is done. Parts of the storage milestone exist as library packages, described in [Storage backends](/docs/storage-backends/).
+skylite is pre-alpha. The binary's server authenticates requests, creates databases, leads the databases it is configured for, answers read-only SQL queries on them, and runs autocommit writes sent on write channels; it has no transactions yet. Leading a database includes compacting its commit log. The milestones below are in planned order. Only the first is done. Parts of the storage milestone exist as library packages, described in [Storage backends](/docs/storage-backends/).
 
 {{< roadmap >}}
 

@@ -7,7 +7,7 @@ status: current
 
 Package `github.com/RandomCodeSpace/skylite/driver`, whose package name is `skylite`, is a Go `database/sql` driver that speaks the protocol of [0005: Client protocol](/docs/decisions/0005-client-protocol/) over HTTPS. This version has the read path only: statements outside a transaction that the server accepts as pure reads.
 
-The [server](/docs/server/) answers `query` and `describe` on the databases it leads; the driver's own tests run against an in-process fake server built from the protocol's codec, and no test yet runs the driver against the real server.
+The [server](/docs/server/) answers `query` and `describe` on the databases it leads, and now accepts autocommit writes on write channels, but this driver does not send them yet: its write path is a separate piece of work. The driver's own tests run against an in-process fake server built from the protocol's codec, and no test yet runs the driver against the real server.
 
 ## Usage
 
@@ -95,6 +95,6 @@ An error the server answered is a `*skylite.Error`, read with `errors.As`. It ca
 
 ## Not yet
 
-- Writes and transactions. They need the server's write channels, replay and `resolve`, which do not exist yet.
+- Writes and transactions. The server has write channels with replay for autocommit writes; the driver does not use them yet, and the server's transactions and `resolve` do not exist yet.
 - Retries. The driver sends each request once; a read refused before acceptance, such as `overloaded` or `not_serving`, is returned to the caller.
 - GORM. No GORM test has been run.

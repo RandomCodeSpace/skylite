@@ -23,6 +23,7 @@ import (
 	"github.com/RandomCodeSpace/skylite/internal/engine"
 	"github.com/RandomCodeSpace/skylite/internal/format"
 	"github.com/RandomCodeSpace/skylite/internal/sqlpolicy"
+	"github.com/RandomCodeSpace/skylite/internal/storage"
 	"github.com/RandomCodeSpace/skylite/internal/storage/localfs"
 )
 
@@ -33,7 +34,13 @@ import (
 // set, changes the server before it starts.
 func newQueryEnv(t *testing.T, edit func(*env)) *env {
 	t.Helper()
-	e := newEnv(t, nil)
+	return newLeaderEnv(t, nil, edit)
+}
+
+// newLeaderEnv is newQueryEnv on a store wrapped by wrap, if it is set.
+func newLeaderEnv(t *testing.T, wrap func(storage.Store) storage.Store, edit func(*env)) *env {
+	t.Helper()
+	e := newEnv(t, wrap)
 	e.s.cfg.Databases = []string{"d"}
 	keys, err := e.s.cfg.Storage.keys("d")
 	if err != nil {
@@ -616,6 +623,45 @@ func TestTimeoutMS(t *testing.T) {
 	}
 }
 
+// TestTimeoutAfterRows: a statement that reaches its time limit after its
+// response started ends with the timeout frame, not a cut stream.
+func TestTimeoutAfterRows(t *testing.T) {
+	e := newQueryEnv(t, nil)
+	// More rows than one frame holds, then no more rows, never ending.
+	body := fmt.Sprintf(`{"sql":%q,"timeout_ms":300}`, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c WHERE x <= 3000")
+	for _, c := range []struct {
+		name   string
+		client *http.Client
+		proto  int
+	}{{"HTTP/1.1", h1Client(), 1}, {"HTTP/2", h2cClient(), 2}} {
+		t.Run(c.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, "http://"+e.addr+"/v1/databases/d/query", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+e.sig.token(t, "reader"))
+			resp, err := c.client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("HTTP/%d: reading the body: %v", resp.ProtoMajor, err)
+			}
+			frames, err := parseFrames(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := answer{resp.StatusCode, frames}
+			if resp.ProtoMajor != c.proto || a.status != 200 || a.code() != "timeout" || len(a.rows()) < 1024 {
+				t.Errorf("HTTP/%d %d, %d rows, %v, want rows then timeout", resp.ProtoMajor, a.status, len(a.rows()), a.last())
+			}
+		})
+	}
+}
+
 func TestResultTooLarge(t *testing.T) {
 	e := newQueryEnv(t, func(e *env) { e.s.limits.ResultBytes = 4096 })
 	a := e.post(t, "query", "reader", q("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 1000) SELECT x, printf('%100d', x) FROM c"))
@@ -709,6 +755,19 @@ func TestTailBoundWithoutCompactionNotReady(t *testing.T) {
 	}
 	if e.s.ready() {
 		t.Error("ready at a tail bound the leader cannot compact past")
+	}
+}
+
+func TestRetryableTailBoundStaysReady(t *testing.T) {
+	// A tail-bound refusal that compaction is clearing matches ErrRetry.
+	e := newQueryEnv(t, nil)
+	d := e.s.dbs["d"]
+	we := e.s.engineError(d, e.leader(t), fmt.Errorf("%w: %w: %w", engine.ErrNotCommitted, engine.ErrTailBound, engine.ErrRetry))
+	if we.Code != "maintenance" || !strings.Contains(we.Message, "retry") {
+		t.Errorf("%v, want maintenance saying retry", we)
+	}
+	if !e.s.ready() {
+		t.Error("not ready at a tail bound compaction is clearing")
 	}
 }
 
@@ -973,9 +1032,10 @@ func TestBodySharePerPrincipal(t *testing.T) {
 	}
 }
 
-// TestMemoryBudgetHolds: whatever the number of databases, the body share
-// and the SQLite connections at their ceiling, the leaders' included, stay
-// within the memory budget, and clients keep a connection.
+// TestMemoryBudgetHolds: whatever the number of databases, the body share,
+// the channels' share and the SQLite connections at their ceiling, the
+// leaders' included, stay within the memory budget, and clients keep a
+// connection.
 func TestMemoryBudgetHolds(t *testing.T) {
 	for n := range maxDatabases + 1 {
 		cfg := testConfig(t, jwksFile(t, newSigner(t, "k1")))
@@ -995,14 +1055,16 @@ func TestMemoryBudgetHolds(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if total := s.bodyShare + int64(s.pool.capacity+n)*connCeiling; total > memoryBudget || s.pool.capacity < 1 {
+		// The channels' share: a receipt per channel, held rows and replay data.
+		channels := int64(s.chl.channels)*receiptBytes + s.chl.held + s.chl.replay
+		if total := s.bodyShare + channels + int64(s.pool.capacity+n)*connCeiling; total > memoryBudget || s.pool.capacity < 1 {
 			t.Errorf("%d databases: %d bytes charged at most, %d client connections; budget %d", n, total, s.pool.capacity, memoryBudget)
 		}
 	}
 }
 
 // TestSlowReaderBounded: a client that stops reading a query's rows holds
-// its SQLite connection only until the statement time ends.
+// its SQLite connection only until a second after the statement time ends.
 func TestSlowReaderBounded(t *testing.T) {
 	e := newQueryEnv(t, func(e *env) { e.s.shutdownTimeout = time.Second })
 	body := fmt.Sprintf(`{"sql":%q,"timeout_ms":1000}`, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 200000) SELECT printf('%200d', x) FROM c")
@@ -1011,11 +1073,16 @@ func TestSlowReaderBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = c.Close() }()
+	start := time.Now()
 	if _, err := fmt.Fprintf(c, "POST /v1/databases/d/query HTTP/1.1\r\nHost: skylite\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", e.sig.token(t, "reader"), len(body), body); err != nil {
 		t.Fatal(err)
 	}
 	e.running(t, 1)
 	e.running(t, 0) // the client never reads
+	// The statement time of 1 s, the terminal margin of 1 s, and slack.
+	if d := time.Since(start); d > 3500*time.Millisecond {
+		t.Errorf("the connection came back after %v, want about 2 s", d)
+	}
 }
 
 // TestTransientMaintenance: maintenance for the local WAL bound ends a

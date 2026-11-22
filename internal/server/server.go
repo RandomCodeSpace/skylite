@@ -2,16 +2,17 @@
 // (docs/content/docs/decisions/0005-client-protocol.md) with the
 // authentication of ADR 0006.
 //
-// This version serves PUT /v1/databases/{db}, which creates a database, and
-// the stateless query and describe requests on the databases it leads (see
-// query.go). For each configured database the server runs an office loop
+// This version serves PUT /v1/databases/{db}, which creates a database, the
+// stateless query and describe requests on the databases it leads (see
+// query.go), and write channels with autocommit writes on them (see
+// channel.go). For each configured database the server runs an office loop
 // (internal/office); only the pod in office serves the database, and every
 // other pod answers not_serving: there are no followers, no forwarding and
-// no cluster membership yet. Every other path of the protocol is
-// authenticated and then answered with not_serving. Of the admission
-// control of ADR 0005 decision 9, the bound on HTTP connections, the body
-// share of the memory budget and the SQLite connection limits are
-// implemented.
+// no cluster membership yet. Every other path of the protocol (cancel,
+// resolve and GET status) is authenticated and then answered with
+// not_serving. Of the admission control of ADR 0005 decision 9, the bound
+// on HTTP connections, the body share of the memory budget, the SQLite
+// connection limits and the channel bounds are implemented.
 package server
 
 import (
@@ -54,6 +55,7 @@ const (
 	maxStreams     = 16               // concurrent streams per HTTP/2 connection
 	maxConns       = 1024             // HTTP connections accepted
 	probeConns     = 64               // connections the readiness probe accepts
+	terminalMargin = time.Second      // a query's write deadline past its statement deadline
 )
 
 const (
@@ -71,20 +73,23 @@ const (
 )
 
 // The memory budget of ADR 0005 decision 9 and what it is divided into:
-// the body share, and SQLite connections at their ceiling in what is left.
-// Nothing else is charged; see docs/content/docs/server.md.
+// the body share; the channels' share, which holds a receipt for each
+// channel, held result rows and retained replay data; and SQLite
+// connections at their ceiling in what is left. Nothing else is charged;
+// see docs/content/docs/server.md.
 //
 // shortcut: the budget is the decision's default without a container limit;
 // derive it from the cgroup limit with the rest of admission.
 const (
 	memoryBudget = 2 << 30
 	bodyShare    = memoryBudget / 2 // request bodies, charged at 8 × Content-Length
-	connCeiling  = 64 << 20         // SQLite connection memory ceiling
-	maxConnLimit = 256              // SQLite connections per pod
+	channelShare = maxChannels*receiptBytes + heldShare + replayShare
+	connCeiling  = 64 << 20 // SQLite connection memory ceiling
+	maxConnLimit = 256      // SQLite connections per pod
 	// maxDatabases is the SQLite connections the budget holds after the
-	// body share: each led database's engine connection is charged a
-	// ceiling, and one must stay for clients.
-	maxDatabases = min(maxConnLimit, (memoryBudget-bodyShare)/connCeiling)
+	// body share and the channels' share: each led database's engine
+	// connection is charged a ceiling, and one must stay for clients.
+	maxDatabases = min(maxConnLimit, (memoryBudget-bodyShare-channelShare)/connCeiling)
 )
 
 // engineConfig is each leader's configuration. The tail bound is the
@@ -112,6 +117,15 @@ type Server struct {
 	dbs      map[string]*database // the configured databases
 	dir      string               // the leaders' local files
 	stopping atomic.Bool          // Serve is shutting down: not ready
+	instance string               // this process's instance identifier, which channel tokens name
+
+	// chMu guards the channel tables, their channels and write locks, and
+	// the counts below (channel.go).
+	chMu         sync.Mutex
+	nChans       int   // channels on this server, ended but unsettled ones included
+	held, replay int64 // held result rows, retained replay data
+	chl          chLimits
+	afterCommit  func() error // nil; a test sets it to fail a write after its COMMIT
 
 	bodyMu              sync.Mutex
 	bodyUsed, bodyShare int64            // request bodies' share of the memory budget, charged at 8 × Content-Length
@@ -172,6 +186,7 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 	s := &Server{
 		cfg: cfg, log: log, guard: g, store: st, limits: l,
 		policy: policy, pool: newPool(maxDatabases - len(cfg.Databases)), engine: engineConfig(), bodyShare: bodyShare, bodyBy: map[string]int64{}, statementTime: stmt,
+		instance: rand.Text(), chl: defaultChLimits(),
 		headerDeadline: headerDeadline, bodyDeadline: bodyDeadline, responseDeadline: time.Duration(l.ResponseMS) * time.Millisecond,
 		idleTimeout: idleTimeout, createTimeout: createTimeout, shutdownTimeout: shutdownTimeout, maxConns: maxConns,
 	}
@@ -214,6 +229,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		}
 	}()
 	defer s.startOffice()()
+	sctx, stopSweep := context.WithCancel(context.Background())
+	defer stopSweep()
+	go s.sweep(sctx)
 	if pln := s.probeLn; pln != nil || s.cfg.ProbeListen != "" {
 		if pln == nil {
 			var err error
@@ -255,9 +273,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	case <-ctx.Done():
 	}
 	s.stopping.Store(true)
-	sctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+	dctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
 	defer cancel()
-	err := srv.Shutdown(sctx)
+	err := srv.Shutdown(dctx)
 	if err != nil {
 		_ = srv.Close()
 		err = fmt.Errorf("server: requests still running after %v were cut: %w", s.shutdownTimeout, err)
@@ -268,12 +286,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	return err
 }
 
-// database is a configured database: its office loop, and the leader that
-// last met a tail bound it cannot compact past, which leaves this server
-// not ready while it leads.
+// database is a configured database: its office loop, the leader that last
+// met a tail bound it cannot compact past, which leaves this server not
+// ready while it leads, and the channel table of its current leader, guarded
+// by Server.chMu.
 type database struct {
-	loop *office.Loop
-	tail atomic.Pointer[engine.Leader]
+	loop  *office.Loop
+	tail  atomic.Pointer[engine.Leader]
+	chans *table
 }
 
 // leader returns the database's leader while this server serves it, or nil.
@@ -388,10 +408,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.out = out
-	done, e, bodyRead := s.handle(st, r, log)
+	done, e, bodyRead := s.handle(st, r, id, log)
 	status := http.StatusOK
 	if e != nil {
-		e.RequestID = id
+		if e.RequestID == "" { // a replayed receipt keeps its request's own
+			e.RequestID = id
+		}
 		status = e.Code.Status() // used only if the response has not started
 		if e.Code == wire.CodeUnauthenticated {
 			h.Set("WWW-Authenticate", "Bearer")
@@ -465,9 +487,9 @@ func (st *stream) Write(p []byte) (int, error) {
 }
 
 // handle runs the checks before acceptance of ADR 0005 in their order, then
-// serves the request. Admission (check 2) is not implemented. bodyRead
-// reports whether the body was read to its end.
-func (s *Server) handle(st *stream, r *http.Request, log *slog.Logger) (done *wire.Done, e *wire.Error, bodyRead bool) {
+// serves the request with request id id. Admission (check 2) is not
+// implemented. bodyRead reports whether the body was read to its end.
+func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger) (done *wire.Done, e *wire.Error, bodyRead bool) {
 	kind, db, e := wire.Route(r.Method, r.URL.EscapedPath())
 	if e != nil {
 		return nil, e, false
@@ -495,14 +517,21 @@ func (s *Server) handle(st *stream, r *http.Request, log *slog.Logger) (done *wi
 	if kind == wire.KindPut {
 		need = auth.RoleAdmin
 	}
-	if !s.guard.Authorize(p, db, need) {
+	authorize := func(need auth.Role) *wire.Error {
+		if s.guard.Authorize(p, db, need) {
+			return nil
+		}
 		attrs := auth.RefusalAttrs(&auth.Error{Code: auth.CodeForbidden, Issuer: p.Issuer, Subject: p.Subject}, token)
 		attrs = append(attrs, slog.String("database", db), slog.String("role", string(need)))
 		log.LogAttrs(r.Context(), slog.LevelInfo, "authorisation refused", attrs...)
-		return nil, wire.NewError(wire.CodeForbidden, "the principal's role on this database name does not allow this request"), false
+		return wire.NewError(wire.CodeForbidden, "the principal's role on this database name does not allow this request")
 	}
-	if kind != wire.KindPut && kind != wire.KindQuery && kind != wire.KindDescribe {
-		return nil, wire.NewError(wire.CodeNotServing, "this server serves only database creation (PUT), query and describe in this version"), false
+	if e := authorize(need); e != nil {
+		return nil, e, false
+	}
+	switch kind {
+	case wire.KindCancel, wire.KindResolve, wire.KindStatus:
+		return nil, wire.NewError(wire.CodeNotServing, "cancel, resolve and status are not served in this version"), false
 	}
 	// Routing comes before the body here: a pod that does not lead the
 	// database cannot serve it, whatever the body holds.
@@ -517,7 +546,11 @@ func (s *Server) handle(st *stream, r *http.Request, log *slog.Logger) (done *wi
 		return nil, e, false
 	}
 	defer release()
-	body, e := s.readBody(r)
+	limit := s.limits.RequestBodyBytes
+	if kind == wire.KindClose {
+		limit = controlBodyBytes
+	}
+	body, e := s.readBody(r, limit)
 	if e != nil {
 		return nil, e, false
 	}
@@ -525,9 +558,24 @@ func (s *Server) handle(st *stream, r *http.Request, log *slog.Logger) (done *wi
 	if e != nil {
 		return nil, e, true
 	}
-	if kind == wire.KindPut {
+	// Writes need the write role (ADR 0006): a write open, and every
+	// request on a write channel but close, checked again on each, since a
+	// token's claims can change.
+	if kind == wire.KindChannel || kind == wire.KindOpen && req.Mode == wire.ModeWrite {
+		if e := authorize(auth.RoleWrite); e != nil {
+			return nil, e, true
+		}
+	}
+	switch kind {
+	case wire.KindPut:
 		done, e = s.create(r.Context(), db, p, log)
-	} else {
+	case wire.KindOpen:
+		done, e = s.openChannel(d, leader, req, who)
+	case wire.KindChannel:
+		done, e = s.channelRequest(r.Context(), st, d, leader, req, body, who, id, log)
+	case wire.KindClose:
+		done, e = s.closeChannel(d, leader, req, who)
+	default:
 		done, e = s.statement(r.Context(), st, d, leader, req, who, log)
 	}
 	return done, e, true
@@ -561,9 +609,10 @@ func (s *Server) chargeBody(r *http.Request, who string) (release func(), e *wir
 	}, nil
 }
 
-// readBody applies ADR 0005's body checks to a PUT or POST and reads the
-// complete body within the body read deadline.
-func (s *Server) readBody(r *http.Request) ([]byte, *wire.Error) {
+// readBody applies ADR 0005's body checks to a PUT or POST, whose body may
+// have limit bytes, and reads the complete body within the body read
+// deadline.
+func (s *Server) readBody(r *http.Request, limit int64) ([]byte, *wire.Error) {
 	mt, _, _ := strings.Cut(r.Header.Get("Content-Type"), ";")
 	switch {
 	case !strings.EqualFold(strings.TrimSpace(mt), "application/json"):
@@ -574,8 +623,8 @@ func (s *Server) readBody(r *http.Request) ([]byte, *wire.Error) {
 		return nil, wire.NewError(wire.CodeInvalidRequest, "Content-Length is required")
 	case !oneContentLength(r):
 		return nil, wire.NewError(wire.CodeInvalidRequest, "Content-Length must appear once, with one value")
-	case r.ContentLength > s.limits.RequestBodyBytes:
-		return nil, wire.NewError(wire.CodeRequestTooLarge, fmt.Sprintf("the body exceeds %d bytes", s.limits.RequestBodyBytes))
+	case r.ContentLength > limit:
+		return nil, wire.NewError(wire.CodeRequestTooLarge, fmt.Sprintf("the body exceeds %d bytes", limit))
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, r.ContentLength+1))
 	if err != nil || int64(len(body)) != r.ContentLength {
