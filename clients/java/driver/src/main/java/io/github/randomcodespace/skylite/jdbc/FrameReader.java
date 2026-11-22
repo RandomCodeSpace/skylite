@@ -23,8 +23,6 @@ final class FrameReader {
     static final int MAX_FRAME = (64 << 20) + 1;
     /** ADR 0005 reserves 4 KiB for the terminal frame, newline included; no configuration makes one larger. */
     static final int MAX_TERMINAL = 4 << 10;
-    /** ADR 0005's frame size, newline included: a columns frame is never larger. */
-    static final int MAX_COLUMNS_FRAME = 1 << 20;
     /** The most entries in one params frame. */
     private static final int MAX_FRAME_ENTRIES = 1024;
 
@@ -179,9 +177,6 @@ final class FrameReader {
             case "columns" -> {
                 if (state != State.START) {
                     throw new Malformed("a columns frame after other frames");
-                }
-                if (lineLen + 1 > MAX_COLUMNS_FRAME) {
-                    throw new Malformed("a columns frame exceeds " + MAX_COLUMNS_FRAME + " bytes");
                 }
                 List<Column> cols = columnsFrame(p);
                 state = State.ROWS;

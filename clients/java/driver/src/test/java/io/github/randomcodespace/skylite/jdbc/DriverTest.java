@@ -238,10 +238,12 @@ class DriverTest {
     void neverPutsTheTokenInAnException() throws Exception {
         Properties failing = props();
         failing.put("tokenProvider", (TokenProvider) () -> {
-            throw new IOException("vault unreachable");
+            throw new IOException("vault refused " + TOKEN);
         });
         try (Connection c = connect(failing); Statement s = c.createStatement()) {
-            fails(SQLInvalidAuthorizationSpecException.class, () -> s.executeQuery("SELECT 1"));
+            SQLException e = fails(SQLInvalidAuthorizationSpecException.class, () -> s.executeQuery("SELECT 1"));
+            assertTrue(e.getMessage().contains("java.io.IOException"), e.getMessage());
+            assertNull(e.getCause(), "the provider's exception, which may hold a token, is dropped");
         }
         Properties spaced = props();
         spaced.put("tokenProvider", (TokenProvider) () -> TOKEN + " trailing");
@@ -562,6 +564,7 @@ class DriverTest {
             long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
             assertTrue(ms >= 2900 && ms < 10_000, "gave up after " + ms + " ms: the timeout plus the 2 s cancel wait");
             assertTrue(fake.last().bodyText().endsWith(",\"timeout_ms\":1000}"));
+            assertFalse(c.isClosed() || s.isClosed(), "a query timeout leaves the statement and connection open");
         }
     }
 
@@ -802,6 +805,18 @@ class DriverTest {
     }
 
     @Test
+    void getMoreResultsPastTheLastResultSetCompletesTheStatement() throws Exception {
+        answer(COLUMN_X, "[1]", FakeServer.done(1));
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            ResultSet rs = s.executeQuery("SELECT 1");
+            s.closeOnCompletion();
+            assertFalse(s.getMoreResults());
+            assertTrue(rs.isClosed());
+            assertTrue(s.isClosed());
+        }
+    }
+
+    @Test
     void aPreparedStatementDescribesItsColumnsOnceItsResultSetIsClosed() throws Exception {
         String cols = "{\"columns\":[{\"name\":\"a\",\"decltype\":\"INTEGER\"}]}";
         fake.responder = (r, ex) -> {
@@ -992,6 +1007,7 @@ class DriverTest {
                 assertEquals("08S01", e.getSQLState());
                 assertTrue(e.getMessage().contains("network timeout of 500 ms"), e.getMessage());
                 assertTrue(ms >= 400 && ms < 5000, "gave up after " + ms + " ms");
+                assertTrue(c.isClosed() && s.isClosed() && rs.isClosed(), "the expiry closes the connection");
             }
         }
     }
@@ -1003,9 +1019,11 @@ class DriverTest {
             c.setNetworkTimeout(Runnable::run, 300);
             s.setQueryTimeout(2);
             long t0 = System.nanoTime();
-            fails(SQLNonTransientConnectionException.class, () -> s.executeQuery("SELECT 1"));
+            SQLException e = fails(SQLNonTransientConnectionException.class, () -> s.executeQuery("SELECT 1"));
             long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
             assertTrue(ms < 1900, "gave up after " + ms + " ms, past the 300 ms network timeout");
+            assertEquals("08S01", e.getSQLState());
+            assertTrue(c.isClosed() && s.isClosed(), "the expiry closes the connection");
         }
     }
 
@@ -1041,5 +1059,134 @@ class DriverTest {
         }
         defaults.setProperty("allowPlaintext", "true");
         new SkyliteDriver().connect("jdbc:skylite:http://db.example/library", new Properties(defaults)).close();
+    }
+
+    // ---- stops racing executions ----
+
+    @Test
+    void aDescribeStaysCancellableAfterAnEarlierResultSetCloses() throws Exception {
+        CountDownLatch described = new CountDownLatch(1);
+        fake.responder = (r, ex) -> {
+            if (r.path().endsWith("/query")) {
+                FakeServer.send(ex, 200, COLUMN_X, "[1]", FakeServer.done(1));
+            } else {
+                described.countDown();
+                release.await(30, TimeUnit.SECONDS);
+                FakeServer.send(ex, 200, COLUMN_X, FakeServer.describeDone(1, 0));
+            }
+        };
+        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement("SELECT 1")) {
+            ResultSet rs = ps.executeQuery();
+            CompletableFuture<Throwable> failed = new CompletableFuture<>();
+            Thread.ofVirtual().start(() -> {
+                try {
+                    ps.getParameterMetaData();
+                    failed.complete(null);
+                } catch (Throwable e) {
+                    failed.complete(e);
+                }
+            });
+            assertTrue(described.await(10, TimeUnit.SECONDS));
+            rs.close();
+            ps.cancel();
+            SQLException e = assertInstanceOf(SQLException.class, failed.get(10, TimeUnit.SECONDS));
+            seen.add(e);
+            assertEquals("57014", e.getSQLState());
+            assertEquals(1, release.getCount(), "the describe ended by the cancel, not by its answer");
+        }
+    }
+
+    @Test
+    void aCancelledResultSetDeliversNoBufferedRow() throws Exception {
+        fake.responder = (r, ex) -> {
+            FakeServer.start(ex, 200, true);
+            OutputStream out = ex.getResponseBody();
+            out.write((COLUMN_X + "\n[1]\n[2]\n").getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            release.await(30, TimeUnit.SECONDS);
+        };
+        try (Connection c = connect(); Statement s = c.createStatement(); ResultSet rs = s.executeQuery("SELECT 1")) {
+            assertTrue(rs.next());
+            s.cancel();
+            assertEquals("57014", fails(SQLException.class, rs::next).getSQLState());
+        }
+    }
+
+    @Test
+    void abortEndsAValidationWithFalse() throws Exception {
+        CountDownLatch described = new CountDownLatch(1);
+        CountDownLatch answered = new CountDownLatch(1);
+        fake.responder = (r, ex) -> {
+            described.countDown();
+            release.await(30, TimeUnit.SECONDS);
+            FakeServer.send(ex, 200, COLUMN_X, FakeServer.describeDone(1, 0));
+            answered.countDown();
+        };
+        Connection c = connect();
+        CompletableFuture<Boolean> valid = CompletableFuture.supplyAsync(() -> {
+            try {
+                return c.isValid(0);
+            } catch (SQLException e) {
+                throw new AssertionError(e);
+            }
+        });
+        assertTrue(described.await(10, TimeUnit.SECONDS));
+        c.abort(Runnable::run);
+        assertTrue(c.isClosed());
+        release.countDown();
+        assertFalse(valid.get(10, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void validationEndsAtTheShorterOfItsTimeoutAndTheNetworkTimeout() throws Exception {
+        fake.responder = (r, ex) -> {
+            FakeServer.start(ex, 200, true);
+            OutputStream out = ex.getResponseBody();
+            for (int i = 0; i < 10; i++) { // each keepalive within the network timeout, the answer past it
+                out.write("{\"keepalive\":{}}\n".getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                Thread.sleep(100);
+            }
+            out.write((COLUMN_X + "\n" + FakeServer.describeDone(1, 0) + "\n").getBytes(StandardCharsets.UTF_8));
+        };
+        Connection c = connect();
+        c.setNetworkTimeout(Runnable::run, 250); // HikariCP's order: the network timeout, then isValid(1)
+        long t0 = System.nanoTime();
+        assertFalse(c.isValid(1));
+        long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        assertTrue(ms >= 200 && ms < 900, "validation took " + ms + " ms");
+        assertTrue(c.isClosed(), "the network timeout passed, which closes the connection");
+    }
+
+    @Test
+    void validationCountsTheTokenAgainstItsTimeout() throws Exception {
+        Properties p = props();
+        p.put("tokenProvider", (TokenProvider) () -> {
+            Thread.sleep(1100);
+            return TOKEN;
+        });
+        answer(COLUMN_X, FakeServer.describeDone(1, 0));
+        try (Connection c = connect(p)) {
+            assertFalse(c.isValid(1));
+            assertFalse(c.isClosed(), "isValid's own timeout leaves the connection open");
+        }
+        assertEquals(0, fake.requests.size());
+    }
+
+    @Test
+    void setNetworkTimeoutNeedsAnExecutor() throws Exception {
+        try (Connection c = connect()) {
+            assertEquals("HY009", fails(SQLException.class, () -> c.setNetworkTimeout(null, 10)).getSQLState());
+        }
+    }
+
+    @Test
+    void aRealIntegerIsReadAsItsExactBigInteger() throws Exception {
+        answer(COLUMN_X, "[1.15292150460684698e18]", FakeServer.done(1));
+        try (Connection c = connect(); Statement s = c.createStatement(); ResultSet rs = s.executeQuery("SELECT 1")) {
+            assertTrue(rs.next());
+            assertEquals(1L << 60, rs.getLong(1));
+            assertEquals(BigInteger.ONE.shiftLeft(60), rs.getObject(1, BigInteger.class));
+        }
     }
 }

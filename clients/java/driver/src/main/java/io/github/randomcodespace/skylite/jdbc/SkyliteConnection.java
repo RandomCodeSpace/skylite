@@ -12,6 +12,7 @@ import java.sql.ResultSet;
 import java.sql.SQLClientInfoException;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientException;
+import java.sql.SQLTimeoutException;
 import java.sql.SQLWarning;
 import java.sql.SQLXML;
 import java.sql.Savepoint;
@@ -28,10 +29,12 @@ import java.util.concurrent.Executor;
  * the connection is read-only and in auto-commit. Writes, transactions and channels come with the server's write
  * channels; until then they raise {@link java.sql.SQLFeatureNotSupportedException}.
  */
-final class SkyliteConnection implements Connection {
+final class SkyliteConnection implements Connection, Exchange.Owner {
     private final Session session;
     private final String url;
     private final Set<SkyliteStatement> statements = ConcurrentHashMap.newKeySet();
+    private final Set<Exchange> validations = ConcurrentHashMap.newKeySet();
+    private final Object validationLock = new Object();
     private volatile boolean closed;
 
     SkyliteConnection(Session session, String url) {
@@ -179,7 +182,7 @@ final class SkyliteConnection implements Connection {
         throw new SQLNonTransientException("skylite: rollback in auto-commit mode", "25000");
     }
 
-    /** Closes the connection's statements, which releases their responses. Nothing is sent. */
+    /** Closes the connection's statements and validations, which releases their responses. Nothing is sent. */
     @Override
     public void close() {
         closed = true;
@@ -187,6 +190,36 @@ final class SkyliteConnection implements Connection {
             s.close();
         }
         statements.clear();
+        for (Exchange ex : validations) {
+            ex.close();
+        }
+    }
+
+    // ---- the owner of isValid's exchanges ----
+
+    @Override
+    public Object lock() {
+        return validationLock;
+    }
+
+    @Override
+    public SQLException admit(Exchange ex) {
+        validations.add(ex);
+        if (closed) { // close() either sees ex or is seen here
+            validations.remove(ex);
+            return Errors.closed("connection");
+        }
+        return null;
+    }
+
+    @Override
+    public void release(Exchange ex) {
+        validations.remove(ex);
+    }
+
+    @Override
+    public SkyliteConnection connection() {
+        return this;
     }
 
     @Override
@@ -322,7 +355,9 @@ final class SkyliteConnection implements Connection {
 
     /**
      * Describes {@code SELECT 1}, as the Go driver's ping does: the cheapest request a server answers without a
-     * channel, which proves the endpoint, the token and the database.
+     * channel, which proves the endpoint, the token and the database. One deadline, the shorter of the timeout and
+     * the network timeout, covers the token, the headers and the body; when the network timeout is the one that
+     * passes, the connection closes. Closing or aborting the connection ends a validation with false.
      */
     @Override
     public boolean isValid(int timeout) throws SQLException {
@@ -332,8 +367,9 @@ final class SkyliteConnection implements Connection {
         if (closed) {
             return false;
         }
-        try (Exchange ex = Exchange.send(
-                session, FrameReader.Kind.DESCRIBE, Request.describe("SELECT 1", session.watermark()), timeout, null)) {
+        long network = session.networkTimeoutMillis();
+        long limit = timeout == 0 ? network : network == 0 ? timeout * 1000L : Math.min(network, timeout * 1000L);
+        try (Exchange ex = Exchange.validate(session, Request.describe("SELECT 1", session.watermark()), limit, this)) {
             FrameReader.Frame f;
             while ((f = ex.next()) != null) {
                 if (f instanceof FrameReader.Failure) {
@@ -344,6 +380,11 @@ final class SkyliteConnection implements Connection {
                 }
             }
             return true;
+        } catch (SQLTimeoutException e) {
+            if (network > 0 && limit == network) {
+                close();
+            }
+            return false;
         } catch (SQLException e) {
             return false;
         }
@@ -402,12 +443,17 @@ final class SkyliteConnection implements Connection {
     }
 
     /**
-     * Bounds the wait for each response's headers, whatever the query timeout, and each wait for more of its body. 0
-     * means the driver's default: 60 s, or more for a longer query timeout, for the headers, and no bound on the body.
+     * Bounds the wait for each response's headers, whatever the query timeout, and each wait for more of its body;
+     * when it passes, the connection and its statements close. 0 means the driver's default: 60 s, or more for a
+     * longer query timeout, for the headers, and no bound on the body. The executor is not used: the driver's own
+     * timer closes the connection.
      */
     @Override
     public void setNetworkTimeout(Executor executor, int milliseconds) throws SQLException {
         checkOpen();
+        if (executor == null) {
+            throw new SQLNonTransientException("skylite: setNetworkTimeout needs an executor", "HY009");
+        }
         if (milliseconds < 0) {
             throw new SQLNonTransientException("skylite: negative network timeout", "HY092");
         }

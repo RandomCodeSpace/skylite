@@ -199,16 +199,14 @@ class FrameReaderTest {
     }
 
     @Test
-    void aColumnsFrameAboveTheFrameSizeIsRefused() throws Exception {
+    void aColumnsFrameIsBoundOnlyByTheReadersFrameBound() throws Exception {
         String head = "{\"columns\":[{\"name\":\"";
         String tail = "\"}]}";
-        int fill = FrameReader.MAX_COLUMNS_FRAME - 1 - head.length() - tail.length(); // 1 MiB with the newline
-        String atBound = head + "a".repeat(fill) + tail + "\n";
-        assertInstanceOf(FrameReader.Columns.class, reader(Kind.QUERY, FrameReader.MAX_FRAME, atBound).next());
-        String above = head + "a".repeat(fill + 1) + tail + "\n";
-        Values.Malformed e = assertThrows(Values.Malformed.class,
-                () -> reader(Kind.QUERY, FrameReader.MAX_FRAME, above).next());
-        assertTrue(e.getMessage().contains("columns frame exceeds"), e.getMessage());
+        // Above ADR 0005's default 1 MiB frame size, which a server may raise, as the Go reader accepts.
+        String big = head + "a".repeat((1 << 20) + 100) + tail + "\n";
+        assertInstanceOf(FrameReader.Columns.class, reader(Kind.QUERY, FrameReader.MAX_FRAME, big).next());
+        Values.Malformed e = assertThrows(Values.Malformed.class, () -> reader(Kind.QUERY, 1 << 20, big).next());
+        assertTrue(e.getMessage().contains("a frame exceeds"), e.getMessage());
     }
 
     @Test

@@ -10,6 +10,7 @@ import java.sql.SQLException;
 import java.sql.SQLNonTransientException;
 import java.sql.SQLWarning;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -19,16 +20,18 @@ import java.util.List;
  */
 class SkyliteStatement implements Statement, Exchange.Owner {
     final SkyliteConnection conn;
-    private SkyliteResultSet result;
+    /** Orders close, cancel, the submission of each request and the publication of its result set. */
+    final Object lock = new Object();
+    private final List<Exchange> live = new ArrayList<>(2); // guarded by lock: an open cursor's, a describe's
+    private volatile SkyliteResultSet result; // written under lock
     private long updateCount = -1;
     private int queryTimeout;
     private long maxRows;
     private int fetchSize;
     private boolean poolable;
     private boolean closeOnCompletion;
-    private volatile boolean closed;
-    volatile Exchange running;
-    volatile boolean cancelRequested;
+    private volatile boolean closed; // written under lock
+    private boolean cancelRequested; // guarded by lock
 
     SkyliteStatement(SkyliteConnection conn) {
         this.conn = conn;
@@ -42,67 +45,95 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     }
 
     @Override
-    public void started(Exchange ex) {
-        running = ex;
+    public Object lock() {
+        return lock;
+    }
+
+    @Override
+    public SQLException admit(Exchange ex) {
         if (cancelRequested) {
-            ex.cancel();
-        } else if (closed || conn.isClosed()) {
-            ex.close();
+            return Exchange.cancelled(null);
+        }
+        if (closed) {
+            return Errors.closed("statement");
+        }
+        if (conn.isClosed()) {
+            return Errors.closed("connection");
+        }
+        live.add(ex);
+        return null;
+    }
+
+    @Override
+    public void release(Exchange ex) {
+        synchronized (lock) {
+            live.remove(ex);
+        }
+    }
+
+    @Override
+    public SkyliteConnection connection() {
+        return conn;
+    }
+
+    /** A new execution or describe: a cancel requested before it is not carried into it. */
+    void begin() {
+        synchronized (lock) {
+            cancelRequested = false;
         }
     }
 
     /**
-     * Sends one query and reads its first frame: a result set when the statement has result columns, otherwise its
-     * update count, which a read reports as 0.
+     * Sends one query and reads its first frame: the result set when the statement has result columns, otherwise
+     * null, with its update count, which a read reports as 0.
      */
-    boolean run(String sql, List<Object> params) throws SQLException {
+    SkyliteResultSet run(String sql, List<Object> params) throws SQLException {
         checkOpen();
         closeResult();
-        cancelRequested = false;
+        begin();
         Session s = conn.session();
         byte[] body = Request.query(sql, params, s.watermark(), queryTimeout * 1000L);
         Exchange ex = Exchange.send(s, FrameReader.Kind.QUERY, body, queryTimeout, this);
-        Frame f;
-        try {
-            f = ex.next();
-        } catch (SQLException e) {
-            running = null;
-            throw e;
-        }
-        switch (f) {
+        switch (ex.next()) {
             case Columns c -> {
-                result = new SkyliteResultSet(this, ex, c.columns(), maxRows, fetchSize);
-                return true;
+                return publish(new SkyliteResultSet(this, ex, c.columns(), maxRows, fetchSize));
             }
             case Done d -> {
-                running = null;
+                ex.close();
                 s.raise(d.txn());
                 updateCount = d.rowsAffected();
-                ex.close();
-                return false;
+                return null;
             }
             case Failure e -> {
-                running = null;
                 ex.close();
                 throw Errors.map(e);
             }
-            default -> {
+            case null, default -> {
                 ex.close();
                 throw Errors.transport("malformed response: an unexpected first frame", null);
             }
         }
     }
 
-    /** Called by the result set when its response ends or is released. */
-    void resultDone(SkyliteResultSet rs) {
-        if (rs == result) {
-            running = null;
+    /** Makes rs the current result set, unless this statement closed first: then rs is released. */
+    SkyliteResultSet publish(SkyliteResultSet rs) throws SQLException {
+        synchronized (lock) {
+            if (!closed) {
+                result = rs;
+                return rs;
+            }
         }
+        rs.close();
+        throw Errors.closed("statement");
     }
 
     /** Called by the result set when it closes: with closeOnCompletion, that closes this statement. */
     void resultClosed(SkyliteResultSet rs) {
-        if (rs == result && closeOnCompletion) {
+        boolean complete;
+        synchronized (lock) {
+            complete = rs == result && closeOnCompletion;
+        }
+        if (complete) {
             close();
         }
     }
@@ -115,21 +146,30 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         return (int) n;
     }
 
-    private void closeResult() {
-        SkyliteResultSet r = result;
-        result = null;
-        updateCount = -1;
-        if (r != null) {
-            r.closeSilently();
+    /** Closes the current result set, if any, and returns it. */
+    private SkyliteResultSet closeResult() {
+        SkyliteResultSet r;
+        synchronized (lock) {
+            r = result;
+            result = null;
+            updateCount = -1;
         }
+        if (r != null) {
+            r.close();
+        }
+        return r;
     }
 
     @Override
     public ResultSet executeQuery(String sql) throws SQLException {
-        if (!run(sql, List.of())) {
+        return query(run(sql, List.of()));
+    }
+
+    static ResultSet query(SkyliteResultSet rs) throws SQLException {
+        if (rs == null) {
             throw new SQLNonTransientException("skylite: the statement returned no result set", "07000");
         }
-        return result;
+        return rs;
     }
 
     /** A write is refused by the server with needs_channel; a read without result columns returns its count, 0. */
@@ -140,7 +180,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
 
     @Override
     public long executeLargeUpdate(String sql) throws SQLException {
-        return update(run(sql, List.of()));
+        return update(run(sql, List.of()) != null);
     }
 
     long update(boolean hasResult) throws SQLException {
@@ -153,7 +193,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
 
     @Override
     public boolean execute(String sql) throws SQLException {
-        return run(sql, List.of());
+        return run(sql, List.of()) != null;
     }
 
     @Override
@@ -213,13 +253,16 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     /** Releases the result set's response, if any. Nothing is sent. */
     @Override
     public void close() {
-        if (closed) {
-            return;
+        List<Exchange> running;
+        synchronized (lock) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            running = List.copyOf(live);
         }
-        closed = true;
         closeResult();
-        Exchange ex = running;
-        if (ex != null) {
+        for (Exchange ex : running) {
             ex.close();
         }
         conn.forget(this);
@@ -297,15 +340,19 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     }
 
     /**
-     * Abandons the running execution: the request if its answer has not arrived, or its response. A stateless read
+     * Abandons what the statement runs, an execution or a describe and an open result set: each request whose
+     * answer has not arrived, or its response, whose buffered rows are then not delivered. A stateless read
      * needs no cancel request (ADR 0005 decision 6): the server stops streaming when the response is dropped.
      */
     @Override
     public void cancel() throws SQLException {
         checkOpen();
-        cancelRequested = true;
-        Exchange ex = running;
-        if (ex != null) {
+        List<Exchange> running;
+        synchronized (lock) {
+            cancelRequested = true;
+            running = List.copyOf(live);
+        }
+        for (Exchange ex : running) {
             ex.cancel();
         }
     }
@@ -346,7 +393,9 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     @Override
     public boolean getMoreResults() throws SQLException {
         checkOpen();
-        closeResult();
+        if (closeResult() != null && closeOnCompletion) { // that was its last result set
+            close();
+        }
         return false;
     }
 

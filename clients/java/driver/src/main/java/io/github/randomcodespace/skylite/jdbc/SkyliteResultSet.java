@@ -91,7 +91,6 @@ final class SkyliteResultSet implements ResultSet {
             f = ex.next();
         } catch (SQLException e) {
             done = true;
-            stmt.resultDone(this);
             throw e;
         }
         switch (f) {
@@ -119,7 +118,6 @@ final class SkyliteResultSet implements ResultSet {
     private void finish() {
         done = true;
         ex.close();
-        stmt.resultDone(this);
     }
 
     @Override
@@ -132,10 +130,6 @@ final class SkyliteResultSet implements ResultSet {
             }
             stmt.resultClosed(this);
         }
-    }
-
-    void closeSilently() {
-        close();
     }
 
     @Override
@@ -512,7 +506,10 @@ final class SkyliteResultSet implements ResultSet {
             r = getBigDecimal(i);
         } else if (type == BigInteger.class) {
             try {
-                r = getBigDecimal(i).toBigIntegerExact();
+                // A REAL's exact binary value: its shortest decimal string can differ from the integer it holds.
+                r = v instanceof Double d && Double.isFinite(d)
+                        ? new BigDecimal(d).toBigIntegerExact()
+                        : getBigDecimal(i).toBigIntegerExact();
             } catch (ArithmeticException e) {
                 throw Errors.data("this " + storageClass(v) + " is not an integer", "22018");
             }

@@ -86,10 +86,7 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
 
     @Override
     public ResultSet executeQuery() throws SQLException {
-        if (!run(sql, bound())) {
-            throw new SQLNonTransientException("skylite: the statement returned no result set", "07000");
-        }
-        return getResultSet();
+        return query(run(sql, bound()));
     }
 
     @Override
@@ -99,12 +96,12 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
 
     @Override
     public long executeLargeUpdate() throws SQLException {
-        return update(run(sql, bound()));
+        return update(run(sql, bound()) != null);
     }
 
     @Override
     public boolean execute() throws SQLException {
-        return run(sql, bound());
+        return run(sql, bound()) != null;
     }
 
     @Override
@@ -123,8 +120,7 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
         Session s = conn.session();
         List<Column> cols = List.of();
         int params = 0;
-        Exchange open = running; // an open result set's, which cancel reaches again after the describe
-        cancelRequested = false;
+        begin();
         try (Exchange ex = Exchange.send(
                 s, FrameReader.Kind.DESCRIBE, Request.describe(sql, s.watermark()), getQueryTimeout(), this)) {
             Frame f;
@@ -137,8 +133,6 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
                     default -> throw Errors.transport("malformed response: a row in a describe answer", null);
                 }
             }
-        } finally {
-            running = open;
         }
         describedColumns = cols;
         describedParams = params;

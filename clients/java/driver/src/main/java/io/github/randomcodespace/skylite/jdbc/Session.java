@@ -56,7 +56,8 @@ final class Session {
 
     /**
      * The bearer token of the next request: from the provider, or the token file read again, trimmed. Refused
-     * before anything is sent when empty or holding characters a bearer token cannot hold. Errors never hold it.
+     * before anything is sent when empty or holding anything but printable ASCII without spaces. A failure of the
+     * source is reported by its exception type alone: its message and cause, which might hold a token, are dropped.
      */
     String token() throws SQLException {
         String t;
@@ -64,7 +65,7 @@ final class Session {
             t = provider != null ? provider.token() : Files.readString(tokenFile, StandardCharsets.UTF_8).strip();
         } catch (Exception e) {
             throw new SQLInvalidAuthorizationSpecException(
-                    "skylite: the token source failed (" + e.getClass().getName() + ")", "28000", e);
+                    "skylite: the token source failed (" + e.getClass().getName() + ")", "28000");
         }
         if (!validBearer(t)) {
             throw new SQLInvalidAuthorizationSpecException(
