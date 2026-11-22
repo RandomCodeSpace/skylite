@@ -1085,3 +1085,28 @@ func TestStaleCommitUnderAttemptLeavesOffice(t *testing.T) {
 		t.Fatalf("an attempt over a retired commit: %v; leader: %v", err, a.Err())
 	}
 }
+
+// A collection pass deletes at most passBatch keys, and later passes
+// finish the list.
+func TestCollectorPassBound(t *testing.T) {
+	quietCompaction(t)
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.Grace, cfg.CompactInterval = time.Nanosecond, time.Hour
+	l := lead(t, st, keys, o, cfg)
+	l.cmpMu.Lock()
+	for i := range 2*passBatch + 10 {
+		l.garbage = append(l.garbage, fmt.Sprintf("probe/none-%d", i))
+	}
+	l.garbageAt = time.Now().Add(-time.Hour)
+	l.cmpMu.Unlock()
+	for i, want := range []int{passBatch + 10, 10, 0} {
+		l.tend()
+		l.cmpMu.Lock()
+		got := len(l.garbage)
+		l.cmpMu.Unlock()
+		if got != want {
+			t.Fatalf("after pass %d: %d keys left, want %d", i+1, got, want)
+		}
+	}
+}

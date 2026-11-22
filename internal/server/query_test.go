@@ -712,6 +712,19 @@ func TestTailBoundWithoutCompactionNotReady(t *testing.T) {
 	}
 }
 
+func TestRetryableTailBoundStaysReady(t *testing.T) {
+	// A tail-bound refusal that compaction is clearing matches ErrRetry.
+	e := newQueryEnv(t, nil)
+	d := e.s.dbs["d"]
+	we := e.s.engineError(d, e.leader(t), fmt.Errorf("%w: %w: %w", engine.ErrNotCommitted, engine.ErrTailBound, engine.ErrRetry))
+	if we.Code != "maintenance" || !strings.Contains(we.Message, "retry") {
+		t.Errorf("%v, want maintenance saying retry", we)
+	}
+	if !e.s.ready() {
+		t.Error("not ready at a tail bound compaction is clearing")
+	}
+}
+
 func TestStandbyNotServingAndNotReady(t *testing.T) {
 	leader := newQueryEnv(t, nil)
 	standby := newEnv(t, nil)
