@@ -767,6 +767,65 @@ func TestUncheckedLeaderStepsDown(t *testing.T) {
 	}
 }
 
+func TestFollowerStopsBeforeLead(t *testing.T) {
+	st, keys := newDatabase(t, t.TempDir())
+	ctx := t.Context()
+	_, primary, err := engine.Takeover(ctx, st, keys, engine.Candidate{Holder: holder(t, "primary"), TTL: 5 * time.Second, Now: time.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, resume := make(chan struct{}), make(chan struct{})
+	office.SetLead(t, func(ctx context.Context, _ storage.Store, _ format.Keys, _ string, _ engine.Office, _ engine.Config) (*engine.Leader, error) {
+		select {
+		case started <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		select {
+		case <-resume:
+			return nil, errors.New("injected Lead failure")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	l, stop := start(t, office.Config{
+		Store: st, Keys: keys, Holder: holder(t, "standby"), TTL: 5 * time.Second, Renew: 200 * time.Millisecond,
+		FollowerReads: true,
+	})
+	initial := waitFor(t, l, 2*time.Second, "follower published", func(s office.State) bool { return s.Follower != nil }).Follower
+	if err := primary.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("standby did not start Lead")
+	}
+	if l.State().Follower != nil {
+		t.Error("Lead started while the standby still published a follower")
+	}
+	select {
+	case <-initial.Done():
+	default:
+		t.Error("Lead started before the follower stopped")
+	}
+	close(resume)
+	next := waitFor(t, l, 2*time.Second, "follower restarted", func(s office.State) bool {
+		return s.Follower != nil && s.Follower != initial
+	}).Follower
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	if l.State().Follower != nil {
+		t.Error("shutdown left a follower published")
+	}
+	select {
+	case <-next.Done():
+	default:
+		t.Error("shutdown did not wait for the follower")
+	}
+}
+
 // A Lead that fails releases the lease and shows in State, and candidacies
 // then back off, doubling.
 func TestLeadFailureBacksOff(t *testing.T) {
