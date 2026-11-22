@@ -130,14 +130,19 @@ public class SkyliteServer implements LauncherSessionListener {
                 .redirectOutput(log.toFile());
         serve.environment().put("TMPDIR", run.toString()); // the leader's local files
         server = serve.start();
-        waitForPort(port, log);
-        put(port, cert, token);
-
         String url = "jdbc:skylite:https://localhost:" + port + "/" + DB;
         Properties props = new Properties();
         props.setProperty("tokenFile", tokenFile.toString());
         props.setProperty("tlsRootCertificates", cert.toString());
-        waitUntilServing(url, props, log);
+        try {
+            waitForPort(port, log);
+            put(port, cert, token);
+            waitUntilServing(url, props, log);
+        } catch (Exception | Error e) {
+            server.destroyForcibly(); // no orphan server when the run cannot start
+            server = null;
+            throw e;
+        }
         System.setProperty("jdbc.url", url);
         for (Map.Entry<Object, Object> e : props.entrySet()) {
             System.setProperty("spring.datasource.hikari.data-source-properties." + e.getKey(), (String) e.getValue());
