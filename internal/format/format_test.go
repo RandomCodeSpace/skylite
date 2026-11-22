@@ -659,7 +659,7 @@ func TestKeysRoundTrip(t *testing.T) {
 			t.Fatalf("%q: %v", prefix, err)
 		}
 		db, txn, tag, group := randDB(r), r.Uint64(), r.Uint64(), r.Uint32()
-		for _, key := range []string{k.Commit(db, txn), k.Base(db, group, txn, tag), k.Manifest(), k.Lease()} {
+		for _, key := range []string{k.Commit(db, txn), k.Base(db, group, txn, tag), k.Manifest(), k.Lease(), k.Leader()} {
 			if !validKey(key) {
 				t.Fatalf("built invalid key %q", key)
 			}

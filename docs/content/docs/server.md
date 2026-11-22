@@ -1,11 +1,11 @@
 ---
 title: Server
-description: What `skylite serve` does in this version, which is authenticate requests, create databases, lead the databases it is configured for, answer read-only queries on them and run autocommit writes and transactions on write channels, and how to configure it.
+description: What `skylite serve` does in this version, which is authenticate requests, create databases, lead the databases it is configured for, answer read-only queries on them, run autocommit writes and transactions on write channels and forward requests between pods, and how to configure it.
 weight: 15
 status: current
 ---
 
-`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on leaders and [opt-in followers](#reading-on-a-follower), and runs autocommit writes and transactions on [write channels](#write-channels) on leaders. It runs no batch or `resolve`. The [Go driver](/docs/go-driver/)'s read path uses `query` and `describe`; no driver sends writes yet.
+`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on leaders and [opt-in followers](#reading-on-a-follower), and runs autocommit writes and transactions on [write channels](#write-channels) on leaders. With a peer listener configured, a pod forwards what it cannot serve to the pod that can ([Forwarding between pods](#forwarding-between-pods)). It runs no batch or `resolve`. The [Go driver](/docs/go-driver/)'s read path uses `query` and `describe`; no driver sends writes yet.
 
 ## What it serves
 
@@ -18,8 +18,8 @@ status: current
 | `POST /v1/databases/{db}/channel` with `channel`, `seq` and `op`: `begin` (optionally with a first statement in `execute`, `min_txn` and `timeout_ms`), `execute` (with `sql`, optionally `params` or `named`, `min_txn` and `timeout_ms`), `commit` (optionally `timeout_ms`), `rollback` or `ping` | A request on the channel: an autocommit write, or a step of a [transaction](#transactions) |
 | `POST /v1/databases/{db}/channel/cancel` with `channel` and `seq` | Cancels that request: `done` with `seq`, `txn_state` and the request's receipt. See [Cancel](#cancel) |
 | `POST /v1/databases/{db}/channel/close` with `channel` | Closes the channel: `done` with `last_seq` and the receipt of that request |
-| Channel requests on a database this server does not lead, or stateless reads with neither a local leader nor an enabled local follower | `503` `not_serving`. The body is not read |
-| `resolve` and `GET` status | After authentication, and authorisation at the `read` role on the name, `503` `not_serving`. The body is not read |
+| Channel requests on a database this server does not lead, or stateless reads with neither a local leader nor an enabled local follower | With `peer` set, forwarded once to the pod that serves them ([Forwarding between pods](#forwarding-between-pods)); otherwise `503` `not_serving`, the body unread |
+| `resolve` and `GET` status | After authentication, and authorisation at the `read` role on the name: with `peer` set, a pod that does not lead the database forwards them to the leader; the leader, or a pod without `peer`, answers `503` `not_serving` without reading the body |
 | Anything else, or a path with a query string | `400` `invalid_request` |
 
 `{db}` is 1 to 63 characters from `a-z`, `0-9` and `-`, starting with a letter or a digit. A `PUT` needs the `admin` role on the name; a write open and every request on a write channel need the `write` role, checked again on each request because a new token's claims can differ; every other request, a close and a cancel included, needs the `read` role. Every answer is a sequence of NDJSON frames ending in one terminal frame, and a refusal is one error frame, with the headers `Skylite-Protocol: 1`, `Skylite-Request-Id`, `Content-Type: application/x-ndjson` and `Cache-Control: no-store`; a `401` also carries `WWW-Authenticate: Bearer`. The error object and its codes are those of [0005's errors](/docs/decisions/0005-client-protocol/#errors).
@@ -34,9 +34,9 @@ The server runs [0005's checks](/docs/decisions/0005-client-protocol/#checks-bef
 2. *Admission is implemented only for connections:* the server accepts at most 1,024 connections at a time, and one beyond that waits in the operating system's listen queue until another closes. There are no request bounds yet.
 3. The bearer token verifies, read from the headers only (`401` `unauthenticated`). The body is never read before this.
 4. The principal holds `read` on the name, and `admin` for a `PUT` (`403` `forbidden`). This comes before routing and before anything that depends on whether the database exists, so the answer is the same either way.
-5. The server must lead the database for channel requests. For `query` and `describe` it can also use an enabled local follower. If neither route applies, it answers `503` `not_serving` with the body unread. A `PUT` can go to any server.
+5. The server must lead the database for channel requests. For `query` and `describe` it can also use an enabled local follower. If neither route applies and it cannot forward the request, because `peer` is not set or another pod forwarded it, it answers `503` `not_serving` with the body unread. A request it can forward goes through steps 6 and 7 and is then forwarded. A `PUT` can go to any server.
 6. The body share of the memory budget has room for 8 × `Content-Length`, and so does the principal's part of it (`429` `overloaded`, the body unread). The share is half the memory budget, 1 GiB; a principal, an issuer and a subject, may hold a quarter of it, 256 MiB, at once. A body is charged from before its read until its request ends, so one that is declared and never sent stays charged until the 30-second body read deadline or the client's close.
-7. `Content-Type` is `application/json`, compared without regard to case, with parameters ignored; `Content-Length` is present once, with one value, and at most 16 MiB, or 4 KiB for a close (`413` `request_too_large` above it); there is no `Transfer-Encoding`. The whole body is read within 30 seconds and must be exactly `Content-Length` bytes: one JSON object of 0005's form with only the fields its request allows, and exactly `{}` for a `PUT`. A cut body, a reset stream or a body that arrives late is `400` `invalid_request`, and nothing is created or run.
+7. `Content-Type` is `application/json`, compared without regard to case, with parameters ignored; `Content-Length` is present once, with one value, and at most 16 MiB, or 4 KiB for a close, a cancel or a resolve (`413` `request_too_large` above it); there is no `Transfer-Encoding`. The whole body is read within 30 seconds and must be exactly `Content-Length` bytes: one JSON object of 0005's form with only the fields its request allows, and exactly `{}` for a `PUT`. A cut body, a reset stream or a body that arrives late is `400` `invalid_request`, and nothing is created or run.
 8. For a `query` or `describe`, the server reserves a SQLite connection (`429` `overloaded`; see [Connections for queries](#connections-for-queries)), and the leader is not in maintenance (`503` `maintenance`).
 
 The 30-second body read deadline starts when the server has read the header block, so it also bounds a body that a refusal leaves unread. Such a refusal is answered at once. On HTTP/1.1 it carries `Connection: close`, and Go's HTTP server reads and discards what is left of the body, within the same deadline, before it closes the connection.
@@ -53,11 +53,11 @@ For each name in `databases`, the server runs the office loop of [0004](/docs/de
 
 ### Reading on a follower
 
-Set `follower_reads` to `true` to let a standby serve `query` and `describe` for its configured databases. A follower polls the durable log about every 250 ms and pins each request to one snapshot before SQLite opens it. An observation of the end of the log is usable for new snapshots for less than two seconds. When the follower has no fresh observation, it refuses with `503` `not_serving`. A request can wait up to 500 ms within its statement budget for a fresh generation at or above `min_txn`. A fresh follower that cannot reach the requested transaction in time answers `503` `behind`.
+With `follower_reads` on, the default, a standby serves `query` and `describe` for its configured databases. A follower polls the durable log about every 250 ms and pins each request to one snapshot before SQLite opens it. An observation of the end of the log is usable for new snapshots for less than two seconds. When the follower has no fresh observation, it refuses with `503` `not_serving`. A request can wait up to 500 ms within its statement budget for a fresh generation at or above `min_txn`. A fresh follower that cannot reach the requested transaction in time answers `503` `behind`.
 
 If compaction overtakes the pin before the response starts, the server can retry once on a newer pin within the request and catch-up budgets. If it cannot obtain a usable replacement, it answers `503` `not_serving`. If compaction overtakes a pin after the response starts, an `internal` error ends the stream. A standby stops polling when it takes office, before it starts leading, and starts polling again after it steps down or fails to start leading.
 
-`follower_reads` defaults to `false`. With it enabled and more than one pod behind a Service, writes and channel requests that reach a follower get `503` `not_serving`. Forwarding is planned. Keep the default for a Service that needs to deliver writes to the leader.
+`follower_reads` defaults to `true`; set it to `false` to serve stateless reads only on the leader. With `peer` set, a follower forwards to the leader a read it has no fresh snapshot for, or is still `behind` on, before its answer starts, and every write and channel request. Without `peer`, those get `503` `not_serving`, so more than one pod behind a Service needs `peer` to deliver writes.
 
 ### How a query runs
 
@@ -189,7 +189,37 @@ With `probe_listen` set, the server answers `GET /readyz` on that address, in pl
 Known limits of readiness in this version:
 
 - Readiness is per pod, not per database. One database at a tail bound its leader cannot compact past makes the pod not ready for every database it leads.
-- Each database's office loop runs on its own, so the databases of a set of pods can be led by different pods, and readiness cannot steer a request to the pod that leads its database; the others answer `not_serving`. List each database on one set of active pods, or run one active pod.
+- Each database's office loop runs on its own, so the databases of a set of pods can be led by different pods, and readiness cannot steer a request to the pod that leads its database. With `peer` set, the others forward it; without it, they answer `not_serving`, so list each database on one set of active pods, or run one active pod.
+
+## Forwarding between pods
+
+With `peer` set, any pod that lists a database accepts any request for it. A pod that cannot serve a request itself forwards it once to the pod that can, over a second listener with mutual TLS. A client never gets a redirect.
+
+| Request on a pod that does not lead the database | Goes to |
+|---|---|
+| `query`, `describe` | A fresh local follower, if `follower_reads` is on; otherwise, or when the follower answers `not_serving` or `behind` before its answer starts, the leader |
+| A channel open, `resolve`, `GET` status | The leader |
+| `channel`, `channel/cancel`, `channel/close` | The pod whose process the token names, which in this version is the leader that opened the channel |
+| `PUT` | Served where it arrives |
+
+A pod that leads the database serves every request itself.
+
+**Membership.** Once its office loop reports it in office, a leader writes a leader record at `<prefix>/<db>/leader` with its process identifier (the one its channel tokens name), the `host:port` of its peer listener, the database identifier, its epoch and the transaction number of its epoch bump. It replaces only a record of an epoch no higher than its own, and retries a failed write every second. On step-down or shutdown it removes the address with a conditional replace, so it never overwrites a later leader's record. A forwarding pod reads the record for each request it forwards. Nothing beyond object storage and the configuration is needed.
+
+**The hop.** The forwarding pod authenticates and authorises the request as usual, reads and checks the whole body, then sends the same method, path, body bytes, end-to-end headers and `Authorization` to the peer listener, with `Skylite-Forwarded: 1`, `Skylite-Request-Id` (its own request id, which the answer carries) and `Skylite-Budget-Ms`: what is left of the statement time, 30 seconds or `timeout_ms` if lower, after the time already spent. Hop-by-hop headers are dropped. The receiving pod verifies the bearer token and the role again, lowers its statement time to the budget, and never forwards the request again: if it cannot serve it, it answers `503` `not_serving`. The answer is relayed as it arrives, frame by frame, with its status and headers. If the other pod's answer is cut after it started, the forwarding pod cuts its own (HTTP/1.1 closes the connection, HTTP/2 resets the stream) and adds no terminal frame. It waits for the other pod at most the budget plus 30 seconds.
+
+**One attempt.** A forwarding pod sends a request at most once and never resends it. When the hop fails it answers itself:
+
+| Failure | Answer |
+|---|---|
+| No leader is recorded, or the record has no address | `503` `no_leader`, or `owner_unreachable` for a channel request, cancel or close; `not_executed: true` |
+| The hop failed before any request header was written, such as a refused connection or a failed TLS handshake | The same, `not_executed: true` |
+| The hop failed after a request header may have been written, or the answer had no `Skylite-Protocol` marker | The same with `not_executed: false`: the other pod may have accepted the request, so its outcome is unsettled |
+| The token names this pod's own process, which does not lead the database | `410` `channel_lost` |
+| The token names another process than the record, the record is of the same database, and its bump is above the token's open head | `410` `channel_lost`: the channel opened under an earlier office, which has ended |
+| The token names another process than the record otherwise | `503` `owner_unreachable`, `not_executed: true` |
+
+**Pod authentication.** The peer listener requires TLS 1.3 and a client certificate that chains to `peer.ca_file`. A forwarding pod requires a server certificate that chains to the same CA and carries `peer.server_name`. Every pod can use one certificate for both. Use a CA that issues peer certificates and nothing else: whoever holds a certificate it issued is a pod. Forwarded requests go only to the address in the leader record, and through no HTTP proxy. The pod-to-pod headers are accepted only on the peer listener: a client that sends `Skylite-Forwarded` or `Skylite-Budget-Ms` gets `400` `invalid_request`, and a `Skylite-Request-Id` it sends is ignored.
 
 ## Configuration
 
@@ -212,7 +242,11 @@ The configuration is one JSON file. Unknown fields are refused, and the server d
     "s3": {"bucket": "my-bucket", "region": "eu-west-1"}
   },
   "databases": ["orders"],
-  "follower_reads": false,
+  "peer": {
+    "listen": ":8444", "address_env": "SKYLITE_PEER_ADDRESS",
+    "cert_file": "/etc/skylite/peer.crt", "key_file": "/etc/skylite/peer.key",
+    "ca_file": "/etc/skylite/peer-ca.crt", "server_name": "skylite-peer"
+  },
   "probe_listen": ":8081"
 }
 ```
@@ -230,7 +264,12 @@ The configuration is one JSON file. Unknown fields are refused, and the server d
 | `storage.gcs` | `bucket` (required) and `endpoint` for an emulator, which then gets no credentials |
 | `storage.azure` | `account` and `container` (required), `endpoint` for Azurite or another blob account URL (empty means `https://<account>.blob.core.windows.net`), and exactly one of `shared_key_file` (path to a file holding the base64 shared key) and `shared_key_env` (name of an environment variable holding it) |
 | `databases` | The databases this server leads and answers queries on: names of the `{db}` form, each once, at most 13. Optional; without it the server serves `PUT` alone. The leaders' local files go in a directory under the system's temporary directory (`TMPDIR`), removed on shutdown |
-| `follower_reads` | Serve stateless reads from a fresh local follower while in standby. Optional, defaults to `false` |
+| `follower_reads` | Serve stateless reads from a fresh local follower while in standby. Optional, defaults to `true` |
+| `peer.listen` | TCP address of the peer listener for [forwarded requests](#forwarding-between-pods). Without `peer`, nothing is forwarded |
+| `peer.address_env` | Name of an environment variable holding the `host:port` other pods dial to reach this pod's peer listener, for example set to `$(POD_IP):8444` from the downward API. The server does not start if it is unset or holds no host |
+| `peer.cert_file`, `peer.key_file` | PEM certificate and key this pod presents as peer server and client, read once at start |
+| `peer.ca_file` | PEM certificates of the CA that issues peer certificates, and nothing else |
+| `peer.server_name` | The DNS name every peer certificate carries, checked on the pod a request is forwarded to |
 | `probe_listen` | TCP address of the [readiness probe](#readiness). Optional |
 
 An `endpoint` must be an `http` or `https` URL with a host and no user information, query string or fragment, so that it carries no credential; the server does not start with one that breaks this, and the error does not repeat the value.
@@ -239,7 +278,7 @@ An `endpoint` must be an `http` or `https` URL with a host and no user informati
 
 ## Logs and shutdown
 
-The server writes JSON log lines to standard error: one when it starts; one per refused request with its request id and code; one for each authentication or authorisation refusal with the fields of [0006](/docs/decisions/0006-authentication/#principal-and-logging): the reason, the configured issuer, the subject once the signature has verified, the key id and the first 12 hex digits of the token's SHA-256 hash, and for a `403` the database and the role it needed; one for each created database with the principal's issuer and subject; the office loop's lines, with the database's name, when it takes office, steps down or fails a candidacy; and one for each query or write that fails with `internal`, ends with an unknown outcome or fails after committing, with the engine's class of the failure. Logs never hold a bearer token or part of one, a channel token, SQL text, parameters or SQLite's messages.
+The server writes JSON log lines to standard error: one when it starts; one per refused request with its request id and code; one for each authentication or authorisation refusal with the fields of [0006](/docs/decisions/0006-authentication/#principal-and-logging): the reason, the configured issuer, the subject once the signature has verified, the key id and the first 12 hex digits of the token's SHA-256 hash, and for a `403` the database and the role it needed; one for each created database with the principal's issuer and subject; the office loop's lines, with the database's name, when it takes office, steps down or fails a candidacy; one for each query or write that fails with `internal`, ends with an unknown outcome or fails after committing, with the engine's class of the failure; and one for each failed forward, saying whether its request may have been sent, and for each leader record the server could not read, write or withdraw. Logs never hold a bearer token or part of one, a channel token, SQL text, parameters or SQLite's messages.
 
 On SIGTERM or SIGINT the server reports itself not ready, stops accepting connections, waits for running requests (a create, a query or a write runs for at most 30 seconds before its commit point, and the wait is at most a minute), leaves office, releasing each lease, then exits with status 0. If requests are still running after a minute, it closes their connections and exits with status 1. A second SIGTERM or SIGINT during the wait ends the process at once.
 
@@ -282,7 +321,9 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 ## Not built yet, and not verified
 
 - Admission control of [0005 decision 9](/docs/decisions/0005-client-protocol/#9-limits-and-defaults): request and per-principal request bounds. The memory budget is fixed at 2 GiB rather than taken from the container's limit, and response frames are not charged to it.
-- `batch`, `describe` on a channel and read-only channels; `resolve`, so a write whose channel was lost stays unknown to its driver; `GET` status; forwarding between pods and cluster membership.
+- `batch`, `describe` on a channel and read-only channels; `resolve`, so a write whose channel was lost stays unknown to its driver; `GET` status.
+- A follower does not forward a `query` or `describe` it cannot compile, as 0005 asks for a schema change it has not applied yet; it answers the compile error. Forwarded requests are not counted against any admission bound beyond the body share, and the leader record is read from storage for every forwarded request.
+- Forwarding is tested between servers in one process on one local store, over loopback TLS, not between pods or through a mesh.
 - `database_not_found` for a query: a server that does not lead the database and has no enabled follower for it answers `not_serving`, whether or not it exists.
 - Keepalive frames during a long query or a write's lock wait, and the compiled-statement cache: every query and write compiles its statement.
 - 0005's commit point is not visible to the server, so a close or a cancel cannot tell a write or commit before it from one in its upload; it interrupts the connection, and the engine reports what happened.

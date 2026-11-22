@@ -6,8 +6,11 @@
 // stateless query and describe requests on leaders and opt-in followers
 // (see query.go), and write channels with autocommit writes, transactions
 // and cancel on leaders (see channel.go). Each configured database has an
-// office loop (internal/office). Every other path of the protocol (resolve
-// and GET status) is authenticated and then answered with not_serving. Of
+// office loop (internal/office). With a peer listener configured, a request
+// this server cannot serve is forwarded one hop to the pod that can (see
+// forward.go). resolve and GET status are authenticated, forwarded to the
+// leader if this server does not lead, and answered there with
+// not_serving. Of
 // the admission control of ADR 0005 decision 9, the bound
 // on HTTP connections, the body share of the memory budget, the SQLite
 // connection limits and the channel bounds are implemented.
@@ -103,15 +106,18 @@ func engineConfig() engine.Config {
 
 // Server serves the client protocol. Create it with New.
 type Server struct {
-	// probeLn, if set, is the readiness probe's listener in place of
-	// cfg.ProbeListen; tests set it to keep their port bound.
-	probeLn net.Listener
-	cfg     Config
-	log     *slog.Logger
-	guard   *auth.Guard
-	store   storage.Store
-	cert    *tls.Certificate
-	limits  wire.Limits
+	// probeLn and peerLn, if set, are the readiness probe's and the peer
+	// listener's in place of cfg.ProbeListen and cfg.Peer.Listen; tests set
+	// them to keep their ports bound.
+	probeLn, peerLn net.Listener
+	peer            *peer        // nil without cfg.Peer
+	peerSeen        atomic.Int64 // requests the peer listener received; tests read it
+	cfg             Config
+	log             *slog.Logger
+	guard           *auth.Guard
+	store           storage.Store
+	cert            *tls.Certificate
+	limits          wire.Limits
 
 	policy   *sqlpolicy.Policy
 	pool     *pool
@@ -200,6 +206,11 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 			return nil, fmt.Errorf("server: tls: %w", err)
 		}
 		s.cert = &c
+	}
+	if cfg.Peer != nil {
+		if s.peer, err = newPeer(cfg.Peer); err != nil {
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -353,20 +364,59 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	} else {
 		p.SetUnencryptedHTTP2(true)
 	}
+	// The peer listener serves forwarded requests: only from a pod that
+	// presents a peer certificate, and never forwarded again.
+	var peerSrv *http.Server
+	if s.peer != nil {
+		pln := s.peerLn
+		if pln == nil {
+			var err error
+			if pln, err = net.Listen("tcp", s.cfg.Peer.Listen); err != nil {
+				return fmt.Errorf("server: peer: %w", err)
+			}
+		}
+		peerSrv = &http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				s.peerSeen.Add(1)
+				s.serve(w, r, true)
+			}),
+			TLSConfig: s.peer.server.Clone(), ReadHeaderTimeout: s.headerDeadline, IdleTimeout: s.idleTimeout,
+			MaxHeaderBytes: int(s.limits.HeaderBlockBytes), HTTP2: srv.HTTP2, ErrorLog: srv.ErrorLog,
+		}
+		go func() { _ = peerSrv.ServeTLS(netutil.LimitListener(pln, s.maxConns), "", "") }()
+	}
 	errc := make(chan error, 1)
 	go func() { errc <- serve() }()
 	select {
 	case err := <-errc:
+		if peerSrv != nil {
+			_ = peerSrv.Close()
+		}
 		return err
 	case <-ctx.Done():
 	}
 	s.stopping.Store(true)
 	dctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
 	defer cancel()
+	perr := make(chan error, 1)
+	go func() {
+		if peerSrv == nil {
+			perr <- nil
+			return
+		}
+		err := peerSrv.Shutdown(dctx)
+		if err != nil {
+			_ = peerSrv.Close()
+		}
+		perr <- err
+	}()
 	err := srv.Shutdown(dctx)
 	if err != nil {
 		_ = srv.Close()
 		err = fmt.Errorf("server: requests still running after %v were cut: %w", s.shutdownTimeout, err)
+	}
+	if pe := <-perr; pe != nil && err == nil {
+		err = fmt.Errorf("server: forwarded requests still running after %v were cut: %w", s.shutdownTimeout, pe)
 	}
 	if serr := <-errc; err == nil && !errors.Is(serr, http.ErrServerClosed) {
 		err = serr
@@ -439,8 +489,11 @@ func (s *Server) addDatabases() error {
 func (s *Server) startOffice() (stop func()) {
 	lctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	for _, d := range s.dbs {
+	for name, d := range s.dbs {
 		wg.Go(func() { _ = d.loop.Run(lctx) })
+		if s.peer != nil {
+			wg.Go(func() { s.announce(lctx, name, d) })
+		}
 	}
 	return func() {
 		cancel()
@@ -482,12 +535,20 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 
 // ServeHTTP answers one request with ADR 0005's headers and NDJSON frames,
 // ending with one terminal frame.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.serve(w, r, false) }
+
+// serve is ServeHTTP for a request from a client, or forwarded by another
+// pod (hop), whose answer it relays.
+func (s *Server) serve(w http.ResponseWriter, r *http.Request, hop bool) {
+	arrived := time.Now()
 	rc := http.NewResponseController(w)
 	// The body read deadline runs from the end of the header block, and also
 	// bounds a body a refusal leaves unread.
-	_ = rc.SetReadDeadline(time.Now().Add(s.bodyDeadline))
+	_ = rc.SetReadDeadline(arrived.Add(s.bodyDeadline))
 	id := rand.Text()
+	if v := r.Header.Get(requestIDHeader); hop && validRequestID(v) {
+		id = v // assigned by the pod that received the request (ADR 0005)
+	}
 	h := w.Header()
 	h.Set("Skylite-Protocol", "1")
 	h.Set("Skylite-Request-Id", id)
@@ -502,7 +563,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.out = out
-	done, e, bodyRead := s.handle(st, r, id, log)
+	done, e, bodyRead := s.handle(st, r, id, log, hop, arrived)
+	if st.relayed {
+		return
+	}
 	status := http.StatusOK
 	if e != nil {
 		if e.RequestID == "" { // a replayed receipt keeps its request's own
@@ -557,6 +621,7 @@ type stream struct {
 	out      *wire.Writer
 	buf      *bytes.Buffer
 	started  bool
+	relayed  bool      // forward relayed another pod's answer
 	deadline time.Time // the write deadline from the start, if set
 }
 
@@ -581,15 +646,26 @@ func (st *stream) Write(p []byte) (int, error) {
 }
 
 // handle runs the checks before acceptance of ADR 0005 in their order, then
-// serves the request with request id id. Admission (check 2) is not
-// implemented. bodyRead reports whether the body was read to its end.
-func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger) (done *wire.Done, e *wire.Error, bodyRead bool) {
+// serves the request with request id id, or forwards it. Admission (check
+// 2) is not implemented. bodyRead reports whether the body was read to its
+// end. hop is set for a request another pod forwarded, which arrived then.
+func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger, hop bool, arrived time.Time) (done *wire.Done, e *wire.Error, bodyRead bool) {
 	kind, db, e := wire.Route(r.Method, r.URL.EscapedPath())
 	if e != nil {
 		return nil, e, false
 	}
 	if r.URL.RawQuery != "" {
 		return nil, wire.NewError(wire.CodeInvalidRequest, "the path must have no query"), false
+	}
+	// The pod-to-pod headers are trusted only on the peer listener.
+	var budget int64
+	if hop {
+		var err error
+		if budget, err = strconv.ParseInt(r.Header.Get(budgetHeader), 10, 64); err != nil || budget < 1 {
+			return nil, wire.NewError(wire.CodeInvalidRequest, "a forwarded request needs Skylite-Budget-Ms, a positive integer"), false
+		}
+	} else if r.Header.Values(forwardedHeader) != nil || r.Header.Values(budgetHeader) != nil {
+		return nil, wire.NewError(wire.CodeInvalidRequest, "Skylite-Forwarded and Skylite-Budget-Ms are sent only between pods"), false
 	}
 	// Authentication, from the headers only: the body is not read before it.
 	token, err := auth.BearerToken(r.Header)
@@ -623,19 +699,24 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	if e := authorize(need); e != nil {
 		return nil, e, false
 	}
-	switch kind {
-	case wire.KindResolve, wire.KindStatus:
-		return nil, wire.NewError(wire.CodeNotServing, "resolve and status are not served in this version"), false
-	}
-	// Route before reading the body. Only stateless reads can use a follower.
+	// Route before reading the body what this server can neither serve nor
+	// forward. Only stateless reads can use a follower; a request another
+	// pod forwarded is never forwarded again.
 	d := s.dbs[db]
 	var leader *engine.Leader
 	var follower *engine.Follower
 	if d != nil {
 		leader, follower = d.serving()
 	}
-	if kind != wire.KindPut && leader == nil && (follower == nil || kind != wire.KindQuery && kind != wire.KindDescribe) {
+	forward := !hop && s.peer != nil && d != nil && kind != wire.KindPut && leader == nil
+	stateless := kind == wire.KindQuery || kind == wire.KindDescribe
+	switch {
+	case (kind == wire.KindResolve || kind == wire.KindStatus) && !forward:
+		return nil, wire.NewError(wire.CodeNotServing, "resolve and status are not served in this version"), false
+	case kind != wire.KindPut && leader == nil && !forward && (follower == nil || !stateless):
 		return nil, wire.NewError(wire.CodeNotServing, "this server does not lead the database or serve this request on a follower"), false
+	case kind == wire.KindStatus:
+		return nil, s.forward(st, r, kind, db, nil, nil, id, arrived, log), false
 	}
 	who := principal(p)
 	release, e := s.chargeBody(r, who)
@@ -644,7 +725,7 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	}
 	defer release()
 	limit := s.limits.RequestBodyBytes
-	if kind == wire.KindClose || kind == wire.KindCancel {
+	if kind == wire.KindClose || kind == wire.KindCancel || kind == wire.KindResolve {
 		limit = controlBodyBytes
 	}
 	body, e := s.readBody(r, limit)
@@ -655,6 +736,9 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	if e != nil {
 		return nil, e, true
 	}
+	if budget > 0 && budget < s.statementTime.Milliseconds() && (req.TimeoutMS == 0 || budget < req.TimeoutMS) {
+		req.TimeoutMS = budget // the forwarding pod's budget only lowers the statement time
+	}
 	// Writes need the write role (ADR 0006): a write open, and every
 	// request on a write channel but close and cancel, which only stop
 	// work, checked again on each, since a token's claims can change.
@@ -662,6 +746,9 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 		if e := authorize(auth.RoleWrite); e != nil {
 			return nil, e, true
 		}
+	}
+	if forward && (!stateless || follower == nil) {
+		return nil, s.forward(st, r, kind, db, req, body, id, arrived, log), true
 	}
 	switch kind {
 	case wire.KindPut:
@@ -676,6 +763,11 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 		done, e = s.cancelRequest(d, leader, req, who, id)
 	default:
 		done, e = s.statement(r.Context(), st, d, leader, follower, req, who, log)
+		// A follower that cannot serve the read before its answer starts
+		// hands it to the leader.
+		if forward && e != nil && !st.started && (e.Code == wire.CodeNotServing || e.Code == wire.CodeBehind) {
+			return nil, s.forward(st, r, kind, db, req, body, id, arrived, log), true
+		}
 	}
 	return done, e, true
 }
