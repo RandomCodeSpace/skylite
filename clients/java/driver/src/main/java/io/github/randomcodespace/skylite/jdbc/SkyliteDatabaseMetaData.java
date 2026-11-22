@@ -138,7 +138,7 @@ final class SkyliteDatabaseMetaData implements DatabaseMetaData {
     @Override public boolean dataDefinitionCausesTransactionCommit() { return false; }
     @Override public boolean dataDefinitionIgnoredInTransactions() { return false; }
     @Override public boolean supportsMultipleTransactions() { return true; }
-    @Override public boolean supportsSavepoints() { return false; }
+    @Override public boolean supportsSavepoints() { return true; }
     @Override public boolean supportsGetGeneratedKeys() { return true; }
     @Override public boolean supportsBatchUpdates() { return true; }
     @Override public boolean supportsNamedParameters() { return false; }

@@ -18,6 +18,8 @@ import java.sql.SQLXML;
 import java.sql.Savepoint;
 import java.sql.Statement;
 import java.sql.Struct;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -28,8 +30,8 @@ import java.util.concurrent.Executor;
  * A connection reads in auto-commit through stateless {@code query} requests, and writes through one write channel
  * of its own, opened on its first write and closed with it. With auto-commit off, the first statement begins a
  * transaction on the channel and every statement runs in it until commit or rollback; a read-only connection runs
- * every statement as a stateless read instead, each at the latest committed state. Savepoints are not supported:
- * the server refuses SAVEPOINT on a channel.
+ * every statement as a stateless read instead, each at the latest committed state. Savepoints are statements of the
+ * transaction, sent as SAVEPOINT, ROLLBACK TO and RELEASE.
  */
 final class SkyliteConnection implements Connection, Exchange.Owner {
     private final Session session;
@@ -41,6 +43,9 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     private volatile boolean closed;
     private volatile boolean autoCommit = true;
     private volatile boolean readOnly;
+    private final List<SkyliteSavepoint> savepoints = new ArrayList<>(); // oldest first; guarded by channel
+    private long savepointTxn; // Channel.transaction() the savepoints belong to; guarded by channel
+    private int savepointIds; // guarded by channel
 
     SkyliteConnection(Session session, String url) {
         this.session = session;
@@ -426,28 +431,121 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         return ResultSet.CLOSE_CURSORS_AT_COMMIT;
     }
 
+    /** An unnamed savepoint, which begins the transaction when none is open. */
     @Override
     public Savepoint setSavepoint() throws SQLException {
-        throw savepoints();
+        return savepoint(null);
     }
 
+    /** A named savepoint, which begins the transaction when none is open. */
     @Override
     public Savepoint setSavepoint(String name) throws SQLException {
-        throw savepoints();
+        if (name == null) {
+            throw new SQLNonTransientException("skylite: the savepoint name is null", "HY009");
+        }
+        return savepoint(name);
     }
 
+    private Savepoint savepoint(String name) throws SQLException {
+        checkOpen();
+        synchronized (channel) {
+            checkSavepoints();
+            SkyliteSavepoint sp = new SkyliteSavepoint(name == null ? ++savepointIds : 0, name);
+            execute("SAVEPOINT " + sp.sql(), List.of(), 0, null);
+            dropEnded();
+            savepoints.add(sp);
+            return sp;
+        }
+    }
+
+    /** Rolls back to the savepoint, which stays; the savepoints set after it are released. */
     @Override
     public void rollback(Savepoint savepoint) throws SQLException {
-        throw savepoints();
+        checkOpen();
+        synchronized (channel) {
+            checkSavepoints();
+            int i = live(savepoint);
+            execute("ROLLBACK TO SAVEPOINT " + savepoints.get(i).sql(), List.of(), 0, null);
+            savepoints.subList(i + 1, savepoints.size()).clear();
+        }
     }
 
+    /** Releases the savepoint and the savepoints set after it. */
     @Override
     public void releaseSavepoint(Savepoint savepoint) throws SQLException {
-        throw savepoints();
+        checkOpen();
+        synchronized (channel) {
+            checkSavepoints();
+            int i = live(savepoint);
+            execute("RELEASE SAVEPOINT " + savepoints.get(i).sql(), List.of(), 0, null);
+            savepoints.subList(i, savepoints.size()).clear();
+        }
     }
 
-    private static SQLException savepoints() {
-        return Errors.unsupported("a savepoint (the server refuses SAVEPOINT on a channel)");
+    private void checkSavepoints() throws SQLException {
+        if (autoCommit) {
+            throw new SQLNonTransientException("skylite: a savepoint in auto-commit mode", "25000");
+        }
+        if (readOnly) {
+            throw new SQLNonTransientException("skylite: a savepoint on a read-only connection, which runs no "
+                    + "transaction", "25000");
+        }
+    }
+
+    /** Forgets the savepoints of a transaction that ended. */
+    private void dropEnded() {
+        long txn = channel.transaction();
+        if (txn != savepointTxn) {
+            savepoints.clear();
+            savepointTxn = txn;
+        }
+    }
+
+    /** The index of savepoint, which must be one of this connection's open transaction not yet released. */
+    private int live(Savepoint savepoint) throws SQLException {
+        dropEnded();
+        int i = savepoints.indexOf(savepoint);
+        if (i < 0 || savepointTxn == 0) {
+            throw new SQLNonTransientException("skylite: the savepoint is not one of this connection's open "
+                    + "transaction, or was released or rolled back past", "3B001");
+        }
+        return i;
+    }
+
+    /**
+     * A savepoint of one transaction, by name or by id. An unnamed one is sent as skylite_savepoint_&lt;id&gt;.
+     * shortcut: two live savepoints of one name, or a name of that form, resolve to the latest, as in SQLite; refuse
+     * duplicates if that bites.
+     */
+    private static final class SkyliteSavepoint implements Savepoint {
+        private final int id;
+        private final String name;
+
+        SkyliteSavepoint(int id, String name) {
+            this.id = id;
+            this.name = name;
+        }
+
+        String sql() {
+            String n = name != null ? name : "skylite_savepoint_" + id;
+            return '"' + n.replace("\"", "\"\"") + '"';
+        }
+
+        @Override
+        public int getSavepointId() throws SQLException {
+            if (name != null) {
+                throw new SQLNonTransientException("skylite: a named savepoint has no id", "HY000");
+            }
+            return id;
+        }
+
+        @Override
+        public String getSavepointName() throws SQLException {
+            if (name == null) {
+                throw new SQLNonTransientException("skylite: an unnamed savepoint has no name", "HY000");
+            }
+            return name;
+        }
     }
 
     @Override

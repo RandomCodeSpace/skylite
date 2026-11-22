@@ -35,6 +35,7 @@ import java.sql.SQLTransientConnectionException;
 import java.sql.SQLNonTransientException;
 import java.sql.SQLTimeoutException;
 import java.sql.SQLTransactionRollbackException;
+import java.sql.Savepoint;
 import java.sql.Statement;
 import java.sql.Timestamp;
 import java.sql.Types;
@@ -677,19 +678,21 @@ class DriverTest {
     // ---- writes, transactions and what this version refuses ----
 
     @Test
-    void aReadOnlyConnectionRefusesWritesAndSavepointsAreNotSupported() throws Exception {
+    void aReadOnlyConnectionRefusesWritesAndSavepoints() throws Exception {
         fake.responder = (r, ex) -> FakeServer.send(ex, 409, FakeServer.error("needs_channel", "not a pure read"));
         try (Connection c = connect(); Statement s = c.createStatement()) {
             assertFalse(c.isReadOnly());
             assertTrue(c.getAutoCommit());
             assertEquals(Connection.TRANSACTION_SERIALIZABLE, c.getTransactionIsolation());
-            fails(SQLFeatureNotSupportedException.class, () -> c.setSavepoint());
+            assertEquals("25000", fails(SQLNonTransientException.class, () -> c.setSavepoint()).getSQLState());
             c.setReadOnly(true);
             SQLNonTransientException e = fails(SQLNonTransientException.class,
                     () -> s.executeUpdate("INSERT INTO t VALUES (1)"));
             assertEquals("25006", e.getSQLState());
             assertTrue(e.getMessage().contains("needs_channel"), e.getMessage());
             fails(SQLNonTransientException.class, () -> s.executeQuery("DELETE FROM t RETURNING *"));
+            c.setAutoCommit(false);
+            assertEquals("25000", fails(SQLNonTransientException.class, () -> c.setSavepoint("a")).getSQLState());
             assertTrue(fake.requests.stream().noneMatch(r -> r.path().contains("/channel")), "nothing on a channel");
         }
     }
@@ -851,6 +854,100 @@ class DriverTest {
         }
         assertEquals(2, fake.requests.stream().filter(r -> r.path().endsWith("/channels")).count());
         assertTrue(channelBodies().get(2).contains("\"seq\":1,\"op\":\"begin\""), channelBodies().get(2));
+    }
+
+    /** The SQL of a channel body's statement, as JSON. */
+    private static String sqlOf(String op, String sql) {
+        return "\"op\":\"" + op + "\"," + (op.equals("begin") ? "\"execute\":{" : "") + "\"sql\":\""
+                + sql.replace("\"", "\\\"") + "\"";
+    }
+
+    @Test
+    void savepointsAreStatementsOfTheTransaction() throws Exception {
+        channel(FakeServer.executed(1, "open", 0, 0), FakeServer.executed(2, "open", 1, 1),
+                FakeServer.executed(3, "open", 0, 0), FakeServer.executed(4, "open", 0, 0),
+                FakeServer.executed(5, "open", 0, 0), FakeServer.executed(6, "open", 0, 0),
+                FakeServer.executed(7, "open", 0, 0), FakeServer.stepped(8));
+        try (Connection c = connect(); Statement s = c.createStatement()) {
+            c.setAutoCommit(false);
+            Savepoint first = c.setSavepoint(); // begins the transaction
+            s.executeUpdate("INSERT INTO t VALUES (1)");
+            Savepoint named = c.setSavepoint("a\"b");
+            Savepoint last = c.setSavepoint();
+            assertEquals(1, first.getSavepointId());
+            assertEquals(2, last.getSavepointId());
+            fails(SQLException.class, first::getSavepointName);
+            assertEquals("a\"b", named.getSavepointName());
+            fails(SQLException.class, named::getSavepointId);
+            c.rollback(named); // keeps named, releases last
+            assertEquals("3B001", fails(SQLNonTransientException.class, () -> c.rollback(last)).getSQLState());
+            c.releaseSavepoint(named);
+            assertEquals("3B001", fails(SQLNonTransientException.class, () -> c.releaseSavepoint(named)).getSQLState());
+            assertEquals("3B001", fails(SQLNonTransientException.class, () -> c.rollback(named)).getSQLState());
+            c.rollback(first);
+            c.commit();
+        }
+        List<String> bodies = channelBodies();
+        List<String> want = List.of(sqlOf("begin", "SAVEPOINT \"skylite_savepoint_1\""),
+                sqlOf("execute", "INSERT INTO t VALUES (1)"), sqlOf("execute", "SAVEPOINT \"a\"\"b\""),
+                sqlOf("execute", "SAVEPOINT \"skylite_savepoint_2\""),
+                sqlOf("execute", "ROLLBACK TO SAVEPOINT \"a\"\"b\""), sqlOf("execute", "RELEASE SAVEPOINT \"a\"\"b\""),
+                sqlOf("execute", "ROLLBACK TO SAVEPOINT \"skylite_savepoint_1\""), "\"op\":\"commit\"");
+        assertEquals(want.size(), bodies.size(), bodies.toString());
+        for (int i = 0; i < want.size(); i++) {
+            assertTrue(bodies.get(i).contains("\"seq\":" + (i + 1) + "," + want.get(i)), bodies.get(i));
+        }
+    }
+
+    @Test
+    void aSavepointNotOfTheOpenTransactionIsRefusedBeforeAnythingIsSent() throws Exception {
+        channel(FakeServer.executed(1, "open", 0, 0), FakeServer.stepped(2), FakeServer.executed(3, "open", 1, 1),
+                FakeServer.stepped(4), FakeServer.executed(5, "open", 0, 0), FakeServer.stepped(6),
+                FakeServer.executed(7, "aborted", 0, 0), FakeServer.stepped(8), FakeServer.executed(9, "open", 0, 0),
+                FakeServer.stepped(10));
+        try (Connection c = connect(); Connection other = connect(); Statement s = c.createStatement()) {
+            c.setAutoCommit(false);
+            other.setAutoCommit(false);
+            Savepoint committed = c.setSavepoint();
+            c.commit();
+            s.executeUpdate("INSERT INTO t VALUES (1)"); // a new transaction
+            assertEquals("3B001", fails(SQLNonTransientException.class, () -> c.rollback(committed)).getSQLState());
+            c.rollback();
+            Savepoint rolledBack = c.setSavepoint("r");
+            c.rollback();
+            assertEquals("3B001", fails(SQLNonTransientException.class, () -> c.rollback(rolledBack)).getSQLState());
+            Savepoint aborted = c.setSavepoint(); // the server reports the transaction aborted
+            assertEquals("3B001", fails(SQLNonTransientException.class,
+                    () -> c.releaseSavepoint(aborted)).getSQLState());
+            c.rollback();
+            Savepoint mine = c.setSavepoint();
+            assertEquals("3B001", fails(SQLNonTransientException.class, () -> other.rollback(mine)).getSQLState());
+            assertEquals("3B001", fails(SQLNonTransientException.class, () -> c.rollback(null)).getSQLState());
+            assertEquals("HY009", fails(SQLNonTransientException.class, () -> c.setSavepoint(null)).getSQLState());
+            c.setAutoCommit(true); // commits
+            assertEquals("25000", fails(SQLNonTransientException.class, () -> c.rollback(mine)).getSQLState());
+            assertEquals(10, channelBodies().size(), channelBodies().toString());
+        }
+        Connection closed = connect();
+        closed.close();
+        assertEquals("HY010", fails(SQLNonTransientException.class, closed::setSavepoint).getSQLState());
+        assertEquals(10, channelBodies().size(), channelBodies().toString());
+    }
+
+    @Test
+    void aSavepointWhoseOutcomeIsUnknownLosesTheTransaction() throws Exception {
+        channel(FakeServer.executed(1, "open", 0, 0), "drop", "drop", "drop");
+        try (Connection c = connect()) {
+            c.setAutoCommit(false);
+            Savepoint sp = c.setSavepoint();
+            assertEquals("08007", fails(SQLNonTransientConnectionException.class, () -> c.setSavepoint("b"))
+                    .getSQLState());
+            assertEquals("SKR03", fails(SQLException.class, () -> c.rollback(sp)).getSQLState());
+            assertEquals("SKR03", fails(SQLException.class, c::commit).getSQLState());
+            c.rollback();
+            assertFalse(c.isClosed());
+        }
+        assertEquals(4, channelBodies().size());
     }
 
     @Test
@@ -1099,7 +1196,7 @@ class DriverTest {
             assertTrue(md.supportsTransactions());
             assertTrue(md.supportsGetGeneratedKeys());
             assertTrue(md.supportsBatchUpdates());
-            assertFalse(md.supportsSavepoints());
+            assertTrue(md.supportsSavepoints());
             assertTrue(md.supportsResultSetType(ResultSet.TYPE_FORWARD_ONLY));
             fails(SQLFeatureNotSupportedException.class, () -> md.getPrimaryKeys(null, null, "t"));
             assertEquals("{\"sql\":\"SELECT sqlite_version()\"}", fake.last().bodyText());

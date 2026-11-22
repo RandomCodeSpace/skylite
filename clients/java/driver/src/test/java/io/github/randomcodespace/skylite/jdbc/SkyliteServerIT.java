@@ -28,7 +28,6 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLInvalidAuthorizationSpecException;
 import java.sql.SQLSyntaxErrorException;
 import java.sql.SQLTransientConnectionException;
@@ -370,7 +369,8 @@ class SkyliteServerIT {
 
     /**
      * A transaction is invisible to another connection until its commit, survives a failed statement, and leaves
-     * nothing after a rollback; a read-only connection refuses writes.
+     * nothing after a rollback; a read-only connection refuses writes; a rollback to a savepoint keeps what came before
+     * it.
      */
     @Test
     void runsTransactions() throws Exception {
@@ -398,7 +398,19 @@ class SkyliteServerIT {
             SQLException ro = assertThrows(SQLException.class,
                     () -> reader.createStatement().executeUpdate("DELETE FROM w_txn"));
             assertEquals("25006", ro.getSQLState(), ro.toString());
-            assertThrows(SQLFeatureNotSupportedException.class, writer::setSavepoint);
+
+            writer.setAutoCommit(false);
+            java.sql.Savepoint first = writer.setSavepoint(); // begins the transaction
+            w.executeUpdate("INSERT INTO w_txn (v) VALUES ('three')");
+            java.sql.Savepoint named = writer.setSavepoint("x\"y");
+            w.executeUpdate("INSERT INTO w_txn (v) VALUES ('four')");
+            writer.rollback(named);
+            writer.releaseSavepoint(first);
+            writer.commit();
+            try (ResultSet rs = w.executeQuery("SELECT group_concat(v) FROM (SELECT v FROM w_txn ORDER BY id)")) {
+                assertTrue(rs.next());
+                assertEquals("one,two,three", rs.getString(1), "rolled back to the savepoint, then committed");
+            }
         }
     }
 

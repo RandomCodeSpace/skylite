@@ -49,6 +49,7 @@ final class Channel {
     private long last; // the last sequence number sent and settled; guarded by this
     private long answered; // System.nanoTime() of the channel's last answer; guarded by this
     private String state = "none"; // txn_state after the last settled request; guarded by this
+    private long begun; // begins sent on the connection's channels; guarded by this
     private volatile boolean lost; // written under this: the connection was discarded after an unknown outcome
     private volatile boolean dead; // written under this: the transaction was lost with its channel; rollback ends it
 
@@ -97,6 +98,11 @@ final class Channel {
         return state;
     }
 
+    /** The number of the open transaction, distinct from every earlier one's, or 0 when none is open. */
+    synchronized long transaction() {
+        return state.equals("open") ? begun : 0;
+    }
+
     /** Why the connection may not be used, or null: it was discarded, or its transaction was lost. */
     SQLException refusal() {
         if (lost) {
@@ -130,6 +136,9 @@ final class Channel {
         boolean transaction = !conn.autoCommit();
         open();
         boolean txnStatement = !state.equals("none");
+        if (transaction && !txnStatement) {
+            begun++;
+        }
         long seq = last + 1;
         byte[] body = Request.execute(token, seq, transaction && !txnStatement, sql, params, session.watermark(),
                 timeoutSeconds * 1000L);

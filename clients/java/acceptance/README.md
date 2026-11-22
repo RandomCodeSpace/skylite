@@ -111,15 +111,11 @@ until the server leads it, and sets the system properties `jdbc.url` and
 `.tlsRootCertificates`, which the pool passes to the driver. The server stops
 when the run ends; its log is in `target/skylite/run-*/skylite.log`.
 
-28 tests pass and one is skipped, with its reason printed:
-
-```text
-SKIPPED TransactionTest.rollbackToSavepointKeepsEarlierWrites: the driver reports no savepoint support; skylite's server refuses SAVEPOINT, RELEASE and ROLLBACK TO on a write channel
-```
-
-That test is skipped wherever the verified connection's driver reports
-`DatabaseMetaData.supportsSavepoints()` false; sqlite-jdbc supports them, so it
-runs on the baseline and in the fault check. The baseline's five known
+All 29 tests pass. `TransactionTest.rollbackToSavepointKeepsEarlierWrites` is
+skipped, with its reason printed, wherever the verified connection's driver
+reports `DatabaseMetaData.supportsSavepoints()` false; skylite's driver and
+sqlite-jdbc both support them, so it runs on skylite, on the baseline and in
+the fault check. The baseline's five known
 failures pass on skylite: its dialect declares foreign keys and takes
 generated keys from the driver, and its driver reports `BIGINT` for an
 `integer` column, implements `getBlob`, and raises

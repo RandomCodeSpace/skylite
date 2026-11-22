@@ -25,8 +25,8 @@ class Baseline implements TestWatcher {
     static final String NO_SAVEPOINTS = "io.github.randomcodespace.skylite.acceptance.Baseline#lacksSavepoints";
 
     /**
-     * Whether the verified connection's driver reports no savepoint support, as skylite's does: its server refuses
-     * SAVEPOINT on a write channel. Never true on the baseline, whose driver supports them.
+     * Whether the verified connection's driver reports no savepoint support. Never true on skylite or the baseline,
+     * whose drivers support them.
      */
     static boolean lacksSavepoints(ExtensionContext context) {
         return !SpringExtension.getApplicationContext(context).getBean(ConnectionReport.class).supportsSavepoints();

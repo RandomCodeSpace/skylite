@@ -40,8 +40,7 @@ class TransactionTest extends AcceptanceTestBase {
     }
 
     // Skipped where the driver reports no savepoints: see README.md, "Running against skylite".
-    @DisabledIf(value = Baseline.NO_SAVEPOINTS, disabledReason = "the driver reports no savepoint support; skylite's"
-            + " server refuses SAVEPOINT, RELEASE and ROLLBACK TO on a write channel")
+    @DisabledIf(value = Baseline.NO_SAVEPOINTS, disabledReason = "the driver reports no savepoint support")
     @Test
     void rollbackToSavepointKeepsEarlierWrites() throws Exception {
         try (Connection c = dataSource.getConnection()) {
