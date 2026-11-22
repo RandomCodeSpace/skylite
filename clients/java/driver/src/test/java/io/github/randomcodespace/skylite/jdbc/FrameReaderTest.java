@@ -258,4 +258,43 @@ class FrameReaderTest {
             }
         });
     }
+
+    // ---- channel answers ----
+
+    @Test
+    void readsChannelAnswersAndRefusesOnesThatLackTheirMembers() throws Exception {
+        Done e = assertInstanceOf(Done.class, readAll(Kind.EXECUTE, COLS + "\n[1,2]\n{\"done\":{\"seq\":3,"
+                + "\"txn_state\":\"open\",\"txn\":9,\"read_only\":false,\"rows_affected\":1,\"last_insert_rowid\":4}}\n").get(2));
+        assertEquals(3, e.seq());
+        assertEquals("open", e.txnState());
+        assertEquals(4, e.lastInsertRowid());
+        refused(Kind.EXECUTE, "{\"done\":{\"seq\":3,\"txn_state\":\"open\",\"txn\":9}}\n"); // no count
+        refused(Kind.STEP, "{\"done\":{\"seq\":3,\"txn_state\":\"closed\",\"txn\":9}}\n");
+        refused(Kind.STEP, COLS + "\n{\"done\":{\"seq\":3,\"txn_state\":\"none\",\"txn\":9}}\n");
+        assertEquals("w1.x", assertInstanceOf(Done.class, readAll(Kind.OPEN, "{\"done\":{\"txn\":1,\"channel\":"
+                + "{\"token\":\"w1.x\",\"id\":\"ab\",\"mode\":\"write\",\"epoch\":1,\"limits\":{\"x\":1}}}}\n").get(0)).token());
+        refused(Kind.OPEN, "{\"done\":{\"txn\":1}}\n");
+
+        Failure f = assertInstanceOf(Failure.class, readAll(Kind.EXECUTE, "{\"error\":{\"code\":\"sql_error\","
+                + "\"not_executed\":false,\"final\":true,\"message\":\"m\",\"request_id\":\"r\",\"txn_state\":\"aborted\"}}\n")
+                .get(0));
+        assertEquals("aborted", f.txnState());
+    }
+
+    @Test
+    void readsTheReceiptInACancelOrCloseAnswer() throws Exception {
+        Done c = assertInstanceOf(Done.class, readAll(Kind.CANCEL, "{\"done\":{\"seq\":5,\"txn_state\":\"none\","
+                + "\"outcome\":{\"seq\":5,\"ok\":false,\"error\":{\"code\":\"cancelled\",\"not_executed\":true,"
+                + "\"final\":true,\"message\":\"m\",\"request_id\":\"r\"}}}}\n").get(0));
+        assertEquals("cancelled", assertInstanceOf(Failure.class, c.outcome()).code());
+        Done closed = assertInstanceOf(Done.class, readAll(Kind.CLOSE, "{\"done\":{\"last_seq\":5,\"outcome\":"
+                + "{\"seq\":5,\"ok\":true,\"txn_state\":\"none\",\"txn\":9,\"committed\":true}}}\n").get(0));
+        assertEquals(9, assertInstanceOf(Done.class, closed.outcome()).txn());
+        assertEquals(0, assertInstanceOf(Done.class, readAll(Kind.CLOSE, "{\"done\":{\"last_seq\":0}}\n").get(0))
+                .lastSeq());
+        refused(Kind.CLOSE, "{\"done\":{\"last_seq\":5}}\n"); // no receipt for its last request
+        refused(Kind.CANCEL, "{\"done\":{\"seq\":5,\"txn_state\":\"none\",\"outcome\":{\"ok\":true}}}\n");
+        refused(Kind.EXECUTE, "{\"done\":{\"seq\":3,\"txn_state\":\"open\",\"txn\":9,\"read_only\":false,"
+                + "\"rows_affected\":1,\"last_insert_rowid\":4,\"outcome\":{\"seq\":1,\"ok\":true,\"txn_state\":\"none\"}}}\n");
+    }
 }

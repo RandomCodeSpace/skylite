@@ -1,8 +1,12 @@
 package io.github.randomcodespace.skylite.jdbc;
 
+import io.github.randomcodespace.skylite.jdbc.FrameReader.Column;
 import io.github.randomcodespace.skylite.jdbc.FrameReader.Columns;
 import io.github.randomcodespace.skylite.jdbc.FrameReader.Done;
 import io.github.randomcodespace.skylite.jdbc.FrameReader.Failure;
+import io.github.randomcodespace.skylite.jdbc.FrameReader.Frame;
+import io.github.randomcodespace.skylite.jdbc.FrameReader.Row;
+import java.sql.BatchUpdateException;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -10,12 +14,14 @@ import java.sql.SQLNonTransientException;
 import java.sql.SQLWarning;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
- * A statement sends each execution as one stateless {@code query}: the server runs pure reads and refuses anything
- * else with {@code needs_channel}, which raises {@link java.sql.SQLFeatureNotSupportedException}. Rows stream; at most
- * one result set is open, and the next execution or {@link #close} releases its response.
+ * A statement sends a read in auto-commit as one stateless {@code query}, whose rows stream. Everything else goes to
+ * the connection's write channel: an executeUpdate, a statement the server answers {@code needs_channel}, and every
+ * statement while auto-commit is off, unless the connection is read-only. A channel answer is read in full before its
+ * result set is returned. At most one result set is open, and the next execution or {@link #close} releases it.
  */
 class SkyliteStatement implements Statement, Exchange.Owner {
     final SkyliteConnection conn;
@@ -31,6 +37,16 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     private boolean closeOnCompletion;
     private volatile boolean closed; // written under lock
     private boolean cancelRequested; // guarded by lock
+    boolean statelessOnly; // the driver's own metadata queries never use the channel
+    private long runningSeq; // the channel request this statement runs, 0 if none; guarded by lock
+    private String runningToken; // the channel runningSeq was sent on; guarded by lock
+    private Exchange runningExchange; // runningSeq's current send; guarded by lock
+    private List<Long> generatedKeys = List.of(); // the rowids of this statement's inserts, when keys were asked for
+    private SkyliteResultSet keys; // the last getGeneratedKeys result set; guarded by lock
+    private String keyLabel;
+    private final List<String> batch = new ArrayList<>();
+    static final String ROWID_LABEL = "last_insert_rowid()";
+    private static final Done END = new Done(0, false, 0, 0, 0, 0, null, null, 0, null, false);
 
     SkyliteStatement(SkyliteConnection conn) {
         this.conn = conn;
@@ -38,7 +54,8 @@ class SkyliteStatement implements Statement, Exchange.Owner {
 
     void checkOpen() throws SQLException {
         if (closed) {
-            throw Errors.closed("statement");
+            SQLException discarded = conn.channel().discarded(); // closed with its connection after an unknown outcome
+            throw discarded != null ? discarded : Errors.closed("statement");
         }
         conn.checkOpen();
     }
@@ -57,10 +74,40 @@ class SkyliteStatement implements Statement, Exchange.Owner {
             return Errors.closed("statement");
         }
         if (conn.isClosed()) {
-            return Errors.closed("connection");
+            return conn.closedError();
         }
         live.add(ex);
         return null;
+    }
+
+    /**
+     * admit for a send of channel request seq on channel token: a cancel requested before its first send refuses it,
+     * as for a query; a resend is not refused by one, since the server may already hold the request.
+     */
+    SQLException admitChannel(Exchange ex, String token, long seq, boolean resend) {
+        if (cancelRequested && !resend) {
+            return Exchange.cancelled(null);
+        }
+        if (closed) {
+            return Errors.closed("statement");
+        }
+        if (conn.isClosed()) {
+            return conn.closedError();
+        }
+        live.add(ex);
+        runningSeq = seq;
+        runningToken = token;
+        runningExchange = ex;
+        return null;
+    }
+
+    /** The channel request has its outcome, or it is unknown: a cancel no longer reaches it. */
+    void channelDone() {
+        synchronized (lock) {
+            runningSeq = 0;
+            runningToken = null;
+            runningExchange = null;
+        }
     }
 
     @Override
@@ -83,13 +130,24 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     }
 
     /**
-     * Sends one query and reads its first frame: the result set when the statement has result columns, otherwise
-     * null, with its update count, which a read reports as 0.
+     * Runs one execution: the result set when the statement has result columns, otherwise null, with its update
+     * count, which a read reports as 0. update is true for executeUpdate, which goes to the channel at once. With
+     * keyLabel, the rowid of an insert is kept for {@link #getGeneratedKeys}.
      */
-    SkyliteResultSet run(String sql, List<Object> params) throws SQLException {
+    SkyliteResultSet run(String sql, List<Object> params, boolean update, String keyLabel) throws SQLException {
         checkOpen();
         closeResult();
+        closeKeys();
         begin();
+        generatedKeys = List.of();
+        this.keyLabel = keyLabel;
+        if (!statelessOnly && conn.onChannel(update)) {
+            return onChannel(sql, params, keyLabel);
+        }
+        return stateless(sql, params, keyLabel);
+    }
+
+    private SkyliteResultSet stateless(String sql, List<Object> params, String keyLabel) throws SQLException {
         Session s = conn.session();
         byte[] body = Request.query(sql, params, s.watermark(), queryTimeout * 1000L);
         Exchange ex = Exchange.send(s, FrameReader.Kind.QUERY, body, queryTimeout, this);
@@ -105,6 +163,9 @@ class SkyliteStatement implements Statement, Exchange.Owner {
             }
             case Failure e -> {
                 ex.close();
+                if (e.code().equals("needs_channel") && !conn.readOnly() && !statelessOnly) {
+                    return onChannel(sql, params, keyLabel); // refused before it ran
+                }
                 throw Errors.map(e);
             }
             case null, default -> {
@@ -112,6 +173,68 @@ class SkyliteStatement implements Statement, Exchange.Owner {
                 throw Errors.transport("malformed response: an unexpected first frame", null);
             }
         }
+    }
+
+    /** Runs on the channel, or as a stateless read when the connection became read-only after it was chosen. */
+    private SkyliteResultSet onChannel(String sql, List<Object> params, String keyLabel) throws SQLException {
+        List<Frame> frames = conn.execute(sql, params, queryTimeout, this);
+        if (frames == null) {
+            return stateless(sql, params, keyLabel);
+        }
+        Done d = (Done) frames.get(frames.size() - 1);
+        if (d.dataOmitted() && d.readOnly()) { // changed nothing: sent again as a new request (ADR 0005 decision 3)
+            frames = conn.execute(sql, params, queryTimeout, this);
+            if (frames == null) {
+                return stateless(sql, params, keyLabel);
+            }
+            d = (Done) frames.get(frames.size() - 1);
+            if (d.dataOmitted() && d.readOnly()) {
+                throw Errors.transport("the read's answer was lost in transport again, and its replay has no rows; "
+                        + "it changed nothing", null);
+            }
+        }
+        if (d.dataOmitted()) {
+            // ADR 0005 decision 3: the base class, which Spring and Hibernate treat as non-transient.
+            if ("none".equals(d.txnState())) {
+                throw new SQLException("skylite: the statement committed as transaction " + d.txn() + ", but its "
+                        + "answer was lost in transport and the server kept no copy of its result", "SKR01", 0);
+            }
+            throw new SQLException("skylite: the statement ran inside the transaction, which is still open with its "
+                    + "effects, but its answer was lost in transport and the server kept no copy of its result",
+                    "SKR02", 0);
+        }
+        if (frames.get(0) instanceof Columns c) {
+            return publish(new SkyliteResultSet(this, FrameReader.Frames.of(frames.subList(1, frames.size())),
+                    c.columns(), maxRows, fetchSize));
+        }
+        updateCount = d.rowsAffected();
+        if (keyLabel != null && d.rowsAffected() > 0 && inserts(sql)) {
+            generatedKeys = List.of(d.lastInsertRowid());
+        }
+        return null;
+    }
+
+    /**
+     * Whether sql starts with INSERT or REPLACE after white space and comments: only then is the connection's last
+     * insert rowid this statement's key. An INSERT inside WITH is not recognised, and returns no key.
+     */
+    static boolean inserts(String sql) {
+        int i = 0, n = sql.length();
+        while (i < n) {
+            char c = sql.charAt(i);
+            if (Character.isWhitespace(c)) {
+                i++;
+            } else if (sql.startsWith("--", i)) {
+                int nl = sql.indexOf('\n', i);
+                i = nl < 0 ? n : nl + 1;
+            } else if (sql.startsWith("/*", i)) {
+                int end = sql.indexOf("*/", i + 2);
+                i = end < 0 ? n : end + 2;
+            } else {
+                break;
+            }
+        }
+        return sql.regionMatches(true, i, "insert", 0, 6) || sql.regionMatches(true, i, "replace", 0, 7);
     }
 
     /** Makes rs the current result set, unless this statement closed first: then rs is released. */
@@ -161,7 +284,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
 
     @Override
     public ResultSet executeQuery(String sql) throws SQLException {
-        return query(run(sql, List.of()));
+        return query(run(sql, List.of(), false, null));
     }
 
     static ResultSet query(SkyliteResultSet rs) throws SQLException {
@@ -171,7 +294,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         return rs;
     }
 
-    /** A write is refused by the server with needs_channel; a read without result columns returns its count, 0. */
+    /** Runs on the write channel, unless the connection is read-only. */
     @Override
     public int executeUpdate(String sql) throws SQLException {
         return count(executeLargeUpdate(sql));
@@ -179,7 +302,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
 
     @Override
     public long executeLargeUpdate(String sql) throws SQLException {
-        return update(run(sql, List.of()) != null);
+        return update(run(sql, List.of(), !conn.readOnly(), null) != null);
     }
 
     long update(boolean hasResult) throws SQLException {
@@ -192,75 +315,94 @@ class SkyliteStatement implements Statement, Exchange.Owner {
 
     @Override
     public boolean execute(String sql) throws SQLException {
-        return run(sql, List.of()) != null;
+        return run(sql, List.of(), false, null) != null;
+    }
+
+    /** The generated keys' column label for autoGeneratedKeys, or null for none. */
+    static String keyLabel(int autoGeneratedKeys) throws SQLException {
+        return switch (autoGeneratedKeys) {
+            case RETURN_GENERATED_KEYS -> ROWID_LABEL;
+            case NO_GENERATED_KEYS -> null;
+            default -> throw new SQLNonTransientException("skylite: unknown autoGeneratedKeys " + autoGeneratedKeys, "HY092");
+        };
+    }
+
+    /** The rowid is the only generated key, whichever columns are asked for; at least one, each from 1. */
+    static String keyLabel(int[] columnIndexes) throws SQLException {
+        if (columnIndexes == null || columnIndexes.length == 0 || Arrays.stream(columnIndexes).anyMatch(i -> i < 1)) {
+            throw new SQLNonTransientException("skylite: the column indexes for generated keys are empty or below 1",
+                    "HY092");
+        }
+        return ROWID_LABEL;
+    }
+
+    /** The rowid is the only generated key: it is labelled with the first column name asked for. */
+    static String keyLabel(String[] columnNames) {
+        return columnNames != null && columnNames.length > 0 && columnNames[0] != null ? columnNames[0] : ROWID_LABEL;
     }
 
     @Override
     public boolean execute(String sql, int autoGeneratedKeys) throws SQLException {
-        if (autoGeneratedKeys != NO_GENERATED_KEYS) {
-            throw Errors.writes();
-        }
-        return execute(sql);
+        return run(sql, List.of(), false, keyLabel(autoGeneratedKeys)) != null;
     }
 
     @Override
     public boolean execute(String sql, int[] columnIndexes) throws SQLException {
-        throw Errors.writes();
+        return run(sql, List.of(), false, keyLabel(columnIndexes)) != null;
     }
 
     @Override
     public boolean execute(String sql, String[] columnNames) throws SQLException {
-        throw Errors.writes();
+        return run(sql, List.of(), false, keyLabel(columnNames)) != null;
     }
 
     @Override
     public int executeUpdate(String sql, int autoGeneratedKeys) throws SQLException {
-        if (autoGeneratedKeys != NO_GENERATED_KEYS) {
-            throw Errors.writes();
-        }
-        return executeUpdate(sql);
+        return count(executeLargeUpdate(sql, autoGeneratedKeys));
     }
 
     @Override
     public int executeUpdate(String sql, int[] columnIndexes) throws SQLException {
-        throw Errors.writes();
+        return count(executeLargeUpdate(sql, columnIndexes));
     }
 
     @Override
     public int executeUpdate(String sql, String[] columnNames) throws SQLException {
-        throw Errors.writes();
+        return count(executeLargeUpdate(sql, columnNames));
     }
 
     @Override
     public long executeLargeUpdate(String sql, int autoGeneratedKeys) throws SQLException {
-        if (autoGeneratedKeys != NO_GENERATED_KEYS) {
-            throw Errors.writes();
-        }
-        return executeLargeUpdate(sql);
+        return update(run(sql, List.of(), !conn.readOnly(), keyLabel(autoGeneratedKeys)) != null);
     }
 
     @Override
     public long executeLargeUpdate(String sql, int[] columnIndexes) throws SQLException {
-        throw Errors.writes();
+        return update(run(sql, List.of(), !conn.readOnly(), keyLabel(columnIndexes)) != null);
     }
 
     @Override
     public long executeLargeUpdate(String sql, String[] columnNames) throws SQLException {
-        throw Errors.writes();
+        return update(run(sql, List.of(), !conn.readOnly(), keyLabel(columnNames)) != null);
     }
 
-    /** Releases the result set's response, if any. Nothing is sent. */
+    /** Releases the result set's response, if any, and the generated keys. Nothing is sent. */
     @Override
     public void close() {
         List<Exchange> running;
+        SkyliteResultSet k;
         synchronized (lock) {
             if (closed) {
                 return;
             }
             closed = true;
             running = List.copyOf(live);
+            k = keys;
         }
         closeResult();
+        if (k != null) {
+            k.close();
+        }
         for (Exchange ex : running) {
             ex.close();
         }
@@ -347,12 +489,25 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     public void cancel() throws SQLException {
         checkOpen();
         List<Exchange> running;
+        long seq;
+        String token;
+        Exchange onChannel;
         synchronized (lock) {
             cancelRequested = true;
             running = List.copyOf(live);
+            seq = runningSeq;
+            token = runningToken;
+            onChannel = runningExchange;
+        }
+        if (seq > 0) {
+            // A channel request's answer is its outcome, so it is not abandoned: the server is asked to cancel it,
+            // and the answer says whether it was cancelled or finished.
+            conn.channel().cancel(token, seq);
         }
         for (Exchange ex : running) {
-            ex.cancel();
+            if (ex != onChannel) {
+                ex.cancel();
+            }
         }
     }
 
@@ -450,22 +605,53 @@ class SkyliteStatement implements Statement, Exchange.Owner {
 
     @Override
     public void addBatch(String sql) throws SQLException {
-        throw Errors.writes();
+        checkOpen();
+        batch.add(sql);
     }
 
     @Override
     public void clearBatch() throws SQLException {
         checkOpen();
+        batch.clear();
     }
 
     @Override
     public int[] executeBatch() throws SQLException {
-        throw Errors.writes();
+        return ints(executeLargeBatch());
     }
 
+    static int[] ints(long[] counts) throws SQLException {
+        int[] out = new int[counts.length];
+        for (int i = 0; i < counts.length; i++) {
+            out[i] = count(counts[i]);
+        }
+        return out;
+    }
+
+    /**
+     * Runs the batch's statements one after another, each a request of its own: the server does not serve batch yet.
+     * The first failure stops it with a {@link BatchUpdateException} holding the counts of those before it.
+     */
     @Override
     public long[] executeLargeBatch() throws SQLException {
-        throw Errors.writes();
+        checkOpen();
+        List<String> sqls = List.copyOf(batch);
+        batch.clear();
+        long[] counts = new long[sqls.size()];
+        for (int i = 0; i < counts.length; i++) {
+            try {
+                counts[i] = executeLargeUpdate(sqls.get(i));
+            } catch (SQLException e) {
+                throw batchFailed(e, java.util.Arrays.copyOf(counts, i));
+            }
+        }
+        return counts;
+    }
+
+    static BatchUpdateException batchFailed(SQLException e, long[] counts) {
+        BatchUpdateException b = new BatchUpdateException(e.getMessage(), e.getSQLState(), e.getErrorCode(), counts, e);
+        b.setNextException(e);
+        return b;
     }
 
     @Override
@@ -474,9 +660,59 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         return conn;
     }
 
+    /** The rowids of a batch's inserts, for {@link #getGeneratedKeys}. */
+    List<Long> generatedKeys() {
+        return generatedKeys;
+    }
+
+    void generatedKeys(List<Long> keys) {
+        generatedKeys = keys;
+    }
+
+    /**
+     * The rowid of the last execution's insert, one per batch entry for a batch, when it asked for keys and inserted
+     * a row; otherwise no row. Its one column is labelled with the first column name asked for, or
+     * {@code last_insert_rowid()}. An insert of several rows has only the last one's rowid, and an insert into a
+     * WITHOUT ROWID table has none: what it returns is an earlier insert's rowid in the same transaction, or 0.
+     */
     @Override
     public ResultSet getGeneratedKeys() throws SQLException {
-        throw Errors.writes();
+        checkOpen();
+        List<Frame> rows = new ArrayList<>();
+        for (Long key : generatedKeys) {
+            rows.add(new Row(new Object[] {key}));
+        }
+        rows.add(END);
+        Column c = new Column(keyLabel != null ? keyLabel : ROWID_LABEL, "INTEGER", null, null, null);
+        SkyliteResultSet rs = new SkyliteResultSet(this, FrameReader.Frames.of(rows), List.of(c), 0, 0);
+        SkyliteResultSet old;
+        synchronized (lock) {
+            if (closed) {
+                old = rs;
+            } else {
+                old = keys;
+                keys = rs;
+            }
+        }
+        if (old != null) {
+            old.close();
+        }
+        if (old == rs) {
+            throw Errors.closed("statement");
+        }
+        return rs;
+    }
+
+    /** Closes the last getGeneratedKeys result set, which a new execution replaces. */
+    private void closeKeys() {
+        SkyliteResultSet k;
+        synchronized (lock) {
+            k = keys;
+            keys = null;
+        }
+        if (k != null) {
+            k.close();
+        }
     }
 
     @Override

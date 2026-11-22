@@ -163,6 +163,15 @@ docs-linkcheck:
 java-acceptance:
 	mvn -B -ntp -f clients/java/acceptance/pom.xml test
 
+# The same suite through skylite's JDBC driver and Hibernate dialect, against a skylite serve that
+# the test run builds from this tree and starts. Installs the driver and the dialect into the local
+# Maven repository first. Needs a JDK, Maven and Go.
+.PHONY: java-acceptance-skylite
+java-acceptance-skylite:
+	mvn -B -ntp -f clients/java/driver/pom.xml install -DskipTests
+	mvn -B -ntp -f clients/java/hibernate/pom.xml install
+	mvn -B -ntp -f clients/java/acceptance/pom.xml test -Pskylite
+
 # Checks the suite itself: runs it once per injected driver fault, each of which must fail a test.
 .PHONY: java-fault-check
 java-fault-check:

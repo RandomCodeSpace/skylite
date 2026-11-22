@@ -30,8 +30,8 @@ final class Errors {
             case "statement_forbidden" -> new SQLSyntaxErrorException(msg, "42501");
             case "database_not_found" -> new SQLNonTransientConnectionException(msg, "08001");
             case "database_exists" -> new SQLNonTransientException(msg, "42710");
-            case "needs_channel" -> new SQLFeatureNotSupportedException(
-                    "skylite: writes are not supported in this driver version; the server answered " + msg, "0A000");
+            case "needs_channel" -> new SQLNonTransientException(
+                    "skylite: the connection is read-only, and the statement is not a pure read: " + msg, "25006");
             // Refused before acceptance: not executed, so a new attempt is safe.
             case "overloaded", "too_many_channels" -> new SQLTransientConnectionException(msg, "08004");
             case "no_leader", "not_serving", "owner_unreachable", "behind" ->
@@ -76,10 +76,6 @@ final class Errors {
 
     static SQLFeatureNotSupportedException unsupported(String what) {
         return new SQLFeatureNotSupportedException("skylite: " + what + " is not supported in this driver version", "0A000");
-    }
-
-    static SQLFeatureNotSupportedException writes() {
-        return unsupported("writing (transactions, updates, batches, generated keys)");
     }
 
     static SQLException closed(String what) {
