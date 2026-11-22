@@ -108,12 +108,7 @@ func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, w
 	if evict != nil {
 		_ = evict.ec.Close()
 	}
-	refuse := func(err error) *wire.Error {
-		if ctx.Err() == context.DeadlineExceeded { //nolint:errorlint // context.Err returns the sentinel itself
-			return timeoutError(0)
-		}
-		return s.engineError(d, leader, err)
-	}
+	refuse := func(err error) *wire.Error { return s.refusal(ctx, d, leader, err) }
 	if c != nil {
 		_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
 			return broken(c.pc.Reset(db.GetInterrupt()))
@@ -135,6 +130,15 @@ func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, w
 		return nil, refuse(err), err
 	}
 	return c, nil, nil
+}
+
+// refusal is the refusal before acceptance of a request whose connection
+// could not be opened or reset under ctx.
+func (s *Server) refusal(ctx context.Context, d *database, leader *engine.Leader, err error) *wire.Error {
+	if ctx.Err() == context.DeadlineExceeded { //nolint:errorlint // context.Err returns the sentinel itself
+		return timeoutError(0)
+	}
+	return s.engineError(d, leader, err)
 }
 
 // open opens an engine connection and applies the policy once, inside a Run
@@ -177,10 +181,13 @@ func (s *Server) statement(ctx context.Context, st *stream, d *database, leader 
 		limit = min(limit, time.Duration(req.TimeoutMS)*time.Millisecond)
 	}
 	// The statement time runs to the last row written, and its deadline is
-	// on the Run's context, which page reads from storage use.
+	// on the Run's context, which page reads from storage use. The write
+	// deadline is a margin later, so that the statement, not the stream,
+	// ends first and its timeout frame is written.
 	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
-	st.deadline, _ = ctx.Deadline()
+	deadline, _ := ctx.Deadline()
+	st.deadline = deadline.Add(terminalMargin)
 	c, e, err := s.conn(ctx, d, leader, who)
 	if e != nil {
 		logInternal(ctx, log, e, err)
