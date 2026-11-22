@@ -54,7 +54,7 @@ For each name in `databases`, the server runs the office loop of [0004](/docs/de
 
 Set `follower_reads` to `true` to let a standby serve `query` and `describe` for its configured databases. A follower polls the durable log about every 250 ms and pins each request to one snapshot before SQLite opens it. An observation of the end of the log is usable for new snapshots for less than two seconds. When the follower has no fresh observation, it refuses with `503` `not_serving`. A request can wait up to 500 ms within its statement budget for a fresh generation at or above `min_txn`. A fresh follower that cannot reach the requested transaction in time answers `503` `behind`.
 
-If compaction overtakes the pin before the response starts, the server can retry once on a newer pin within the request and catch-up budgets. If it cannot obtain a usable replacement, it answers `503` `not_serving`. If compaction overtakes a pin after the response starts, an `internal` error with `not_executed: false` ends the stream. A standby stops polling when it takes office, before it starts leading, and starts polling again after it steps down or fails to start leading.
+If compaction overtakes the pin before the response starts, the server can retry once on a newer pin within the request and catch-up budgets. If it cannot obtain a usable replacement, it answers `503` `not_serving`. If compaction overtakes a pin after the response starts, an `internal` error ends the stream. A standby stops polling when it takes office, before it starts leading, and starts polling again after it steps down or fails to start leading.
 
 `follower_reads` defaults to `false`. With it enabled and more than one pod behind a Service, writes and channel requests that reach a follower get `503` `not_serving`. Forwarding is planned. Keep the default for a Service that needs to deliver writes to the leader.
 
@@ -247,7 +247,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 
 - Admission control of [0005 decision 9](/docs/decisions/0005-client-protocol/#9-limits-and-defaults): request and per-principal request bounds. The memory budget is fixed at 2 GiB rather than taken from the container's limit, and response frames are not charged to it.
 - Transactions (`begin`, `commit` and `rollback` with a transaction), `cancel` and the transaction timers; `batch`, `describe` on a channel and read-only channels; `resolve`, so a write whose channel was lost stays unknown to its driver; `GET` status; forwarding between pods and cluster membership.
-- `database_not_found` for a query: a server that does not lead the database answers `not_serving`, whether or not it exists.
+- `database_not_found` for a query: a server that does not lead the database and has no enabled follower for it answers `not_serving`, whether or not it exists.
 - Keepalive frames during a long query or a write's lock wait, and the compiled-statement cache: every query and write compiles its statement.
 - 0005's commit point is not visible to the server, so a close cannot tell a write before it from one in its upload; it interrupts the connection, and the engine reports what happened.
 - A tail bound the leader cannot compact past is noticed when a request meets it, so a server that takes office there reports itself ready until its first query.

@@ -293,7 +293,7 @@ func TestReplicaFailureAfterRow(t *testing.T) {
 			replica.s.ServeHTTP(replicaResponse{rec, &rowSent}, req)
 			frames, err := parseFrames(rec.Body.Bytes())
 			a := answer{rec.Code, frames}
-			if err != nil || a.status != http.StatusOK || a.code() != tc.code || a.err()["not_executed"] != false || a.err()["final"] != false ||
+			if err != nil || a.status != http.StatusOK || a.code() != tc.code || a.err()["not_executed"] != true || a.err()["final"] != false ||
 				len(a.frames) != 3 || !reflect.DeepEqual(a.rows(), []string{`[1]`}) {
 				t.Errorf("failure after first row: %d %v (%v)", a.status, a.frames, err)
 			}
@@ -461,6 +461,24 @@ func TestReplicaExpiredRequest(t *testing.T) {
 		if e == nil || e.Code != want {
 			t.Errorf("expired request with min_txn=%d: %v, want %s", minTxn, e, want)
 		}
+	}
+}
+
+// TestReplicaCancelledRequest: a client that went away on a caught-up
+// follower gets not_serving, and the server logs no error for it.
+func TestReplicaCancelledRequest(t *testing.T) {
+	leader := newQueryEnv(t, nil)
+	replica := newReplicaEnv(t, leader, true, &replicaStore{})
+	waitReplica(t, replica.s.ready, 2*time.Second, "replica did not become ready")
+	f := replica.s.dbs["d"].loop.State().Follower
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, e := replica.s.followerStatement(ctx, &stream{}, f, &wire.Request{MinTxn: 1}, "reader", replica.s.log)
+	if e == nil || e.Code != wire.CodeNotServing {
+		t.Errorf("cancelled request: %v, want not_serving", e)
+	}
+	if strings.Contains(replica.logs.String(), `"level":"ERROR"`) {
+		t.Errorf("a cancelled request logged an error: %s", replica.logs.String())
 	}
 }
 

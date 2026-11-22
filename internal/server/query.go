@@ -272,14 +272,15 @@ func (s *Server) followerStatement(ctx context.Context, st *stream, f *engine.Fo
 				continue
 			}
 			return nil, followerUnavailable()
+		case errors.Is(ctx.Err(), context.Canceled):
+			return nil, followerUnavailable() // the client went away; not a server fault
 		case errors.Is(ctx.Err(), context.DeadlineExceeded):
 			e = timeoutError(0)
 		default:
 			e = wire.NewError(wire.CodeInternal, "the follower read failed")
 		}
 		logInternal(ctx, log, e, err)
-		e.NotExecuted = !st.started
-		return nil, e
+		return nil, e // a read has no effect, so not_executed stays true (0005)
 	}
 }
 
