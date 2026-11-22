@@ -217,12 +217,21 @@ func TestInsertOrRollbackAborts(t *testing.T) {
 			t.Errorf("request %d while aborted: %v", i, r.frames)
 		}
 	}
-	if r := post(sq(tok, 7, "rollback")); r.done()["txn_state"] != "none" {
+	if r := post(sq(tok, 7, "rollback", "sql", "SELECT 1")); r.code() != "invalid_request" || r.err()["not_executed"] != true || r.err()["txn_state"] != "aborted" {
+		t.Errorf("an invalid rollback while aborted: %v, want invalid_request, still aborted", r.frames)
+	}
+	if r := post(sq(tok, 8, "rollback")); r.done()["txn_state"] != "none" {
 		t.Errorf("rollback: %v", r.frames)
 	}
-	if r := post(sq(tok, 8, "begin")); r.done()["txn_state"] != "open" {
+	if r := post(sq(tok, 9, "begin")); r.done()["txn_state"] != "open" {
 		t.Errorf("begin after the rollback: %v", r.frames)
 	}
+	// An interrupted write: SQLite rolls the transaction back.
+	slow := "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) INSERT INTO other SELECT x FROM c"
+	if r := post(ex(tok, 10, slow, "timeout_ms", 200)); r.code() != "timeout" || r.err()["not_executed"] != false || r.err()["txn_state"] != "aborted" {
+		t.Errorf("a write past the statement time: %v, want timeout and aborted", r.frames)
+	}
+	e.writes(t)
 	if got := e.count(t, "SELECT count(*) FROM t"); got != "[0]" {
 		t.Errorf("rows %s", got)
 	}
@@ -269,6 +278,9 @@ func TestCancelBeforeArrivalSameAndOtherBody(t *testing.T) {
 	}
 	// Inside a transaction: the transaction stays open.
 	post(sq(tok, 3, "begin"))
+	if r := post(sq(tok, 3, "ping")); r.code() != "sequence_conflict" {
+		t.Errorf("a different body for the number after the cancelled one: %v, want sequence_conflict", r.frames)
+	}
 	if r := cancel(4); r.done()["txn_state"] != "open" {
 		t.Errorf("cancel in a transaction: %v", r.frames)
 	}
@@ -358,11 +370,16 @@ func TestLifetimeFiresWhileCommitting(t *testing.T) {
 		t.Errorf("rows %s", got)
 	}
 	// Before its commit point, the lifetime ends a running statement and
-	// aborts the transaction, even a read's.
+	// aborts the transaction, even a read's. It counts from the begin.
 	e.post(t, "channel", "writer", sq(tok, 4, "begin"))
+	time.Sleep(600 * time.Millisecond)
+	start := time.Now()
 	r := e.post(t, "channel", "writer", ex(tok, 5, cpuBound))
 	if er := r.err(); r.code() != "timeout" || er["not_executed"] != false || er["txn_state"] != "aborted" || !strings.Contains(er["message"].(string), "lifetime") {
 		t.Errorf("a statement past the lifetime: %v", r.frames)
+	}
+	if d := time.Since(start); d > 900*time.Millisecond {
+		t.Errorf("the statement ran %v, want the lifetime to end it about 400ms in", d)
 	}
 	e.writes(t)
 	// And, idle, the transaction is aborted by the sweep.
@@ -375,7 +392,9 @@ func TestLifetimeFiresWhileCommitting(t *testing.T) {
 }
 
 func TestTxnIdleLimitAndStatementTime(t *testing.T) {
-	e, _, tok := newTxnEnv(t, func(e *env) { e.s.limits.WriteTxnIdleMS, e.s.chl.sweep = 500, 20*time.Millisecond })
+	e, _, tok := newTxnEnv(t, func(e *env) {
+		e.s.limits.ChannelIdleMS, e.s.limits.WriteTxnIdleMS, e.s.chl.sweep = 1500, 500, 20*time.Millisecond
+	})
 	post := func(body string) answer { return e.post(t, "channel", "writer", body) }
 	// The statement time inside a transaction: a read times out, and the
 	// transaction stays open.
@@ -395,6 +414,7 @@ func TestTxnIdleLimitAndStatementTime(t *testing.T) {
 	if r := post(ex(tok, 6, "INSERT INTO t VALUES (1)")); r.code() != "transaction_aborted" || r.err()["cause"] != nil {
 		t.Errorf("after the idle limit: %v", r.frames)
 	}
+	e.waitChan(t, tok, func(_ state, ok bool) bool { return !ok }) // an aborted channel idles away too
 }
 
 func TestChannelIdleTimerIgnoredWithTxnOpen(t *testing.T) {
@@ -444,6 +464,20 @@ func TestMaintenanceAbortsOpenTxn(t *testing.T) {
 	if got := e.count(t, "SELECT group_concat(a) FROM t"); got != `["3"]` {
 		t.Errorf("rows %s", got)
 	}
+	// Leaving the aborted state clears the cause.
+	post(sq(tok, 6, "begin", "execute", map[string]any{"sql": "INSERT INTO t VALUES (4)"}))
+	post(ex(tok, 7, "INSERT OR ROLLBACK INTO t VALUES (3)"))
+	if r := post(sq(tok, 8, "ping")); r.code() != "transaction_aborted" || r.err()["cause"] != nil {
+		t.Errorf("after a later abort by SQLite: %v, want no cause", r.frames)
+	}
+	// A channel ended with its transaction open, as when its leader stops,
+	// releases the transaction.
+	post(sq(tok, 9, "rollback"))
+	post(sq(tok, 10, "begin"))
+	e.s.chMu.Lock()
+	e.s.end(e.s.dbs["d"].chans.chans[tok])
+	e.s.chMu.Unlock()
+	e.writes(t)
 }
 
 // TestConcurrentCloseCancel: closes and cancels that race with running
@@ -513,4 +547,137 @@ func TestConcurrentCloseCancel(t *testing.T) {
 	if a := e.post(t, "channel", "writer", ex(e.open(t, "writer"), 1, "INSERT INTO t VALUES (5)")); a.done() == nil || a.status != http.StatusOK {
 		t.Errorf("a write after the rounds: %v", a.frames)
 	}
+}
+
+// TestInvalidRollbackKeepsInvalidCommitEnds: a rollback that fails its
+// validation is recorded and leaves the transaction open, holding the
+// write lock; a commit that fails its validation ends it.
+func TestInvalidRollbackKeepsInvalidCommitEnds(t *testing.T) {
+	e, _, tok := newTxnEnv(t, nil)
+	post := func(body string) answer { return e.post(t, "channel", "writer", body) }
+	other := e.open(t, "admin")
+	post(sq(tok, 2, "begin", "execute", map[string]any{"sql": "INSERT INTO t VALUES (1)"}))
+	if r := post(sq(tok, 3, "rollback", "sql", "SELECT 1")); r.code() != "invalid_request" || r.err()["not_executed"] != true || r.err()["txn_state"] != "open" {
+		t.Errorf("an invalid rollback: %v, want invalid_request with the transaction open", r.frames)
+	}
+	if st, open := e.txState(tok); st != wire.TxnOpen || !open {
+		t.Errorf("state %q, open %v after the invalid rollback", st, open)
+	}
+	if r := e.post(t, "channel", "admin", ex(other, 1, "INSERT INTO other VALUES (1)")); r.code() != "busy" {
+		t.Errorf("a write after the invalid rollback: %v, want busy", r.frames)
+	}
+	if r := post(sq(tok, 4, "commit", "sql", "SELECT 1")); r.code() != "invalid_request" || r.err()["not_executed"] != true || r.err()["txn_state"] != "none" {
+		t.Errorf("an invalid commit: %v, want invalid_request with the transaction ended", r.frames)
+	}
+	if st, open := e.txState(tok); st != wire.TxnNone || open {
+		t.Errorf("state %q, open %v after the invalid commit", st, open)
+	}
+	e.writes(t)
+	if got := e.count(t, "SELECT count(*) FROM t"); got != "[0]" {
+		t.Errorf("rows %s, want none", got)
+	}
+}
+
+// TestCancelWaiterVsNextRequest: a cancel that waits for its running
+// request answers stale_sequence if the next request is accepted before it
+// takes the channel again. The interleaving is set by hand.
+func TestCancelWaiterVsNextRequest(t *testing.T) {
+	for _, nextFinished := range []bool{false, true} {
+		e, _, tok := newTxnEnv(t, nil)
+		s, d, leader := e.s, e.s.dbs["d"], e.leader(t)
+		waiting, fin := make(chan struct{}), make(chan struct{})
+		s.chMu.Lock()
+		ch := d.chans.chans[tok]
+		ch.last, ch.running, ch.receipt, ch.finished = 2, true, nil, fin
+		ch.cancel = func(error) { close(waiting) }
+		s.chMu.Unlock()
+		type res struct {
+			done *wire.Done
+			e    *wire.Error
+			p    any
+		}
+		got := make(chan res, 1)
+		go func() {
+			var r res
+			defer func() { r.p = recover(); got <- r }()
+			r.done, r.e = s.cancelRequest(d, leader, &wire.Request{Channel: tok, Seq: 2}, ch.who, "id")
+		}()
+		<-waiting
+		s.chMu.Lock() // the cancel waits for fin with chMu released
+		ch.running, ch.receipt = false, &wire.Receipt{Done: &wire.Done{Kind: wire.DoneCommit, Seq: 2, Txn: 7, Wrote: true}}
+		close(fin)
+		ch.last, ch.running, ch.receipt, ch.finished = 3, true, nil, make(chan struct{}) // 3 accepted
+		if nextFinished {
+			te := wire.NewError(wire.CodeTimeout, "x").Recorded(false)
+			te.Seq = 3
+			ch.running, ch.receipt = false, &wire.Receipt{Error: te}
+		}
+		s.chMu.Unlock()
+		r := <-got
+		if r.p != nil || r.done != nil || r.e == nil || r.e.Code != wire.CodeStaleSequence || r.e.Seq != 2 {
+			t.Errorf("nextFinished=%v: cancel(2) answered %+v, %+v, panic %v; want stale_sequence", nextFinished, r.done, r.e, r.p)
+		}
+		s.chMu.Lock()
+		ch.running = false // nothing runs 3
+		s.chMu.Unlock()
+	}
+}
+
+// TestCloseJoinsRunningTxn: a close that joins a request running in a
+// transaction answers only once the transaction is rolled back; a cancel
+// that joins it answers txn_state none, and a cancel of another number is
+// refused. The running request is set by hand and recorded through record,
+// with the pool held so that the rollback cannot finish early.
+func TestCloseJoinsRunningTxn(t *testing.T) {
+	e, _, tok := newTxnEnv(t, nil)
+	s, d, leader := e.s, e.s.dbs["d"], e.leader(t)
+	e.post(t, "channel", "writer", sq(tok, 2, "begin"))
+	interrupted := make(chan struct{}, 2)
+	s.chMu.Lock()
+	ch := d.chans.chans[tok]
+	ch.last, ch.running, ch.receipt, ch.finished = 3, true, nil, make(chan struct{})
+	ch.cancel = func(error) { interrupted <- struct{}{} }
+	s.chMu.Unlock()
+	type res struct {
+		done *wire.Done
+		e    *wire.Error
+	}
+	closed, cancelled := make(chan res, 1), make(chan res, 1)
+	go func() {
+		var r res
+		r.done, r.e = s.closeChannel(d, leader, &wire.Request{Channel: tok}, ch.who)
+		closed <- r
+	}()
+	<-interrupted
+	if _, er := s.cancelRequest(d, leader, &wire.Request{Channel: tok, Seq: 4}, ch.who, "id"); er == nil || er.Code != wire.CodeChannelLost {
+		t.Errorf("cancel of the next on a closing channel: %+v, want channel_lost", er)
+	}
+	go func() {
+		var r res
+		r.done, r.e = s.cancelRequest(d, leader, &wire.Request{Channel: tok, Seq: 3}, ch.who, "id")
+		cancelled <- r
+	}()
+	<-interrupted
+	s.pool.mu.Lock()
+	ce := wire.NewError(wire.CodeCancelled, "x").Recorded(true)
+	ce.Seq, ce.TxnState = 3, wire.TxnOpen
+	s.record(ch, &wire.Receipt{Error: ce}, nil, nil, false, wire.TxnOpen)
+	select {
+	case r := <-closed:
+		t.Errorf("the close answered %+v before the transaction's connection was released", r.done)
+		closed <- r
+	case <-time.After(200 * time.Millisecond):
+	}
+	s.pool.mu.Unlock()
+	if r := <-cancelled; r.done == nil || r.done.TxnState != wire.TxnNone {
+		t.Errorf("cancel that joined a close: %+v, %+v; want txn_state none", r.done, r.e)
+	}
+	<-closed
+	s.chMu.Lock()
+	h := d.chans.lock.held
+	s.chMu.Unlock()
+	if h {
+		t.Error("the write lock is held after the close answered")
+	}
+	e.writes(t)
 }

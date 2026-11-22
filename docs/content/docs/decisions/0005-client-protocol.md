@@ -12,6 +12,8 @@ weight: 5
 
 **Amended** by implementing `query` and `describe` in `skylite serve` and its review, on 2026-11-16: a pod that does not serve the database may answer `not_serving` after check 4 and before the body is read, and refusals before acceptance are not final and their order is not a promise ([checks before acceptance](#checks-before-acceptance)); in the first server version only the leader serves stateless requests ([decision 5](#5-reads), [decision 7](#7-transport-and-routing)) and answers `not_serving`, not `database_not_found`, for a missing database (check 4); and transaction control that the policy refuses at prepare is `invalid_request`, not `statement_forbidden` ([the policy hook](#5-reads), step 2).
 
+**Amended** by implementing transactions on write channels in `skylite serve` and its review, on 2026-11-22: a `rollback` that fails its validation after acceptance is recorded with `not_executed: true` and leaves the transaction state as it was, open or aborted ([state machine](#channel-state-machine)).
+
 Nothing in this record exists yet. Every statement about skylite, its server and its drivers is a requirement or a plan. The Decision section and the [wire specification](#wire-specification) are a specification: the server and the two drivers are to be written from them independently. Statements about other software carry a link pinned to a version and a line, or are labelled inference or unverified.
 
 ## Context
@@ -724,6 +726,7 @@ The [checks before acceptance](#checks-before-acceptance) come first. The owner 
 | open | `begin` | Accept, record `invalid_state` | open | `invalid_state` |
 | running in transaction | any request other than `rollback` finishes or fails, validation after acceptance included | Record; read `sqlite3_get_autocommit` | open, or aborted if SQLite ended the transaction | The result or error with `txn_state` |
 | running in transaction | `rollback` finishes | Roll back, close the connection, record | idle | `done` |
+| running in transaction | `rollback` fails its validation after acceptance | Record | open | The error, `not_executed: true`, `txn_state: "open"` |
 | committing | the transaction wrote nothing, or is read-only | End it, close the connection, record committed at the snapshot | idle | `done`, `wrote: false` |
 | committing | reaches its commit point | none | durable wait | none yet |
 | committing | fails before its commit point (too large, statement time, transaction lifetime, cancel, `maintenance`, a deferred constraint, any other error) | Roll back, close the connection, record | idle | The error, `final`, `not_executed: true` |
@@ -731,6 +734,7 @@ The [checks before acceptance](#checks-before-acceptance) come first. The owner 
 | durable wait | storage: definitely not committed | Close the connection, record `commit_failed` | idle | `commit_failed` |
 | durable wait | storage: unknown within the engine's bound | The pod stops serving the database | ended | `commit_outcome_unknown` if the response can still be written |
 | aborted | `rollback` | Accept, record | idle | `done` |
+| aborted | `rollback` that fails its validation after acceptance | Accept, record the error | aborted | The error, `not_executed: true`, `txn_state: "aborted"` |
 | aborted | any other sequenced request | Accept, record `transaction_aborted` | aborted | `transaction_aborted`, with `cause: "maintenance"` when maintenance ended the transaction |
 | idle, open, aborted | `cancel`, `seq` = last | none | unchanged | `done`, the receipt |
 | idle, open, aborted | `cancel`, `seq` = last + 1 | Record *s* as cancelled, without a digest; *s* becomes last | unchanged | `done`, the `cancelled` receipt |

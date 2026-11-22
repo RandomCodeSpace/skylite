@@ -171,7 +171,7 @@ func (s *Server) end(ch *channel) {
 	if ch.running {
 		return
 	}
-	if ch.tx != nil {
+	if ch.tx != nil && !ch.closing { // a waiting close drops it before its answer
 		go s.dropTxn(ch)()
 	}
 	t := ch.t
@@ -633,7 +633,9 @@ func (s *Server) endTxn(ch *channel) {
 // its next request other than rollback is answered transaction_aborted.
 func (s *Server) abortTxn(ch *channel, cause string) {
 	ch.state, ch.cause = wire.TxnAborted, cause
-	go s.dropTxn(ch)()
+	if !ch.closing { // a waiting close drops it before its answer
+		go s.dropTxn(ch)()
+	}
 }
 
 // watch aborts tx, ch's open transaction, if the engine ends it while no
@@ -685,6 +687,9 @@ func (s *Server) cancelRequest(d *database, leader *engine.Leader, req *wire.Req
 		s.chMu.Unlock()
 		<-fin
 		s.chMu.Lock()
+		if ch.last != seq { // the next request was accepted while this waited
+			return nil, owned(wire.NewError(wire.CodeStaleSequence, fmt.Sprintf("the sequence number is below the last accepted, %d", ch.last)), ch, seq)
+		}
 		if ch.lost != nil {
 			e := *ch.lost
 			e.Seq = seq
