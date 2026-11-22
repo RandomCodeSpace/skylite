@@ -288,12 +288,15 @@ final class Exchange implements FrameReader.Frames {
         abort();
     }
 
-    /** The network timeout passed: like a socket timeout, that ends the logical connection and all it holds. */
+    /**
+     * The network timeout passed: like a socket timeout, that ends the logical connection and all it holds. It may
+     * run on the timer thread, which must never block: the connection's close, which waits, runs elsewhere.
+     */
     private void stall() {
         synchronized (lock) {
             stalled = true;
         }
-        owner.connection().close(); // before the reader wakes, which closing this exchange's body does
+        owner.connection().closeLater(); // closed before the reader wakes, which closing this exchange's body does
         abort();
     }
 

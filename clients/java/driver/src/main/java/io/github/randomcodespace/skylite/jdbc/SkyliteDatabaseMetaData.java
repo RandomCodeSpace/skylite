@@ -322,7 +322,12 @@ final class SkyliteDatabaseMetaData implements DatabaseMetaData {
             ps.setObject(i + 1, params.get(i));
         }
         ps.closeOnCompletion();
-        return ps.executeQuery();
+        try {
+            return ps.executeQuery();
+        } catch (SQLException e) {
+            ps.close();
+            throw e;
+        }
     }
 
     private static final String[] COLUMNS = {"TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "COLUMN_NAME", "DATA_TYPE",

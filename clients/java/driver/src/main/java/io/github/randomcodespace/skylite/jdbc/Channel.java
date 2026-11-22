@@ -8,7 +8,9 @@ import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -16,31 +18,50 @@ import java.util.concurrent.TimeUnit;
  * sent one at a time, each with the next sequence number, and each answer is read in full before the caller sees
  * any of it. A request whose answer is lost in transport is sent again with the same body and sequence number: the
  * server replays its recorded outcome, or answers in_flight while it still runs, so the resend never runs it twice.
- * It is not a retry policy: a request the server refused or failed is never sent again.
+ * It is not a retry policy: a request the server refused or failed is never sent again, and a request that may have
+ * been accepted is never sent on another channel.
  *
- * <p>When the outcome of a sent request cannot be learnt, the driver raises {@code 08007} and stops using the
- * channel, closing it without waiting; the server does not serve {@code resolve} yet, so nothing settles it.
+ * <p>When the outcome of a sent request cannot be learnt, the driver raises {@code 08007} and gives the channel up,
+ * closing it without waiting; the server does not serve {@code resolve} yet, so nothing settles it. The connection is
+ * then given up too (ADR 0005 decision 4): with a transaction open, its later statements and its commit fail with
+ * {@code SKR03} and send nothing, and its rollback succeeds locally; after that, and outside a transaction, every use
+ * of the connection fails with {@code 08003}.
+ *
+ * <p>The channel's state is read and changed under this object's lock, which a request holds while it runs. Close
+ * waits for it; cancel does not take it.
  */
 final class Channel {
     /** Sends of one request when its answer is lost in transport: the first and two resends. */
     private static final int SENDS = 3;
     /** The wait before a request the server reports in_flight is sent again. */
     private static final long IN_FLIGHT_PAUSE_MILLIS = 200;
+    /** ADR 0005's reopening rule: an idle channel with no answer for this long is replaced before it is used. */
+    static volatile long reopenAfterNanos = TimeUnit.SECONDS.toNanos(60);
 
     private final SkyliteConnection conn;
     private final Session session;
-    /** Exchanges a connection's close must not stop: its own steps and the control requests. */
+    /** The owner of open, commit, rollback and cancel: refused once the connection closed, and stopped by abort. */
     private final Exchange.Owner control;
-    private volatile String token; // null until opened, and after the channel ended with nothing pending
+    /** The owner of close, which is never refused. */
+    private final Exchange.Owner closer;
+    private final Set<Exchange> controls = ConcurrentHashMap.newKeySet();
+    private String token; // null until opened, and after the channel was closed or given up; guarded by this
     private long last; // the last sequence number sent and settled; guarded by this
-    private volatile String state = "none"; // txn_state after the last settled request
-    private volatile boolean lost; // an outcome is unknown: the channel is not used again
+    private long answered; // System.nanoTime() of the channel's last answer; guarded by this
+    private String state = "none"; // txn_state after the last settled request; guarded by this
+    private volatile boolean lost; // written under this: the channel was given up after an unknown outcome
+    private volatile boolean dead; // written under this: and a transaction was open, which rollback ends
 
     Channel(SkyliteConnection conn) {
         this.conn = conn;
         this.session = conn.session();
+        this.control = owner(true);
+        this.closer = owner(false);
+    }
+
+    private Exchange.Owner owner(boolean refuseClosed) {
         Object lock = new Object();
-        this.control = new Exchange.Owner() {
+        return new Exchange.Owner() {
             @Override
             public Object lock() {
                 return lock;
@@ -48,11 +69,21 @@ final class Channel {
 
             @Override
             public SQLException admit(Exchange ex) {
+                if (!refuseClosed) {
+                    return null;
+                }
+                controls.add(ex);
+                if (conn.isClosed()) { // abort either sees ex or is seen here
+                    controls.remove(ex);
+                    return Errors.closed("connection");
+                }
                 return null;
             }
 
             @Override
-            public void release(Exchange ex) {}
+            public void release(Exchange ex) {
+                controls.remove(ex);
+            }
 
             @Override
             public SkyliteConnection connection() {
@@ -62,7 +93,7 @@ final class Channel {
     }
 
     /** The channel's transaction state: none, open or aborted. */
-    String state() {
+    synchronized String state() {
         return state;
     }
 
@@ -70,57 +101,85 @@ final class Channel {
         return lost;
     }
 
+    /** Why the connection may not be used, or null: its transaction was lost, or the channel was given up. */
+    SQLException refusal() {
+        if (dead) {
+            return new SQLException("skylite: the transaction was lost with its write channel after an unknown "
+                    + "outcome, and nothing more of it is sent; roll it back", "SKR03", 0);
+        }
+        if (lost) {
+            return new SQLNonTransientConnectionException("skylite: the connection was given up after an unknown "
+                    + "outcome on its write channel; open a new connection", "08003");
+        }
+        return null;
+    }
+
+    private void usable() throws SQLException {
+        if (conn.isClosed()) {
+            throw Errors.closed("connection");
+        }
+        SQLException refused = refusal();
+        if (refused != null) {
+            throw refused;
+        }
+    }
+
     /**
-     * Runs one statement on the channel. With transaction, the first statement after a transaction ended is sent as
-     * a begin's first statement, so that a transaction starts with its first statement; otherwise it is an execute,
+     * Runs one statement on the channel. With auto-commit off, the first statement after a transaction ended is sent
+     * as a begin's first statement, so that a transaction starts with its first statement; otherwise it is an execute,
      * which outside a transaction is an autocommit write. Returns every frame of the answer, its done last.
      */
-    synchronized List<Frame> execute(boolean transaction, String sql, List<Object> params, int timeoutSeconds,
-            SkyliteStatement stmt) throws SQLException {
-        for (int opens = 0; ; opens++) {
-            open();
-            boolean begin = transaction && state.equals("none");
-            long seq = last + 1;
-            byte[] body = Request.execute(token, seq, begin, sql, params, session.watermark(), timeoutSeconds * 1000L);
+    synchronized List<Frame> execute(String sql, List<Object> params, int timeoutSeconds, SkyliteStatement stmt)
+            throws SQLException {
+        usable();
+        boolean transaction = !conn.autoCommit();
+        open();
+        boolean txnStatement = !state.equals("none");
+        long seq = last + 1;
+        byte[] body = Request.execute(token, seq, transaction && !txnStatement, sql, params, session.watermark(),
+                timeoutSeconds * 1000L);
+        return send(seq, Kind.EXECUTE, body, timeoutSeconds * 1000L, stmt, txnStatement, transaction);
+    }
+
+    /** Commits the open transaction; with none open, nothing is sent. */
+    synchronized void commit() throws SQLException {
+        usable();
+        if (!state.equals("none")) {
+            step("commit");
+        }
+    }
+
+    /**
+     * Rolls back the open or aborted transaction; with none, nothing is sent. A channel given up rolls back locally:
+     * its transaction can no longer commit.
+     */
+    synchronized void rollback() throws SQLException {
+        if (conn.isClosed()) {
+            throw Errors.closed("connection");
+        }
+        if (!lost && !state.equals("none")) {
             try {
-                return send(seq, Kind.EXECUTE, body, timeoutSeconds * 1000L, stmt);
-            } catch (Ended e) {
-                // A channel that ended while idle, as its idle limit ends it, is replaced once: nothing of this ran.
-                if (!e.wasIdle || opens > 0) {
-                    throw e.exception;
+                step("rollback");
+            } catch (SQLException e) {
+                if (!lost) {
+                    throw e;
                 }
             }
         }
+        dead = false;
     }
 
-    /** The channel ended before seq reached it, so nothing of seq ran. */
-    private static final class Ended extends SQLException {
-        private static final long serialVersionUID = 1L;
-        final transient SQLException exception;
-        final boolean wasIdle;
-
-        Ended(SQLException exception, boolean wasIdle) {
-            this.exception = exception;
-            this.wasIdle = wasIdle;
-        }
-    }
-
-    /** commit or rollback of the open transaction. */
-    synchronized Done step(String op) throws SQLException {
+    private void step(String op) throws SQLException {
         open();
         long seq = last + 1;
-        try {
-            List<Frame> frames = send(seq, Kind.STEP, Request.step(token, seq, op), 0, null);
-            return (Done) frames.get(frames.size() - 1);
-        } catch (Ended e) {
-            throw e.exception;
-        }
+        send(seq, Kind.STEP, Request.step(token, seq, op), 0, null, false, false);
     }
 
     private void open() throws SQLException {
-        if (lost) {
-            throw new SQLNonTransientConnectionException("skylite: the connection's write channel was given up after "
-                    + "an unknown outcome; open a new connection", "08003");
+        if (token != null && state.equals("none") && System.nanoTime() - answered > reopenAfterNanos) {
+            String t = token; // idle too long: the server may end it at its idle limit before the next request
+            token = null;
+            CompletableFuture.runAsync(() -> closeQuietly(t));
         }
         if (token != null) {
             return;
@@ -136,16 +195,19 @@ final class Channel {
         token = d.token();
         last = 0;
         state = "none";
+        answered = System.nanoTime();
     }
 
     /**
      * Sends seq's body, and again with the same bytes while its answer is lost in transport or the server reports it
-     * in_flight. stmt, if any, is the statement whose cancel reaches this request.
+     * in_flight. stmt, if any, is the statement whose cancel reaches this request. txnStatement: an execute sent while
+     * a transaction is open, whose recorded failure is its outcome. transaction: an application transaction is open,
+     * from its begin, which an unknown outcome loses.
      */
-    private List<Frame> send(long seq, Kind kind, byte[] body, long timeoutMillis, SkyliteStatement stmt)
-            throws SQLException {
+    private List<Frame> send(long seq, Kind kind, byte[] body, long timeoutMillis, SkyliteStatement stmt,
+            boolean txnStatement, boolean transaction) throws SQLException {
         try {
-            return sendOnce(seq, kind, body, timeoutMillis, stmt);
+            return sendOnce(seq, kind, body, timeoutMillis, stmt, txnStatement, transaction);
         } finally {
             if (stmt != null) {
                 stmt.channelDone();
@@ -153,32 +215,33 @@ final class Channel {
         }
     }
 
-    private List<Frame> sendOnce(long seq, Kind kind, byte[] body, long timeoutMillis, SkyliteStatement stmt)
-            throws SQLException {
+    private List<Frame> sendOnce(long seq, Kind kind, byte[] body, long timeoutMillis, SkyliteStatement stmt,
+            boolean txnStatement, boolean transaction) throws SQLException {
         long deadline = System.nanoTime()
                 + TimeUnit.MILLISECONDS.toNanos(Exchange.RESPONSE_HEADER_TIMEOUT.toMillis() + timeoutMillis);
         long wait = Exchange.RESPONSE_HEADER_TIMEOUT.toMillis() + timeoutMillis;
-        boolean sent = false;
-        SQLException transport = null;
-        for (int sends = 0; ; ) {
+        boolean sent = false; // a send of seq may have reached the server
+        boolean fresh = true; // no earlier send of seq may have been accepted
+        int drops = 0; // sends whose answer was lost in transport
+        for (;;) {
             boolean[] admitted = {false};
             List<Frame> frames;
             try {
-                frames = exchange("channel", kind, body, wait, tracking(stmt, seq, admitted, sent));
+                frames = exchange("channel", kind, body, wait, tracking(stmt, token, seq, admitted, sent));
             } catch (SQLException e) {
                 sent |= admitted[0];
                 if (!sent) {
                     throw e; // nothing was sent: seq is still free
                 }
-                if (!admitted[0] || !"08S01".equals(e.getSQLState()) || ++sends == SENDS
+                if (!admitted[0] || !"08S01".equals(e.getSQLState()) || ++drops >= SENDS
                         || System.nanoTime() > deadline || Thread.currentThread().isInterrupted()) {
-                    throw unknown(seq, e);
+                    throw unknown(seq, e, transaction);
                 }
-                transport = e;
+                fresh = false;
                 continue;
             }
-            sends++;
             sent = true;
+            answered = System.nanoTime();
             Frame f = frames.get(frames.size() - 1);
             if (f instanceof Done d) {
                 settle(seq, d.txnState());
@@ -187,34 +250,38 @@ final class Channel {
             }
             Failure e = (Failure) f;
             if (e.code().equals("in_flight") && System.nanoTime() < deadline) {
-                pause();
+                fresh = false;
+                try {
+                    pause();
+                } catch (SQLException interrupted) {
+                    throw unknown(seq, interrupted, transaction);
+                }
                 continue;
             }
-            if (e.isFinal() && !e.code().equals("sequence_conflict")) {
+            // channel_lost is not a proof (ADR 0005 decision 4), and sequence_conflict says seq is not this body's.
+            if (e.code().equals("channel_lost") || e.code().equals("sequence_conflict")) {
+                throw unknown(seq, Errors.map(e), transaction);
+            }
+            // A recorded failure is the outcome when it was not executed, or of a statement inside a transaction.
+            if (e.isFinal() && (e.notExecuted() || txnStatement)) {
                 settle(seq, e.txnState() != null ? e.txnState() : state);
                 if (e.txn() > 0) {
                     session.raise(e.txn());
                 }
                 throw Errors.map(e);
             }
-            if (e.code().equals("channel_lost") && e.notExecuted() && sends == 1 && transport == null) {
-                // The channel ended before this request reached it, so nothing of it ran.
-                boolean wasIdle = state.equals("none");
-                token = null;
-                state = "none";
-                throw new Ended(wasIdle ? Errors.map(e) : new SQLNonTransientConnectionException("skylite: the write "
-                        + "channel ended and its transaction was rolled back (" + Errors.map(e).getMessage() + ")",
-                        "08003"), wasIdle);
-            }
-            if (e.notExecuted() && sends == 1 && transport == null && !e.code().equals("sequence_conflict")) {
+            if (!e.isFinal() && e.notExecuted() && fresh) {
                 throw Errors.map(e); // refused before acceptance: seq is still free
             }
-            throw unknown(seq, Errors.map(e));
+            throw unknown(seq, Errors.map(e), transaction);
         }
     }
 
-    /** The owner of one send of seq: stmt's, so that its cancel reaches seq, or the control owner; notes admission. */
-    private Exchange.Owner tracking(SkyliteStatement stmt, long seq, boolean[] admitted, boolean resend) {
+    /**
+     * The owner of one send of seq on token t: stmt's, so that its cancel reaches seq, or the control owner; notes
+     * admission.
+     */
+    private Exchange.Owner tracking(SkyliteStatement stmt, String t, long seq, boolean[] admitted, boolean resend) {
         Exchange.Owner base = stmt != null ? stmt : control;
         return new Exchange.Owner() {
             @Override
@@ -224,7 +291,7 @@ final class Channel {
 
             @Override
             public SQLException admit(Exchange ex) {
-                SQLException refused = stmt != null ? stmt.admitChannel(ex, seq, resend) : base.admit(ex);
+                SQLException refused = stmt != null ? stmt.admitChannel(ex, t, seq, resend) : base.admit(ex);
                 admitted[0] = refused == null;
                 return refused;
             }
@@ -255,22 +322,28 @@ final class Channel {
         }
     }
 
-    /** The request's outcome cannot be learnt: the channel is given up and closed without waiting. */
-    private SQLException unknown(long seq, SQLException cause) {
+    /**
+     * The request's outcome cannot be learnt: the channel is given up, and with it the transaction, if one is open.
+     * The channel is closed without waiting, unless the connection is closing, whose close sends it and waits.
+     */
+    private SQLException unknown(long seq, SQLException cause, boolean transaction) {
         lost = true;
+        dead = transaction;
         state = "none";
-        String t = token;
-        CompletableFuture.runAsync(() -> closeQuietly(t));
+        if (!conn.isClosed()) {
+            String t = token;
+            token = null;
+            CompletableFuture.runAsync(() -> closeQuietly(t));
+        }
         return new SQLNonTransientConnectionException("skylite: the outcome of request " + seq
                 + " on the write channel is unknown; it may have committed (" + cause.getMessage() + ")", "08007", cause);
     }
 
     /**
-     * Asks the server to cancel request seq, waiting up to the cancel wait for its answer, which is ignored: the
-     * request's own answer carries what happened.
+     * Asks the server to cancel request seq on channel t, waiting up to the cancel wait for its answer, which is
+     * ignored: the request's own answer carries what happened.
      */
-    void cancel(long seq) {
-        String t = token;
+    void cancel(String t, long seq) {
         if (t == null || lost) {
             return;
         }
@@ -281,13 +354,24 @@ final class Channel {
         }
     }
 
-    /** Closes the channel, which rolls back an open transaction, waiting up to the cancel wait. */
-    void close() {
-        String t = token;
-        token = null;
-        if (t != null && !lost) {
-            closeQuietly(t);
+    /** Stops the open, commit, rollback or cancel in flight, as {@link java.sql.Connection#abort} does. */
+    void abort() {
+        for (Exchange ex : controls) {
+            ex.close();
         }
+    }
+
+    /**
+     * Closes the channel, which rolls back an open transaction, waiting up to the cancel wait. A request in flight on
+     * it ends first.
+     */
+    void close() {
+        String t;
+        synchronized (this) {
+            t = token;
+            token = null;
+        }
+        closeQuietly(t);
     }
 
     private void closeQuietly(String t) {
@@ -295,7 +379,7 @@ final class Channel {
             return;
         }
         try {
-            exchange("channel/close", Kind.CLOSE, Request.close(t), Exchange.CANCEL_WAIT.toMillis(), control);
+            exchange("channel/close", Kind.CLOSE, Request.close(t), Exchange.CANCEL_WAIT.toMillis(), closer);
         } catch (SQLException ignored) {
             // the server ends the channel at its idle limit
         }

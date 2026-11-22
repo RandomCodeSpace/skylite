@@ -21,6 +21,7 @@ import java.sql.Struct;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 
@@ -60,7 +61,12 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     /** Runs a statement on the channel, in the transaction when auto-commit is off. */
     java.util.List<FrameReader.Frame> execute(String sql, java.util.List<Object> params, int timeoutSeconds,
             SkyliteStatement stmt) throws SQLException {
-        return channel.execute(!autoCommit, sql, params, timeoutSeconds, stmt);
+        return channel.execute(sql, params, timeoutSeconds, stmt);
+    }
+
+    /** getAutoCommit for the driver's own use, which checks openness itself; changed under the channel's lock. */
+    boolean autoCommit() {
+        return autoCommit;
     }
 
     Session session() {
@@ -71,9 +77,14 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         return url;
     }
 
+    /** Refuses every use of a closed connection, and of one given up after an unknown outcome (ADR 0005). */
     void checkOpen() throws SQLException {
         if (closed) {
             throw Errors.closed("connection");
+        }
+        SQLException refused = channel.refusal();
+        if (refused != null) {
+            throw refused;
         }
     }
 
@@ -161,7 +172,7 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     /** The rowid is the only generated key, whichever columns are asked for. */
     @Override
     public PreparedStatement prepareStatement(String sql, int[] columnIndexes) throws SQLException {
-        return prepare(sql, SkyliteStatement.ROWID_LABEL);
+        return prepare(sql, SkyliteStatement.keyLabel(columnIndexes));
     }
 
     /** The rowid is the only generated key, labelled with the first name asked for. */
@@ -196,10 +207,12 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     @Override
     public void setAutoCommit(boolean autoCommit) throws SQLException {
         checkOpen();
-        if (autoCommit && !this.autoCommit && !channel.state().equals("none")) {
-            commit();
+        synchronized (channel) { // after a statement in flight, which may begin a transaction
+            if (autoCommit && !this.autoCommit) {
+                channel.commit();
+            }
+            this.autoCommit = autoCommit;
         }
-        this.autoCommit = autoCommit;
     }
 
     @Override
@@ -210,37 +223,56 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
 
     /**
      * Commits the open transaction; with none open, as when no statement ran since the last commit, nothing is sent.
-     * A commit whose outcome is unknown raises {@code 08007}.
+     * A commit whose outcome is unknown raises {@code 08007}, and the connection is given up; a transaction lost
+     * with its channel raises {@code SKR03} and sends nothing.
      */
     @Override
     public void commit() throws SQLException {
         checkOpen();
-        if (autoCommit) {
-            throw new SQLNonTransientException("skylite: commit in auto-commit mode", "25000");
-        }
-        if (!channel.state().equals("none")) {
-            channel.step("commit");
-        }
-    }
-
-    /** Rolls back the open or aborted transaction; with none, nothing is sent. */
-    @Override
-    public void rollback() throws SQLException {
-        checkOpen();
-        if (autoCommit) {
-            throw new SQLNonTransientException("skylite: rollback in auto-commit mode", "25000");
-        }
-        if (!channel.state().equals("none")) {
-            channel.step("rollback");
+        synchronized (channel) {
+            if (autoCommit) {
+                throw new SQLNonTransientException("skylite: commit in auto-commit mode", "25000");
+            }
+            channel.commit();
         }
     }
 
     /**
-     * Closes the connection's statements and validations, which releases their responses, then its write channel,
-     * which rolls back an open transaction, waiting up to 2 s for the server's answer.
+     * Rolls back the open or aborted transaction; with none, nothing is sent. A transaction lost with its channel
+     * rolls back locally.
+     */
+    @Override
+    public void rollback() throws SQLException {
+        if (closed) {
+            throw Errors.closed("connection");
+        }
+        synchronized (channel) {
+            if (autoCommit) {
+                throw new SQLNonTransientException("skylite: rollback in auto-commit mode", "25000");
+            }
+            channel.rollback();
+        }
+    }
+
+    /**
+     * Closes the connection's statements and validations, which releases their responses and ends a statement in
+     * flight, then its write channel, which rolls back an open transaction, waiting up to 2 s for the server's
+     * answer. A commit or rollback in flight on another thread settles first.
      */
     @Override
     public void close() {
+        release();
+        channel.close();
+    }
+
+    /** {@link #close}, except that the channel's close, which waits for its answer, runs on another thread. */
+    void closeLater() {
+        release();
+        CompletableFuture.runAsync(channel::close);
+    }
+
+    /** Marks the connection closed and closes its statements and validations, none of which waits. */
+    private void release() {
         closed = true;
         for (SkyliteStatement s : statements) {
             s.close();
@@ -249,7 +281,6 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         for (Exchange ex : validations) {
             ex.close();
         }
-        channel.close();
     }
 
     // ---- the owner of isValid's exchanges ----
@@ -297,10 +328,12 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     @Override
     public void setReadOnly(boolean readOnly) throws SQLException {
         checkOpen();
-        if (readOnly != this.readOnly && !channel.state().equals("none")) {
-            throw new SQLNonTransientException("skylite: setReadOnly inside a transaction", "25000");
+        synchronized (channel) {
+            if (readOnly != this.readOnly && !channel.state().equals("none")) {
+                throw new SQLNonTransientException("skylite: setReadOnly inside a transaction", "25000");
+            }
+            this.readOnly = readOnly;
         }
-        this.readOnly = readOnly;
     }
 
     @Override
@@ -510,7 +543,9 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         if (executor == null) {
             throw new SQLNonTransientException("skylite: abort needs an executor", "HY009");
         }
-        close();
+        release();
+        channel.abort();
+        executor.execute(channel::close); // the channel's close waits for its answer
     }
 
     /**
