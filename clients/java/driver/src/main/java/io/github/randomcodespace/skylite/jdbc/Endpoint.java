@@ -119,7 +119,7 @@ record Endpoint(String base, String database) {
         return new SQLNonTransientConnectionException("skylite: the JDBC URL " + what, "08001");
     }
 
-    /** The URL of a request on this database: query or describe. */
+    /** The URL of a request on this database, such as query, describe, channels or channel/cancel. */
     URI uri(String request) {
         return URI.create(base + "/v1/databases/" + database + "/" + request);
     }

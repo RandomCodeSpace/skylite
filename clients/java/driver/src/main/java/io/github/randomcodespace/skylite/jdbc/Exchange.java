@@ -25,10 +25,11 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 /**
- * One stateless request and its response: query or describe. It is sent once and never retried. Closing it, before
- * or during the body, releases the HTTP response; {@link #cancel} and the query timeout do that from another thread.
+ * One request and its response: a stateless query or describe, or a channel request. It is sent once; only
+ * {@link Channel} sends a channel request's body again. Closing it, before or during the body, releases the HTTP
+ * response; {@link #cancel} and the query timeout do that from another thread.
  */
-final class Exchange implements AutoCloseable {
+final class Exchange implements FrameReader.Frames {
     /** ADR 0005's driver wait for a cancel answer: how long past a query timeout the server's own answer may take. */
     static final Duration CANCEL_WAIT = Duration.ofSeconds(2);
     /** The wait for a response's headers, as the Go driver's default: ADR 0005's request time T at the defaults. */
@@ -88,7 +89,20 @@ final class Exchange implements AutoCloseable {
             }
             stop = t.toMillis();
         }
-        return start(s, kind, body, token, owner, timeoutSeconds, network, stop, headerWait(network, stop));
+        return start(s, kind == FrameReader.Kind.QUERY ? "query" : "describe", kind, body, token, owner, timeoutSeconds,
+                network, stop, headerWait(network, stop));
+    }
+
+    /**
+     * Sends a request of a channel to path. No timer stops it: a write's answer is its outcome, and the server ends
+     * the statement at its timeout_ms. The network timeout, or else waitMillis, bounds the wait for the headers.
+     */
+    static Exchange channel(Session s, String path, FrameReader.Kind kind, byte[] body, long waitMillis, Owner owner)
+            throws SQLException {
+        int network = s.networkTimeoutMillis();
+        String token = s.token();
+        return start(s, path, kind, body, token, owner, 0, network, 0,
+                Duration.ofMillis(network > 0 ? network : waitMillis));
     }
 
     /**
@@ -119,14 +133,14 @@ final class Exchange implements AutoCloseable {
             }
             wait = Duration.ofMillis(left).plus(CANCEL_WAIT); // the stop timer, not this wait, ends it
         }
-        return start(s, FrameReader.Kind.DESCRIBE, body, token, owner, 0, 0, left, wait);
+        return start(s, "describe", FrameReader.Kind.DESCRIBE, body, token, owner, 0, 0, left, wait);
     }
 
-    private static Exchange start(Session s, FrameReader.Kind kind, byte[] body, String token, Owner owner,
-            int timeoutSeconds, int network, long stopMillis, Duration wait) throws SQLException {
+    private static Exchange start(Session s, String path, FrameReader.Kind kind, byte[] body, String token,
+            Owner owner, int timeoutSeconds, int network, long stopMillis, Duration wait) throws SQLException {
         Exchange ex = new Exchange(owner, timeoutSeconds, network);
         HttpRequest.BodyPublisher bytes = HttpRequest.BodyPublishers.ofByteArray(body);
-        HttpRequest req = HttpRequest.newBuilder(s.endpoint().uri(kind == FrameReader.Kind.QUERY ? "query" : "describe"))
+        HttpRequest req = HttpRequest.newBuilder(s.endpoint().uri(path))
                 .timeout(wait)
                 .header("Authorization", "Bearer " + token)
                 .header("Content-Type", "application/json")
@@ -222,7 +236,8 @@ final class Exchange implements AutoCloseable {
     }
 
     /** The next frame, or null after the terminal frame. An error frame is returned, not thrown. */
-    Frame next() throws SQLException {
+    @Override
+    public Frame next() throws SQLException {
         try {
             Frame f = reader.next();
             if (stopping()) { // a frame read after a stop, perhaps from a buffer, is not delivered

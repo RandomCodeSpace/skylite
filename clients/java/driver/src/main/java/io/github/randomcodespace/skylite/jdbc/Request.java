@@ -5,7 +5,7 @@ import java.sql.SQLException;
 import java.sql.SQLNonTransientException;
 import java.util.List;
 
-/** The bodies of the stateless requests of ADR 0005: query and describe. Errors never hold a value. */
+/** The request bodies of ADR 0005: query, describe and the write channel's. Errors never hold a value. */
 final class Request {
     private Request() {}
 
@@ -40,10 +40,81 @@ final class Request {
         return finish(sb);
     }
 
-    private static StringBuilder start(String sql) throws SQLException {
+    /** {@code {"mode":"write"}}: a write channel's open. */
+    static byte[] open() {
+        return "{\"mode\":\"write\"}".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    }
+
+    /**
+     * A statement on a channel: {@code {"channel":t,"seq":n,"op":"execute","sql":...,"params":[...],"min_txn":n,
+     * "timeout_ms":n}}, or with begin {@code {"channel":t,"seq":n,"op":"begin","min_txn":n,"timeout_ms":n,
+     * "execute":{"sql":...,"params":[...]}}}; zero and empty fields are left out.
+     */
+    static byte[] execute(String channel, long seq, boolean begin, String sql, List<Object> params, long minTxn,
+            long timeoutMs) throws SQLException {
+        StringBuilder sb = channel(channel, seq).append(",\"op\":").append(begin ? "\"begin\"" : "\"execute\"");
+        sb.append(begin ? ",\"execute\":{" : ",");
+        statement(sb, sql, params);
+        if (begin) {
+            sb.append('}');
+        }
+        if (minTxn > 0) {
+            sb.append(",\"min_txn\":").append(minTxn);
+        }
+        if (timeoutMs > 0) {
+            sb.append(",\"timeout_ms\":").append(Math.min(timeoutMs, Integer.MAX_VALUE));
+        }
+        return finish(sb);
+    }
+
+    /** {@code {"channel":t,"seq":n,"op":op}}: commit or rollback. */
+    static byte[] step(String channel, long seq, String op) throws SQLException {
+        return finish(channel(channel, seq).append(",\"op\":\"").append(op).append('"'));
+    }
+
+    /** {@code {"channel":t,"seq":n}}. */
+    static byte[] cancel(String channel, long seq) throws SQLException {
+        return finish(channel(channel, seq));
+    }
+
+    /** {@code {"channel":t}}. */
+    static byte[] close(String channel) throws SQLException {
+        StringBuilder sb = new StringBuilder(channel.length() + 16).append("{\"channel\":");
+        Values.appendString(sb, channel);
+        return finish(sb);
+    }
+
+    private static StringBuilder channel(String channel, long seq) {
+        StringBuilder sb = new StringBuilder(channel.length() + 64).append("{\"channel\":");
+        Values.appendString(sb, channel);
+        return sb.append(",\"seq\":").append(seq);
+    }
+
+    /** {@code "sql":...,"params":[...]}, the params left out when empty. */
+    private static void statement(StringBuilder sb, String sql, List<Object> params) throws SQLException {
+        checkSql(sql);
+        sb.append("\"sql\":");
+        Values.appendString(sb, sql);
+        if (!params.isEmpty()) {
+            sb.append(",\"params\":[");
+            for (int i = 0; i < params.size(); i++) {
+                if (i > 0) {
+                    sb.append(',');
+                }
+                Values.append(sb, params.get(i));
+            }
+            sb.append(']');
+        }
+    }
+
+    private static void checkSql(String sql) throws SQLException {
         if (sql == null || sql.isEmpty() || sql.indexOf('\0') >= 0) {
             throw new SQLNonTransientException("skylite: the SQL must be non-empty and hold no U+0000", "42000");
         }
+    }
+
+    private static StringBuilder start(String sql) throws SQLException {
+        checkSql(sql);
         StringBuilder sb = new StringBuilder(sql.length() + 32).append("{\"sql\":");
         Values.appendString(sb, sql);
         return sb;
