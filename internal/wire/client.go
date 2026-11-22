@@ -239,6 +239,7 @@ const (
 	dChannel
 	dCommitted
 	dWrote
+	dLastSeq
 )
 
 // doneRequired lists, for each done kind a Reader reads, the members it must
@@ -251,6 +252,7 @@ var doneRequired = map[DoneKind]int{
 	DoneExecute:  dSeq | dTxnState | dTxn | dReadOnly | dRowsAffected | dLastInsertRowID,
 	DoneCommit:   dSeq | dTxnState | dTxn | dCommitted | dWrote,
 	DoneRollback: dSeq | dTxnState | dTxn,
+	DoneClose:    dLastSeq, // its outcome is skipped
 }
 
 // terminalFrameBytes bounds a terminal frame, newline included: ADR 0005
@@ -272,8 +274,15 @@ type Reader struct {
 	state    int // the Writer's states
 	columns  int
 	params   int64 // names read
+	result   int64 // bytes of the frames before the terminal frame
+	limit    int64 // the most result may reach; 0 for no limit
 	f        Frame
 }
+
+// LimitResult makes Next refuse a response whose frames before the
+// terminal frame pass n bytes, newlines included: a channel's advertised
+// result_bytes, which its owner never exceeds.
+func (r *Reader) LimitResult(n int64) { r.limit = n }
 
 // NewReader returns a Reader of a response to a request whose done frame is
 // of kind k, reading frames of at most maxFrame bytes, newline included.
@@ -308,6 +317,11 @@ func (r *Reader) Next() (*Frame, error) {
 		}
 		if skip {
 			continue
+		}
+		if r.f.Kind != FrameDone && r.f.Kind != FrameError {
+			if r.result += int64(len(r.line)); r.limit > 0 && r.result > r.limit {
+				return nil, malformed("the result exceeds the channel's result_bytes of %d", r.limit)
+			}
 		}
 		if r.f.Kind == FrameDone || r.f.Kind == FrameError {
 			r.state = stateEnded
@@ -621,6 +635,9 @@ func (r *Reader) done() error {
 			seen |= dWrote
 		case "data_omitted":
 			d.DataOmitted, ok, err = r.boolean()
+		case "last_seq":
+			d.LastSeq, ok, err = r.p.integer(0, math.MaxInt64)
+			seen |= dLastSeq
 		default:
 			return r.skip()
 		}
@@ -640,8 +657,9 @@ func (r *Reader) done() error {
 	return nil
 }
 
-// channel reads an open answer's channel object; it requires the token and
-// the identifier, and skips the limits.
+// channel reads an open answer's channel object; it requires the token,
+// the identifier and, of the limits, the two a driver enforces:
+// request_body_bytes and result_bytes. It skips the other limits.
 func (r *Reader) channel(c *Channel) error {
 	err := r.members("channel", func(n string) (ok bool, err error) {
 		switch n {
@@ -650,6 +668,19 @@ func (r *Reader) channel(c *Channel) error {
 			ok = ok && validToken(c.Token)
 		case "id":
 			c.ID, ok, err = r.p.str()
+			ok = ok && validChannelID(c.ID)
+		case "limits":
+			ok, err = true, r.members("limits", func(n string) (ok bool, err error) {
+				switch n {
+				case "request_body_bytes":
+					c.Limits.RequestBodyBytes, ok, err = r.p.integer(1, math.MaxInt64)
+				case "result_bytes":
+					c.Limits.ResultBytes, ok, err = r.p.integer(1, math.MaxInt64)
+				default:
+					return r.skip()
+				}
+				return ok, err
+			})
 		case "mode":
 			var s string
 			s, ok, err = r.p.str()
@@ -661,10 +692,24 @@ func (r *Reader) channel(c *Channel) error {
 		}
 		return ok, err
 	})
-	if err == nil && (c.Token == "" || c.ID == "") {
-		err = malformed("the channel lacks its token or id")
+	if err == nil && (c.Token == "" || c.ID == "" || c.Limits.RequestBodyBytes == 0 || c.Limits.ResultBytes == 0) {
+		err = malformed("the channel lacks its token, its id or its limits")
 	}
 	return err
+}
+
+// validChannelID reports whether s is a channel identifier: 32 lowercase
+// hexadecimal characters.
+func validChannelID(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := range len(s) {
+		if (s[i] < '0' || s[i] > '9') && (s[i] < 'a' || s[i] > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Reader) errorObject() error {

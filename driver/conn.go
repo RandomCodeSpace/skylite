@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/RandomCodeSpace/skylite/internal/wire"
 )
@@ -190,9 +191,10 @@ func (cn *conn) QueryContext(ctx context.Context, query string, args []driver.Na
 }
 
 // ExecContext runs the statement on the write channel: an autocommit
-// write, or a statement of the open transaction.
+// write, or a statement of the open transaction. Its rows are read and
+// dropped.
 func (cn *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	a, err := cn.do(ctx, cn.execute(query, args), wire.DoneExecute)
+	a, err := cn.do(ctx, time.Now().Add(resendWindow), cn.execute(query, args), wire.DoneExecute, false)
 	if err != nil {
 		return nil, err
 	}
@@ -201,9 +203,15 @@ func (cn *conn) ExecContext(ctx context.Context, query string, args []driver.Nam
 
 // channelQuery runs a query on the write channel and returns its rows,
 // read whole: ADR 0005 decision 6 settles a channel request before any of
-// its rows reach database/sql.
+// its rows reach database/sql. A read-only statement whose replay omits its
+// rows is sent again as a new request, within the same resend window (ADR
+// 0005 decision 3).
 func (cn *conn) channelQuery(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	a, err := cn.do(ctx, cn.execute(query, args), wire.DoneExecute)
+	by := time.Now().Add(resendWindow)
+	a, err := cn.do(ctx, by, cn.execute(query, args), wire.DoneExecute, true)
+	for err == nil && a.done.DataOmitted && a.done.ReadOnly {
+		a, err = cn.do(ctx, by, cn.execute(query, args), wire.DoneExecute, true)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -241,9 +249,12 @@ func (cn *conn) call(query string, args []driver.NamedValue) *wire.Call {
 // nothing, and reports its parameter count. Inside a transaction it sends
 // nothing and the count is unknown: a stateless describe cannot see the
 // transaction's schema changes, and the server does not describe on a
-// channel yet.
+// channel yet. A lost transaction refuses it.
 func (cn *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	if cn.inTx {
+		if err := cn.usable(); err != nil {
+			return nil, err
+		}
 		return &stmt{cn: cn, query: query, params: -1}, nil
 	}
 	rs, err := cn.send(ctx, wire.KindDescribe, &wire.Call{SQL: query})

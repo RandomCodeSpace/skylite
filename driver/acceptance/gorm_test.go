@@ -331,10 +331,9 @@ func TestTransactions(t *testing.T) {
 	}); !errors.Is(err, errRollback) {
 		t.Fatalf("Transaction: %v", err)
 	}
-	var n int64
-	db.Model(&Author{}).Where("name IN ?", []string{"Committed", "Rolled back"}).Count(&n)
-	if n != 1 {
-		t.Fatalf("%d authors; want only the committed one", n)
+	var names []string
+	if err := db.Model(&Author{}).Where("name IN ?", []string{"Committed", "Rolled back"}).Pluck("name", &names).Error; err != nil || len(names) != 1 || names[0] != "Committed" {
+		t.Fatalf("authors %v, %v; want only the committed one", names, err)
 	}
 
 	// A manual transaction, with a failing statement, then a rollback.

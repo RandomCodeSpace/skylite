@@ -297,6 +297,7 @@ type Error struct {
 	SQLiteExtendedCode int64
 	Txn                int64
 	Epoch              int64
+	Cause              string // "maintenance" on a transaction_aborted that maintenance caused
 
 	committed bool
 	is        []error // the sentinels and the context's error it matches
@@ -324,11 +325,16 @@ func (e *Error) Unwrap() []error { return e.is }
 // the request committed.
 func (e *Error) Committed() bool { return e.committed }
 
+// Retryable reports whether the transaction can be run again from its
+// start: maintenance ended it, and nothing of it committed (ADR 0005
+// decision 9).
+func (e *Error) Retryable() bool { return e.Code == CodeTransactionAborted && e.Cause == "maintenance" }
+
 // serverError converts an error frame.
 func serverError(we *wire.Error) *Error {
 	return &Error{
 		Code: we.Code, NotExecuted: we.NotExecuted, Final: we.Final, Message: we.Message, RequestID: we.RequestID,
 		ChannelID: we.ChannelID, Seq: we.Seq, SQLiteCode: we.SQLiteCode, SQLiteExtendedCode: we.SQLiteExtendedCode,
-		Txn: we.Txn, Epoch: we.Epoch,
+		Txn: we.Txn, Epoch: we.Epoch, Cause: we.Cause,
 	}
 }

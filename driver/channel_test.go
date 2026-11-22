@@ -14,7 +14,10 @@ import (
 	"github.com/RandomCodeSpace/skylite/internal/wire"
 )
 
-const testChannel = "w1.inst.db.1.secret"
+const (
+	testChannel   = "w1.inst.db.1.secret"
+	testChannelID = "0123456789abcdef0123456789abcdef"
+)
 
 // channels answers opens with a channel of token testChannel, closes and
 // cancels with a done frame, and passes every other request to answer.
@@ -23,7 +26,7 @@ func channels(answer func(http.ResponseWriter, *wire.Writer, call, *http.Request
 		switch c.kind {
 		case wire.KindOpen:
 			_ = ww.Done(&wire.Done{Kind: wire.DoneOpen, Txn: 1, Channel: &wire.Channel{
-				Token: testChannel, ID: "c1", Mode: wire.ModeWrite, Epoch: 1, Limits: wire.DefaultLimits(),
+				Token: testChannel, ID: testChannelID, Mode: wire.ModeWrite, Epoch: 1, Limits: wire.DefaultLimits(),
 			}})
 		case wire.KindClose:
 			_ = ww.Done(&wire.Done{Kind: wire.DoneClose})
@@ -189,7 +192,7 @@ func TestUnknownOutcomes(t *testing.T) {
 			_ = c.Close()
 			var se *Error
 			if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, driver.ErrBadConn) || errors.Is(err, ErrTransactionLost) ||
-				!errors.As(err, &se) || se.Code != code || se.ChannelID != "c1" || se.Seq != 1 || se.Epoch != 1 {
+				!errors.As(err, &se) || se.Code != code || se.ChannelID != testChannelID || se.Seq != 1 || se.Epoch != 1 {
 				t.Fatalf("err %v (%+v); want ErrOutcomeUnknown with the channel", err, se)
 			}
 			if strings.Contains(err.Error(), testChannel) {
@@ -211,7 +214,7 @@ func TestSettledFailureKeepsTheChannel(t *testing.T) {
 	f := newFake(t, true, channels(func(w http.ResponseWriter, ww *wire.Writer, c call, _ *http.Request) {
 		if c.req.Seq == 1 {
 			e := wire.NewError(wire.CodeSQLError, "UNIQUE constraint failed").Recorded(false)
-			e.Seq, e.SQLiteCode = 1, 19
+			e.Seq, e.SQLiteCode, e.ChannelID, e.TxnState = 1, 19, testChannelID, wire.TxnNone
 			refuse(w, ww, e)
 			return
 		}
@@ -429,7 +432,12 @@ func TestIdleChannelIsReplaced(t *testing.T) {
 	if _, err := c.ExecContext(context.Background(), "DELETE FROM t"); err != nil {
 		t.Fatal(err)
 	}
-	if got := kinds(f.lastCalls()); got != "open execute close open execute" {
+	// The old channel is closed in the background, so that its close does
+	// not hold up the request.
+	for deadline := time.Now().Add(5 * time.Second); !strings.Contains(kinds(f.lastCalls()), "close") && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := kinds(f.lastCalls()); got != "open execute open execute close" && got != "open execute open close execute" && got != "open execute close open execute" {
 		t.Fatalf("calls %q", got)
 	}
 }

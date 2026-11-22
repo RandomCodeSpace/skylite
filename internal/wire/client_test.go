@@ -299,7 +299,7 @@ func TestReaderRefuses(t *testing.T) {
 func TestReaderReadsChannelAnswers(t *testing.T) {
 	l := DefaultLimits()
 	for _, d := range []*Done{
-		{Kind: DoneOpen, Txn: 7, Channel: &Channel{Token: "w1.x", ID: "c1", Mode: ModeWrite, Epoch: 2, Limits: l}},
+		{Kind: DoneOpen, Txn: 7, Channel: &Channel{Token: "w1.x", ID: "7c1d2e3f40a1b2c37c1d2e3f40a1b2c3", Mode: ModeWrite, Epoch: 2, Limits: l}},
 		{Kind: DoneBegin, Seq: 1, TxnState: TxnOpen, Txn: 7},
 		{Kind: DoneExecute, Seq: 2, TxnState: TxnAborted, Txn: 7, RowsAffected: 1, LastInsertRowID: -3, DataOmitted: true},
 		{Kind: DoneCommit, Seq: 3, TxnState: TxnNone, Txn: 8, Wrote: true},
@@ -314,11 +314,53 @@ func TestReaderReadsChannelAnswers(t *testing.T) {
 		want := *d
 		if want.Channel != nil {
 			c := *want.Channel
-			c.Limits = Limits{} // skipped
+			c.Limits = Limits{RequestBodyBytes: l.RequestBodyBytes, ResultBytes: l.ResultBytes} // the rest are skipped
 			want.Channel = &c
 		}
 		if err != nil || len(frames) != 1 || !reflect.DeepEqual(frames[0].Done, &want) {
 			t.Fatalf("%s: frames %+v, %v; want %+v", buf.String(), frames, err, want)
+		}
+	}
+	// A close answer: its last_seq, with its outcome skipped.
+	frames, err := readAll(`{"done":{"last_seq":4,"outcome":{"done":{"seq":4,"txn_state":"none","txn":8}}}}`+"\n", DoneClose, 1<<10)
+	if err != nil || len(frames) != 1 || frames[0].Done.LastSeq != 4 {
+		t.Fatalf("close answer: frames %+v, %v", frames, err)
+	}
+}
+
+// TestReaderRefusesBadChannels checks that an open answer needs a channel
+// identifier of 32 lowercase hexadecimal characters and both limits a driver
+// enforces.
+func TestReaderRefusesBadChannels(t *testing.T) {
+	const id, limits = `"7c1d2e3f40a1b2c37c1d2e3f40a1b2c3"`, `{"request_body_bytes":256,"result_bytes":64}`
+	for name, channel := range map[string]string{
+		"short id":        `{"token":"w1.x","id":"c1","mode":"write","epoch":1,"limits":` + limits + `}`,
+		"upper-case id":   `{"token":"w1.x","id":"7C1D2E3F40A1B2C37C1D2E3F40A1B2C3","mode":"write","epoch":1,"limits":` + limits + `}`,
+		"no limits":       `{"token":"w1.x","id":` + id + `,"mode":"write","epoch":1}`,
+		"no result_bytes": `{"token":"w1.x","id":` + id + `,"mode":"write","epoch":1,"limits":{"request_body_bytes":256}}`,
+		"zero body limit": `{"token":"w1.x","id":` + id + `,"mode":"write","epoch":1,"limits":{"request_body_bytes":0,"result_bytes":64}}`,
+	} {
+		if _, err := readAll(`{"done":{"txn":1,"channel":`+channel+`}}`+"\n", DoneOpen, 1<<10); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// TestReaderLimitsResult checks that LimitResult counts every frame before
+// the terminal frame, newlines included, and skips keepalives.
+func TestReaderLimitsResult(t *testing.T) {
+	const body = `{"keepalive":{}}` + "\n" + `{"columns":[{"name":"id"}]}` + "\n" + "[1]\n[2]\n" + `{"done":{"seq":1,"txn_state":"none","txn":1,"read_only":false,"last_insert_rowid":0,"rows_affected":0}}` + "\n"
+	for limit, ok := range map[int64]bool{36: true, 35: false} { // the columns frame is 28 bytes, each row 4
+		r, err := NewReader(strings.NewReader(body), DoneExecute, 1<<10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.LimitResult(limit)
+		for err == nil {
+			_, err = r.Next()
+		}
+		if errors.Is(err, io.EOF) != ok {
+			t.Errorf("limit %d: %v", limit, err)
 		}
 	}
 }
