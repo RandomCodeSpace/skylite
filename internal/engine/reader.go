@@ -1,9 +1,9 @@
 // Package engine is skylite's storage engine: it keeps a database in object
 // storage as decision record 0004 (docs/content/docs/decisions/0004-storage-engine.md)
 // lays it out, in the objects package format encodes. It creates a database
-// (Create), reads its pages as of a transaction number (Open, Reader), and
-// takes office by lease, epoch swap and epoch bump (Takeover, Office,
-// Lease).
+// (Create), reads its pages as of a transaction number (Open, Reader),
+// opens read-only SQLite snapshots (Follow, Follower), and takes office by
+// lease, epoch swap and epoch bump (Takeover, Office, Lease).
 //
 // # Reading
 //
@@ -59,9 +59,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
+	"time"
 	"unique"
 
 	"github.com/RandomCodeSpace/skylite/internal/format"
@@ -112,6 +114,8 @@ type Reader struct {
 	commits []*commit // the commits after a.m.Txn up to txn, in order
 	txn     uint64
 	size    uint32 // database size in pages at txn
+	// observedAt is when the read that found the end of the log began.
+	observedAt time.Time
 	// baseLimit is the highest page the base may still supply: pages above
 	// it were beyond the database size at some commit after a.m.Txn.
 	baseLimit uint32
@@ -266,6 +270,12 @@ func (r *Reader) ReadPage(ctx context.Context, pgno uint32) ([]byte, error) {
 // changed; pages still current stay cached. On an error the reader stays
 // where it was.
 func (r *Reader) Advance(ctx context.Context) error {
+	return r.advance(ctx, false)
+}
+
+// With sharedIndex, r is a shallow copy of a published reader. Copy the
+// index only when the walk will extend it. A new anchor rebuilds it.
+func (r *Reader) advance(ctx context.Context, sharedIndex bool) error {
 	a := r.a
 	info, err := r.st.Head(ctx, r.keys.Manifest())
 	if err != nil {
@@ -283,6 +293,11 @@ func (r *Reader) Advance(ctx context.Context) error {
 	if a.version != r.a.version {
 		r.reset(a, cs)
 		return nil
+	}
+	if sharedIndex && len(cs) > len(r.commits) {
+		r.pages = maps.Clone(r.pages)
+		r.floors = slices.Clone(r.floors)
+		r.commits = slices.Clip(r.commits)
 	}
 	for _, c := range cs[len(r.commits):] {
 		r.add(c)
@@ -372,6 +387,7 @@ func (r *Reader) walk(ctx context.Context, a anchor, cs []*commit, target uint64
 		if len(cs) > 0 {
 			prevSize = cs[len(cs)-1].h.DBSize
 		}
+		started := time.Now()
 		c, err := r.fetchCommit(ctx, a.m, next, prevSize)
 		var stale *staleError
 		switch {
@@ -394,6 +410,7 @@ func (r *Reader) walk(ctx context.Context, a anchor, cs []*commit, target uint64
 			switch {
 			case probe == next || errors.Is(err, storage.ErrNotFound):
 				if target == 0 {
+					r.observedAt = started
 					return a, cs, nil
 				}
 				return anchor{}, nil, fmt.Errorf("%w: transaction %d, head at %d", ErrBeyondHead, target, last)
