@@ -36,7 +36,7 @@ func openReadConn(ctx context.Context, r Reader) (*ReadConn, error) {
 	// mode=ro selects OPEN_READONLY. Use OpenContext so the initial header
 	// reads and SQLite setup have the same deadline as admission.
 	db, err := sqlite3.OpenContext(sqlite3.WithMaxMemory(ctx, 64<<20),
-		"file:"+followerFilename+"?mode=ro&vfs="+name+"&_pragma=temp_store(MEMORY)")
+		"file:"+followerFilename+"?mode=ro&immutable=1&vfs="+name+"&_pragma=temp_store(MEMORY)")
 	if err == nil {
 		err = ctx.Err()
 	}

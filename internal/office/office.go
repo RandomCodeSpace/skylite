@@ -57,6 +57,8 @@ type Config struct {
 	Holder string // the lease's holder name; see NewHolder
 	Dir    string // local directory for the leader's files
 	Engine engine.Config
+	// FollowerReads tails the database while this node stands by.
+	FollowerReads bool
 
 	TTL time.Duration // lease time to live; DefaultTTL if 0
 	// Renew is the renewal period, TTL/3 if 0. It is at most TTL/3, so that
@@ -79,11 +81,12 @@ type Config struct {
 
 // State is a loop's leadership at one moment.
 type State struct {
-	// Leader serves the database while this node leads it, and is nil
-	// otherwise: the database is ready on this node only while it is set.
+	// Leader serves the database while this node leads it, and is nil otherwise.
 	// A leader that has stopped (its Err is set) stays here until the
 	// loop notices, within about a second.
 	Leader *engine.Leader
+	// Follower serves snapshots while this node stands by, if enabled.
+	Follower *engine.Follower
 	// Office is the office Leader holds, and zero while Leader is nil.
 	Office engine.Office
 	// Reason is why the loop last stopped leading, or last failed to start
@@ -184,6 +187,14 @@ func (l *Loop) set(leader *engine.Leader, o engine.Office, reason error) {
 	l.changed = make(chan struct{})
 }
 
+func (l *Loop) setFollower(f *engine.Follower) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.state.Follower = f
+	close(l.changed)
+	l.changed = make(chan struct{})
+}
+
 // Run runs candidacies until one takes office, keeps office, and starts
 // again whenever it leaves office, until ctx ends. After a failed attempt,
 // and after leaving office, it waits a backoff that doubles from a second,
@@ -223,6 +234,26 @@ func (l *Loop) set(leader *engine.Leader, o engine.Office, reason error) {
 // lease in hand: in that shutdown, after a Lead that failed, or after a
 // candidacy that took office as ctx ended. It returns nil otherwise.
 func (l *Loop) Run(ctx context.Context) error {
+	var stopFollower func()
+	follow := func() {
+		if !l.cfg.FollowerReads || stopFollower != nil || ctx.Err() != nil {
+			return
+		}
+		fctx, cancel := context.WithCancel(ctx)
+		f := engine.Follow(fctx, l.cfg.Store, l.cfg.Keys, l.cfg.Engine.Cache)
+		l.setFollower(f)
+		stopFollower = func() {
+			l.setFollower(nil)
+			cancel()
+			<-f.Done()
+			stopFollower = nil
+		}
+	}
+	defer func() {
+		if stopFollower != nil {
+			stopFollower()
+		}
+	}()
 	first := min(firstBackoff, l.cfg.Renew)
 	backoff := first
 	pause := func() bool {
@@ -238,11 +269,13 @@ func (l *Loop) Run(ctx context.Context) error {
 		case ctx.Err() != nil:
 			return nil
 		case held != nil:
+			follow()
 			if !l.standby(ctx, held.Expires) {
 				return nil
 			}
 			continue
 		case t == nil:
+			follow()
 			if !pause() {
 				return nil
 			}
@@ -262,12 +295,16 @@ func (l *Loop) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return rerr
 			}
+			follow()
 			if !pause() {
 				return nil
 			}
 			continue
 		}
 		backoff = first
+		if stopFollower != nil {
+			stopFollower()
+		}
 		l.log.Info("office: leading", "epoch", t.office.Epoch, "head", t.office.Head)
 		l.set(leader, t.office, nil)
 		done, err := l.lead(ctx, t, leader, renewal.C)
@@ -275,6 +312,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		if done {
 			return err
 		}
+		follow()
 		if !pause() {
 			return nil
 		}

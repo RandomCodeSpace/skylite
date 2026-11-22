@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -15,9 +16,14 @@ import (
 // above the requested transaction within its catch-up budget.
 var ErrBehind = errors.New("engine: follower is behind")
 
+// ErrStale means the follower has no fresh observation of the log's end.
+var ErrStale = fmt.Errorf("%w: no fresh snapshot", ErrBehind)
+
+// FollowerMaxWait bounds the time spent waiting for a fresh snapshot.
+const FollowerMaxWait = 500 * time.Millisecond
+
 const (
 	followerPollInterval = 250 * time.Millisecond
-	followerMaxWait      = 500 * time.Millisecond
 	followerFreshness    = 2 * time.Second
 )
 
@@ -49,6 +55,17 @@ func newFollower(ctx context.Context) *Follower {
 
 // Done closes when the follower stops polling.
 func (f *Follower) Done() <-chan struct{} { return f.done }
+
+// Fresh reports whether the follower can currently admit a snapshot.
+func (f *Follower) Fresh() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ctx.Err() == nil && f.invalid == nil && fresh(f.current)
+}
+
+func fresh(r *Reader) bool {
+	return r != nil && time.Since(r.observedAt) < followerFreshness
+}
 
 func (f *Follower) follow(st storage.Store, keys format.Keys, cache *Cache) {
 	defer close(f.done)
@@ -110,15 +127,37 @@ func (f *Follower) poll(st storage.Store, keys format.Keys, cache *Cache) error 
 // the follower stops new admissions, and existing connections keep their
 // pins.
 func (f *Follower) Open(ctx context.Context, minTxn uint64) (*ReadConn, error) {
+	p, err := f.Pin(ctx, minTxn)
+	if err != nil {
+		return nil, err
+	}
+	return p.Open(ctx)
+}
+
+// ReadPin is one immutable follower snapshot. It retains its transaction
+// even if compaction later makes that transaction unreadable.
+type ReadPin struct{ reader Reader }
+
+// Txn returns the pin's durable transaction number.
+func (p *ReadPin) Txn() uint64 { return p.reader.Txn() }
+
+// Open opens a read-only SQLite connection on this pin, subject to ctx.
+func (p *ReadPin) Open(ctx context.Context) (*ReadConn, error) {
+	return openReadConn(ctx, p.reader)
+}
+
+// Pin waits for a fresh snapshot at or above minTxn, subject to ctx and
+// FollowerMaxWait. Opening SQLite on the pin can use a separate budget.
+func (f *Follower) Pin(ctx context.Context, minTxn uint64) (*ReadPin, error) {
 	r, err := f.pin(ctx, minTxn)
 	if err != nil {
 		return nil, err
 	}
-	return openReadConn(ctx, r)
+	return &ReadPin{reader: r}, nil
 }
 
 func (f *Follower) pin(ctx context.Context, minTxn uint64) (Reader, error) {
-	wait, cancel := context.WithTimeout(ctx, followerMaxWait)
+	wait, cancel := context.WithTimeout(ctx, FollowerMaxWait)
 	defer cancel()
 	for {
 		f.mu.Lock()
@@ -130,10 +169,13 @@ func (f *Follower) pin(ctx context.Context, minTxn uint64) (Reader, error) {
 		case f.ctx.Err() != nil:
 			return Reader{}, f.ctx.Err()
 		case wait.Err() != nil:
+			if !fresh(r) {
+				return Reader{}, ErrStale
+			}
 			return Reader{}, ErrBehind
 		case invalid != nil:
 			return Reader{}, invalid
-		case r != nil && r.Txn() >= minTxn && time.Since(r.observedAt) < followerFreshness:
+		case fresh(r) && r.Txn() >= minTxn:
 			return *r, nil
 		}
 
