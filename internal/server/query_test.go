@@ -695,6 +695,166 @@ func TestConnectionLimits(t *testing.T) {
 	}
 }
 
+// waiting waits until n stateless requests wait for a connection.
+func (e *env) waiting(t *testing.T, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		e.s.pool.mu.Lock()
+		got := len(e.s.pool.queue)
+		e.s.pool.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d requests wait for a connection, want %d", got, n)
+		}
+	}
+}
+
+// settled waits until the pool has no connection in use and no waiter.
+func (e *env) settled(t *testing.T) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		p := e.s.pool
+		p.mu.Lock()
+		busy, queue, waiting, by := p.open-len(p.idle), len(p.queue), len(p.waiting), len(p.busy)
+		p.mu.Unlock()
+		if busy == 0 && queue == 0 && waiting == 0 && by == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d connections in use, %d waiters, %d principals waiting, %d principals busy; want none", busy, queue, waiting, by)
+		}
+	}
+}
+
+func TestReadersBeyondQuotaWait(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) {
+		e.s.pool = newPool(4) // one per principal
+		e.s.pool.maxWait = 10 * time.Second
+	})
+	held := e.postAsync(t, "query", "reader", fmt.Sprintf(`{"sql":%q,"timeout_ms":300}`, cpuBound))
+	e.running(t, 1)
+	var got []<-chan answer
+	for range 8 {
+		got = append(got, e.postAsync(t, "query", "reader", q("SELECT 1")))
+	}
+	e.waiting(t, 8)
+	if a := <-held; a.code() != "timeout" {
+		t.Errorf("the holder: %d %v, want timeout", a.status, a.last())
+	}
+	for i, c := range got {
+		if a := <-c; a.status != 200 || a.done() == nil {
+			t.Errorf("waiting reader %d: %d %v, want rows", i, a.status, a.last())
+		}
+	}
+	e.settled(t)
+}
+
+func TestReadWaitExpires(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) {
+		e.s.pool = newPool(4)
+		e.s.pool.maxWait = 100 * time.Millisecond
+	})
+	held := e.postAsync(t, "query", "reader", fmt.Sprintf(`{"sql":%q,"timeout_ms":5000}`, cpuBound))
+	e.running(t, 1)
+	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
+		t.Errorf("after the wait: %d %v, want overloaded", a.status, a.last())
+	}
+	// The statement time bounds the wait too.
+	e.s.pool.maxWait = 10 * time.Second
+	if a := e.post(t, "query", "reader", `{"sql":"SELECT 1","timeout_ms":100}`); a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
+		t.Errorf("after timeout_ms: %d %v, want overloaded", a.status, a.last())
+	}
+	select {
+	case a := <-held:
+		t.Fatalf("the holder ended first: %d %v", a.status, a.last())
+	default:
+	}
+	e.waiting(t, 0)
+}
+
+func TestCancelWhileWaitingForConnection(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) {
+		e.s.pool = newPool(4)
+		e.s.pool.maxWait = 10 * time.Second
+	})
+	held := e.postAsync(t, "query", "reader", fmt.Sprintf(`{"sql":%q,"timeout_ms":1000}`, cpuBound))
+	e.running(t, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+e.addr+"/v1/databases/d/query", strings.NewReader(q("SELECT 1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+e.sig.token(t, "reader"))
+	gone := make(chan error, 1)
+	go func() {
+		resp, err := h1Client().Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		gone <- err
+	}()
+	e.waiting(t, 1)
+	cancel()
+	if err := <-gone; !errors.Is(err, context.Canceled) {
+		t.Errorf("the cancelled request: %v, want context.Canceled", err)
+	}
+	e.waiting(t, 0) // long before the holder ends
+	select {
+	case a := <-held:
+		t.Fatalf("the holder ended first: %d %v", a.status, a.last())
+	default:
+	}
+	<-held
+	e.settled(t)
+	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != 200 {
+		t.Errorf("after the cancel: %d %v, want rows", a.status, a.last())
+	}
+}
+
+func TestConnectionWaitFairness(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) {
+		e.s.pool = newPool(2) // one per principal, two in all
+		e.s.pool.maxWait = 10 * time.Second
+		e.s.pool.waiters, e.s.pool.waitersBy = 4, 2
+	})
+	long := e.postAsync(t, "query", "reader", fmt.Sprintf(`{"sql":%q,"timeout_ms":5000}`, cpuBound))
+	short := e.postAsync(t, "query", "writer", fmt.Sprintf(`{"sql":%q,"timeout_ms":500}`, cpuBound))
+	e.running(t, 2)
+	var readers []<-chan answer
+	for i := range 2 {
+		readers = append(readers, e.postAsync(t, "query", "reader", q("SELECT 1")))
+		e.waiting(t, i+1)
+	}
+	// The principal's waiting bound refuses its third at once; another
+	// principal still waits.
+	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
+		t.Errorf("the principal's third waiter: %d %v, want overloaded", a.status, a.last())
+	}
+	admin := e.postAsync(t, "query", "admin", q("SELECT 1"))
+	e.waiting(t, 3)
+	// The connection the writer frees goes to admin, behind the reader's
+	// waiters, which the reader's own quota holds back.
+	if a := <-admin; a.status != 200 || a.done() == nil {
+		t.Errorf("admin: %d %v, want rows", a.status, a.last())
+	}
+	select {
+	case a := <-long:
+		t.Fatalf("the reader's holder ended before admin was served: %d %v", a.status, a.last())
+	default:
+	}
+	<-short
+	<-long
+	for i, c := range readers {
+		if a := <-c; a.status != 200 || a.done() == nil {
+			t.Errorf("reader %d: %d %v, want rows", i, a.status, a.last())
+		}
+	}
+	e.settled(t)
+}
+
 func TestBodyShareOverloaded(t *testing.T) {
 	// A principal's quarter of the share is one byte short of this body.
 	e := newQueryEnv(t, func(e *env) { e.s.bodyShare = 4*8*int64(len(q("SELECT 1"))) - 1 })

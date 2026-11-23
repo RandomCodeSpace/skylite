@@ -36,7 +36,9 @@ type pconn struct {
 // close, idle or not; capacity is how many the budget holds after the body
 // share and the leaders' own connections, and a principal may hold a
 // quarter of them at once (ADR 0005 decision 9). An admission that finds
-// the pool full closes an idle connection first.
+// the pool full closes an idle connection first. A stateless request that
+// finds no room waits for it first in, first out, within the waiting
+// bounds, for at most maxWait.
 type pool struct {
 	mu           sync.Mutex
 	capacity     int
@@ -44,10 +46,33 @@ type pool struct {
 	open         int
 	idle         []*pconn // most recently used last
 	busy         map[string]int
+	queue        []*connWaiter
+	waiting      map[string]int // waiters per principal
+	// The waiting bounds, which tests lower.
+	waiters, waitersBy int
+	maxWait            time.Duration
 }
 
+// connWaiter is a stateless request waiting for a connection; c and evict
+// are what take gave it once ready is closed.
+type connWaiter struct {
+	leader   *engine.Leader
+	who      string
+	c, evict *pconn
+	ready    chan struct{}
+}
+
+const (
+	maxConnWaiters   = 256                    // stateless requests waiting for a connection, per pod
+	maxConnWaitersBy = 64                     // per pod and principal
+	maxConnWait      = 250 * time.Millisecond // and never past the statement time
+)
+
 func newPool(capacity int) *pool {
-	return &pool{capacity: capacity, perPrincipal: max(1, capacity/4), busy: map[string]int{}}
+	return &pool{
+		capacity: capacity, perPrincipal: max(1, capacity/4), busy: map[string]int{}, waiting: map[string]int{},
+		waiters: maxConnWaiters, waitersBy: maxConnWaitersBy, maxWait: maxConnWait,
+	}
 }
 
 // take reserves a connection for principal who on leader. It returns an
@@ -57,6 +82,63 @@ func newPool(capacity int) *pool {
 func (p *pool) take(leader *engine.Leader, who string) (c, evict *pconn, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.takeLocked(leader, who)
+}
+
+// await is take that, when who or the pool is at its limit, waits for room
+// first in, first out until ctx ends. ok is false if ctx ends first or a
+// waiting bound is reached.
+func (p *pool) await(ctx context.Context, leader *engine.Leader, who string) (c, evict *pconn, ok bool) {
+	p.mu.Lock()
+	if c, evict, ok = p.takeLocked(leader, who); ok || len(p.queue) >= p.waiters || p.waiting[who] >= p.waitersBy {
+		p.mu.Unlock()
+		return c, evict, ok
+	}
+	w := &connWaiter{leader: leader, who: who, ready: make(chan struct{})}
+	p.queue = append(p.queue, w)
+	p.waiting[who]++
+	p.mu.Unlock()
+	select {
+	case <-w.ready:
+		return w.c, w.evict, true
+	case <-ctx.Done():
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-w.ready: // granted as ctx ended: the caller releases it as any other
+		return w.c, w.evict, true
+	default:
+		p.queue = slices.DeleteFunc(p.queue, func(x *connWaiter) bool { return x == w })
+		p.unwaitLocked(who)
+		return nil, nil, false
+	}
+}
+
+func (p *pool) unwaitLocked(who string) {
+	if p.waiting[who]--; p.waiting[who] == 0 {
+		delete(p.waiting, who)
+	}
+}
+
+// grantLocked gives room to the waiters that now fit, in their order; one
+// that its principal's limit holds back does not hold back the others.
+func (p *pool) grantLocked() {
+	for i := 0; i < len(p.queue); {
+		w := p.queue[i]
+		c, evict, ok := p.takeLocked(w.leader, w.who)
+		if !ok {
+			i++
+			continue
+		}
+		w.c, w.evict = c, evict
+		p.queue = slices.Delete(p.queue, i, i+1)
+		p.unwaitLocked(w.who)
+		close(w.ready)
+	}
+}
+
+func (p *pool) takeLocked(leader *engine.Leader, who string) (c, evict *pconn, ok bool) {
 	if p.busy[who] >= p.perPrincipal {
 		return nil, nil, false
 	}
@@ -92,6 +174,7 @@ func (p *pool) release(who string, c *pconn, keep bool) {
 	} else {
 		p.open--
 	}
+	p.grantLocked()
 	p.mu.Unlock()
 	if !keep && c != nil {
 		_ = c.ec.Close()
@@ -101,7 +184,7 @@ func (p *pool) release(who string, c *pconn, keep bool) {
 // conn returns a connection of leader for who, reset for its new holder, or
 // the refusal before acceptance and the engine's error behind it, if any.
 func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, who string) (*pconn, *wire.Error, error) {
-	c, refusal := s.reserve(leader, who)
+	c, refusal := s.reserve(ctx, leader, who)
 	if refusal != nil {
 		return nil, refusal, nil
 	}
@@ -129,8 +212,13 @@ func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, w
 	return c, nil, nil
 }
 
-func (s *Server) reserve(leader *engine.Leader, who string) (*pconn, *wire.Error) {
-	c, evict, ok := s.pool.take(leader, who)
+// reserve is check 12 of ADR 0005 for a stateless request: it waits for a
+// connection for at most the pool's maxWait within ctx, and is refused
+// overloaded if none comes.
+func (s *Server) reserve(ctx context.Context, leader *engine.Leader, who string) (*pconn, *wire.Error) {
+	wctx, cancel := context.WithTimeout(ctx, s.pool.maxWait)
+	c, evict, ok := s.pool.await(wctx, leader, who)
+	cancel()
 	if !ok {
 		return nil, wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later")
 	}
@@ -293,7 +381,7 @@ func followerUnavailable() *wire.Error {
 func (s *Server) runFollower(ctx context.Context, pin *engine.ReadPin, req *wire.Request, st *stream, who string) (done *wire.Done, e *wire.Error, err error) {
 	// Follower connections use the same slots as leader connections. Each
 	// pin has its own SQLite connection and is discarded on release.
-	if _, e := s.reserve(nil, who); e != nil {
+	if _, e := s.reserve(ctx, nil, who); e != nil {
 		return nil, e, nil
 	}
 	defer s.pool.release(who, nil, false)
