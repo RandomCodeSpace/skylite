@@ -888,7 +888,9 @@ func (l *lockEnv) busy(t *testing.T, subject, tok, msg string) {
 }
 
 func TestWriteLockFIFOAndBusy(t *testing.T) {
-	l := newLockEnv(t, func(e *env) { e.s.chl.waiters, e.s.chl.waitersBy = 2, 1 })
+	// A long lock wait: on a slow runner the default 5 s can expire before
+	// the hold is released, and the test is about order, not the wait.
+	l := newLockEnv(t, func(e *env) { e.s.chl.waiters, e.s.chl.waitersBy, e.s.limits.LockWaitMS = 2, 1, 60000 })
 	e := l.e
 	release := l.hold(t)
 	w := e.postAsync(t, "channel", "writer", ex(l.toks["writer"][0], 1, "INSERT INTO t VALUES (1)"))
@@ -901,9 +903,10 @@ func TestWriteLockFIFOAndBusy(t *testing.T) {
 	e.s.chMu.Unlock()
 	l.busy(t, "admin", l.toks["admin"][1], "too many writers") // the database's bound
 	release()
-	tw, ta := num((<-w).done(), "txn"), num((<-a).done(), "txn")
+	aw, aa := <-w, <-a
+	tw, ta := num(aw.done(), "txn"), num(aa.done(), "txn")
 	if tw == 0 || ta != tw+1 {
-		t.Errorf("transactions %d then %d, want first in, first out", tw, ta)
+		t.Errorf("transactions %d then %d, want first in, first out (writer %v, admin %v)", tw, ta, aw.err(), aa.err())
 	}
 	l.waiting(t, 0)
 }
