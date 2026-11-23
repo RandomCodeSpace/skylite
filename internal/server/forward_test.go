@@ -264,7 +264,7 @@ func TestForwardEachKind(t *testing.T) {
 	if st, ok := leader.chState(tok); ok && !st.closing {
 		t.Error("the leader still holds the closed channel")
 	}
-	if a := pod.post(t, "resolve", "writer", cancelBody(tok, 1)); a.code() != "not_serving" || !strings.Contains(a.err()["message"].(string), "not served in this version") {
+	if a := pod.post(t, "resolve", "writer", cancelBody(tok, 1)); a.done()["resolution"] != "committed" {
 		t.Errorf("resolve: %d %v", a.status, a.frames)
 	}
 	a, h, err := call(h1Client(), http.MethodGet, "http://"+pod.addr+"/v1/databases/d", pod.sig.token(t, "reader"), "")

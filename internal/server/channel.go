@@ -32,9 +32,9 @@ import (
 // afterwards. A begin waits for the lock and runs BEGIN IMMEDIATE on a
 // fresh connection; the transaction holds both until its commit, its
 // rollback, or its abort by SQLite, a transaction limit or the engine, and
-// its connection is then closed. Batch, channel describe, read-only
-// channels and resolve are not built: batch and describe are refused with
-// not_serving before acceptance.
+// its connection is then closed. Batch, channel describe and read-only
+// channels are not built: batch and describe are refused with not_serving
+// before acceptance. Resolve is in resolve.go.
 
 // Channel bounds of ADR 0005 decision 9, and this server's shares of the
 // memory budget for channels: a receipt per channel, held result rows and
@@ -80,6 +80,8 @@ type table struct {
 	by     map[string]int      // channels per principal
 	replay int64               // retained replay data
 	lock   writeLock
+	hdrs   map[uint64]*header // commit headers below the engine's index floor, read for resolves
+	hdrSem chan struct{}      // header reads in flight for resolves
 }
 
 // channel is one write channel.
@@ -162,7 +164,7 @@ func (s *Server) table(d *database, leader *engine.Leader) *table {
 		}
 		s.endTable(t)
 	}
-	d.chans = &table{leader: leader, office: st.Office, chans: map[string]*channel{}, by: map[string]int{}, lock: writeLock{by: map[string]int{}}}
+	d.chans = &table{leader: leader, office: st.Office, chans: map[string]*channel{}, by: map[string]int{}, lock: writeLock{by: map[string]int{}}, hdrs: map[uint64]*header{}, hdrSem: make(chan struct{}, headerReadsDB)}
 	return d.chans
 }
 
