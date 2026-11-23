@@ -55,7 +55,7 @@ detail = "A version tag publishes tar.gz archives for Linux and macOS on amd64 a
 [[items]]
 title = "Channels: batch, describe, read-only channels, resolve"
 status = "planned"
-detail = "The rest of decision record 0005 on the server: batch requests, describe on a channel, read-only channels, and resolve, so that a driver can settle a write whose outcome it lost. Resolve and GET status exist on the leader; batch, describe on a channel and read-only channels remain."
+detail = "The rest of decision record 0005 on the server: batch requests, describe on a channel, read-only channels, and resolve, so that a driver can settle a write whose outcome it lost. Resolve, GET status, batch and describe on a channel exist on the leader; read-only channels remain."
 
 [[items]]
 title = "Admission control"
