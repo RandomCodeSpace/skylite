@@ -1,15 +1,15 @@
 {{ define "bodyclass" }}home{{ end }}
 {{ define "main" }}
-{{- $arch := site.GetPage "/docs/architecture" -}}
 {{- $start := site.GetPage "/docs/getting-started" -}}
 {{- $roadmap := site.GetPage "/docs/roadmap" -}}
 <section class="hero wrap" aria-labelledby="hero-title">
   <h1 id="hero-title">A SQL database server where object storage is the source of truth.</h1>
   <div class="hero-text">
-    <p class="lede">skylite is a beta Go project: a SQL server on SQLite for Kubernetes pods that have no persistent volumes. It keeps all durable state in object storage and treats pod disk as a cache. Services read and write through it over HTTPS.</p>
-    <p class="redmark"><strong>Beta.</strong> The server runs reads, writes and transactions, with leader failover and follower reads. Its cloud backends are tested against emulators only, and it has not run on a real Kubernetes cluster yet. The roadmap below lists what is still planned.</p>
+    <p class="lede">skylite is a SQL server built on SQLite that keeps all durable state in object storage, with Azure Blob Storage as its primary backend. It needs no persistent volume: its own disk is scratch space. Applications connect over HTTPS with a Go <code>database/sql</code> driver or a JDBC driver.</p>
+    <p class="redmark"><strong>Beta, v0.0.2.</strong> The server runs reads, writes and transactions, with leader failover and follower reads. The Azure backend has been tested against a real storage account; S3 and Google Cloud Storage only against emulators. It has not run on a Kubernetes cluster yet, and there is no container image.</p>
     <p class="actions">
-      <a class="btn btn-primary" href="{{ $arch.RelPermalink }}">Read the design direction</a>
+      <a class="btn btn-primary" href="{{ $start.RelPermalink }}">Quick start</a>
+      <a class="btn" href="{{ (site.GetPage "/docs").RelPermalink }}">Documentation</a>
       <a class="btn" href="{{ site.Params.repo }}">Source on GitHub</a>
     </p>
   </div>
@@ -24,8 +24,8 @@
   <div class="split">
     <div class="prose">
       <p>Teams on Kubernetes often want a small relational database for their services, without running a stateful database tier or attaching persistent volumes to pods.</p>
-      <p>Object storage is already durable, cheap and replicated, and it comes with cloud-native authentication. skylite is designed to make it the source of truth, so that anything inside a pod can be thrown away and rebuilt.</p>
-      <p>The plan is to build on SQLite rather than a new engine, so the SQL dialect and file format will be SQLite&rsquo;s own.</p>
+      <p>Object storage is already durable, cheap and replicated, and it comes with cloud-native authentication. skylite makes it the source of truth, so that anything inside a pod can be thrown away and rebuilt.</p>
+      <p>It builds on SQLite rather than a new engine, so the SQL dialect is SQLite&rsquo;s own.</p>
     </div>
     <aside class="trade" aria-labelledby="trade-h">
       <h3 id="trade-h">The trade, by design</h3>
@@ -54,12 +54,12 @@
 <section class="band wrap" aria-labelledby="today">
   <div class="split split-even">
     <div class="prose">
-      <h2 id="today">What runs today</h2>
-      <p>With a Go toolchain installed, install the binary and ask for its version. Its server, <code>skylite serve</code>, creates databases, answers queries and runs writes and transactions; the <a href="{{ $start.RelPermalink }}">getting started guide</a> links to its configuration.</p>
-      <p>To build from a clone instead, run <code>make build</code> and then <code>./bin/skylite version</code>. The <a href="{{ $start.RelPermalink }}">getting started guide</a> has both paths.</p>
+      <h2 id="today">Try it</h2>
+      <p>Each release has signed binaries for Linux and macOS on amd64 and arm64. The <a href="{{ $start.RelPermalink }}">quick start</a> verifies the download, runs a server on a local directory and connects to it from Go and from Java.</p>
+      <p>With a Go toolchain you can also run <code>go install github.com/RandomCodeSpace/skylite/cmd/skylite@v0.0.2</code>.</p>
     </div>
     <div class="quick">
-      {{ transform.Highlight "go install github.com/RandomCodeSpace/skylite/cmd/skylite@latest\nskylite version" "sh" }}
+      {{ transform.Highlight "gh release download v0.0.2 -R RandomCodeSpace/skylite \\\n  -p 'skylite_0.0.2_linux_amd64.tar.gz' -p 'SHA256SUMS*'\ntar -xzf skylite_0.0.2_linux_amd64.tar.gz\n./skylite version" "sh" }}
     </div>
   </div>
 </section>

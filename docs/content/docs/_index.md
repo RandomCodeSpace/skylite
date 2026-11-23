@@ -1,23 +1,44 @@
 ---
 title: Documentation
 linkTitle: Overview
-description: What skylite is meant to be, what exists today, and where the design is going.
+description: What skylite is, who it is for, what has been verified, and where to start.
 status: current
 listChildren: false
 ---
 
-skylite aims to be a SQL database server where object storage is the source of truth. It is a Go project, and the plan is to build it on SQLite. It is meant to run in Kubernetes pods that have no persistent volumes. In the design, all durable state lives in object storage, and pod disk is only a cache.
+skylite is a SQL database server whose only durable state is in object storage: Azure Blob Storage, Amazon S3, Google Cloud Storage, or a local directory for trials. It runs SQLite underneath, so the SQL dialect is SQLite's. Applications connect over HTTPS with a Go `database/sql` driver or a JDBC driver, and authenticate with OIDC JWT bearer tokens. A server keeps nothing on its own disk that it cannot lose, so it runs without a persistent volume.
 
-The project is beta. The binary prints its version and help, and its server authenticates requests, creates databases, leads the databases it is configured for, answers stateless reads on leaders and opt-in followers, runs autocommit writes and transactions sent on write channels, which the Go and JDBC drivers use, and forwards a request it cannot serve to the pod that can. Its cloud storage backends are tested against emulators only. Pages that describe goals or design rather than behaviour say so at the top.
+## Who it is for
+
+skylite suits services that want a small relational database without running a stateful database tier, and that can accept its trade-offs:
+
+- **Writes wait for object storage.** Every commit is uploaded and confirmed before it is acknowledged. Against a real Azure account that measured a median of about 17 ms per commit with one writer, and about 50 to 70 commits per second per database ([measurements](/docs/azure-blob/#performance)).
+- **One writer per database.** Each database has one leader at a time; writes and transactions run on it, one after another. Other servers can answer reads and take over when the leader stops.
+- **SQLite's SQL**, behind a server-side [SQL policy](/docs/decisions/0007-sql-policy/) that limits what statements may do.
+
+## Status
+
+skylite is **beta**. The current release is v0.0.2.
+
+What exists and is tested on every pull request:
+
+- The server: database creation, reads, autocommit writes and transactions, leader election with fencing, failover, follower reads, and forwarding between servers.
+- The Go driver, through a GORM acceptance suite against a real server.
+- The JDBC driver and Hibernate dialect, through a 29-test Spring Data JPA acceptance suite against a real server.
+- The storage backends, against emulators: Azurite (Azure), RustFS (S3) and fake-gcs-server (Google Cloud Storage).
+
+Also verified by hand: the Azure backend's integration tests and the GORM suite against a real Azure storage account, authenticated with an Entra ID service principal.
+
+Not verified yet: Amazon S3 and Google Cloud Storage themselves, a Kubernetes cluster, a service mesh or ingress, a real Entra ID tenant as the token issuer for clients, driver failover across several pods, Azure workload and managed identity, and a 24-hour soak.
+
+Not available: a container image, a Helm chart, and published Maven artifacts. Releases are signed binaries for Linux and macOS, and the Java artifacts are built from source. The [roadmap](/docs/roadmap/) lists what is planned.
 
 ## Where to start
 
-- [Getting started](/docs/getting-started/) installs the binary and shows the only commands that work today.
-- [Architecture](/docs/architecture/) sets out the design direction and the questions that are still open.
-- [Go driver](/docs/go-driver/) describes the Go `database/sql` driver: queries, writes and transactions.
-- [JDBC driver](/docs/jdbc-driver/) describes the JDBC driver, its Hibernate dialect and their run of the Spring Data JPA acceptance suite.
-- [Storage backends](/docs/storage-backends/) describes the storage interface's backends, all four of which (`localfs`, `s3`, `gcs` and `azure`) the server can use.
-- [Roadmap and status](/docs/roadmap/) lists the milestones that are done and those still planned, in order.
-- [Decisions](/docs/decisions/) holds the architecture decision records.
-- [Reference](/docs/reference/) holds pages generated from the source, starting with the CLI.
-- [Contributing to docs](/docs/contributing-docs/) explains how these pages are written and built.
+- [Quick start](/docs/getting-started/): download, verify, run on a local directory, connect from Go and Java.
+- [Azure Blob Storage](/docs/azure-blob/): account, container, permissions, credentials and measured performance.
+- [Sizing](/docs/sizing/) and [Running in production](/docs/operations/): memory, disk, several servers, failover, errors to handle.
+- [Go driver](/docs/go-driver/) and [JDBC driver](/docs/jdbc-driver/): connecting applications, GORM and Spring Boot.
+- [Configuration reference](/docs/configuration/): every key of the configuration file.
+
+The design records, architecture and roadmap are under **Design and project** in the menu.

@@ -695,6 +695,283 @@ func TestConnectionLimits(t *testing.T) {
 	}
 }
 
+// waiting waits until n stateless requests wait for a connection.
+func (e *env) waiting(t *testing.T, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		e.s.pool.mu.Lock()
+		got := len(e.s.pool.queue)
+		e.s.pool.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d requests wait for a connection, want %d", got, n)
+		}
+	}
+}
+
+// settled waits until the pool has no connection in use and no waiter.
+func (e *env) settled(t *testing.T) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		p := e.s.pool
+		p.mu.Lock()
+		busy, queue, waiting, by := p.open-len(p.idle), len(p.queue), len(p.waiting), len(p.busy)
+		p.mu.Unlock()
+		if busy == 0 && queue == 0 && waiting == 0 && by == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d connections in use, %d waiters, %d principals waiting, %d principals busy; want none", busy, queue, waiting, by)
+		}
+	}
+}
+
+// occupy takes n of subject's connections from the pool until the returned
+// function gives them back.
+func (e *env) occupy(t *testing.T, subject string, n int) func() {
+	t.Helper()
+	who := testIssuer + "\x00" + subject // as principal makes it
+	for i := range n {
+		_, evict, ok := e.s.pool.take(nil, who)
+		if !ok {
+			t.Fatalf("%s's connection %d is not free", subject, i)
+		}
+		if evict != nil {
+			_ = evict.ec.Close()
+		}
+	}
+	return func() {
+		for range n {
+			e.s.pool.release(who, nil, false)
+		}
+	}
+}
+
+func TestReadersBeyondQuotaWait(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) {
+		e.s.pool = newPool(4) // one per principal
+		e.s.pool.maxWait = 10 * time.Second
+	})
+	free := e.occupy(t, "reader", 1)
+	var got []<-chan answer
+	for range 8 {
+		got = append(got, e.postAsync(t, "query", "reader", q("SELECT 1")))
+	}
+	e.waiting(t, 8)
+	free()
+	for i, c := range got {
+		if a := <-c; a.status != 200 || a.done() == nil {
+			t.Errorf("waiting reader %d: %d %v, want rows", i, a.status, a.last())
+		}
+	}
+	e.settled(t)
+}
+
+func TestReadWaitExpires(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) {
+		e.s.pool = newPool(4)
+		e.s.pool.maxWait = 100 * time.Millisecond
+	})
+	free := e.occupy(t, "reader", 1)
+	start := time.Now()
+	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
+		t.Errorf("after the wait: %d %v, want overloaded", a.status, a.last())
+	}
+	if d := time.Since(start); d < 100*time.Millisecond {
+		t.Errorf("refused after %v, want the wait first", d)
+	}
+	// The statement time bounds the wait too.
+	e.s.pool.maxWait = 10 * time.Second
+	if a := e.post(t, "query", "reader", `{"sql":"SELECT 1","timeout_ms":100}`); a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
+		t.Errorf("after timeout_ms: %d %v, want overloaded", a.status, a.last())
+	}
+	e.waiting(t, 0)
+	free()
+	e.settled(t)
+}
+
+func TestCancelWhileWaitingForConnection(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) {
+		e.s.pool = newPool(4)
+		e.s.pool.maxWait = 10 * time.Second
+	})
+	free := e.occupy(t, "reader", 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+e.addr+"/v1/databases/d/query", strings.NewReader(q("SELECT 1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+e.sig.token(t, "reader"))
+	gone := make(chan error, 1)
+	go func() {
+		resp, err := h1Client().Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		gone <- err
+	}()
+	e.waiting(t, 1)
+	cancel()
+	if err := <-gone; !errors.Is(err, context.Canceled) {
+		t.Errorf("the cancelled request: %v, want context.Canceled", err)
+	}
+	e.waiting(t, 0) // while the connection is still held
+	free()
+	e.settled(t)
+	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != 200 {
+		t.Errorf("after the cancel: %d %v, want rows", a.status, a.last())
+	}
+}
+
+func TestConnectionWaitFairness(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) {
+		e.s.pool = newPool(2) // one per principal, two in all
+		e.s.pool.maxWait = 10 * time.Second
+		e.s.pool.waiters, e.s.pool.waitersBy = 4, 2
+	})
+	long, short := e.occupy(t, "reader", 1), e.occupy(t, "writer", 1)
+	var readers []<-chan answer
+	for i := range 2 {
+		readers = append(readers, e.postAsync(t, "query", "reader", q("SELECT 1")))
+		e.waiting(t, i+1)
+	}
+	// The principal's waiting bound refuses its third at once; another
+	// principal still waits.
+	e.refusedAtOnce(t, "reader", 2)
+	admin := e.postAsync(t, "query", "admin", q("SELECT 1"))
+	e.waiting(t, 3)
+	// The connection the writer frees goes to admin, behind the reader's
+	// waiters, which the reader's own quota holds back.
+	short()
+	if a := <-admin; a.status != 200 || a.done() == nil {
+		t.Errorf("admin: %d %v, want rows", a.status, a.last())
+	}
+	e.waiting(t, 2)
+	long()
+	for i, c := range readers {
+		if a := <-c; a.status != 200 || a.done() == nil {
+			t.Errorf("reader %d: %d %v, want rows", i, a.status, a.last())
+		}
+	}
+	e.settled(t)
+}
+
+// refusedAtOnce posts a query of subject and wants it refused overloaded
+// without its joining the n requests that wait for a connection.
+func (e *env) refusedAtOnce(t *testing.T, subject string, n int) {
+	t.Helper()
+	a := e.postAsync(t, "query", subject, q("SELECT 1"))
+	for {
+		select {
+		case a := <-a:
+			if a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
+				t.Errorf("%s's waiter past the bound: %d %v, want overloaded", subject, a.status, a.last())
+			}
+			return
+		case <-time.After(5 * time.Millisecond):
+		}
+		e.s.pool.mu.Lock()
+		got := len(e.s.pool.queue)
+		e.s.pool.mu.Unlock()
+		if got > n {
+			t.Errorf("%s's waiter past the bound waits, one of %d", subject, got)
+			return
+		}
+	}
+}
+
+func TestPodWaitingBound(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) {
+		e.s.pool = newPool(2) // one per principal, two in all
+		e.s.pool.maxWait = 10 * time.Second
+		e.s.pool.waiters = 2
+	})
+	freeReader, freeAdmin := e.occupy(t, "reader", 1), e.occupy(t, "admin", 1)
+	var got []<-chan answer
+	for i, s := range []string{"reader", "admin"} {
+		got = append(got, e.postAsync(t, "query", s, q("SELECT 1")))
+		e.waiting(t, i+1)
+	}
+	// Each principal is below its own bound; the pod is at its own.
+	e.refusedAtOnce(t, "writer", 2)
+	freeReader()
+	freeAdmin()
+	for i, c := range got {
+		if a := <-c; a.status != 200 || a.done() == nil {
+			t.Errorf("waiter %d: %d %v, want rows", i, a.status, a.last())
+		}
+	}
+	e.settled(t)
+}
+
+// TestWriteWaitsForTurnover: a write waits for a connection only if a
+// stateless request got one of those it lacks within the wait: one of its
+// principal's at the principal's limit, and any when the pod is full.
+func TestWriteWaitsForTurnover(t *testing.T) {
+	p := newPool(4) // one per principal
+	for _, who := range []string{"a", "b", "c", "d"} {
+		if _, _, ok := p.take(nil, who); !ok {
+			t.Fatalf("no connection for %s", who)
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.turningLocked("a") || !p.turningLocked("w") {
+		t.Error("no wait behind connections just taken by stateless requests")
+	}
+	delete(p.reads, "a") // a's connection is a transaction's
+	if p.turningLocked("a") {
+		t.Error("a waits at its limit for the other principals' turnover")
+	}
+	if !p.turningLocked("w") {
+		t.Error("w, below its limit, does not wait for the pod's turnover")
+	}
+	p.read = time.Now().Add(-p.maxWait)
+	if p.turningLocked("w") {
+		t.Error("w waits for a pod whose stateless requests are older than the wait")
+	}
+}
+
+// TestGrantAsWaitEnds: a waiter granted a connection as its wait ends takes
+// it, and the pool counts it back once released.
+func TestGrantAsWaitEnds(t *testing.T) {
+	p := newPool(4)
+	p.maxWait = time.Hour
+	if _, _, ok := p.take(nil, "a"); !ok {
+		t.Fatal("no connection for a")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	got := make(chan bool, 1)
+	go func() {
+		_, _, ok := p.await(ctx, nil, "a", false)
+		got <- ok
+	}()
+	for queued := 0; queued == 0; time.Sleep(time.Millisecond) {
+		p.mu.Lock()
+		queued = len(p.queue)
+		p.mu.Unlock()
+	}
+	p.mu.Lock()
+	cancel()
+	time.Sleep(50 * time.Millisecond) // the waiter wakes for the cancel and waits for p.mu
+	delete(p.busy, "a")               // release, with p.mu already held
+	p.open--
+	p.grantLocked()
+	p.mu.Unlock()
+	if !<-got {
+		t.Fatal("the waiter dropped the connection granted as its wait ended")
+	}
+	p.release("a", nil, false)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.open != 0 || len(p.busy) != 0 || len(p.queue) != 0 || len(p.waiting) != 0 {
+		t.Errorf("open %d, busy %v, %d queued, waiting %v; want none", p.open, p.busy, len(p.queue), p.waiting)
+	}
+}
+
 func TestBodyShareOverloaded(t *testing.T) {
 	// A principal's quarter of the share is one byte short of this body.
 	e := newQueryEnv(t, func(e *env) { e.s.bodyShare = 4*8*int64(len(q("SELECT 1"))) - 1 })

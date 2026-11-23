@@ -3,6 +3,7 @@ title: Architecture
 description: The design of skylite, and the questions that are still open.
 weight: 20
 status: design
+navgroup: project
 ---
 
 This page records the design the project has decided on. Most of it is built; the [roadmap](/docs/roadmap/) lists what is not. The storage engine exists as a library package: database creation, paged reads, the leader's commit path, takeover, compaction, retirement, garbage collection and follower snapshots. The server leads the databases it is configured for through it, compaction included, serves stateless reads on leaders and opt-in followers, runs autocommit writes and transactions on leader-owned channels, and forwards a request it cannot serve one hop to the pod that serves it. The storage design follows [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/), which rests on the [durability spike](/docs/decisions/0002-durability-spike/) and on exploratory probes. The spike ran against an object-store emulator. The probes ran against in-memory models of storage, which is weaker evidence. The record is accepted on condition: the SQLite-side mechanisms must pass the engine's own tests at the pinned versions, or the design falls back to a single-connection mode or returns to the record. The record lists what those tests must prove before any of it is relied on.

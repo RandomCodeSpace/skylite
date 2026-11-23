@@ -136,6 +136,10 @@ type Server struct {
 	chl          chLimits
 	afterCommit  func() error  // nil; a test sets it to fail a write after its COMMIT
 	hdrSem       chan struct{} // header reads in flight for resolves (resolve.go)
+	// nil; a test sets them to act between the sweep's start on a database
+	// and its look at the channel table, and between a resolve's step 1 and
+	// its observation.
+	sweepGap, resolveGap func()
 
 	bodyMu              sync.Mutex
 	bodyUsed, bodyShare int64            // request bodies' share of the memory budget, charged at 8 × Content-Length
@@ -814,7 +818,7 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	case wire.KindCancel:
 		done, e = s.cancelRequest(d, leader, req, who, id)
 	case wire.KindResolve:
-		done, e = s.resolve(r.Context(), d, leader, req)
+		done, e = s.resolve(r.Context(), d, leader, req, who)
 	default:
 		done, e = s.statement(r.Context(), st, d, leader, follower, req, who, log)
 		// A follower that cannot serve the read before its answer starts
