@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/ncruces/go-sqlite3"
@@ -57,6 +58,10 @@ var (
 	compactTick = time.Second
 	// maxManifestSize is format.MaxManifestSize.
 	maxManifestSize = format.MaxManifestSize
+	// retireWidth is how many commits retirement reads and replaces at
+	// once: one at a time, three round trips each, it fell behind 26
+	// commits a second on Azure.
+	retireWidth = 32
 	// drawTag draws a compaction attempt's tag.
 	drawTag = func() (uint64, error) {
 		var b [8]byte
@@ -610,19 +615,28 @@ func (l *Leader) retireLimit(now time.Time) uint64 {
 
 // retireLocked retires, with l.cmpMu held, up to passBatch commits above
 // the retired-through cursor that a manifest has covered for the grace
-// period, and advances the cursor over each one a read shows retired or a
-// bump.
+// period, retireWidth at a time, and advances the cursor over each one a
+// read shows retired or a bump, up to the first that it does not.
 func (l *Leader) retireLocked() {
 	limit := l.retireLimit(time.Now())
-	for range passBatch {
-		if l.retiredThrough >= limit || l.cctx.Err() != nil {
-			return
+	for done := uint64(0); done < passBatch && l.retiredThrough < limit && l.cctx.Err() == nil; {
+		n := min(uint64(retireWidth), limit-l.retiredThrough, passBatch-done) //nolint:gosec // a small positive constant
+		ok := make([]bool, n)
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Go(func() {
+				r, err := retireCommit(l.cctx, l.st, l.keys, l.office.DB, l.retiredThrough+1+i)
+				ok[i] = err == nil && r
+			})
 		}
-		ok, err := retireCommit(l.cctx, l.st, l.keys, l.office.DB, l.retiredThrough+1)
-		if err != nil || !ok {
-			return
+		wg.Wait()
+		for _, r := range ok {
+			if !r {
+				return
+			}
+			l.retiredThrough++
 		}
-		l.retiredThrough++
+		done += n
 	}
 }
 

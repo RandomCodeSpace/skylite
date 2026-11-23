@@ -73,13 +73,19 @@ func jwksFile(t *testing.T, signers ...signer) string {
 
 func (s signer) token(t *testing.T, subject string) string {
 	t.Helper()
+	return s.tokenFrom(t, testIssuer, subject)
+}
+
+// tokenFrom is token with issuer iss.
+func (s signer) tokenFrom(t *testing.T, iss, subject string) string {
+	t.Helper()
 	js, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: s.key}, (&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", s.kid))
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now()
 	tok, err := jwt.Signed(js).Claims(map[string]any{
-		"iss": testIssuer, "sub": subject, "aud": testAudience, "iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
+		"iss": iss, "sub": subject, "aud": testAudience, "iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
 	}).Serialize()
 	if err != nil {
 		t.Fatal(err)

@@ -60,7 +60,7 @@ detail = "The rest of decision record 0005 on the server: batch requests, descri
 [[items]]
 title = "Admission control"
 status = "planned"
-detail = "The rest of decision record 0005's admission control. The bound on HTTP connections, the body share of the memory budget, the SQLite connection limits and the channel bounds exist."
+detail = "What remains of decision record 0005's admission control: charging HTTP connections, running responses and resolve's header windows to the memory budget, and letting a frame larger than 1 MiB wait for room. The request bounds, the control capacity, the memory budget from the container's limit, its body share, the SQLite connection limits and the channel bounds exist."
 
 [[items]]
 title = "Follower-owned read channels"
