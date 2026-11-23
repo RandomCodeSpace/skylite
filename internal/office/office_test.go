@@ -814,62 +814,76 @@ func TestUncheckedLeaderStepsDown(t *testing.T) {
 	}
 }
 
-func TestFollowerStopsBeforeLead(t *testing.T) {
+// TestFollowerServesDuringLead: a standby that takes office keeps its
+// follower published while Lead runs, keeps the same follower after a
+// failed Lead, and stops it only once the leader is published.
+func TestFollowerServesDuringLead(t *testing.T) {
 	st, keys := newDatabase(t, t.TempDir())
 	ctx := t.Context()
 	_, primary, err := engine.Takeover(ctx, st, keys, engine.Candidate{Holder: holder(t, "primary"), TTL: 5 * time.Second, Now: time.Now})
 	if err != nil {
 		t.Fatal(err)
 	}
-	started, resume := make(chan struct{}), make(chan struct{})
-	office.SetLead(t, func(ctx context.Context, _ storage.Store, _ format.Keys, _ string, _ engine.Office, _ engine.Config) (*engine.Leader, error) {
+	started, resume := make(chan *engine.Follower), make(chan bool)
+	var mu sync.Mutex
+	var l *office.Loop
+	office.SetLead(t, func(ctx context.Context, s storage.Store, k format.Keys, dir string, o engine.Office, cfg engine.Config) (*engine.Leader, error) {
+		mu.Lock()
+		f := l.State().Follower
+		mu.Unlock()
 		select {
-		case started <- struct{}{}:
+		case started <- f:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 		select {
-		case <-resume:
-			return nil, errors.New("injected Lead failure")
+		case ok := <-resume:
+			if !ok {
+				return nil, errors.New("injected Lead failure")
+			}
+			return engine.Lead(ctx, s, k, dir, o, cfg)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	})
+	mu.Lock()
 	l, stop := start(t, office.Config{
 		Store: st, Keys: keys, Holder: holder(t, "standby"), TTL: 5 * time.Second, Renew: 200 * time.Millisecond,
 		FollowerReads: true,
 	})
+	mu.Unlock()
 	initial := waitFor(t, l, 2*time.Second, "follower published", func(s office.State) bool { return s.Follower != nil }).Follower
 	if err := primary.Release(ctx); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("standby did not start Lead")
+	during := func() {
+		t.Helper()
+		select {
+		case f := <-started:
+			if f != initial {
+				t.Fatalf("Lead started with follower %p published, want %p", f, initial)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("standby did not start Lead")
+		}
+		select {
+		case <-initial.Done():
+			t.Fatal("the follower stopped before Lead ended")
+		default:
+		}
 	}
-	if l.State().Follower != nil {
-		t.Error("Lead started while the standby still published a follower")
-	}
+	during()
+	resume <- false
+	during() // the next candidacy, after the failed Lead, keeps the same follower
+	resume <- true
+	waitFor(t, l, 5*time.Second, "leading without a follower", func(s office.State) bool { return s.Leader != nil && s.Follower == nil })
 	select {
 	case <-initial.Done():
-	default:
-		t.Error("Lead started before the follower stopped")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the follower kept polling while leading")
 	}
-	close(resume)
-	next := waitFor(t, l, 2*time.Second, "follower restarted", func(s office.State) bool {
-		return s.Follower != nil && s.Follower != initial
-	}).Follower
 	if err := stop(); err != nil {
 		t.Fatal(err)
-	}
-	if l.State().Follower != nil {
-		t.Error("shutdown left a follower published")
-	}
-	select {
-	case <-next.Done():
-	default:
-		t.Error("shutdown did not wait for the follower")
 	}
 }
 

@@ -9,7 +9,7 @@ navgroup: reference
 
 This page is the precise reference for the server's protocol and limits. To set up and run skylite, start with the [quick start](/docs/getting-started/), [Azure Blob Storage](/docs/azure-blob/) and [Running in production](/docs/operations/); every configuration key is in the [configuration reference](/docs/configuration/).
 
-`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on leaders and [opt-in followers](#reading-on-a-follower), and runs autocommit writes and transactions on [write channels](#write-channels) on leaders. With a peer listener configured, a pod forwards what it cannot serve to the pod that can ([Forwarding between pods](#forwarding-between-pods)). The leader settles a write whose channel was lost with [`resolve`](#resolve) and answers `GET` status. It runs no batch. The [Go driver](/docs/go-driver/) sends `query`, `describe`, opens, channel requests, `cancel` and `close`; the [JDBC driver](/docs/jdbc-driver/) uses `query`, `describe` and write channels.
+`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on leaders and [opt-in followers](#reading-on-a-follower), and runs autocommit writes and transactions on [write channels](#write-channels) on leaders. With a peer listener configured, a pod forwards what it cannot serve to the pod that can ([Forwarding between pods](#forwarding-between-pods)). The leader settles a write whose channel was lost with [`resolve`](#resolve) and answers `GET` status. The [Go driver](/docs/go-driver/) sends `query`, `describe`, opens, channel requests, `cancel` and `close`; the [JDBC driver](/docs/jdbc-driver/) uses `query`, `describe` and write channels.
 
 ## What it serves
 
@@ -19,7 +19,7 @@ This page is the precise reference for the server's protocol and limits. To set 
 | `POST /v1/databases/{db}/query` with `sql` and optionally `params` or `named`, `min_txn` and `timeout_ms` | One pure read on the leader or on an enabled follower: a `columns` frame, one frame per row, then `done` with `txn`, `read_only`, `rows_affected` and `last_insert_rowid`. See [Queries](#queries) |
 | `POST /v1/databases/{db}/describe` with `sql` and optionally `min_txn` | The statement's result columns and parameter names, without running it: a `columns` frame, `params` frames, then `done` with `txn` and `param_count` |
 | `POST /v1/databases/{db}/channels` with `{"mode":"write"}` | Opens a write channel: `done` with `txn`, the leader's head, and `channel` with `token`, `id`, `mode`, `epoch` and `limits`. See [Write channels](#write-channels). A read-only open gets `503` `not_serving` |
-| `POST /v1/databases/{db}/channel` with `channel`, `seq` and `op`: `begin` (optionally with a first statement in `execute`, `min_txn` and `timeout_ms`), `execute` (with `sql`, optionally `params` or `named`, `min_txn` and `timeout_ms`), `commit` (optionally `timeout_ms`), `rollback` or `ping` | A request on the channel: an autocommit write, or a step of a [transaction](#transactions) |
+| `POST /v1/databases/{db}/channel` with `channel`, `seq` and `op`: `begin` (optionally with a first statement in `execute`, `min_txn` and `timeout_ms`), `execute` (with `sql`, optionally `params` or `named`, `min_txn` and `timeout_ms`), `batch` (with `sql` and `param_sets`, or `statements`, optionally `min_txn` and `timeout_ms`), `describe` (with `sql`), `commit` (optionally `timeout_ms`), `rollback` or `ping` | A request on the channel: an autocommit write, a step of a [transaction](#transactions), or a [batch or describe](#batch-and-describe) |
 | `POST /v1/databases/{db}/channel/cancel` with `channel` and `seq` | Cancels that request: `done` with `seq`, `txn_state` and the request's receipt. See [Cancel](#cancel) |
 | `POST /v1/databases/{db}/channel/close` with `channel` | Closes the channel: `done` with `last_seq` and the receipt of that request |
 | Channel requests on a database this server does not lead, or stateless reads with neither a local leader nor an enabled local follower | With `peer` set, forwarded once to the pod that serves them ([Forwarding between pods](#forwarding-between-pods)); otherwise `503` `not_serving`, the body unread |
@@ -73,7 +73,7 @@ For each name in `databases`, the server runs the office loop of [0004](/docs/de
 
 With `follower_reads` on, the default when `peer` is set, a standby serves `query` and `describe` for its configured databases. A follower polls the durable log about every 250 ms and pins each request to one snapshot before SQLite opens it. An observation of the end of the log is usable for new snapshots for less than two seconds. When the follower has no fresh observation, it refuses with `503` `not_serving`. A request can wait up to 500 ms within its statement budget for a fresh generation at or above `min_txn`. A fresh follower that cannot reach the requested transaction in time answers `503` `behind`.
 
-If compaction overtakes the pin before the response starts, the server can retry once on a newer pin within the request and catch-up budgets. If it cannot obtain a usable replacement, it answers `503` `not_serving`. If compaction overtakes a pin after the response starts, an `internal` error ends the stream. A standby stops polling when it takes office, before it starts leading, and starts polling again after it steps down or fails to start leading.
+If compaction overtakes the pin before the response starts, the server can retry once on a newer pin within the request and catch-up budgets. If it cannot obtain a usable replacement, it answers `503` `not_serving`. If compaction overtakes a pin after the response starts, an `internal` error ends the stream. A standby that takes office keeps serving from its follower while its leader starts, stops polling once the leader serves, and starts polling again after it steps down. A standby whose leader fails to start keeps its follower.
 
 `follower_reads` defaults to `true` when `peer` is set and to `false` without it; set it to `false` to serve stateless reads only on the leader. With `peer` set, a follower forwards to the leader a read it has no fresh snapshot for, or is still `behind` on, before its answer starts, and every write and channel request. Without `peer`, those get `503` `not_serving`, so more than one pod behind a Service needs `peer` to deliver writes. That is why the default is `false` without `peer`: a standby that serves reads is ready, so a Service would send it writes it refuses.
 
@@ -106,7 +106,7 @@ A connection is reset before every reuse, [as 0007 requires](/docs/decisions/000
 
 ## Write channels
 
-A write channel is [0005's channel](/docs/decisions/0005-client-protocol/#2-channels) on the leader. In this version it carries the sequenced requests `begin`, `execute`, `commit`, `rollback` and `ping`, each with `channel`, `seq` and `op`: an `execute` with no transaction open is an autocommit write of one statement, and the others run [transactions](#transactions). A channel holds a SQLite connection only while a request runs or a transaction is open.
+A write channel is [0005's channel](/docs/decisions/0005-client-protocol/#2-channels) on the leader. In this version it carries the sequenced requests `begin`, `execute`, `batch`, `describe`, `commit`, `rollback` and `ping`, each with `channel`, `seq` and `op`: an `execute` with no transaction open is an autocommit write of one statement, a `batch` with none an autocommit write of several, and the others run [transactions](#transactions) or [describe a statement](#batch-and-describe). A channel holds a SQLite connection only while a request runs or a transaction is open.
 
 ### Opening
 
@@ -118,9 +118,9 @@ After the checks above, a request on a channel goes through these, in order:
 
 1. The token names this database (`400` `invalid_request`).
 2. It names this server process and a channel of the leader in office, of this principal, that has not ended (`410` `channel_lost`). With `peer` set, a request whose token names another process was already forwarded to that process, before this check, on a leader too ([Forwarding between pods](#forwarding-between-pods)). Without `peer`, a token of another process gets `channel_lost`. A request of another principal leaves the channel untouched.
-3. The channel is not closing (`channel_lost`); the operation is not `batch` or `describe`, which get `503` `not_serving` and take no sequence number.
+3. The channel is not closing (`channel_lost`).
 4. The sequence number, by [0005's table](/docs/decisions/0005-client-protocol/#2-channels): the last, recorded as cancelled before it arrived, gets that `cancelled` receipt whatever the body; the next number with nothing running is accepted; the next with a request running gets `409` `channel_busy`; the last, with the same body digest, gets `409` `in_flight` while it runs and its recorded outcome after; the last with another body, `409` `sequence_conflict` (`final: true`); a lower number `409` `stale_sequence`, a higher `409` `sequence_gap`. A refusal changes nothing.
-5. For a `begin` or `execute` with no transaction open: `min_txn` is at most the leader's head (`503` `behind`), and the leader is not in maintenance (`503` `maintenance`). Its SQLite connection is reserved and opened fresh after acceptance, once it holds the write lock.
+5. For a `begin`, `execute` or `batch` with no transaction open: `min_txn` is at most the leader's head (`503` `behind`), and the leader is not in maintenance (`503` `maintenance`). Its SQLite connection is reserved and opened fresh after acceptance, once it holds the write lock. A `describe` with no transaction open reserves a pooled connection, as a query does (`429` `overloaded`, `503` `maintenance`).
 
 Then the request is accepted: its sequence number and the SHA-256 digest of its exact body are recorded, the answer is `200`, and its outcome is recorded whatever it is. A field the request may not have, or a bad value, is a recorded `invalid_request`. `ping` records `txn`: the snapshot inside a transaction, otherwise the leader's head.
 
@@ -171,6 +171,17 @@ A transaction follows [0005's channel state machine](/docs/decisions/0005-client
 No timer acts on a commit past its commit point: a commit in its upload when its lifetime passes completes, and its answer is the commit. While a transaction is open the channel idle limit does not run.
 
 The engine tells the server through the connection when it ends an open transaction on its own, as maintenance rolls one back ([0005, requirement 15](/docs/decisions/0005-client-protocol/#requirements-on-the-engine-and-the-format)); the server then releases the write lock and aborts the channel without waiting for its next request. A statement or commit that maintenance interrupts records `maintenance`, and its transaction is aborted or, for a commit, ended.
+
+### Batch and describe
+
+A **`batch`** is one statement run once per parameter set, `sql` with `param_sets`, all arrays or all objects, or several statements, `statements`, each with `sql` and optionally `params` or `named`: 1 to 10,000 entries. An entry runs under the SQL policy like any statement, and must return no columns; transaction control in it is refused as in an `execute`. Its answer is one `results` frame per 1,024 entries, each entry's `rows_affected` and `last_insert_rowid`, then `done` with `entries`, the sum of `rows_affected` and the last `last_insert_rowid`. The first entry that fails stops it, and its error carries `batch_index`, counted from 0; a statement of `param_sets` that does not compile fails at entry 0.
+
+- With no transaction open, a batch is an autocommit write: it takes the write lock and a fresh connection, runs every entry inside one `BEGIN IMMEDIATE` and `COMMIT`, and is one commit, carrying the commit identifier of its own sequence number. Its `results` frames are held like a write's rows until the commit has an outcome. A batch that fails leaves nothing and sends no `results` frame.
+- Inside a transaction it runs on the transaction's connection. The entries before a failed one keep their effects and their `results` frames are sent; the error has `not_executed: false`, as for an `execute`.
+
+Replay keeps a batch's `results` frames within the 64 KiB of retained data; a batch with more is replayed with `data_omitted: true`.
+
+A **`describe`** answers a `columns` frame, `params` frames and `done` with `param_count` and `txn`, without running the statement: with no transaction open, on a pooled connection, as the stateless `describe` does, and `txn` is the leader's head; inside a transaction, on its connection, so that it sees the transaction's own schema changes, and `txn` is the transaction's snapshot. `SAVEPOINT`, `RELEASE` and `ROLLBACK TO` can be described inside a transaction only; other transaction control is `invalid_request`. A describe that fails records its error with `not_executed: true`, inside a transaction too, and leaves the transaction open.
 
 ### Cancel
 
@@ -359,7 +370,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 ## Not built yet, and not verified
 
 - Of the memory budget of [0005 decision 9](/docs/decisions/0005-client-protocol/#9-limits-and-defaults): HTTP connections and response frames are not charged to it, a frame larger than 1 MiB does not wait for room, and the 1,024-connection bound is the only bound on connections ([the amendment of 2026-11-23](/docs/decisions/0005-client-protocol/)). The cgroup is read at `/sys/fs/cgroup`, which is the container's own inside a cgroup namespace.
-- `batch`, `describe` on a channel and read-only channels.
+- Read-only channels.
 - The header window of [0005 requirement 11](/docs/decisions/0005-client-protocol/#requirements-on-the-engine-and-the-format) is the engine's index, not filled in the background, and the headers a resolve reads from storage are not charged to the memory budget ([Resolve](#resolve)).
 - A follower does not forward a `query` or `describe` it cannot compile, as 0005 asks for a schema change it has not applied yet; it answers the compile error. The leader record is read from storage for every forwarded request.
 - Forwarding is tested between servers in one process on one local store, over loopback TLS, not between pods or through a mesh.

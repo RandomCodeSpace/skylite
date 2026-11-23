@@ -234,6 +234,7 @@ func TestInterleavingUnknownCompactionSwap(t *testing.T) {
 // header read and between its header and table reads. It re-reads the
 // manifest and gives up.
 func TestInterleavingRetireRacesTakeoverWalk(t *testing.T) {
+	walkReads(t, 1, format.CommitHeaderSize) // the table in a read of its own
 	for _, betweenReads := range []bool{false, true} {
 		e := newEnv(t, 25)
 		key := e.keys.Commit(e.h.db, 4)

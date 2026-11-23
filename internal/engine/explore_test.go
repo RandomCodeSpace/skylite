@@ -91,6 +91,7 @@ var perturbations = map[string]perturbation{
 // the number of requests the scenario made.
 func explore(t *testing.T, seed uint64, ps, gs uint32, budget int64, acts map[int][]perturbation) int {
 	t.Helper()
+	walkReads(t, 1, firstRead) // requests one at a time, in an order the acts can name
 	ctx := context.Background()
 	st, keys := newStore(t)
 	h := exploreHistory(t, st, keys, seed, ps, gs)
