@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -35,6 +36,7 @@ const (
 	minWait             = 100 * time.Millisecond // a standby's shortest wait
 	maxPoll             = 5 * time.Second        // a standby's longest wait between reads of the lease
 	stopCheck           = time.Second            // how often a leader checks whether its leader has stopped
+	maxSeen             = 256                    // manifest numbers a standby keeps for the grace period
 )
 
 // Reasons a loop stops leading, as State.Reason reports them.
@@ -107,6 +109,11 @@ type Loop struct {
 	mu      sync.Mutex
 	state   State
 	changed chan struct{}
+
+	// What the standby read of the manifest, for the next Lead; only Run's
+	// goroutine uses them.
+	seen        []engine.Seen
+	seenVersion string
 }
 
 // term is one stay in office.
@@ -200,8 +207,10 @@ func (l *Loop) setFollower(f *engine.Follower) {
 // and after leaving office, it waits a backoff that doubles from a second,
 // or the renewal period if that is shorter, up to the renewal period, and
 // starts from there again once a leader is in office. A standby never
-// takes over a live lease: it reads the lease, and only the lease, at most
+// takes over a live lease: it reads the lease at most
 // min(renewal period, 5 s) apart and under a timeout of one renewal period,
+// with the manifest's token, and its body when the token changed, for
+// the grace period of retirement (engine.Config.Seen),
 // and runs a candidacy once the lease reads as released or expired, or
 // cannot be read.
 //
@@ -352,6 +361,7 @@ func (l *Loop) standby(ctx context.Context, expires time.Time) bool {
 			return true
 		}
 		rctx, cancel := context.WithTimeout(ctx, l.cfg.Renew)
+		l.observe(rctx)
 		b, err := l.read(rctx, l.cfg.Keys.Lease(), format.MaxLeaseSize+1)
 		cancel()
 		if err != nil {
@@ -365,6 +375,35 @@ func (l *Loop) standby(ctx context.Context, expires time.Time) bool {
 			return true
 		}
 		expires = renewed.Add(l.cfg.TTL)
+	}
+}
+
+// observe records the manifest's transaction number when its version has
+// changed since the last read, and when this node read it, for the grace
+// period of retirement once it takes office (engine.Config.Seen). It keeps
+// at most maxSeen numbers, dropping the second oldest, which only shortens
+// what retirement may assume. A read that fails records nothing.
+func (l *Loop) observe(ctx context.Context) {
+	key := l.cfg.Keys.Manifest()
+	info, err := l.cfg.Store.Head(ctx, key)
+	if err != nil || info.Version == l.seenVersion {
+		return
+	}
+	b, err := l.read(ctx, key, format.MaxManifestSize+1)
+	if err != nil {
+		return
+	}
+	m, err := format.DecodeManifest(b, format.DatabaseID{})
+	if err != nil {
+		return
+	}
+	l.seenVersion = info.Version
+	if n := len(l.seen); n > 0 && l.seen[n-1].Txn >= m.Txn {
+		return // an epoch swap, or a read that overtook a later one
+	}
+	l.seen = append(l.seen, engine.Seen{Txn: m.Txn, At: time.Now()})
+	if len(l.seen) > maxSeen {
+		l.seen = slices.Delete(l.seen, 1, 2)
 	}
 }
 
@@ -383,8 +422,10 @@ func (l *Loop) start(ctx context.Context, t *term, renewal <-chan time.Time) (*e
 		err    error
 	}
 	done := make(chan result, 1)
+	cfg := l.cfg.Engine
+	cfg.Seen = slices.Clone(l.seen)
 	go func() {
-		leader, err := lead(lctx, l.cfg.Store, l.cfg.Keys, l.cfg.Dir, t.office, l.cfg.Engine)
+		leader, err := lead(lctx, l.cfg.Store, l.cfg.Keys, l.cfg.Dir, t.office, cfg)
 		done <- result{leader, err}
 	}()
 	var lost error

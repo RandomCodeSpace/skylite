@@ -530,13 +530,10 @@ func TestRetiredThroughCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := checkLeaderManifest(t, st.Store, keys, o.DB)
-	// A retires the first 10 commits it may, then its retires fail.
-	retires := 0
+	// A retires the commits it may up to 12, and its retires above fail.
 	st.setRule(func(op, key string) fault {
-		if op == "replace" && isCommit(key) {
-			if retires++; retires > 10 {
-				return fault{noEffect: true}
-			}
+		if _, txn, err := keys.ParseCommit(key); op == "replace" && err == nil && txn > 12 {
+			return fault{noEffect: true}
 		}
 		return fault{}
 	})
@@ -545,8 +542,8 @@ func TestRetiredThroughCursor(t *testing.T) {
 	a.retireLocked()
 	cursor := a.retiredThrough
 	a.cmpMu.Unlock()
-	if cursor == 0 || cursor >= m.Txn {
-		t.Fatalf("cursor %d after ten retires below a manifest at %d", cursor, m.Txn)
+	if cursor != 12 || cursor >= m.Txn {
+		t.Fatalf("cursor %d after the retires up to 12 below a manifest at %d", cursor, m.Txn)
 	}
 	mustRun(t, ca, "INSERT INTO t VALUES (100)")
 	if err := compactNow(a); err != nil {

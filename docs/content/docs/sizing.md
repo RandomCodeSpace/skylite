@@ -32,6 +32,10 @@ The server writes these files under the system temporary directory, `TMPDIR` (`/
 
 Each server process keeps its files in a directory of its own, `skylite-<host name>_<random>`, removed on a clean shutdown. A process that crashes leaves its directory behind, and the next process does not reuse or remove it: an `emptyDir` keeps it across container restarts until the pod is deleted. Pages are read from object storage on demand and cached in memory, so there is no local copy of the database to keep. A small `emptyDir` mounted at `TMPDIR` (or at `/tmp`) is enough. The first two rows add up to 320 MiB per led database; leave room above that for spool files and for directories left by crashed processes. A read-only root filesystem works as long as `TMPDIR` is writable.
 
+## Object storage
+
+Each commit is one object in the database's commit log. Once a compaction has folded a commit into the base and the five-minute grace period has passed, the leader rewrites the commit to a 144-byte header, 32 commits at a time; the object itself is never deleted ([0004](/docs/decisions/0004-storage-engine/#8-compaction-retirement-and-garbage-collection)). So storage holds the base, about the size of the database, the commits of the last few minutes in full, and 144 bytes for every commit ever made: 144 MB per million commits, about 4.5 GB a year at one commit a second. Object versioning or soft delete on the container keeps the full form of each rewritten commit until that policy expires it.
+
 ## CPU
 
 CPU use has not been measured. Write throughput is bound by the round trip to object storage, not by CPU; see the [measured numbers on Azure](/docs/azure-blob/#performance).

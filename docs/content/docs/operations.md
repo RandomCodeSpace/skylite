@@ -38,7 +38,7 @@ Without `peer`, a pod that does not lead a database answers `503` `not_serving` 
 
 ## Failover
 
-The leader holds a 60-second lease on each database and renews it every 20 seconds. A standby reads the lease at most every 5 seconds.
+The leader holds a 60-second lease on each database and renews it every 20 seconds. A standby reads the lease at most every 5 seconds, and with it the manifest's version, so that once it takes office it can retire commits that older manifests have covered for the five-minute grace period without waiting that period again.
 
 | Event | What happens |
 |---|---|
