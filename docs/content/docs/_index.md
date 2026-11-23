@@ -18,18 +18,18 @@ skylite suits services that want a small relational database without running a s
 
 ## Status
 
-skylite is **beta**. The current release is v0.0.2.
+skylite is **beta**. The current release is v0.0.3.
 
 What exists and is tested on every pull request:
 
-- The server: database creation, reads, autocommit writes and transactions, leader election with fencing, failover, follower reads, and forwarding between servers.
+- The server: database creation, reads, autocommit writes, batches and transactions, read-only transactions, resolve of lost writes, leader election with fencing, failover, follower reads, and forwarding between servers.
 - The Go driver, through a GORM acceptance suite against a real server.
 - The JDBC driver and Hibernate dialect, through a 33-test Spring Data JPA acceptance suite against a real server.
 - The storage backends, against emulators: Azurite (Azure), RustFS (S3) and fake-gcs-server (Google Cloud Storage).
 
-Also verified by hand: the Azure backend's integration tests and the GORM suite against a real Azure storage account, authenticated with an Entra ID service principal.
+Also verified by hand against a real Azure storage account: the Azure backend's integration tests and the GORM suite, authenticated with an Entra ID service principal, and a failover soak of three servers on one machine in which no acknowledged write was lost ([failover timings](/docs/operations/#failover)).
 
-Not verified yet: Amazon S3 and Google Cloud Storage themselves, a Kubernetes cluster, a service mesh or ingress, a real Entra ID tenant as the token issuer for clients, driver failover across several pods, Azure workload and managed identity, and a 24-hour soak.
+Not verified yet: Amazon S3 and Google Cloud Storage themselves (emulators only), a Kubernetes cluster, a service mesh or ingress, a real Entra ID tenant as the token issuer for clients, driver failover across several pods, Azure workload and managed identity, and a 24-hour soak.
 
 Not available: a container image, a Helm chart, and published Maven artifacts. Releases are signed binaries for Linux and macOS, and the Java artifacts are built from source. The [roadmap](/docs/roadmap/) lists what is planned.
 

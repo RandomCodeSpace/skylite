@@ -25,7 +25,7 @@ detail = "A storage layer under SQLite (ncruces/go-sqlite3) that uploads each co
 [[items]]
 title = "Leader lease and failover"
 status = "done"
-detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader. The takeover, the lease and a loop that takes office, renews the lease, steps down when deposed or stopped, and drains and releases on shutdown exist, and skylite serve runs the loop for each database it is configured for. The server in office serves writes. A standby can serve stateless reads when enabled. Not yet run on a real Kubernetes cluster."
+detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader. The takeover, the lease and a loop that takes office, renews the lease, steps down when deposed or stopped, and drains and releases on shutdown exist, and skylite serve runs the loop for each database it is configured for. The server in office serves writes. A standby can serve stateless reads when enabled, and keeps serving them during a takeover. A failover soak of three servers on one machine against a real Azure storage account lost no acknowledged write; a graceful failover took 5.6 to 8.8 seconds to the first successful write, and a killed or paused leader 48 to 52 seconds, bounded by the 60-second lease. Not yet run on a real Kubernetes cluster."
 
 [[items]]
 title = "Read replicas"
@@ -35,7 +35,7 @@ detail = "The engine follower polls the durable log and pins each read-only SQLi
 [[items]]
 title = "HTTPS query API and sessions"
 status = "done"
-detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, database creation (PUT), the stateless query and describe requests on leaders and opt-in followers, and write channels on the leader: open, close, cancel, autocommit writes, ping and transactions (begin, commit, rollback, savepoints, the aborted state and the transaction timers) on a channel, with sequence numbers, receipts and replay, so that a resent write never runs twice. With a peer listener, any pod takes any request and forwards it one hop, over mutual TLS, to the leader or the channel's owner, located through a leader record in object storage. Not yet, planned below: batch, describe on a channel, read-only channels, resolve and the rest of admission control."
+detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, database creation (PUT), the stateless query and describe requests on leaders and opt-in followers, and write channels on the leader: open, close, cancel, autocommit writes, ping and transactions (begin, commit, rollback, savepoints, the aborted state and the transaction timers) on a channel, with sequence numbers, receipts and replay, so that a resent write never runs twice. With a peer listener, any pod takes any request and forwards it one hop, over mutual TLS, to the leader or the channel's owner, located through a leader record in object storage. Batch, describe on a channel, read-only channels and resolve are the channels milestone below; what remains of admission control is planned below."
 
 [[items]]
 title = "Clients: Go driver, JDBC driver and Hibernate dialect"
@@ -60,7 +60,7 @@ detail = "The rest of decision record 0005 on the server: batch requests, descri
 [[items]]
 title = "Admission control"
 status = "planned"
-detail = "What remains of decision record 0005's admission control: charging HTTP connections, running responses and resolve's header windows to the memory budget, and letting a frame larger than 1 MiB wait for room. The request bounds, the control capacity, the memory budget from the container's limit, its body share, the SQLite connection limits and the channel bounds exist."
+detail = "What remains of decision record 0005's admission control: charging HTTP connections, running responses and the headers a resolve reads from storage to the memory budget, and letting a frame larger than 1 MiB wait for room. The request bounds, the control capacity, the memory budget from the container's memory limit with the request body limit that scales with it, the SQLite connection limits and the channel bounds exist."
 
 [[items]]
 title = "Follower-owned read channels"

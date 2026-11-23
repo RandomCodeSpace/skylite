@@ -27,19 +27,23 @@ stateful database tier, and that accept:
   answer reads and take over when it stops.
 - **SQLite's SQL dialect.**
 
-## Status: beta (v0.0.2)
+## Status: beta (v0.0.3)
 
-Tested on every pull request: the server (reads, writes, transactions, leader
-election and failover, follower reads, forwarding between servers), the Go
-driver through a GORM acceptance suite, and the JDBC driver and Hibernate
-dialect through a Spring Data JPA acceptance suite, against a real server. The
-storage backends are tested against emulators (Azurite, RustFS,
-fake-gcs-server); the Azure backend has also been run by hand against a real
-storage account.
+Tested on every pull request: the server (reads, writes, transactions,
+read-only transactions, batches, resolve, leader election and failover,
+follower reads, forwarding between servers), the Go driver through a GORM
+acceptance suite, and the JDBC driver and Hibernate dialect through a Spring
+Data JPA acceptance suite, against a real server. The storage backends are
+tested against emulators (Azurite, RustFS, fake-gcs-server).
 
-Not verified yet: Amazon S3 and Google Cloud Storage themselves, a Kubernetes
-cluster, a service mesh or ingress, a real Entra ID tenant as token issuer,
-driver failover across several pods, and a 24-hour soak.
+Run by hand against a real Azure storage account: the Azure backend's
+integration and conformance tests, the GORM acceptance suite, and a failover
+soak of three servers on one machine (SIGTERM, SIGKILL and SIGSTOP of the
+leader) that lost no acknowledged write.
+
+Not verified yet: Amazon S3 and Google Cloud Storage themselves (emulators
+only), a Kubernetes cluster, a service mesh or ingress, a real Entra ID tenant
+as token issuer, driver failover across several pods, and a 24-hour soak.
 
 Not available: a container image, a Helm chart, and published Maven artifacts
 (build the Java driver with `mvn install`). See the
@@ -50,7 +54,7 @@ Not available: a container image, a Helm chart, and published Maven artifacts
 Download a release for Linux or macOS, verify it and run it:
 
 ```sh
-VERSION=0.0.2
+VERSION=0.0.3
 gh release download "v$VERSION" -R RandomCodeSpace/skylite \
   -p "skylite_${VERSION}_linux_amd64.tar.gz" -p 'SHA256SUMS*'
 sha256sum --ignore-missing -c SHA256SUMS
@@ -61,7 +65,7 @@ tar -xzf "skylite_${VERSION}_linux_amd64.tar.gz"
 Or install with Go 1.26 or later:
 
 ```sh
-go install github.com/RandomCodeSpace/skylite/cmd/skylite@v0.0.2
+go install github.com/RandomCodeSpace/skylite/cmd/skylite@v0.0.3
 ```
 
 The [quick start](https://randomcodespace.github.io/skylite/docs/getting-started/)
