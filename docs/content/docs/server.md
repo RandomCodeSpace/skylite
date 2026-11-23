@@ -9,7 +9,7 @@ navgroup: reference
 
 This page is the precise reference for the server's protocol and limits. To set up and run skylite, start with the [quick start](/docs/getting-started/), [Azure Blob Storage](/docs/azure-blob/) and [Running in production](/docs/operations/); every configuration key is in the [configuration reference](/docs/configuration/).
 
-`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on leaders and [opt-in followers](#reading-on-a-follower), and runs autocommit writes and transactions on [write channels](#write-channels) on leaders. With a peer listener configured, a pod forwards what it cannot serve to the pod that can ([Forwarding between pods](#forwarding-between-pods)). It runs no batch or `resolve`. The [Go driver](/docs/go-driver/) sends `query`, `describe`, opens, channel requests, `cancel` and `close`; the [JDBC driver](/docs/jdbc-driver/) uses `query`, `describe` and write channels.
+`skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on leaders and [opt-in followers](#reading-on-a-follower), and runs autocommit writes and transactions on [write channels](#write-channels) on leaders. With a peer listener configured, a pod forwards what it cannot serve to the pod that can ([Forwarding between pods](#forwarding-between-pods)). The leader settles a write whose channel was lost with [`resolve`](#resolve) and answers `GET` status. It runs no batch. The [Go driver](/docs/go-driver/) sends `query`, `describe`, opens, channel requests, `cancel` and `close`; the [JDBC driver](/docs/jdbc-driver/) uses `query`, `describe` and write channels.
 
 ## What it serves
 
@@ -23,7 +23,8 @@ This page is the precise reference for the server's protocol and limits. To set 
 | `POST /v1/databases/{db}/channel/cancel` with `channel` and `seq` | Cancels that request: `done` with `seq`, `txn_state` and the request's receipt. See [Cancel](#cancel) |
 | `POST /v1/databases/{db}/channel/close` with `channel` | Closes the channel: `done` with `last_seq` and the receipt of that request |
 | Channel requests on a database this server does not lead, or stateless reads with neither a local leader nor an enabled local follower | With `peer` set, forwarded once to the pod that serves them ([Forwarding between pods](#forwarding-between-pods)); otherwise `503` `not_serving`, the body unread |
-| `resolve` and `GET` status | After authentication, and authorisation at the `read` role on the name: with `peer` set, a pod that does not lead the database forwards `resolve` to the leader; the leader, or a pod without `peer`, answers `503` `not_serving` without reading the body. Every pod answers `GET` status with `503` `not_serving` |
+| `POST /v1/databases/{db}/resolve` with `channel` and `seq` | On the leader: `done` with `resolution`, `committed`, `not_committed`, `pending` or `unknown`, and `txn`. See [Resolve](#resolve). A pod that does not lead the database forwards it to the leader with `peer` set, and otherwise answers `503` `not_serving` |
+| `GET /v1/databases/{db}`, without a body | On the leader: `done` with `txn`, the leader's head, `epoch`, `sqlite_version` and `limits`, the open answer's. A pod that does not lead the database answers `503` `not_serving`: a `GET` is never forwarded. A `GET` with a body is `400` `invalid_request` |
 | Anything else, or a path with a query string | `400` `invalid_request` |
 
 `{db}` is 1 to 63 characters from `a-z`, `0-9` and `-`, starting with a letter or a digit. A `PUT` needs the `admin` role on the name; a write open and every request on a write channel need the `write` role, checked again on each request because a new token's claims can differ; every other request, a close and a cancel included, needs the `read` role. Every answer is a sequence of NDJSON frames ending in one terminal frame, and a refusal is one error frame, with the headers `Skylite-Protocol: 1`, `Skylite-Request-Id`, `Content-Type: application/x-ndjson` and `Cache-Control: no-store`; a `401` also carries `WWW-Authenticate: Bearer`. The error object and its codes are those of [0005's errors](/docs/decisions/0005-client-protocol/#errors).
@@ -183,6 +184,24 @@ A close needs the `read` role and the channel's principal. A channel with nothin
 
 A channel also ends when it has been idle for 10 minutes (the channel idle limit, checked every second; idle time runs from the end of one request to the arrival of the next, a replay or a refusal included, and never while a request runs or a transaction is open), and when its leader stops or leaves office, which rolls back an open transaction. A request that runs when the leader stops keeps its channel in the table, ended but unsettled, until it has finished. Every request on an ended channel gets `channel_lost`.
 
+### Resolve
+
+A `resolve` settles a write whose channel was lost, by [0005 decision 4](/docs/decisions/0005-client-protocol/#resolving-a-request-after-its-channel-is-lost). It names a channel and a sequence number, needs the `write` role, has a 4 KiB body limit, changes nothing and records nothing. Any pod takes it and forwards it to the leader, which answers with the commit identifier of that token and number:
+
+| The leader finds | Answer |
+|---|---|
+| It has stopped serving the database | `unknown` |
+| The token's open head above its head: it has been deposed without knowing it yet | `503` `behind`; send it again |
+| The open head more than the resolve bound, 100,000 transactions, below its head | `unknown` |
+| A commit above the open head carrying the identifier | `committed`, with that commit as `txn` |
+| Otherwise, an epoch bump above the open head | `not_committed` |
+| Otherwise, the channel live in its table, closing or ended but unsettled included, under any principal | `pending` |
+| Otherwise | `not_committed` |
+
+Every answer but `committed` carries the leader's head as `txn`. A token that names another database, or whose open head is not a number, is `400` `invalid_request`. A write that changed nothing created no commit, so once its channel has ended it is `not_committed`, which is exact: it has no effect.
+
+The leader answers from one observation: it reads its channel table, then the engine's index of commit headers and its head in one step, then checks that it still serves. The engine's index holds the headers above the manifest the leader took office on and of every commit since, and drops those more than 65,536 numbers below the head once a compaction has passed them. When the range from the open head to the head reaches below the index, the resolve reads the missing headers from storage, newest first, at most 16 at a time per database and 64 per server, each once: the leader keeps those it read for later resolves, and a resolve waits for a header another is reading. One resolve per principal and database reads from storage at a time, and one resolve starts at most 4,096 header reads, then answers `unknown`; sent again, it continues from the headers already read. A read runs within the statement time, 30 seconds, on its own, so a client that goes away does not fail it for others. A read that fails is tried again until the request's statement time ends, and the answer is then `unknown`; a header missing or corrupt in storage is `unknown` at once. A header below the head never changes, retired or not, so a header read from storage is as good as one in the index.
+
 ### Maintenance, the tail bound and a stopping leader
 
 While the leader is in maintenance, a query or describe gets `503` `maintenance`, and a running one ends with `maintenance` as its terminal frame. The leader compacts the database's log in the background. When the log still reaches the engine's tail bound, 32,768 commits above the manifest, the engine refuses reads and writes until a compaction clears it: a query then gets `maintenance` with a message that names the bound and asks for a retry, and the server stays ready. If the leader cannot compact, because the new manifest would pass its size limit, the refusal lasts: the message says the leader cannot compact, and the server reports itself not ready for as long as it leads that database. A query running when the leader stops, on shutdown, step-down or fail-stop, is interrupted and ends with `not_serving`. A write interrupted that way gets `channel_lost` (see [Write channels](#write-channels)). At the tail bound, a write refused before acceptance gets `maintenance` without naming the bound: the engine refuses its fresh connection as it does in any maintenance.
@@ -205,7 +224,7 @@ With `peer` set, any pod that lists a database accepts any request for it. A pod
 | `query`, `describe` | A fresh local follower, if `follower_reads` is on; otherwise, or when the follower answers `not_serving` or `behind` before its answer starts, the leader |
 | A channel open, `resolve` | The leader |
 | `channel`, `channel/cancel`, `channel/close` | The pod whose process the token names, which in this version is the leader that opened the channel |
-| `PUT`, `GET` status | Served where it arrives; status is `503` `not_serving` on every pod |
+| `PUT`, `GET` status | Served where it arrives; status is `503` `not_serving` on a pod that does not lead |
 
 A pod that leads the database serves every request itself, except a channel request, cancel or close whose token names another process: it is forwarded as on any other pod, so that a leader deposed without noticing yet, for up to a lease renewal period, sends it to the leader in office rather than answering `channel_lost`.
 
@@ -326,7 +345,8 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 ## Not built yet, and not verified
 
 - Admission control of [0005 decision 9](/docs/decisions/0005-client-protocol/#9-limits-and-defaults): request and per-principal request bounds. The memory budget is fixed at 2 GiB rather than taken from the container's limit, and response frames are not charged to it.
-- `batch`, `describe` on a channel and read-only channels; `resolve`, so a write whose channel was lost stays unknown to its driver; `GET` status.
+- `batch`, `describe` on a channel and read-only channels.
+- The header window of [0005 requirement 11](/docs/decisions/0005-client-protocol/#requirements-on-the-engine-and-the-format) is the engine's index, not filled in the background, and the headers a resolve reads from storage are not charged to the memory budget ([Resolve](#resolve)). `resolve` has no admission capacity of its own yet, and, like a close and a cancel, it is charged to the body share.
 - A follower does not forward a `query` or `describe` it cannot compile, as 0005 asks for a schema change it has not applied yet; it answers the compile error. Forwarded requests are not counted against any admission bound beyond the body share, and the leader record is read from storage for every forwarded request.
 - Forwarding is tested between servers in one process on one local store, over loopback TLS, not between pods or through a mesh.
 - `database_not_found` for a query: a server that does not lead the database and has no enabled follower for it answers `not_serving`, whether or not it exists.
