@@ -91,11 +91,18 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-surefire-plugin</artifactId>
           <version>3.6.1</version>
+          <configuration>
+            <!-- A hang, such as a blocked body read that @Timeout's interrupt cannot end, fails the build. -->
+            <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
+          </configuration>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-failsafe-plugin</artifactId>
           <version>3.6.1</version>
+          <configuration>
+            <forkedProcessTimeoutInSeconds>900</forkedProcessTimeoutInSeconds>
+          </configuration>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
