@@ -7,14 +7,14 @@ status: current
 
 Every durable byte in skylite goes through one interface, the `storage.Store` of package `internal/storage`. Its package documentation is the contract: create-if-absent and compare-and-swap as the only writes, version tokens that never repeat for a key, strongly consistent reads and listings, and a rule for writes whose outcome is unknown. Package `internal/storage/storagetest` is the conformance suite every backend must pass.
 
-Each cloud backend is tested against an emulator (RustFS, fake-gcs-server, Azurite). The Azure backend has also been run once by hand against the real service. The [server](/docs/server/) can be configured to use `localfs`, `s3`, `gcs` or `azure`.
+Each cloud backend is tested against an emulator (RustFS, fake-gcs-server, Azurite). The Azure backend has also been run by hand against the real service. The [server](/docs/server/) can be configured to use `localfs`, `s3`, `gcs` or `azure`.
 
 | Package | Service | Status |
 |---|---|---|
 | `internal/storage/localfs` | a local directory (Linux and macOS) | reference backend |
 | `internal/storage/s3` | Amazon S3 and S3-compatible stores | tested against the RustFS emulator only; one conformance subtest is skipped there (see below) |
 | `internal/storage/gcs` | Google Cloud Storage | tested against the fake-gcs-server emulator only |
-| `internal/storage/azureblob` | Azure Blob Storage | tested against the Azurite emulator; the GORM acceptance suite run once by hand against the real service |
+| `internal/storage/azureblob` | Azure Blob Storage | tested against the Azurite emulator in CI, and by hand against the real service |
 
 ## Amazon S3 and S3-compatible stores
 
@@ -182,6 +182,11 @@ Tested against Azurite 3.37.0 (`mcr.microsoft.com/azure-storage/azurite`, pinned
 
 `make integration` runs them in CI, together with the server's `PUT` test against Azurite (`TestPutOnAzure`, with both a shared-key file and an environment variable). It keeps Azurite's data on the container's disk: Azurite frees the data of deleted blobs only every 10 minutes, and the suite writes more than its in-memory store holds on a CI runner.
 
-Run once by hand against the real Azure Blob Storage service, not in CI: the GORM acceptance suite on `skylite serve` with `entra: true` and an Entra ID service principal (client secret) that holds Storage Blob Data Contributor. All of its tests passed, and the objects were in the container afterwards.
+Run by hand against the real Azure Blob Storage service on 2026-11-23, not in CI, with an Entra ID service principal (client secret) that holds Storage Blob Data Contributor on the account:
 
-Not tested: this backend's own conformance and fault tests against the real service, workload identity, managed identity, account keys of a real account, throttling, HTTP/2 against the service, a proxy between the backend and the service, and the assumption that an ETag never repeats for a key. Azurite derives its ETags from the time in milliseconds multiplied by a random factor, so on the emulator two writes in the same millisecond can, rarely, share one.
+- this backend's integration tests above, the conformance suite and the fault tests included: all passed. With `SKYLITE_TEST_AZURE_ACCOUNT_URL=https://<account>.blob.core.windows.net/` and the service principal in `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET`, `go test -tags integration ./internal/storage/azureblob` creates a container for each test with that credential and a user delegation SAS for it, and deletes it afterwards;
+- the GORM acceptance suite on `skylite serve` with `entra: true`: all of its tests passed, and the objects were in the container afterwards.
+
+One difference from Azurite: the real service deletes a container in the background. For about 3 seconds after the deletion was accepted, requests through the container's SAS still succeeded, or found no blob, although the container's own properties already reported it missing; Azurite refuses them at once. A write acknowledged in that window is lost with the container. `TestMissingContainer` waits for the refusals before it checks them.
+
+Not tested: workload identity, managed identity, account keys of a real account, throttling, HTTP/2 against the service, a proxy between the backend and the service, and the assumption that an ETag never repeats for a key. Azurite derives its ETags from the time in milliseconds multiplied by a random factor, so on the emulator two writes in the same millisecond can, rarely, share one.
