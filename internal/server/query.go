@@ -54,6 +54,10 @@ type pool struct {
 	// principal with one in use.
 	read  time.Time
 	reads map[string]time.Time
+	// Read-only transactions that hold a connection or a place for one, in
+	// all and per principal (holdTxn).
+	txns   int
+	txnsBy map[string]int
 	// The waiting bounds, which tests lower.
 	waiters, waitersBy int
 	maxWait            time.Duration
@@ -65,6 +69,7 @@ type connWaiter struct {
 	leader   *engine.Leader
 	who      string
 	write    bool
+	held     bool // for a read-only transaction: no turnover to record
 	c, evict *pconn
 	ready    chan struct{}
 }
@@ -77,7 +82,7 @@ const (
 
 func newPool(capacity int) *pool {
 	return &pool{
-		capacity: capacity, perPrincipal: max(1, capacity/4), busy: map[string]int{}, waiting: map[string]int{}, reads: map[string]time.Time{},
+		capacity: capacity, perPrincipal: max(1, capacity/4), busy: map[string]int{}, waiting: map[string]int{}, reads: map[string]time.Time{}, txnsBy: map[string]int{},
 		waiters: maxConnWaiters, waitersBy: maxConnWaitersBy, maxWait: maxConnWait,
 	}
 }
@@ -89,7 +94,37 @@ func newPool(capacity int) *pool {
 func (p *pool) take(leader *engine.Leader, who string) (c, evict *pconn, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.takeLocked(leader, who, false)
+	return p.takeLocked(leader, who, true)
+}
+
+// holdTxn reserves a place for a read-only transaction of who, which
+// unholdTxn gives back. A transaction holds its connection for up to its
+// lifetime, and a write granted its lock waits only for connections that
+// stateless requests turn over, so read-only transactions hold at most half
+// the pod's connections, rounded down, and at most all but one of a
+// principal's quota: the rest stay with stateless requests and writes, the
+// principal's own included. Both bounds are at least 1: a pod too small to
+// spare a connection, or a principal whose quota is 1, still gets one
+// read-only transaction, as it gets one write transaction, and what else
+// needs that connection is refused overloaded until the transaction ends.
+func (p *pool) holdTxn(who string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.txns >= max(1, p.capacity/2) || p.txnsBy[who] >= max(1, p.perPrincipal-1) {
+		return false
+	}
+	p.txns++
+	p.txnsBy[who]++
+	return true
+}
+
+func (p *pool) unholdTxn(who string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.txns--
+	if p.txnsBy[who]--; p.txnsBy[who] == 0 {
+		delete(p.txnsBy, who)
+	}
 }
 
 // await is take that, when who or the pool is at its limit, waits for room
@@ -99,13 +134,15 @@ func (p *pool) take(leader *engine.Leader, who string) (c, evict *pconn, ok bool
 // bounds, which the write locks bound to one per database; it waits only
 // if a connection is likely to come (turningLocked), and is otherwise
 // refused at once, since every other writer of its database waits behind it.
-func (p *pool) await(ctx context.Context, leader *engine.Leader, who string, write bool) (c, evict *pconn, ok bool) {
+// held says a read-only transaction is to hold the connection, which then
+// counts as no turnover.
+func (p *pool) await(ctx context.Context, leader *engine.Leader, who string, write, held bool) (c, evict *pconn, ok bool) {
 	p.mu.Lock()
-	if c, evict, ok = p.takeLocked(leader, who, write); ok || !write && (len(p.queue) >= p.waiters || p.waiting[who] >= p.waitersBy) || write && !p.turningLocked(who) {
+	if c, evict, ok = p.takeLocked(leader, who, !write && !held); ok || !write && (len(p.queue) >= p.waiters || p.waiting[who] >= p.waitersBy) || write && !p.turningLocked(who) {
 		p.mu.Unlock()
 		return c, evict, ok
 	}
-	w := &connWaiter{leader: leader, who: who, write: write, ready: make(chan struct{})}
+	w := &connWaiter{leader: leader, who: who, write: write, held: held, ready: make(chan struct{})}
 	i := len(p.queue)
 	if write { // behind the writes already waiting
 		if i = slices.IndexFunc(p.queue, func(x *connWaiter) bool { return !x.write }); i < 0 {
@@ -158,7 +195,7 @@ func (p *pool) unwaitLocked(who string) {
 func (p *pool) grantLocked() {
 	for i := 0; i < len(p.queue); {
 		w := p.queue[i]
-		c, evict, ok := p.takeLocked(w.leader, w.who, w.write)
+		c, evict, ok := p.takeLocked(w.leader, w.who, !w.write && !w.held)
 		if !ok {
 			i++
 			continue
@@ -170,8 +207,10 @@ func (p *pool) grantLocked() {
 	}
 }
 
-func (p *pool) takeLocked(leader *engine.Leader, who string, write bool) (c, evict *pconn, ok bool) {
-	if c, evict, ok = p.roomLocked(leader, who); ok && !write {
+// takeLocked is roomLocked that records the grant as turnover if turns: the
+// grant of a stateless request, which soon frees its connection.
+func (p *pool) takeLocked(leader *engine.Leader, who string, turns bool) (c, evict *pconn, ok bool) {
+	if c, evict, ok = p.roomLocked(leader, who); ok && turns {
 		p.read = time.Now()
 		p.reads[who] = p.read
 	}
@@ -224,8 +263,9 @@ func (p *pool) release(who string, c *pconn, keep bool) {
 
 // conn returns a connection of leader for who, reset for its new holder, or
 // the refusal before acceptance and the engine's error behind it, if any.
-func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, who string) (*pconn, *wire.Error, error) {
-	c, refusal := s.reserve(ctx, leader, who)
+// held is as for the pool's await.
+func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, who string, held bool) (*pconn, *wire.Error, error) {
+	c, refusal := s.reserve(ctx, leader, who, held)
 	if refusal != nil {
 		return nil, refusal, nil
 	}
@@ -256,8 +296,8 @@ func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, w
 // reserve is check 12 of ADR 0005 for a stateless request: it waits for a
 // connection for at most the pool's maxWait within ctx, and is refused
 // overloaded if none comes.
-func (s *Server) reserve(ctx context.Context, leader *engine.Leader, who string) (*pconn, *wire.Error) {
-	c, evict, ok := s.pool.await(ctx, leader, who, false)
+func (s *Server) reserve(ctx context.Context, leader *engine.Leader, who string, held bool) (*pconn, *wire.Error) {
+	c, evict, ok := s.pool.await(ctx, leader, who, false, held)
 	if !ok {
 		return nil, wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later")
 	}
@@ -326,7 +366,7 @@ func (s *Server) statement(ctx context.Context, st *stream, d *database, leader 
 	if leader == nil {
 		return s.followerStatement(ctx, st, follower, req, who, log)
 	}
-	c, e, err := s.conn(ctx, d, leader, who)
+	c, e, err := s.conn(ctx, d, leader, who, false)
 	if e != nil {
 		logInternal(ctx, log, e, err)
 		return nil, e
@@ -420,7 +460,7 @@ func followerUnavailable() *wire.Error {
 func (s *Server) runFollower(ctx context.Context, pin *engine.ReadPin, req *wire.Request, st *stream, who string) (done *wire.Done, e *wire.Error, err error) {
 	// Follower connections use the same slots as leader connections. Each
 	// pin has its own SQLite connection and is discarded on release.
-	if _, e := s.reserve(ctx, nil, who); e != nil {
+	if _, e := s.reserve(ctx, nil, who, false); e != nil {
 		return nil, e, nil
 	}
 	defer s.pool.release(who, nil, false)
@@ -564,6 +604,14 @@ func statementError(ctx context.Context, err error) (*wire.Error, error) {
 	if se, ok := errors.AsType[*sqlite3.Error](err); ok {
 		e := wire.NewError(wire.CodeSQLError, se.Error())
 		e.SQLiteCode, e.SQLiteExtendedCode = int64(se.Code()), int64(se.ExtendedCode())
+		return e, nil
+	}
+	// ncruces reports an error by its code alone when SQLite's message is
+	// the generic one, as for SQLITE_READONLY under PRAGMA query_only. Any
+	// other bare code, SQLITE_CORRUPT or SQLITE_IOERR among them, is internal.
+	if xc, ok := errors.AsType[sqlite3.ExtendedErrorCode](err); ok && errors.Is(xc, sqlite3.READONLY) {
+		e := wire.NewError(wire.CodeSQLError, xc.Error())
+		e.SQLiteCode, e.SQLiteExtendedCode = int64(xc.Code()), int64(xc)
 		return e, nil
 	}
 	// The response could not be written, or the engine failed: nobody may
