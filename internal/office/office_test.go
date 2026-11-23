@@ -1250,6 +1250,62 @@ func TestStandbyHandsSeenToLead(t *testing.T) {
 	}
 }
 
+// slowManifest hangs the manifest's Head as hangStore hangs its reads, and
+// fails a read whose context has ended, as a remote store does and a local
+// one need not.
+type slowManifest struct{ *hangStore }
+
+func (s slowManifest) Head(ctx context.Context, key string) (storage.Info, error) {
+	if s.hang.Load() && key == s.keys.Manifest() {
+		<-ctx.Done()
+		return storage.Info{}, ctx.Err()
+	}
+	return s.hangStore.Head(ctx, key)
+}
+
+func (s slowManifest) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, storage.Info{}, err
+	}
+	return s.hangStore.Get(ctx, key)
+}
+
+// TestStandbyManifestReadKeepsLeaseBudget: a standby whose manifest reads
+// hang still reads the lease, each read under its full timeout, and runs
+// no candidacy against a live lease.
+func TestStandbyManifestReadKeepsLeaseBudget(t *testing.T) {
+	rec, keys := newDatabase(t, t.TempDir())
+	a, _ := start(t, office.Config{Store: rec, Keys: keys, Holder: holder(t, "a"), TTL: 30 * time.Second, Renew: 100 * time.Millisecond})
+	waitFor(t, a, 5*time.Second, "leading", leading)
+	other := &recStore{Store: rec.Store, keys: keys}
+	var leaseReads atomic.Int32
+	other.setGot(func(key string) {
+		if key == keys.Lease() {
+			leaseReads.Add(1)
+		}
+	})
+	st := &hangStore{recStore: other}
+	b, _ := start(t, office.Config{Store: slowManifest{st}, Keys: keys, Holder: holder(t, "b"), TTL: 30 * time.Second, Renew: 100 * time.Millisecond})
+	deadline := time.Now().Add(10 * time.Second)
+	for leaseReads.Load() < 2 { // a candidacy, then standing by
+		if time.Now().After(deadline) {
+			t.Fatalf("b never stood by: %d lease reads, state %+v", leaseReads.Load(), b.State())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	st.hang.Store(true) // a candidacy now hangs on its manifest read
+	leaseReads.Store(0)
+	for leaseReads.Load() < 5 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d lease reads while the manifest reads hang", leaseReads.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s := b.State(); s.Leader != nil {
+		t.Fatalf("b took office from a live lease: %+v", s.Office)
+	}
+}
+
 func readAll(st storage.Store, key string) ([]byte, error) {
 	rc, _, err := st.Get(context.Background(), key)
 	if err != nil {

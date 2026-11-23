@@ -209,10 +209,10 @@ func (l *Loop) setFollower(f *engine.Follower) {
 // starts from there again once a leader is in office. A standby never
 // takes over a live lease: it reads the lease at most
 // min(renewal period, 5 s) apart and under a timeout of one renewal period,
-// with the manifest's token, and its body when the token changed, for
-// the grace period of retirement (engine.Config.Seen),
 // and runs a candidacy once the lease reads as released or expired, or
-// cannot be read.
+// cannot be read. After each read that finds the lease live it reads the
+// manifest's token, and its body when the token changed, under a timeout of
+// its own, for the grace period of retirement (engine.Config.Seen).
 //
 // A node in office starts its leader with engine.Lead, which walks the log
 // tail and can take longer than a time to live, and keeps renewing while it
@@ -363,7 +363,6 @@ func (l *Loop) standby(ctx context.Context, expires time.Time) bool {
 			return true
 		}
 		rctx, cancel := context.WithTimeout(ctx, l.cfg.Renew)
-		l.observe(rctx)
 		b, err := l.read(rctx, l.cfg.Keys.Lease(), format.MaxLeaseSize+1)
 		cancel()
 		if err != nil {
@@ -377,6 +376,11 @@ func (l *Loop) standby(ctx context.Context, expires time.Time) bool {
 			return true
 		}
 		expires = renewed.Add(l.cfg.TTL)
+		// After the lease read and under a bound of its own, so that a slow
+		// manifest read never takes the lease read's budget.
+		octx, cancel := context.WithTimeout(ctx, l.cfg.Renew)
+		l.observe(octx)
+		cancel()
 	}
 }
 
@@ -403,7 +407,7 @@ func (l *Loop) observe(ctx context.Context) {
 	if n := len(l.seen); n > 0 && l.seen[n-1].Txn >= m.Txn {
 		return // an epoch swap, or a read that overtook a later one
 	}
-	l.seen = append(l.seen, engine.Seen{Txn: m.Txn, At: time.Now()})
+	l.seen = append(l.seen, engine.Seen{DB: m.DB, Txn: m.Txn, At: time.Now()})
 	if len(l.seen) > maxSeen {
 		l.seen = slices.Delete(l.seen, 1, 2)
 	}

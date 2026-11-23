@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/RandomCodeSpace/skylite/internal/format"
 )
 
 // TestRetirementKeepsUpWithWrites: under a sustained write rate, with each
@@ -109,22 +111,32 @@ func TestRetirementInFlight(t *testing.T) {
 // TestGraceAcrossLeaderChange: a leader retires what a manifest covers once
 // its node has known that manifest for the grace period, however recently
 // it took office; a manifest it read too recently, or one it never read,
-// starts no retirement.
+// starts no retirement, nor does a reading of another database or one with
+// no time or a time to come, which delays nothing.
 func TestGraceAcrossLeaderChange(t *testing.T) {
 	cases := map[string]struct {
-		seen func(txn uint64) []Seen
+		seen func(db format.DatabaseID, txn uint64) []Seen
 		want func(txn uint64) uint64
 	}{
-		"read an hour ago": {func(txn uint64) []Seen {
-			return []Seen{{1, time.Now().Add(-3 * time.Hour)}, {txn, time.Now().Add(-2 * time.Hour)}}
+		"read an hour ago": {func(db format.DatabaseID, txn uint64) []Seen {
+			return []Seen{{db, 1, time.Now().Add(-3 * time.Hour)}, {db, txn, time.Now().Add(-2 * time.Hour)}}
 		}, func(txn uint64) uint64 { return txn }},
-		"read a minute ago":  {func(txn uint64) []Seen { return []Seen{{txn, time.Now().Add(-time.Minute)}} }, func(uint64) uint64 { return 0 }},
-		"older one only":     {func(txn uint64) []Seen { return []Seen{{txn / 2, time.Now().Add(-2 * time.Hour)}, {txn, time.Now()}} }, func(txn uint64) uint64 { return txn / 2 }},
-		"never read":         {func(uint64) []Seen { return nil }, func(uint64) uint64 { return 0 }},
-		"above the manifest": {func(txn uint64) []Seen { return []Seen{{txn + 5, time.Now().Add(-2 * time.Hour)}} }, func(uint64) uint64 { return 0 }},
-		"out of order ignored": {func(txn uint64) []Seen {
-			return []Seen{{txn, time.Now().Add(-time.Minute)}, {txn - 1, time.Now().Add(-2 * time.Hour)}}
+		"read a minute ago": {func(db format.DatabaseID, txn uint64) []Seen { return []Seen{{db, txn, time.Now().Add(-time.Minute)}} }, func(uint64) uint64 { return 0 }},
+		"older one only": {func(db format.DatabaseID, txn uint64) []Seen {
+			return []Seen{{db, txn / 2, time.Now().Add(-2 * time.Hour)}, {db, txn, time.Now()}}
+		}, func(txn uint64) uint64 { return txn / 2 }},
+		"never read": {func(format.DatabaseID, uint64) []Seen { return nil }, func(uint64) uint64 { return 0 }},
+		"above the manifest": {func(db format.DatabaseID, txn uint64) []Seen {
+			return []Seen{{db, txn + 5, time.Now().Add(-2 * time.Hour)}}
 		}, func(uint64) uint64 { return 0 }},
+		"out of order ignored": {func(db format.DatabaseID, txn uint64) []Seen {
+			return []Seen{{db, txn, time.Now().Add(-time.Minute)}, {db, txn - 1, time.Now().Add(-2 * time.Hour)}}
+		}, func(uint64) uint64 { return 0 }},
+		"another database": {func(_ format.DatabaseID, txn uint64) []Seen {
+			return []Seen{{format.DatabaseID{1}, txn, time.Now().Add(-2 * time.Hour)}}
+		}, func(uint64) uint64 { return 0 }},
+		"no time":      {func(db format.DatabaseID, txn uint64) []Seen { return []Seen{{db, txn, time.Time{}}} }, func(uint64) uint64 { return 0 }},
+		"time to come": {func(db format.DatabaseID, txn uint64) []Seen { return []Seen{{db, txn, time.Now().Add(time.Hour)}} }, func(uint64) uint64 { return 0 }},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -144,12 +156,18 @@ func TestGraceAcrossLeaderChange(t *testing.T) {
 			m := checkLeaderManifest(t, st.Store, keys, o.DB)
 			_ = c.Close()
 			_ = a.Close()
-			cfg.Seen = tc.seen(m.Txn)
+			cfg.Seen = tc.seen(o.DB, m.Txn)
 			b := lead(t, st, keys, takeOffice(t, st.Store, keys), cfg)
 			b.cmpMu.Lock()
 			b.retireLocked()
 			got := b.retiredThrough
+			// A grace period after the takeover, its own read of the manifest
+			// covers it all, whatever the node read before.
+			later := b.retireLimit(time.Now().Add(cfg.Grace + time.Minute))
 			b.cmpMu.Unlock()
+			if later != m.Txn {
+				t.Fatalf("retire limit %d a grace period on, want %d", later, m.Txn)
+			}
 			if want := tc.want(m.Txn); got != want {
 				t.Fatalf("retired through %d, want %d, under a manifest at %d", got, want, m.Txn)
 			}
