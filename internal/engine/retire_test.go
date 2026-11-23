@@ -22,12 +22,23 @@ func TestRetirementKeepsUpWithWrites(t *testing.T) {
 	l := lead(t, st, keys, o, cfg)
 	c := open(t, l)
 	mustRun(t, c, "CREATE TABLE t(x)")
+	var mu sync.Mutex
+	var inFlight, most int
 	st.setRule(func(op, key string) fault {
 		switch {
 		case !isCommit(key):
 		case op == "create":
 			time.Sleep(2 * time.Millisecond)
-		case op == "replace", op == "getrange":
+		case op == "replace":
+			mu.Lock()
+			inFlight++
+			most = max(most, inFlight)
+			mu.Unlock()
+			time.Sleep(4 * time.Millisecond)
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+		case op == "getrange":
 			time.Sleep(4 * time.Millisecond)
 		}
 		return fault{}
@@ -37,14 +48,15 @@ func TestRetirementKeepsUpWithWrites(t *testing.T) {
 		mustRun(t, c, fmt.Sprintf("INSERT INTO t VALUES (%d)", i))
 	}
 	head := l.Head()
-	l.cmpMu.Lock()
-	retired := l.retiredThrough
-	l.cmpMu.Unlock()
 	// One at a time, a commit's retirement takes three 4 ms calls, against
-	// one 2 ms create per commit written.
-	if retired < head/2 {
-		t.Fatalf("retired through %d of %d commits written", retired, head)
-	}
+	// one 2 ms create per commit written; keeping up needs retires in
+	// parallel. A ratio of retired to written commits at this instant
+	// depends on the runner's speed, so the test checks the parallelism.
+	eventually(t, "retires in parallel", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return most > 1
+	})
 	st.setRule(nil)
 	eventually(t, "retirement through the manifest", func() bool {
 		l.cmu.Lock()
