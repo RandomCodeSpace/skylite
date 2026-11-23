@@ -66,10 +66,11 @@ type chLimits struct {
 	waiters, waitersBy            int
 	held, replay                  int64
 	sweep                         time.Duration
+	resolveReads                  int // header reads one resolve may start (resolve.go)
 }
 
 func defaultChLimits() chLimits {
-	return chLimits{maxChannels, maxChannelsDB, maxChannelsPrincipal, maxWaiters, maxWaitersBy, heldShare, replayShare, sweepInterval}
+	return chLimits{maxChannels, maxChannelsDB, maxChannelsPrincipal, maxWaiters, maxWaitersBy, heldShare, replayShare, sweepInterval, headerReadsResolve}
 }
 
 // table holds the write channels of one leader, the database's leader on
@@ -84,6 +85,9 @@ type table struct {
 	lock   writeLock
 	hdrs   map[uint64]*header // commit headers below the engine's index floor, read for resolves
 	hdrSem chan struct{}      // header reads in flight for resolves
+	// reading holds, per principal, the channel its one resolve that reads
+	// headers from storage closes when it is done.
+	reading map[string]chan struct{}
 }
 
 // channel is one write channel.
@@ -169,7 +173,7 @@ func (s *Server) table(d *database, leader *engine.Leader) *table {
 		}
 		s.endTable(t)
 	}
-	d.chans = &table{leader: leader, office: st.Office, chans: map[string]*channel{}, by: map[string]int{}, lock: writeLock{by: map[string]int{}}, hdrs: map[uint64]*header{}, hdrSem: make(chan struct{}, headerReadsDB)}
+	d.chans = &table{leader: leader, office: st.Office, chans: map[string]*channel{}, by: map[string]int{}, lock: writeLock{by: map[string]int{}}, hdrs: map[uint64]*header{}, hdrSem: make(chan struct{}, headerReadsDB), reading: map[string]chan struct{}{}}
 	return d.chans
 }
 
@@ -227,8 +231,13 @@ func (s *Server) sweep(ctx context.Context) {
 		}
 		idle := time.Duration(s.limits.ChannelIdleMS) * time.Millisecond
 		for _, d := range s.dbs {
-			cur := d.leader()
+			if s.sweepGap != nil {
+				s.sweepGap()
+			}
 			s.chMu.Lock()
+			// The leader is read with s.chMu held: a table that table
+			// created for a leader taking office since is never ended here.
+			cur := d.leader()
 			if t := d.chans; t != nil && t.leader != cur {
 				s.endTable(t)
 				d.chans = nil
@@ -848,14 +857,24 @@ func (s *Server) closeChannel(d *database, leader *engine.Leader, req *wire.Requ
 }
 
 // writeConn reserves a SQLite connection for who and opens a fresh one on
-// t's leader, for a write that holds t's write lock (ADR 0005 decision 9).
-// A write that gets none returns its receipt, a recorded overloaded when
-// the pod's or who's connections are all in use, or the unrecorded error
-// that ends the channel.
+// t's leader, for a write that holds t's write lock (ADR 0005 decision 9),
+// waiting for it ahead of the stateless requests for at most the pool's
+// maxWait, and only while stateless requests are turning those connections
+// over: the lock is held throughout, so a wait for a connection that is not
+// coming would stall every writer of the database. A write that gets none
+// returns its receipt, a recorded overloaded when the pod's or who's
+// connections stayed in use, or the unrecorded error that ends the channel.
 func (s *Server) writeConn(ctx context.Context, d *database, t *table, who string, limit time.Duration, log *slog.Logger) (*pconn, *wire.Receipt, *wire.Error) {
-	_, evict, ok := s.pool.take(nil, who)
+	_, evict, ok := s.pool.await(ctx, nil, who, true)
 	if !ok {
-		return nil, &wire.Receipt{Error: wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later").Recorded(false)}, nil
+		e := wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later")
+		switch {
+		case cancelled(ctx):
+			e = wire.NewError(wire.CodeCancelled, "cancelled before it ran")
+		case ctx.Err() != nil:
+			e = s.timeout(ctx, limit)
+		}
+		return nil, &wire.Receipt{Error: e.Recorded(false)}, nil
 	}
 	if evict != nil {
 		_ = evict.ec.Close()

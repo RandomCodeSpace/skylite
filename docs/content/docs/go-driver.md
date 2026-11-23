@@ -1,15 +1,24 @@
 ---
 title: Go driver
-description: The Go database/sql driver, which reads through the stateless query endpoint and writes and runs transactions on write channels, how to configure it, how it reports outcomes it cannot learn, and what it does not do yet.
-weight: 20
+description: Connect a Go application to skylite with database/sql or GORM. Install, connection settings, tokens, transactions, and errors and retries.
+weight: 40
+navgroup: guides
 status: current
 ---
 
-Package `github.com/RandomCodeSpace/skylite/driver`, whose package name is `skylite`, is a Go `database/sql` driver that speaks the protocol of [0005: Client protocol](/docs/decisions/0005-client-protocol/) over HTTPS. Queries outside a transaction go to the stateless `query` endpoint; writes and transactions go on a [write channel](/docs/server/#write-channels) that each connection opens on first use.
+The Go driver is the package `github.com/RandomCodeSpace/skylite/driver` (package name `skylite`), a `database/sql` driver that talks to the server over HTTPS. It is tested against an in-process fake server and, through a GORM acceptance suite, against a real `skylite serve` on every pull request.
 
-The driver's unit tests run against an in-process fake server built from the protocol's codec. An acceptance test, the module `driver/acceptance`, runs GORM through its sqlite dialector on this driver against `skylite serve` built from the same tree; CI runs it on every pull request.
+## Install
 
-## Usage
+The driver is part of the main module and needs Go 1.26 or later:
+
+```sh
+go get github.com/RandomCodeSpace/skylite@v0.0.2
+```
+
+## Connect
+
+A DSN cannot carry a token source, so open the database with a connector:
 
 ```go
 import (
@@ -24,9 +33,9 @@ import (
 func open() (*sql.DB, error) {
 	c, err := skylite.NewConnector(skylite.Config{
 		Endpoint: "https://skylite.example.internal",
-		Database: "library",
+		Database: "orders",
 		Token: skylite.TokenFunc(func(ctx context.Context) (string, error) {
-			// A projected service account token, read again on every request.
+			// A projected service account token, read again for every request.
 			b, err := os.ReadFile("/var/run/secrets/tokens/skylite")
 			return strings.TrimSpace(string(b)), err
 		}),
@@ -38,25 +47,78 @@ func open() (*sql.DB, error) {
 }
 ```
 
-`db.Close()` closes the connector, which waits for the background cancels and closes of abandoned channels still running, up to 5 seconds when the token source honours its context, so that the server rolls back what those channels hold at once, and closes the idle connections of the driver's own HTTP client. It never closes those of a client passed as `HTTPClient`. An abandon that starts while `Close` waits sends nothing; the server rolls that channel back at its idle limit. A token source must not call `db.Close()`: a `Close` from inside a background abandon never returns.
+`Endpoint` must be `https://` unless you set `AllowPlaintext: true`, which is meant for a local trial or a server behind a mesh that encrypts traffic. For a private CA, pass its roots in `TLSConfig`. All fields are listed under [Configuration](#configuration).
 
-`db.QueryContext(ctx, "SELECT id, title FROM books WHERE id > ?", 10)`, `db.ExecContext` and `db.BeginTx` then work as with any driver.
+`sql.Open("skylite", dsn)` is registered but fails on first use with `skylite.ErrNoDSN`.
 
-### GORM
+## Tokens
+
+The driver calls `Token` before every HTTP request and sends the result as a bearer token. Read the token fresh each time, as above, so that a rotated token (such as a Kubernetes projected service account token) is picked up without a restart. The token must come from an issuer in the server's [`auth` configuration](/docs/configuration/#auth), and a rule there must grant the role your application needs: `read` for queries, `write` for writes and transactions.
+
+The driver never logs, and its errors never contain the token or the request URL.
+
+## GORM
 
 GORM's sqlite dialector accepts an existing `*sql.DB`, so GORM runs on this driver unchanged:
 
 ```go
+import (
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
+
 db, err := gorm.Open(sqlite.Dialector{Conn: sqlDB}, &gorm.Config{})
 ```
 
-The acceptance test runs `gorm.io/gorm` v1.31.2 with `gorm.io/driver/sqlite` v1.6.0, built without cgo, so the dialector's own SQLite driver is never used. It covers `AutoMigrate`, create, read, update, soft and hard delete, associations (has one, has many, belongs to, many to many, preloading and joins), `Transaction` commit and rollback, a nested `Transaction` rolled back to its savepoint, `Begin` and `Rollback`, `CreateInBatches` and errors: a unique violation, a missing record, a missing table, a statement the SQL policy forbids.
+The acceptance suite runs `gorm.io/gorm` v1.31.2 with `gorm.io/driver/sqlite` v1.6.0, built without cgo, so the dialector's own SQLite driver is never used. It covers `AutoMigrate`, create, read, update, soft and hard delete, associations (has one, has many, belongs to, many to many, preloading and joins), `Transaction` commit and rollback, nested transactions with savepoints, `Begin` and `Rollback`, `CreateInBatches`, and errors.
 
-GORM's error translation does not know skylite's errors: with `TranslateError` on, a unique violation stays a `*skylite.Error` (code `sql_error`, SQLite code 19) rather than `gorm.ErrDuplicatedKey`, and an unknown outcome passes through untranslated.
+Two things to know:
 
-**A cancelled `Create` can lose `ErrOutcomeUnknown` in GORM.** GORM runs `Create` in a transaction of its own unless `SkipDefaultTransaction` is set. When the context ends after the `INSERT` was sent, the driver returns an error matching `skylite.ErrOutcomeUnknown` and `context.Canceled`, and `database/sql` rolls the transaction back because the context ended. If that rollback runs before GORM's cleanup, GORM's own `Rollback` gets `sql.ErrTxDone` from `database/sql`, and GORM v1.31.2 joins the two errors with `fmt.Errorf("%v; %w")`: the unknown outcome survives only in the error's text, and `errors.Is` matches `sql.ErrTxDone` alone. The driver cannot prevent it, because `database/sql` returns `sql.ErrTxDone` without calling the driver. The acceptance test `TestCancelledCreate` forces that ordering and checks this behaviour, so a GORM upgrade that changes it fails the test. To keep `errors.Is(err, skylite.ErrOutcomeUnknown)` on a cancelled create, set `SkipDefaultTransaction: true`, which makes a single-row `Create` one autocommit write; the same test checks that it then matches both `skylite.ErrOutcomeUnknown` and `context.Canceled`.
+- GORM's error translation does not know skylite's errors. With `TranslateError` on, a unique violation stays a `*skylite.Error` (code `sql_error`, SQLite code 19) rather than `gorm.ErrDuplicatedKey`.
+- GORM wraps each `Create` in a transaction of its own unless `SkipDefaultTransaction` is set. If the context is cancelled after the insert was sent, GORM can turn the driver's unknown-outcome error into one that `errors.Is` matches only as `sql.ErrTxDone`. Set `SkipDefaultTransaction: true` to keep `errors.Is(err, skylite.ErrOutcomeUnknown)` working; a single-row `Create` is then one autocommit write. The acceptance test `TestCancelledCreate` checks both behaviours, so a GORM upgrade that changes them fails the test.
 
-## Configuration
+## Queries, writes and transactions
+
+Use `database/sql` as with any driver:
+
+- `QueryContext` and `QueryRowContext` outside a transaction are stateless reads, which any server in a deployment can answer.
+- `ExecContext` outside a transaction is an autocommit write of one statement, run on the leader.
+- `BeginTx` starts a transaction on the leader. Every statement in it, reads included, runs on the leader and holds the database's write lock until `Commit` or `Rollback`, so other writers wait. Keep transactions short: the server aborts one that is idle for 30 seconds or older than 5 minutes.
+- Read-only transactions (`sql.TxOptions{ReadOnly: true}`) are refused with `skylite.ErrReadOnlyUnsupported`. Run reads outside a transaction instead.
+- Parameters are positional (`?`) or named (`sql.Named("t", v)` for `:t`, `@t` or `$t`), not both in one statement.
+
+Each `sql.DB` remembers the newest transaction it has seen and sends it with later requests, so a read after your own write sees that write, even when a different server answers it.
+
+## Errors and retries
+
+An error the server answered is a `*skylite.Error`:
+
+```go
+var e *skylite.Error
+switch {
+case errors.Is(err, skylite.ErrOutcomeUnknown):
+	// The write may or may not have committed. Check before repeating it.
+case errors.As(err, &e) && e.NotExecuted &&
+	(e.Code == skylite.CodeOverloaded || e.Code == skylite.CodeBusy ||
+		e.Code == skylite.CodeNotServing || e.Code == skylite.CodeNoLeader):
+	// Nothing ran. Retry with backoff.
+case errors.As(err, &e) && e.Retryable():
+	// Maintenance aborted the transaction. Run it again from the start.
+}
+```
+
+- **What the driver retries itself.** On a write channel, a request that got no settled answer (a lost response, or a refusal such as `overloaded` before the server accepted it) is sent again with the same sequence number, for up to 60 seconds; the server runs it at most once. A `begin` or autocommit write refused with `behind` is moved to a new channel when the server proves it never ran. Nothing else is retried.
+- **What you retry.** Stateless reads refused with `overloaded`, `not_serving`, `no_leader` or `behind` are returned to you; so are writes that end with `busy`, and channel opens refused with `no_leader` or `too_many_channels`. They had no effect (`NotExecuted` is true): retry with backoff.
+- **Unknown outcomes.** An error matching `skylite.ErrOutcomeUnknown` means a write or commit was sent and its result could not be learnt, for example because the leader stopped. It is never reported as success or as `driver.ErrBadConn`, so `database/sql` never resends it. Inside a transaction, every later statement and the `Commit` then fail with `skylite.ErrTransactionLost`, and the transaction never commits.
+- **`database/sql` and `driver.ErrBadConn`.** The driver returns `driver.ErrBadConn` only before anything was sent, so `database/sql`'s own retry never runs a request twice.
+
+[Running in production](/docs/operations/#errors-to-handle) lists every error code and what to do about it.
+
+## Reference
+
+The rest of this page is the driver's exact behaviour.
+
+### Configuration
 
 | Field | Meaning |
 |---|---|
@@ -73,7 +135,7 @@ No secret goes in the configuration's strings. The driver never logs, and its er
 
 The driver is registered for `sql.Open` as `"skylite"`, but a DSN cannot carry a token source, so `sql.Open("skylite", dsn)` fails on first use with `skylite.ErrNoDSN`. Use `skylite.NewConnector` and `sql.OpenDB`, as above.
 
-## What works
+### What works
 
 - **Queries.** `QueryContext` and `QueryRowContext` outside a transaction send the statement to the stateless `query` endpoint. Rows are decoded as their frames arrive, never buffered whole. `Rows.Close` before the end releases the response, and a cancelled context aborts the request. A statement the server answers with `needs_channel`, because it is not a pure read, such as an `INSERT ... RETURNING`, is sent on the write channel instead; the server executed nothing the first time.
 - **Writes.** `ExecContext` runs the statement on the connection's write channel: outside a transaction, an autocommit write of one statement. `RowsAffected` and `LastInsertId` are the server's `rows_affected` and `last_insert_rowid`. An `ExecContext` of a read also goes on the channel, and takes the database's write lock there.
@@ -84,7 +146,7 @@ The driver is registered for `sql.Open` as `"skylite"`, but a DSN cannot carry a
 - **Parameters.** Positional (`?`) or named (`sql.Named("t", v)` for `:t`, `@t` or `$t`), not both in one statement.
 - **Read-your-writes.** Each `sql.DB` keeps the highest transaction number its answers have reported and sends it as `min_txn` with every stateless request, every `begin` and every autocommit `execute`.
 
-## Write channels
+### Write channels
 
 Each connection holds at most one write channel. It opens it with its first write, `begin`, or query that the server sends on, and closes it in `Close`, which waits up to 5 seconds for the close's answer. An open answer must carry a write channel: its identifier, mode, epoch and limits; otherwise the request fails before anything is sent on it. A channel that has had no answer for more than 60 seconds, or whose next sequence number would pass 2^62, is replaced before its next use outside a transaction, as [0005's reopening rule](/docs/decisions/0005-client-protocol/#resolving-a-request-after-its-channel-is-lost) and its sequence bound ask; the old channel is closed in the background, so its close never holds up the request. The server ends a channel idle for 10 minutes.
 
@@ -104,7 +166,7 @@ An unknown outcome is never reported as a success and never as `driver.ErrBadCon
 
 **A lost transaction.** After an unknown outcome inside a transaction, every later statement of it and its `Commit` fail at once with an error matching `skylite.ErrTransactionLost`, and nothing is sent; the transaction never commits, because its `commit` is never sent and the server rolls it back when the channel closes or the transaction's idle limit, 30 seconds, passes. Its `Rollback` returns nil, as does a `Rollback` whose own outcome is unknown, for the same reason. A `Commit` whose outcome is unknown matches `skylite.ErrOutcomeUnknown`: it may have committed.
 
-## Values
+### Values
 
 | Go value bound | Sent as | Read back as |
 |---|---|---|
@@ -118,7 +180,7 @@ An unknown outcome is never reported as a success and never as `driver.ErrBadCon
 
 A column's type name is its declared type as SQLite reads it: without the arguments in parentheses, which SQLite ignores, trimmed, in upper case. So `datetime(6)` is `DATETIME` and reads as a date column, while `DATETIMEX` does not. `Rows.ColumnTypes` reports that same name as `DatabaseTypeName`. The protocol carries no nullability or scan type, so those are not reported.
 
-## Errors
+### Errors
 
 An error the server answered is a `*skylite.Error`, read with `errors.As`. It carries the protocol's `Code` (constants `skylite.CodeBusy` and so on), the `NotExecuted` and `Final` flags, the message, the request ID, the `Cause` and, when SQLite produced the error, its codes. `Retryable()` is true for a `transaction_aborted` with cause `maintenance`: maintenance ended the transaction, nothing of it committed, and it can be run again from its start.
 
@@ -130,7 +192,7 @@ An error the server answered is a `*skylite.Error`, read with `errors.As`. It ca
 | A body that ends early | An error wrapping `io.ErrUnexpectedEOF`, never a short result. |
 | A frame above the driver's bound | An error. The driver reads a frame of at most 64 MiB plus its newline, the default result limit, and a terminal frame of at most 4 KiB. A server configured with a larger result limit can send a row the driver refuses. |
 
-## Not yet
+### Not yet
 
 - `resolve`. The server does not serve it, so a write or commit whose channel was lost stays unknown. The driver does not settle a request it gave up on through the `close` answer either: it reports it unknown. Only a `behind` refusal is settled through a close.
 - Batches, read-only transactions and describe inside a transaction: the server does not serve them on a channel yet.

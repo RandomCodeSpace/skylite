@@ -1,9 +1,9 @@
 {{- $cur := .cur -}}
 <ul>
-  {{- range .section.Pages.ByWeight }}
+  {{- range .pages }}
   <li>
     <a href="{{ .RelPermalink }}"{{ if eq . $cur }} aria-current="page"{{ end }}>{{ or .LinkTitle .Title }}</a>
-    {{- if and .IsSection .Pages }}{{ partial "docnav-tree.html" (dict "section" . "cur" $cur) }}{{ end }}
+    {{- if and .IsSection .Pages }}{{ partial "docnav-tree.html" (dict "pages" .Pages.ByWeight "cur" $cur) }}{{ end }}
   </li>
   {{- end }}
 </ul>

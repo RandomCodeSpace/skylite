@@ -5,101 +5,83 @@
 
 A SQL database server where object storage is the source of truth.
 
-skylite is a beta Go project: a SQL server on SQLite for Kubernetes pods with
-no persistent volumes. All durable state lives in object storage (Azure Blob,
-AWS S3, Google Cloud Storage or the local filesystem), and clients talk to it
-over HTTPS.
+skylite runs SQLite behind an HTTPS API and keeps all durable state in object
+storage: Azure Blob Storage (the primary backend), Amazon S3, Google Cloud
+Storage, or a local directory for trials. A server needs no persistent volume.
+Applications connect with a Go `database/sql` driver (works with GORM) or a
+JDBC driver with a Hibernate dialect (works with Spring Data JPA), and
+authenticate with OIDC JWT bearer tokens.
 
-## Status: beta
+Documentation: https://randomcodespace.github.io/skylite/
 
-`skylite serve` authenticates requests with OIDC JWT bearer tokens, creates
-databases in object storage, leads the databases it is configured for with a
-lease and fencing by conditional writes, compacts their commit logs, answers
-stateless reads on leaders and opt-in followers, and runs autocommit writes and
-transactions on write channels. With a peer listener, a pod forwards a request
-it cannot serve one hop, over mutual TLS, to the pod that serves it. The Go
-driver passes a GORM acceptance test, and the JDBC driver and Hibernate dialect
-pass a Spring Data JPA acceptance suite, both against the real server.
+## Is it for you
 
-Not yet verified: the real Azure, S3 and Google Cloud Storage services (the
-cloud backends are tested against emulators only), a real Kubernetes cluster,
-a real Entra ID tenant as token issuer, driver failover across several pods,
-and a 24-hour soak. Batch requests, read-only channels, resolve, admission
-control and a container image are still planned; see the roadmap below.
+skylite fits services that want a small relational database without running a
+stateful database tier, and that accept:
 
-## Why
+- **Writes wait for object storage.** A commit is acknowledged only after it is
+  uploaded. Measured once against a real Azure account: one writer about 53
+  commits/s with a median of 17 ms; 4 to 64 writers about 63 to 67 commits/s in
+  total. These are observations of one setup, not guarantees.
+- **One writer per database.** Each database has one leader; other servers
+  answer reads and take over when it stops.
+- **SQLite's SQL dialect.**
 
-Running a SQL database in Kubernetes usually means persistent volumes, and
-persistent volumes tie a pod to a disk. skylite aims to remove that coupling by
-making object storage the only durable store, so a pod can be replaced or
-rescheduled without moving a disk.
+## Status: beta (v0.0.2)
 
-## Quickstart
+Tested on every pull request: the server (reads, writes, transactions, leader
+election and failover, follower reads, forwarding between servers), the Go
+driver through a GORM acceptance suite, and the JDBC driver and Hibernate
+dialect through a Spring Data JPA acceptance suite, against a real server. The
+storage backends are tested against emulators (Azurite, RustFS,
+fake-gcs-server); the Azure backend has also been run by hand against a real
+storage account.
 
-Install with Go:
+Not verified yet: Amazon S3 and Google Cloud Storage themselves, a Kubernetes
+cluster, a service mesh or ingress, a real Entra ID tenant as token issuer,
+driver failover across several pods, and a 24-hour soak.
+
+Not available: a container image, a Helm chart, and published Maven artifacts
+(build the Java driver with `mvn install`). See the
+[roadmap](https://randomcodespace.github.io/skylite/docs/roadmap/).
+
+## Quick start
+
+Download a release for Linux or macOS, verify it and run it:
 
 ```sh
-go install github.com/RandomCodeSpace/skylite/cmd/skylite@latest
-skylite version
+VERSION=0.0.2
+gh release download "v$VERSION" -R RandomCodeSpace/skylite \
+  -p "skylite_${VERSION}_linux_amd64.tar.gz" -p 'SHA256SUMS*'
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf "skylite_${VERSION}_linux_amd64.tar.gz"
+./skylite version
 ```
 
-Or build from source:
+Or install with Go 1.26 or later:
 
 ```sh
-git clone https://github.com/RandomCodeSpace/skylite.git
-cd skylite
-make build
-./bin/skylite version
+go install github.com/RandomCodeSpace/skylite/cmd/skylite@v0.0.2
 ```
 
-`skylite help` lists the available commands.
+The [quick start](https://randomcodespace.github.io/skylite/docs/getting-started/)
+checks the release signature, runs a server on a local directory and connects
+to it from Go and from Java.
 
-## Design goals
+## Documentation
 
-The roadmap below says which goals are met. The storage design is recorded in
-[decision record 0004](https://randomcodespace.github.io/skylite/docs/decisions/0004-storage-engine/).
-
-- A write is acknowledged only after it is confirmed in object storage.
-- Pod disk is a cache only.
-- One leader per database, chosen by a lease in object storage, with stale
-  leaders fenced by conditional writes.
-- Readers fetch pages on demand with a bounded cache.
-- SQL over HTTPS, so it works through Istio and ingress.
-- A Go `database/sql` driver, and a JDBC driver with a Hibernate dialect.
-- Authentication, authorization and SQL lockdown on the query endpoint.
-
-## Roadmap
-
-Done:
-
-1. Evaluate Litebase as a base and run a durability spike against Azurite.
-2. Storage interface and four backends (Azure Blob, AWS S3, Google Cloud
-   Storage, local filesystem) with an emulator test suite.
-3. Storage engine: commit log, paged reads, compaction.
-4. Leader lease and failover.
-5. Read replicas: stateless reads on leaders and opt-in followers.
-6. HTTPS query API with write channels and transactions, and one-hop
-   forwarding between pods.
-7. Clients: Go driver proven with GORM, JDBC driver proven with Spring Data JPA.
-8. Endpoint authentication, authorization and SQL lockdown.
-9. Signed release binaries.
-
-Planned:
-
-1. Batch requests, describe on a channel, read-only channels and resolve.
-2. The rest of admission control.
-3. Follower-owned read channels.
-4. A container image.
-5. Verification against the real cloud storage services, on a real Kubernetes
-   cluster and with a real Entra ID tenant, driver failover across several
-   pods, and a 24-hour soak.
-
-The [roadmap page](https://randomcodespace.github.io/skylite/docs/roadmap/)
-has the details.
+- [Quick start](https://randomcodespace.github.io/skylite/docs/getting-started/)
+- [Azure Blob Storage](https://randomcodespace.github.io/skylite/docs/azure-blob/)
+- [Sizing](https://randomcodespace.github.io/skylite/docs/sizing/) and
+  [running in production](https://randomcodespace.github.io/skylite/docs/operations/)
+- [Go driver](https://randomcodespace.github.io/skylite/docs/go-driver/) and
+  [JDBC driver](https://randomcodespace.github.io/skylite/docs/jdbc-driver/)
+- [Configuration reference](https://randomcodespace.github.io/skylite/docs/configuration/)
+- Design: [architecture](https://randomcodespace.github.io/skylite/docs/architecture/)
+  and [decision records](https://randomcodespace.github.io/skylite/docs/decisions/)
 
 ## Links
 
-- Documentation: https://randomcodespace.github.io/skylite/
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [License](LICENSE) (Apache-2.0)

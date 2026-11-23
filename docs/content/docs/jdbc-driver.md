@@ -1,53 +1,109 @@
 ---
 title: JDBC driver
-description: The JDBC driver and its Hibernate dialect, how to configure them, how writes and transactions reach the server, and what they do not do yet.
-weight: 21
+description: Connect a Java application to skylite with JDBC, Hibernate or Spring Data JPA. Build and install, connection URL, tokens, Spring Boot settings, transactions, and errors and retries.
+weight: 50
+navgroup: guides
 status: current
 ---
 
-`clients/java/driver` is a JDBC driver, artifact `io.github.randomcodespace:skylite-jdbc`, that speaks the protocol of [0005: Client protocol](/docs/decisions/0005-client-protocol/) over HTTPS, as [0003: JDBC transport](/docs/decisions/0003-jdbc-transport/) decided. It needs Java 21 or later. It reads through the stateless `query` endpoint and writes through a write channel per connection, with autocommit writes and transactions. `clients/java/hibernate` is a Hibernate ORM dialect for it, artifact `io.github.randomcodespace:skylite-hibernate` ([below](#hibernate-dialect)). Neither is published to a Maven repository; build them with `mvn -f clients/java/driver/pom.xml verify` and `mvn -f clients/java/hibernate/pom.xml verify`.
+The JDBC driver (`io.github.randomcodespace:skylite-jdbc`) talks to the server over HTTPS and needs Java 21 or later. A Hibernate dialect (`io.github.randomcodespace:skylite-hibernate`) comes with it. Both are tested against a real `skylite serve` on every pull request, including a 29-test Spring Data JPA acceptance suite through HikariCP and Hibernate.
 
-The driver's tests run against an in-process fake server that checks every request against 0005, and against a real `skylite serve` built from this repository. The [Spring Data JPA acceptance suite](#spring-data-jpa) runs through the driver, the dialect, HikariCP and Hibernate against a real `skylite serve` as well.
+## Build and install
 
-## Usage
+The driver and the dialect are not published to any Maven repository yet. Build them from a clone and install them into your local Maven repository, or into your organisation's repository manager:
+
+```sh
+git clone https://github.com/RandomCodeSpace/skylite.git
+cd skylite
+mvn -q -f clients/java/driver/pom.xml install -DskipTests
+mvn -q -f clients/java/hibernate/pom.xml install -DskipTests
+```
+
+Leave out `-DskipTests` to run the tests as well; the driver's integration tests build the server, so they need Go.
+
+Both have version `0.0.0-SNAPSHOT`:
+
+```xml
+<dependency>
+  <groupId>io.github.randomcodespace</groupId>
+  <artifactId>skylite-jdbc</artifactId>
+  <version>0.0.0-SNAPSHOT</version>
+</dependency>
+<dependency>
+  <groupId>io.github.randomcodespace</groupId>
+  <artifactId>skylite-hibernate</artifactId>
+  <version>0.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+The driver's only runtime dependency is `jackson-core` 3. The dialect depends on Hibernate ORM's community dialects, which are LGPL-2.1-or-later; the driver does not.
+
+## Connect
+
+The URL is `jdbc:skylite:https://host[:port][/base]/<database>`. The driver registers itself with `DriverManager`; its class is `io.github.randomcodespace.skylite.jdbc.SkyliteDriver`.
 
 ```java
-import io.github.randomcodespace.skylite.jdbc.TokenProvider;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.util.Properties;
-
-public final class ProjectedToken implements TokenProvider {
-    // A projected service account token, read again for every request.
-    @Override
-    public String token() throws Exception {
-        return Files.readString(Path.of("/var/run/secrets/tokens/skylite")).strip();
-    }
-
-    public static void main(String[] args) throws SQLException {
-        Properties p = new Properties();
-        p.setProperty("tokenProvider", ProjectedToken.class.getName());
-        try (Connection c = DriverManager.getConnection("jdbc:skylite:https://skylite.example.internal/library", p);
-                PreparedStatement ps = c.prepareStatement("SELECT id, title FROM books WHERE id > ?")) {
-            ps.setLong(1, 10);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    System.out.println(rs.getLong("id") + " " + rs.getString("title"));
-                }
-            }
-        }
-    }
+Properties p = new Properties();
+p.setProperty("tokenFile", "/var/run/secrets/tokens/skylite");
+try (Connection c = DriverManager.getConnection("jdbc:skylite:https://skylite.example.internal/orders", p)) {
+    // ...
 }
 ```
 
-The driver registers itself through `META-INF/services/java.sql.Driver`; its class is `io.github.randomcodespace.skylite.jdbc.SkyliteDriver`. For a token file alone, `p.setProperty("tokenFile", "/var/run/secrets/tokens/skylite")` does the same as the provider above.
+| Property | Meaning |
+|---|---|
+| `tokenFile` | A file holding the bearer token, read again before every request, so a rotated token is picked up at once. |
+| `tokenProvider` | Instead of `tokenFile`: the name of a class implementing `io.github.randomcodespace.skylite.jdbc.TokenProvider`, whose `token()` is called before every request. |
+| `tlsRootCertificates` | A PEM file of CA certificates to trust instead of the JVM's trust store, for a private CA. |
+| `allowPlaintext` | `true` permits an `http://` URL, for a local trial or a server behind a mesh that encrypts traffic. |
 
-## Configuration
+Exactly one of `tokenFile` and `tokenProvider` is required. `user` and `password` are ignored. The token must come from an issuer in the server's [`auth` configuration](/docs/configuration/#auth), with a rule granting `read` for queries and `write` for writes and transactions. Connection properties are trusted configuration: never build them from user input. The driver never logs, and its exceptions never contain the token or the URL.
+
+## Spring Boot and Spring Data JPA
+
+```properties
+spring.datasource.url=jdbc:skylite:https://skylite.example.internal/orders
+spring.datasource.driver-class-name=io.github.randomcodespace.skylite.jdbc.SkyliteDriver
+spring.datasource.hikari.data-source-properties.tokenFile=/var/run/secrets/tokens/skylite
+spring.jpa.database-platform=io.github.randomcodespace.skylite.hibernate.SkyliteDialect
+spring.jpa.open-in-view=false
+```
+
+HikariCP passes `data-source-properties` to the driver, which is how the acceptance suite sets `tokenFile` and `tlsRootCertificates`. The suite runs Spring Boot 4.1.2 with Hibernate 7.4.13.Final, HikariCP with at most 4 connections, `ddl-auto=create`, and Hibernate batching (`hibernate.jdbc.batch_size=50`, `order_inserts=true`); other versions have not been tested.
+
+The dialect extends Hibernate's community `SQLiteDialect` in two ways: generated identifiers come from `getGeneratedKeys` on the insert's own answer, and foreign keys are declared inside `create table`, where skylite enforces them.
+
+Each pooled connection holds one write channel on the server, and writes to one database run one at a time, so a large pool does not speed up writes. Size the pool for your read concurrency.
+
+## Queries, writes and transactions
+
+- In auto-commit mode, a query is a stateless read, which any server in a deployment can answer, and an update is an autocommit write of one statement on the leader.
+- With `setAutoCommit(false)`, the transaction starts with its first statement and runs on the leader. It holds the database's write lock until `commit()` or `rollback()`, so other writers wait. Keep transactions short: the server aborts one that is idle for 30 seconds or older than 5 minutes. Savepoints work.
+- After `setReadOnly(true)`, every statement is a stateless read. A statement that is not a pure read then fails with SQLState `25006`.
+- `executeBatch` sends the statements one at a time; the server has no batch request yet.
+- `Statement.setQueryTimeout` and `Statement.cancel()` work for reads and writes.
+
+The driver remembers the newest transaction each database has answered and sends it with later requests, so a read after your own write sees that write, even when a different server answers it.
+
+## Errors and retries
+
+Server errors become `SQLException`s whose class and SQLState follow the error code, and whose message holds the code, the server's message and the request id. The full table is under [Errors](#errors).
+
+| What you see | Meaning | What to do |
+|---|---|---|
+| `SQLTransientConnectionException`, SQLState `08004` (`overloaded`, `too_many_channels`) | The server is at capacity. Nothing ran. | Retry with backoff. |
+| `SQLTransientConnectionException`, SQLState `08001` (`no_leader`, `not_serving`, `owner_unreachable`, `behind`, `maintenance`) | No server can serve the request right now, as during failover. Nothing ran. | Retry with backoff. |
+| `SQLTransactionRollbackException`, SQLState `40001` (`busy`, or `transaction_aborted` caused by maintenance) | The write lock was not granted in time, or maintenance rolled the transaction back. | Retry the whole transaction. |
+| `SQLNonTransientConnectionException`, SQLState `08007` | The outcome of a write or commit is unknown: it may have committed. The connection is closed. | Check the data before repeating the write. |
+| `SQLIntegrityConstraintViolationException`, SQLState `23000` | A constraint failed. | Do not retry. |
+
+The driver resends a write whose answer was lost, with the same sequence number, so the server runs it at most once. It retries nothing else: requests refused with `overloaded`, `not_serving` or `busy` are raised to your code, and Spring does not retry them for you. [Running in production](/docs/operations/#errors-to-handle) explains each error code.
+
+## Reference
+
+The rest of this page is the driver's exact behaviour.
+
+### Configuration
 
 The URL is `jdbc:skylite:https://host[:port][/base]/<database>`: the server's base URL, then the database name as the last path segment. The name is 1 to 63 characters from `a-z`, `0-9` and `-`, starting with a letter or digit. User information, a query, a fragment, an empty host and `.` or `..` path segments are refused, as by the [Go driver](/docs/go-driver/), and so is a port outside 1 to 65535; the error does not repeat the URL.
 
@@ -62,7 +118,7 @@ Exactly one of `tokenProvider` and `tokenFile` is required. Each property is rea
 
 The driver uses HTTP/2 when the server offers it, and refuses every redirect, so a request and its token go only to the URL's host. It waits up to 60 seconds for the headers of each response, or longer for a query timeout above that. `Connection.setNetworkTimeout` replaces that wait, whatever the query timeout, and also bounds each wait for more of a response's body, as a socket read timeout would; when it passes, the driver closes the connection, its statements and their result sets, and raises `SQLNonTransientConnectionException` with SQLState `08S01`, or `08007` for a channel request the server may have accepted, as [Unknown outcomes](#what-works) says. A query timeout leaves the connection open. HTTP clients are shared by connections with the same trust settings.
 
-## What works
+### What works
 
 - **Queries.** In auto-commit, `Statement` and `PreparedStatement` send each `executeQuery` and `execute` to the stateless `query` endpoint, with the SQL and its parameters. Rows are decoded as their frames arrive, never buffered whole; `ResultSet` is forward-only and read-only. Closing a result set, its statement or its connection before the end releases the HTTP response. A response that ends before its terminal frame is an error, never a short result. A statement the server answers `needs_channel`, because it is not a pure read, was refused before it ran, and goes to the write channel instead.
 - **Writes.** A connection opens one write channel on its first write and closes it when it closes. In auto-commit, `executeUpdate`, and a statement refused with `needs_channel`, is an `execute` on the channel: an autocommit write, committed or failed as a whole before its answer arrives. Every channel request carries the channel's next sequence number, and its answer, rows included, is read in full before the caller sees any of it. When the answer is lost in transport, the driver sends the same bytes again with the same sequence number, at most twice more: the server answers with the recorded outcome, or `in_flight` while the request still runs, after which the driver waits 200 ms and sends it again, for up to 60 seconds plus the query timeout. Answers lost in transport are counted apart from `in_flight` answers. That is not a retry: a request the server refused or failed is never sent again, a refusal before acceptance of a request's first send leaves its sequence number free for the next request, and a request that may have been accepted is never sent on another channel. A channel with no transaction open and no answer for 60 seconds is closed and replaced before its next request, so that the server's channel idle limit (10 minutes) rarely ends a channel the driver still uses. That is the 60-second part of 0005's reopening rule; its open-head part, which replaces a channel opened more than half the resolve bound below the pool's highest transaction, is not implemented.
@@ -80,7 +136,7 @@ The driver uses HTTP/2 when the server offers it, and refuses every redirect, so
 - **Results the server dropped.** When a channel request's answer was lost and its replay comes without the rows, which the server keeps only up to 64 KiB (0005 decision 3), a read-only statement is sent again as a new request, once: when that answer comes without its rows too, the driver raises `SQLNonTransientConnectionException` with SQLState `08S01`, since the read changed nothing. A write is not sent again: an autocommit write raises `SQLException` with SQLState `SKR01`, vendor code 0 and its transaction number in the message, since it committed, and a write inside a transaction raises `SQLException` with SQLState `SKR02`, the transaction still open with its effects.
 - **Read-your-writes.** One watermark per database, keyed by the canonical base URL and the database name and kept for the driver class's life, is raised from each answer's `txn` and sent as `min_txn`, so connections and URLs that differ only in canonicalisation share it.
 
-## Values
+### Values
 
 | Storage class | `getObject` | Also readable as |
 |---|---|---|
@@ -97,7 +153,7 @@ A column's type name is its declared type without the arguments in parentheses, 
 
 Parameters: `setLong` and the other integer setters send INTEGER, `setBoolean` INTEGER 0 or 1, `setDouble` REAL (a NaN is refused), `setBigDecimal` TEXT in plain notation, `setString` TEXT, `setBytes` BLOB. `setObject` also takes `LocalDate`, `LocalTime` and `LocalDateTime`, written as their fields, `Instant`, `OffsetDateTime` and `ZonedDateTime`, written in UTC, and `java.sql.Date`, `Time` and `Timestamp`, written as their wall-clock fields in the JVM's zone or the given calendar's. A year outside 0001 to 9999, a NaN and a string with a lone surrogate are refused when they are set, before anything is sent.
 
-## Errors
+### Errors
 
 An error the server answered becomes an `SQLException` whose message holds 0005's error code, the server's message and the request ID. The class and SQLState follow the code's meaning. Codes for requests refused before acceptance, which never executed, map to `SQLTransientConnectionException`; no code whose outcome can be unknown does. The vendor code is 0, except for `sql_error`.
 
@@ -126,7 +182,7 @@ An error the server answered becomes an `SQLException` whose message holds 0005'
 
 The rows from `busy` down answer channel requests. A recorded failure is the request's outcome and is raised as the table says; an answer that leaves a sent request's outcome unknown raises `08007` instead, as [Unknown outcomes](#what-works) says, whatever its code. A stateless response that breaks the protocol, ends before its terminal frame, lacks the `Skylite-Protocol: 1` header or is a redirect, and a transport failure, raise `SQLNonTransientConnectionException` with SQLState `08S01`; a read is never sent again.
 
-## Hibernate dialect
+### Hibernate dialect
 
 `io.github.randomcodespace.skylite.hibernate.SkyliteDialect` extends Hibernate's community `SQLiteDialect` (`hibernate-community-dialects`, 7.4.13.Final, the version Spring Boot 4.1.2 manages) with two changes:
 
@@ -135,11 +191,11 @@ The rows from `busy` down answer channel requests. A recorded failure is the req
 
 Set it with `spring.jpa.database-platform` or `hibernate.dialect`. The module is Apache-2.0 and depends on Hibernate ORM, which is LGPL-2.1-or-later; it copies nothing from Hibernate, and the driver depends on neither.
 
-## Spring Data JPA
+### Spring Data JPA
 
 `make java-acceptance-skylite` runs the 29-test acceptance suite in `clients/java/acceptance/` through the driver, the dialect, HikariCP and Hibernate against a `skylite serve` that the test run builds from this tree and starts on the local file system, with HTTPS and JWT authentication; the CI job `java-acceptance-skylite` runs it on every pull request. All 29 tests pass. The suite's README says how it is run.
 
-## Not yet
+### Not yet
 
 - `resolve`, which the server does not serve: an unknown outcome stays unknown. Server-side `batch`, read-only channels and snapshot reads in a read-only transaction.
 - Catalog metadata other than `getTables` and `getColumns`, streams and LOB parameters, and JDBC escape syntax, which is sent unprocessed.
