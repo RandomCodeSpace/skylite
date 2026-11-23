@@ -279,6 +279,7 @@ func openAzure(a *Azure) (storage.Store, error) {
 	}
 	tr := dt.Clone()
 	tr.IdleConnTimeout = azureIdleConnTimeout
+	tr.ResponseHeaderTimeout = storage.ResponseHeaderTimeout
 	// A redirect would resend a signed request, body included, elsewhere.
 	hc := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	opts := &container.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: hc}}

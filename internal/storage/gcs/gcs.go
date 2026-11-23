@@ -142,9 +142,17 @@ type Store struct {
 
 var _ storage.Store = (*Store)(nil)
 
-// Open returns a Store on cfg.Bucket. It does not contact the service.
+// Open returns a Store on cfg.Bucket. It does not contact the service. Its
+// HTTP transport, a clone of http.DefaultTransport, waits
+// storage.ResponseHeaderTimeout for each response's headers.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
-	return open(ctx, cfg, http.DefaultTransport)
+	dt, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("gcs: http.DefaultTransport is not an *http.Transport")
+	}
+	tr := dt.Clone()
+	tr.ResponseHeaderTimeout = storage.ResponseHeaderTimeout
+	return open(ctx, cfg, tr)
 }
 
 // open is Open with base carrying the HTTP requests, below authentication.
