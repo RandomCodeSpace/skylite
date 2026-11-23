@@ -118,13 +118,17 @@ func config(dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	store, err := perfStorage(dir)
+	if err != nil {
+		return "", err
+	}
 	c, err := json.Marshal(map[string]any{
 		"listen": "127.0.0.1:0", "plaintext": true, "databases": []string{"gorm"},
 		"auth": map[string]any{
 			"issuers": []any{map[string]any{"issuer": iss, "audience": "skylite", "jwks_file": filepath.Join(dir, "jwks.json")}},
 			"rules":   []any{map[string]any{"issuer": iss, "subject": "gorm", "database": "*", "role": "admin"}},
 		},
-		"storage": perfStorage(dir),
+		"storage": store,
 	})
 	if err != nil {
 		return "", err

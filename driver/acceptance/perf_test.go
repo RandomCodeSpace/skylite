@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -20,19 +21,19 @@ import (
 // SKYLITE_PERF_PREFIX set, that prefix of container SKYLITE_PERF_CONTAINER
 // in the account at SKYLITE_TEST_AZURE_ACCOUNT_URL, with the Entra
 // credential from the AZURE_* environment.
-func perfStorage(dir string) map[string]any {
+func perfStorage(dir string) (map[string]any, error) {
 	prefix := os.Getenv("SKYLITE_PERF_PREFIX")
 	if prefix == "" {
-		return map[string]any{"localfs": map[string]any{"path": filepath.Join(dir, "store")}}
+		return map[string]any{"localfs": map[string]any{"path": filepath.Join(dir, "store")}}, nil
 	}
 	u, err := url.Parse(os.Getenv("SKYLITE_TEST_AZURE_ACCOUNT_URL"))
 	if err != nil || u.Host == "" {
-		panic("SKYLITE_PERF_PREFIX needs SKYLITE_TEST_AZURE_ACCOUNT_URL, https://<account>.blob.core.windows.net/")
+		return nil, errors.New("SKYLITE_PERF_PREFIX needs SKYLITE_TEST_AZURE_ACCOUNT_URL, https://<account>.blob.core.windows.net/")
 	}
 	account, _, _ := strings.Cut(u.Host, ".")
 	return map[string]any{"prefix": prefix, "azure": map[string]any{
 		"account": account, "container": os.Getenv("SKYLITE_PERF_CONTAINER"), "endpoint": "https://" + u.Host, "entra": true,
-	}}
+	}}, nil
 }
 
 func pct(d []time.Duration, p float64) time.Duration {
@@ -100,7 +101,8 @@ func TestPerf(t *testing.T) {
 			t.Fatal(q, err)
 		}
 	}
-	mustExec(`CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY, w INTEGER, v BLOB)`)
+	mustExec(`DROP TABLE IF EXISTS kv`) // ids start at 1 again on a rerun on the same prefix
+	mustExec(`CREATE TABLE kv (id INTEGER PRIMARY KEY, w INTEGER, v BLOB)`)
 	payload := make([]byte, 256)
 	_, _ = rand.Read(payload)
 
