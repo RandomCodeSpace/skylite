@@ -147,17 +147,33 @@ class BatchReadOnlyTest {
         }
     }
 
-    /** An answer with more results than the request's entries breaks the protocol; it is no index overflow. */
+    /**
+     * An answer with more results than the request's entries breaks the protocol, but its outcome settled: committed,
+     * result unavailable (SKR01), or run in the open transaction (SKR02), never an 08 state that invites a re-run.
+     */
     @Test
-    void moreResultsThanEntriesIsAMalformedAnswer() throws Exception {
+    void moreResultsThanEntriesReportsTheSettledOutcomeWithoutCounts() throws Exception {
         server.on("channel", FakeServer.results(0, 1, 1, 1) + "\n" + FakeServer.batched(1, "none", 3, 3));
         try (Connection c = server.connect(); Statement s = c.createStatement()) {
             s.addBatch("DELETE FROM a");
             s.addBatch("DELETE FROM b");
             BatchUpdateException e = assertThrows(BatchUpdateException.class, s::executeBatch);
-            assertEquals("08S01", e.getSQLState(), e.toString());
+            assertEquals("SKR01", e.getSQLState(), e.toString());
+            assertArrayEquals(new int[0], e.getUpdateCounts());
+            assertFalse(c.isClosed());
+        }
+        assertEquals(1, server.bodies("channel").size(), "a committed batch is never sent again");
+
+        server.on("channel", begun(1), FakeServer.results(0, 1, 1, 1) + "\n" + FakeServer.batched(2, "open", 3, 3));
+        try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            c.setAutoCommit(false);
+            s.addBatch("DELETE FROM a");
+            s.addBatch("DELETE FROM b");
+            BatchUpdateException e = assertThrows(BatchUpdateException.class, s::executeBatch);
+            assertEquals("SKR02", e.getSQLState(), e.toString());
             assertArrayEquals(new int[0], e.getUpdateCounts());
         }
+        assertEquals(1 + 2, server.bodies("channel").size());
     }
 
     /** Inside a transaction a batch above the entry limit is split; outside one it is refused, unsent. */

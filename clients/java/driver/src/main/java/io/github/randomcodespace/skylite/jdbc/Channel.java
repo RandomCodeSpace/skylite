@@ -252,16 +252,22 @@ final class Channel {
                 List<Frame> frames = call(s, Kind.BATCH,
                         (t, q) -> Request.batch(t, q, sql, entries.subList(start, end), session.watermark(), ms), ms,
                         stmt, auto ? Mode.AUTOCOMMIT : Mode.TXN);
+                boolean surplus = false; // more results than entries: the counts are unusable, the outcome is not
                 for (Frame f : frames) {
-                    if (f instanceof Results r) {
+                    if (f instanceof Results r && !surplus) {
                         if (r.rowsAffected().length > end - from) {
-                            throw Errors.transport("malformed response: more results than the batch's "
-                                    + (end - start) + " entries", null);
+                            surplus = true;
+                            from = start;
+                            continue;
                         }
                         System.arraycopy(r.rowsAffected(), 0, rows, from, r.rowsAffected().length);
                         System.arraycopy(r.lastInsertRowids(), 0, ids, from, r.lastInsertRowids().length);
                         from += r.rowsAffected().length;
                     }
+                }
+                // settled: never 08S01, which would invite a re-run of a batch that may have committed
+                if (surplus && frames.get(frames.size() - 1) instanceof Done d) {
+                    throw omitted(d, "its answer held more results than its " + (end - start) + " entries");
                 }
                 switch (frames.get(frames.size() - 1)) {
                     case Failure e -> {
@@ -271,7 +277,7 @@ final class Channel {
                         }
                         throw Errors.map(e);
                     }
-                    case Done d when d.dataOmitted() -> throw omitted(d);
+                    case Done d when d.dataOmitted() -> throw omitted(d, LOST);
                     default -> from = end;
                 }
             }
@@ -281,16 +287,21 @@ final class Channel {
         }
     }
 
-    /** The error for a channel answer whose data the driver lost: committed (SKR01), or in a transaction (SKR02). */
-    static SQLException omitted(Done d) {
+    /** The usual reason why a channel answer's data is gone. */
+    static final String LOST = "its answer was lost in transport and the server kept no copy of its result";
+
+    /**
+     * The error for a channel answer whose data the driver lost, for the reason why: committed (SKR01), or in a
+     * transaction (SKR02).
+     */
+    static SQLException omitted(Done d, String why) {
         // ADR 0005 decision 3: the base class, which Spring and Hibernate treat as non-transient.
         if ("none".equals(d.txnState())) {
-            return new SQLException("skylite: the statement committed as transaction " + d.txn() + ", but its "
-                    + "answer was lost in transport and the server kept no copy of its result", "SKR01", 0);
+            return new SQLException("skylite: the statement committed as transaction " + d.txn() + ", but " + why,
+                    "SKR01", 0);
         }
         return new SQLException("skylite: the statement ran inside the transaction, which is still open with its "
-                + "effects, but its answer was lost in transport and the server kept no copy of its result",
-                "SKR02", 0);
+                + "effects, but " + why, "SKR02", 0);
     }
 
     /** The end index of each part of a batch that fits the channel's entry and body limits, in order. */
@@ -415,8 +426,9 @@ final class Channel {
     /**
      * Sends the request as the channel's next sequence number until it has an outcome: its answer, a recorded
      * failure, or one settled after its answer was lost. A recorded failure that ran nothing outside a transaction
-     * and may pass later, and a behind refusal, which closes the channel, are sent again after a pause, as a new
-     * request; an autocommit write settled as not committed is sent once more, on a new channel.
+     * and may pass later, and a behind refusal of the first send, which closes the channel, are sent again after a
+     * pause, as a new request; a behind after a send that may have been accepted is sent again with the same bytes
+     * instead ({@link #deliver}). An autocommit write settled as not committed is sent once more, on a new channel.
      */
     private List<Frame> attempt(Slot s, Kind kind, Body body, long timeoutMillis, SkyliteStatement stmt, Mode mode)
             throws SQLException {
@@ -582,10 +594,15 @@ final class Channel {
                 }
             }
             // The hop may have delivered seq, as a lost answer may have: the same bytes replay its outcome.
-            if (e.code().equals("owner_unreachable") && !e.notExecuted() && ++drops < SENDS
-                    && Retry.left(deadline) > 0) {
+            if (e.code().equals("owner_unreachable") && !e.notExecuted() && ++drops < SENDS) {
                 fresh = false;
-                continue;
+                try {
+                    if (Retry.pause(drops - 1, deadline)) {
+                        continue;
+                    }
+                } catch (SQLException interrupted) {
+                    return new Delivery(null, null, interrupted, false);
+                }
             }
             return new Delivery(null, null, Errors.map(e), false);
         }

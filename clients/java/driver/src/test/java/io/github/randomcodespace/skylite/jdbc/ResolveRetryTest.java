@@ -283,6 +283,20 @@ class ResolveRetryTest {
         assertEquals(1, server.bodies("channels").size());
     }
 
+    /** behind after an owner_unreachable that may have run: the same bytes again, never a new channel. */
+    @Test
+    void behindAfterOwnerUnreachableIsSentAgainOnTheSameChannel() throws Exception {
+        server.on("channel", FakeServer.channelError("owner_unreachable", false, false, "none"), refused("behind"),
+                INSERTED);
+        try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            assertEquals(1, s.executeUpdate(INSERT));
+        }
+        List<String> sent = server.bodies("channel");
+        assertEquals(3, sent.size());
+        assertEquals(1, sent.stream().distinct().count(), sent.toString());
+        assertEquals(1, server.bodies("channels").size());
+    }
+
     /** A live channel is settled by its close: last_seq below the request proves it never ran. */
     @Test
     void aWriteWhoseAnswersAreLostIsSettledByTheClose() throws Exception {
@@ -318,9 +332,14 @@ class ResolveRetryTest {
     void ownerUnreachableThatMayHaveRunIsSentAgainWithTheSameBytes() throws Exception {
         String unreachable = FakeServer.channelError("owner_unreachable", false, false, "none");
         server.on("channel", unreachable, INSERTED);
+        Retry.baseMillis = Retry.MAX_MILLIS;
         try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            long began = System.nanoTime();
             assertEquals(1, s.executeUpdate(INSERT));
+            long took = System.nanoTime() - began;
+            assertTrue(took >= 500_000_000L, "the resend waits out the backoff's first pause: " + took + " ns");
         }
+        Retry.baseMillis = 1;
         List<String> sent = server.bodies("channel");
         assertEquals(2, sent.size());
         assertEquals(1, sent.stream().distinct().count(), sent.toString());

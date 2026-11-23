@@ -219,7 +219,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
             }
         }
         if (d.dataOmitted() && !(update && d.outcome() instanceof Done)) {
-            throw Channel.omitted(d);
+            throw Channel.omitted(d, Channel.LOST);
         }
         if (frames.get(0) instanceof Columns c) {
             return publish(new SkyliteResultSet(this, FrameReader.Frames.of(frames.subList(1, frames.size())),
