@@ -111,20 +111,20 @@ until the server leads it, and sets the system properties `jdbc.url` and
 `.tlsRootCertificates`, which the pool passes to the driver. The server stops
 when the run ends; its log is in `target/skylite/run-*/skylite.log`.
 
-All 29 tests pass. `TransactionTest.rollbackToSavepointKeepsEarlierWrites` is
+All 33 tests pass. `TransactionTest.rollbackToSavepointKeepsEarlierWrites` is
 skipped, with its reason printed, wherever the verified connection's driver
 reports `DatabaseMetaData.supportsSavepoints()` false; skylite's driver and
 sqlite-jdbc both support them, so it runs on skylite, on the baseline and in
-the fault check. The baseline's five known
+the fault check. The baseline's six known
 failures pass on skylite: its dialect declares foreign keys and takes
 generated keys from the driver, and its driver reports `BIGINT` for an
-`integer` column, implements `getBlob`, and raises
+`integer` column, implements `getBlob`, raises
 `SQLIntegrityConstraintViolationException` with SQL state `23000` for
-`SQLITE_CONSTRAINT`.
+`SQLITE_CONSTRAINT`, and runs a read-only transaction on a read-only channel.
 
 ### Tests skipped on the baseline
 
-Five tests are known to fail on the baseline stack, sqlite-jdbc with the
+Six tests are known to fail on the baseline stack, sqlite-jdbc with the
 Hibernate community SQLite dialect (see "Known baseline failures" below). They
 are skipped only when the verified connection above uses the driver
 `org.sqlite.JDBC` and the dialect `org.hibernate.community.dialect.SQLiteDialect`;
@@ -230,6 +230,10 @@ the tests start the application themselves.
 | `OptimisticLockingTest.versionIncrementsAndStaleUpdateFails` | `@Version` increments by one, and saving a stale detached copy raises `ObjectOptimisticLockingFailureException` | Saving a detached copy goes through Hibernate's merge, which loads the current row and rejects the version before any `UPDATE` is sent; this test does not reach the driver's update count |
 | `OptimisticLockingTest.updateMatchingNoRowFailsOnFlush` | Inside a transaction, a managed account is loaded, its stored version is advanced by plain JDBC on the same connection, and the entity is changed and flushed; the flush raises `ObjectOptimisticLockingFailureException` and the row keeps its balance | The flush sends `update ... where id = ? and version = ?`, which matches no row; only the update count of 0 from the driver tells Hibernate the update failed. A driver that reports 1 for every update fails this test |
 | `BatchInsertTest.insertsAreBatched` | 500 inserts with JDBC batching on; Hibernate prepares the insert at most once per batch of 50; read back through a fresh persistence context, the (id, sequence value) pairs are exactly the 500 that were saved, and in `rowid` order the sequence values are in the order they were added to the batch | Batching uses `addBatch`/`executeBatch` on a prepared statement; ids are application-generated UUIDs because Hibernate does not batch `IDENTITY` inserts |
+| `BatchInsertTest.deletesAreBatched` | 499 entity deletes in one transaction; Hibernate prepares the delete at most once per batch of 50, and only the one row not deleted remains | Hibernate batches deletes and updates as it batches inserts, and checks each entry's update count |
+| `BatchInsertTest.aFailedBatchInATransactionRollsBack` | On one pooled connection with auto-commit off, a batch of four inserts whose third breaks a unique constraint raises `BatchUpdateException`; through skylite's driver its update counts are those of the two entries before it. After `rollback()` a new connection sees no row | A batch that fails stops, and its exception says how far it got; the transaction's rollback undoes the entries that ran |
+| `ReadOnlyTransactionTest.readsOneSnapshot` | Inside a Spring read-only transaction, a count, then an insert committed by a connection outside the pool, then the same count, which is unchanged; after the transaction the count includes the insert | `@Transactional(readOnly = true)` is served as one consistent read |
+| `ReadOnlyTransactionTest.refusesWrites` | A native insert inside a Spring read-only transaction fails, and no row is written | Spring makes the connection read-only for the transaction, and the driver must enforce it; see "Known baseline failures" |
 | `ColumnTypesTest.valuesRoundTrip` | String, long, double, boolean, `BigDecimal`, `Instant`, `LocalDate` and `byte[]` in a `blob` column round-trip in three rows: the top of each range (`Long.MAX_VALUE`, a string with an apostrophe, accented letters, `✓` and `😀`, now, a 300 KiB payload); the bottom (`Long.MIN_VALUE`, `-Double.MAX_VALUE`, a negative decimal, a string of 90,000 characters, a date and a time in 1969, 3 bytes); and small values (-42, `-Math.E`, -0.01, `false`, the epoch, an empty string, an empty payload). Each payload read back is compared with a copy taken before saving, since the driver receives the entity's own array. An `int` column, in `Event`, round-trips `Integer.MIN_VALUE`, -7 and `Integer.MAX_VALUE` | Each Java type goes through a dialect type mapping and a specific `ResultSet` getter; drivers that convert values get signs, ranges, long strings, characters outside 16 bits and dates before 1970 wrong |
 | `ColumnTypesTest.nullsRoundTrip` | The same columns, all null | Binding null needs the right SQL type from the dialect |
 | `ColumnTypesTest.parameterReboundToNullBindsNull` | One prepared statement inserts a string and a long, then, with both parameters set to null, inserts again; the second row is null in both | Applications and Hibernate reuse prepared statements; a driver that skips `setNull` on a parameter already set sends the old value |
@@ -251,11 +255,12 @@ faults that cancel each other out, may pass.
 
 `make java-fault-check` runs the check (`src/test/java/.../selfcheck/`).
 `FaultyDriver` is a JDBC driver for `jdbc:faulty:jdbc:sqlite:...` URLs that
-wraps sqlite-jdbc. It first repairs the five known baseline failures on the
+wraps sqlite-jdbc. It first repairs the six known baseline failures on the
 JDBC side (it turns foreign keys on and declares the `book` foreign key,
-reports `id` columns as `BIGINT`, implements `getBlob`, and raises constraint
-errors as `SQLIntegrityConstraintViolationException` with SQL state 23000), so
-that with no fault all 29 tests run and pass. Then it injects the one fault
+reports `id` columns as `BIGINT`, implements `getBlob`, raises constraint
+errors as `SQLIntegrityConstraintViolationException` with SQL state 23000, and
+makes an open connection read-only with `pragma query_only`), so
+that with no fault all 33 tests run and pass. Then it injects the one fault
 named by `-Dacceptance.fault`. `FaultCheck` runs the whole suite in a separate
 JVM once with no fault, which must pass every test with none skipped, and once
 per fault, which must fail at least one test and must have applied the fault
@@ -266,7 +271,8 @@ run's database, which already holds the schema, so that only
 `java-acceptance` CI job runs the check after the baseline; it took 266
 seconds on an 8-core machine. `-Dacceptance.faults=a,b` runs a subset.
 
-The table below is from the run on 2026-11-15 at commit e51dde4. "Applied" is
+The table below is from the run on 2026-11-15 at commit e51dde4, when the
+suite had 29 tests; the four tests added since are not in it. "Applied" is
 how many times the fault changed a call or its result; each run has its own
 database file.
 
@@ -364,7 +370,7 @@ Notes on how the faults were expressed:
 
 ## Known baseline failures
 
-Five tests fail on the baseline (Spring Boot 4.1.2, Hibernate ORM 7.4.13,
+Six tests fail on the baseline (Spring Boot 4.1.2, Hibernate ORM 7.4.13,
 sqlite-jdbc 3.53.4.0). They show requirements on a driver and dialect together,
 not defects of one side: for each one, the notes below say which side could
 satisfy it, and, for the three constraint tests, what the suite itself requires
@@ -384,6 +390,12 @@ except where a test result is quoted.
   ([Dialect.java#L1868-L1881](https://github.com/hibernate/hibernate-orm/blob/7.4.13/hibernate-core/src/main/java/org/hibernate/dialect/Dialect.java#L1868-L1881)).
   Either side could satisfy it: a dialect that treats an `integer` column as
   equivalent to `bigint`, or a driver that reports such a column as `BIGINT`.
+- `ReadOnlyTransactionTest.refusesWrites`: the insert succeeds. Spring calls
+  `Connection.setReadOnly(true)` on the pooled connection, sqlite-jdbc refuses
+  to change the flag of an open connection, and Spring ignores that failure
+  and runs the transaction as a writable one. The driver side could satisfy
+  it, as skylite's does and as the fault check's wrapper does with `pragma
+  query_only`.
 - `LobTest.lobRoundTrips`: fails with `not implemented by SQLite JDBC driver`.
   For a `@Lob byte[]`, the community dialect registers
   `BlobJdbcType.PRIMITIVE_ARRAY_BINDING` for the BLOB JDBC type

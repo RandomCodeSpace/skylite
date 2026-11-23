@@ -43,9 +43,10 @@ import javax.sql.rowset.serial.SerialBlob;
  * A JDBC driver for URLs {@code jdbc:faulty:jdbc:sqlite:...} that delegates to sqlite-jdbc, used only to check that
  * the acceptance suite catches driver faults ({@link FaultCheck}).
  *
- * <p>It first repairs the five known baseline failures on the JDBC side, so that with no fault every test runs and
+ * <p>It first repairs the six known baseline failures on the JDBC side, so that with no fault every test runs and
  * passes: it turns foreign keys on and declares the book table's foreign key, reports {@code id} columns as
- * BIGINT, implements {@code getBlob}, and raises constraint errors as SQL state 23000. Then it injects the one
+ * BIGINT, implements {@code getBlob}, raises constraint errors as SQL state 23000, and makes an open connection
+ * read-only with {@code pragma query_only}. Then it injects the one
  * fault named by {@code -Dacceptance.fault}, counts each time the fault changed a result, and prints the count on
  * exit, so a run shows that the fault was exercised.
  */
@@ -197,6 +198,7 @@ public final class FaultyDriver implements Driver {
         private final Map<String, Object> firstReads = new HashMap<>();
         private Statement lastInsertHere;
         private boolean requestedAutoCommit = true;
+        private boolean readOnly;
 
         ConnectionHandler(Connection real, String url) {
             this.real = real;
@@ -226,6 +228,16 @@ public final class FaultyDriver implements Driver {
                     if (is("autocommit-ignored")) {
                         return requestedAutoCommit;
                     }
+                }
+                case "setReadOnly" -> { // sqlite-jdbc refuses it on an open connection
+                    readOnly = (Boolean) args[0];
+                    try (Statement s = real.createStatement()) {
+                        s.execute("pragma query_only = " + (readOnly ? 1 : 0));
+                    }
+                    return null;
+                }
+                case "isReadOnly" -> {
+                    return readOnly;
                 }
                 case "getMetaData" -> {
                     return proxy(DatabaseMetaData.class, new MetaDataHandler((DatabaseMetaData) call(real, method, args), (Connection) self, url));

@@ -1,24 +1,30 @@
 package io.github.randomcodespace.skylite.acceptance;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
 import jakarta.persistence.EntityManagerFactory;
+import java.sql.BatchUpdateException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.util.List;
 import java.util.stream.IntStream;
+import javax.sql.DataSource;
 import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 
-/** Several hundred inserts sent as JDBC batches. */
+/** Several hundred inserts and deletes sent as JDBC batches, and a batch that fails inside a transaction. */
 @SpringBootTest(properties = "spring.jpa.properties.hibernate.generate_statistics=true")
 class BatchInsertTest extends AcceptanceTestBase {
     private static final int ROWS = 500;
     private static final int BATCH_SIZE = 50;
 
     @Autowired EntityManagerFactory emf;
+    @Autowired DataSource dataSource;
 
     @Test
     void insertsAreBatched() {
@@ -39,5 +45,47 @@ class BatchInsertTest extends AcceptanceTestBase {
         assertThat(events.findAll()).extracting(Event::getId, Event::getSeq)
                 .containsExactlyInAnyOrderElementsOf(saved.stream().map(e -> tuple(e.getId(), e.getSeq())).toList());
         assertThat(events.seqInInsertionOrder()).isEqualTo(IntStream.range(0, ROWS).boxed().toList());
+    }
+
+    @Test
+    void deletesAreBatched() {
+        SessionFactory sf = emf.unwrap(SessionFactory.class);
+        List<Event> saved = events.saveAll(IntStream.range(0, ROWS).mapToObj(Event::new).toList());
+        Statistics stats = sf.getStatistics();
+        stats.clear();
+
+        events.deleteAll(saved.subList(0, ROWS - 1)); // one transaction, an entity delete per row
+
+        assertThat(stats.getEntityDeleteCount()).isEqualTo(ROWS - 1);
+        assertThat(stats.getPrepareStatementCount()).isLessThanOrEqualTo(ROWS / BATCH_SIZE + 1);
+        assertThat(events.findAll()).extracting(Event::getSeq).containsExactly(ROWS - 1);
+    }
+
+    /**
+     * A batch that fails inside a transaction stops at the failing entry, which the exception reports through the
+     * update counts of the entries before it; rolling back undoes those too.
+     */
+    @Test
+    void aFailedBatchInATransactionRollsBack() throws Exception {
+        try (Connection c = dataSource.getConnection()) {
+            c.setAutoCommit(false);
+            try (PreparedStatement insert = c.prepareStatement("insert into author (name, email) values (?, ?)")) {
+                for (String email : List.of("a@example.com", "b@example.com", "a@example.com", "c@example.com")) {
+                    insert.setString(1, "Writer");
+                    insert.setString(2, email);
+                    insert.addBatch();
+                }
+                boolean skylite = c.getMetaData().getDriverName().startsWith("skylite");
+                assertThatThrownBy(insert::executeBatch).isInstanceOfSatisfying(BatchUpdateException.class, e -> {
+                    if (skylite) { // what sqlite-jdbc reports is not checked
+                        assertThat(e.getUpdateCounts()).containsExactly(1, 1);
+                    }
+                });
+            } finally {
+                c.rollback();
+                c.setAutoCommit(true);
+            }
+        }
+        assertThat(countFromSecondConnection("author")).isZero();
     }
 }
