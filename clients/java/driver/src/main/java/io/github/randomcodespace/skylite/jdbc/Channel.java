@@ -272,7 +272,7 @@ final class Channel {
                 switch (frames.get(frames.size() - 1)) {
                     case Failure e -> {
                         // In a transaction the entries before batch_index ran, though a replayed receipt has no results
-                        for (long ran = auto ? 0 : Math.min(start + e.batchIndex(), end); from < ran; from++) {
+                        for (int ran = auto ? 0 : (int) Math.min(start + e.batchIndex(), end); from < ran; from++) {
                             rows[from] = Statement.SUCCESS_NO_INFO;
                         }
                         throw Errors.map(e);
