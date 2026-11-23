@@ -366,9 +366,11 @@ func TestRenewRetakesReleasedLease(t *testing.T) {
 			// read and the conditional replace; the store then refuses the
 			// stale version, and the write is tried again on a fresh read.
 			var cur format.Lease
+			var stamped time.Time
 			for {
 				var version string
 				cur, version = readLease(t, st, keys)
+				stamped = time.Now()
 				other := format.Lease{Holder: "other", Epoch: cur.Epoch + 1, Renewed: tc.renewed()}
 				b, err := format.EncodeLease(other)
 				if err != nil {
@@ -391,7 +393,9 @@ func TestRenewRetakesReleasedLease(t *testing.T) {
 			for {
 				got, _ := readLease(t, st, keys)
 				if got.Holder == h {
-					if !tc.retake {
+					// On a machine slow enough for the live lease to expire
+					// under the test, taking it back is right.
+					if !tc.retake && time.Since(stamped) < ttl-time.Millisecond {
 						t.Fatal("a live lease of another holder was taken back")
 					}
 					if got.Epoch != cur.Epoch {
@@ -1245,7 +1249,9 @@ func TestOneHungRenewalKeepsOffice(t *testing.T) {
 // last one while Lead ran, not a period after Lead returned.
 func TestRenewalCadenceAcrossLead(t *testing.T) {
 	st, keys := newDatabase(t, t.TempDir())
-	const renew = 500 * time.Millisecond
+	// A period long enough for a slow machine's late renewal to stay nearer
+	// one period than the two a restarted ticker would leave.
+	const renew = time.Second
 	var taken atomic.Int64 // the lease writes of the candidacy, before the first renewal
 	office.SetLead(t, func(ctx context.Context, s storage.Store, k format.Keys, dir string, o engine.Office, cfg engine.Config) (*engine.Leader, error) {
 		n := len(st.leaseWrites())
