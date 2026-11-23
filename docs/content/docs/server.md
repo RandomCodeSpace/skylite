@@ -1,9 +1,13 @@
 ---
-title: Server
-description: What `skylite serve` does in this version, which is authenticate requests, create databases, lead the databases it is configured for, answer read-only queries on them, run autocommit writes and transactions on write channels and forward requests between pods, and how to configure it.
-weight: 15
+title: Server reference
+linkTitle: Server reference
+description: The exact behaviour of `skylite serve` in this version. The requests it serves, the checks it runs and their order, every limit, leadership, forwarding between pods, readiness and shutdown.
+weight: 70
 status: current
+navgroup: reference
 ---
+
+This page is the precise reference for the server's protocol and limits. To set up and run skylite, start with the [quick start](/docs/getting-started/), [Azure Blob Storage](/docs/azure-blob/) and [Running in production](/docs/operations/); every configuration key is in the [configuration reference](/docs/configuration/).
 
 `skylite serve -config <file>` runs the server of [0005: Client protocol](/docs/decisions/0005-client-protocol/) with the authentication of [0006: Authentication](/docs/decisions/0006-authentication/). In this version it creates databases, leads the databases its configuration lists, answers the two stateless requests, `query` and `describe`, on leaders and [opt-in followers](#reading-on-a-follower), and runs autocommit writes and transactions on [write channels](#write-channels) on leaders. With a peer listener configured, a pod forwards what it cannot serve to the pod that can ([Forwarding between pods](#forwarding-between-pods)). It runs no batch or `resolve`. The [Go driver](/docs/go-driver/) sends `query`, `describe`, opens, channel requests, `cancel` and `close`; the [JDBC driver](/docs/jdbc-driver/) uses `query`, `describe` and write channels.
 
