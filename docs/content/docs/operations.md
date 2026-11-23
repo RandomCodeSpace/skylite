@@ -51,7 +51,7 @@ Taking office does not download the database: the new leader reads pages from st
 
 - **Reads** keep working on standbys with fresh followers. Reads that must go to the leader fail with `503` (`no_leader`, `not_serving`, `owner_unreachable` or `behind`) until a new leader is in office.
 - **Writes and transactions** run on write channels, which belong to the leader that opened them. When that leader stops, its channels end: an open transaction is rolled back, and a write that was running when it stopped has an **unknown outcome** (`channel_lost`). It may or may not have committed. New writes fail with `503` until a leader is in office, then succeed on a new channel.
-- The drivers do not retry these failures, and there is no way yet to ask the server afterwards whether a lost write committed. Your application decides: retry operations that are safe to repeat, and check the data before repeating one that is not.
+- The [Go driver](/docs/go-driver/#errors-and-retries) sends refused requests again with backoff, and asks the new leader with `resolve` whether a lost write committed; it reports an unknown outcome only when that does not settle it. The [JDBC driver's guide](/docs/jdbc-driver/#errors-and-retries) says what it does. For an outcome that stays unknown, your application decides: retry operations that are safe to repeat, and check the data before repeating one that is not.
 
 ## Shutdown
 
