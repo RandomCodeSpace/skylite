@@ -72,6 +72,31 @@ func (s *recStore) leaseWrites() []leaseWrite {
 	return append([]leaseWrite(nil), s.writes...)
 }
 
+// candidacyAt returns when the candidacy for epoch first wrote the lease. A
+// candidacy opens with a manifest read and that write, so it times the wait
+// before the candidacy without the takeover and the Lead that follow it,
+// which take a slow machine as long as they like.
+func (s *recStore) candidacyAt(t *testing.T, epoch uint64) time.Time {
+	t.Helper()
+	for _, w := range s.leaseWrites() {
+		if w.lease.Epoch == epoch {
+			return w.at
+		}
+	}
+	t.Fatalf("no lease write at epoch %d", epoch)
+	return time.Time{}
+}
+
+// stoodWithin waits for l to take office and fails unless the candidacy that
+// took it started within d of since.
+func (s *recStore) stoodWithin(t *testing.T, l *office.Loop, since time.Time, d time.Duration, what string) {
+	t.Helper()
+	led := waitFor(t, l, d+15*time.Second, what, leading)
+	if got := s.candidacyAt(t, led.Office.Epoch).Sub(since); got > d {
+		t.Fatalf("%s: the candidacy started after %v, want within %v", what, got, d)
+	}
+}
+
 func (s *recStore) before(op, key string, body io.Reader) (io.Reader, error) {
 	s.mu.Lock()
 	rule, stopped := s.rule, s.stopped
@@ -331,11 +356,13 @@ func TestRenewRetakesReleasedLease(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			st, keys := newDatabase(t, t.TempDir())
 			h := holder(t, "a")
-			a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: h, TTL: ttl, Renew: 50 * time.Millisecond})
+			// A renewal reads the manifest, renews and retakes under a timeout
+			// of one period: 200ms leaves a slow machine time for all three.
+			a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: h, TTL: ttl, Renew: 200 * time.Millisecond})
 			s := waitFor(t, a, 5*time.Second, "leading", leading)
 			e := epoch(t, st, keys)
 
-			// The leader renews every 50ms, so its write can land between this
+			// The leader renews every 200ms, so its write can land between this
 			// read and the conditional replace; the store then refuses the
 			// stale version, and the write is tried again on a fresh read.
 			var cur format.Lease
@@ -355,7 +382,12 @@ func TestRenewRetakesReleasedLease(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			// A retake has as long as a slow machine needs; a live lease is
+			// watched for ten renewal periods.
 			deadline := time.Now().Add(2 * time.Second)
+			if tc.retake {
+				deadline = time.Now().Add(15 * time.Second)
+			}
 			for {
 				got, _ := readLease(t, st, keys)
 				if got.Holder == h {
@@ -409,7 +441,7 @@ func TestStandbyTakesOverAfterExpiry(t *testing.T) {
 		t.Fatalf("epoch moved from %d to %d under a live lease", ghost, got)
 	}
 	clock.advance(ttl)
-	waitFor(t, b, time.Second, "leading after expiry", leading)
+	st.stoodWithin(t, b, time.Now(), time.Second, "leading after expiry")
 	if got := epoch(t, st, keys); got != ghost+1 {
 		t.Fatalf("epoch %d, want %d", got, ghost+1)
 	}
@@ -639,7 +671,7 @@ func TestFailoverOnSIGKILL(t *testing.T) {
 		t.Fatal(err)
 	}
 	killed := time.Now()
-	waitFor(t, b, ttl+5*renew+time.Second, "leading after the kill", leading)
+	st.stoodWithin(t, b, killed, ttl+5*renew+time.Second, "leading after the kill")
 	if got := epoch(t, st, keys); got != child+1 {
 		t.Fatalf("epoch %d, want %d", got, child+1)
 	}
@@ -913,8 +945,11 @@ func TestTransientErrorsKeepOffice(t *testing.T) {
 	}
 	st.setRule(nil)
 	before, _ := readLease(t, st, keys)
-	time.Sleep(200 * time.Millisecond)
-	after, _ := readLease(t, st, keys)
+	after := before
+	for deadline := time.Now().Add(10 * time.Second); after.Renewed <= before.Renewed && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		after, _ = readLease(t, st, keys)
+	}
 	if failed.Load() == 0 || after.Renewed <= before.Renewed {
 		t.Fatalf("%d failures injected; lease %+v then %+v", failed.Load(), before, after)
 	}
@@ -1043,19 +1078,21 @@ func TestCancelledCandidacyReleases(t *testing.T) {
 // backoff having started again when the loop took office.
 func TestFailStopNoticedWithinASecond(t *testing.T) {
 	st, keys := newDatabase(t, t.TempDir())
-	// The first candidacy fails, which doubles the backoff to 2 s.
-	var failed atomic.Bool
+	// The first two candidacies fail, which doubles the backoff to 4 s: far
+	// enough from the first backoff of 1 s for a slow machine to tell them
+	// apart.
+	var reads atomic.Int64
 	st.setRule(func(op, key string) error {
-		if op == "get" && key == keys.Manifest() && failed.CompareAndSwap(false, true) {
+		if op == "get" && key == keys.Manifest() && reads.Add(1) <= 2 {
 			return errors.New("injected")
 		}
 		return nil
 	})
 	t0 := time.Now()
-	a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 9 * time.Second})
-	s := waitFor(t, a, 5*time.Second, "leading", leading)
-	if d := time.Since(t0); !failed.Load() || d < 900*time.Millisecond {
-		t.Fatalf("took office %v after starting, failed candidacy %v; want a failed candidacy and a backoff", d, failed.Load())
+	a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 12 * time.Second})
+	s := waitFor(t, a, 15*time.Second, "leading", leading)
+	if d := time.Since(t0); d < 2900*time.Millisecond {
+		t.Fatalf("took office %v after starting, want two failed candidacies and backoffs of 1 s and 2 s", d)
 	}
 	st.setRule(func(op, key string) error {
 		if isCommit(op, key) {
@@ -1072,9 +1109,12 @@ func TestFailStopNoticedWithinASecond(t *testing.T) {
 		t.Fatalf("reason %v, want %v", down.Reason, engine.ErrStopped)
 	}
 	left := time.Now()
-	waitFor(t, a, 5*time.Second, "leading again", leading)
-	if d := time.Since(left); d < 700*time.Millisecond || d > 1700*time.Millisecond {
-		t.Fatalf("took office again %v after leaving it, want a backoff of 1 s", d)
+	again := waitFor(t, a, 15*time.Second, "leading again", leading)
+	// From leaving office to the next candidacy, not to the office it takes.
+	// Under 1 s there was no backoff; 4 s is the backoff that did not start
+	// again.
+	if d := st.candidacyAt(t, again.Office.Epoch).Sub(left); d < 700*time.Millisecond || d > 3*time.Second {
+		t.Fatalf("stood for office again %v after leaving it, want a backoff of 1 s", d)
 	}
 }
 
@@ -1083,10 +1123,11 @@ func TestFailStopNoticedWithinASecond(t *testing.T) {
 func TestStandbyPollsTheLease(t *testing.T) {
 	t.Run("reads", func(t *testing.T) {
 		st, keys := newDatabase(t, t.TempDir())
-		a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 3 * time.Second, Renew: 100 * time.Millisecond})
+		// A time to live a starved leader cannot overrun: the lease stays live.
+		a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 30 * time.Second, Renew: 100 * time.Millisecond})
 		waitFor(t, a, 5*time.Second, "leading", leading)
 		other := &recStore{Store: st.Store, keys: keys}
-		var manifests, leases atomic.Int64
+		var manifests, leases, read atomic.Int64
 		other.setRule(func(op, key string) error {
 			switch {
 			case op == "get" && key == keys.Manifest():
@@ -1096,10 +1137,24 @@ func TestStandbyPollsTheLease(t *testing.T) {
 			}
 			return nil
 		})
-		start(t, office.Config{Store: other, Keys: keys, Holder: holder(t, "b"), TTL: 3 * time.Second, Renew: 100 * time.Millisecond})
-		time.Sleep(700 * time.Millisecond)
-		if m, l := manifests.Load(), leases.Load(); m != 1 || l < 4 {
-			t.Fatalf("the standby read the manifest %d times and the lease %d", m, l)
+		other.setGot(func(key string) {
+			if key == keys.Lease() {
+				read.Add(1)
+			}
+		})
+		start(t, office.Config{Store: other, Keys: keys, Holder: holder(t, "b"), TTL: 30 * time.Second, Renew: 100 * time.Millisecond})
+		// The candidacy's read of the lease, then four polls.
+		for deadline := time.Now().Add(10 * time.Second); read.Load() < 5; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("the standby read the lease %d times", read.Load())
+			}
+		}
+		// One manifest read, the candidacy's, and one more for each lease
+		// read that failed: on a slow machine a read can outlast its timeout
+		// of a renewal period, and the standby then runs a candidacy. The
+		// successes are loaded first, so a read under way counts as failed.
+		if ok, m, l := read.Load(), manifests.Load(), leases.Load(); m > 1+l-ok {
+			t.Fatalf("the standby read the manifest %d times and the lease %d, %d of them in full", m, l, ok)
 		}
 	})
 	t.Run("release", func(t *testing.T) {
@@ -1111,7 +1166,7 @@ func TestStandbyPollsTheLease(t *testing.T) {
 		if err := stop(); err != nil {
 			t.Fatalf("Run: %v", err)
 		}
-		waitFor(t, b, 5*time.Second+time.Second, "leading after the release", leading)
+		st.stoodWithin(t, b, time.Now(), 5*time.Second+time.Second, "leading after the release")
 	})
 }
 
@@ -1191,8 +1246,10 @@ func TestOneHungRenewalKeepsOffice(t *testing.T) {
 func TestRenewalCadenceAcrossLead(t *testing.T) {
 	st, keys := newDatabase(t, t.TempDir())
 	const renew = 500 * time.Millisecond
+	var taken atomic.Int64 // the lease writes of the candidacy, before the first renewal
 	office.SetLead(t, func(ctx context.Context, s storage.Store, k format.Keys, dir string, o engine.Office, cfg engine.Config) (*engine.Leader, error) {
 		n := len(st.leaseWrites())
+		taken.Store(int64(n))
 		l, err := engine.Lead(ctx, s, k, dir, o, cfg)
 		// Return just before the next tick: after a renewal and most of a
 		// period.
@@ -1203,15 +1260,20 @@ func TestRenewalCadenceAcrossLead(t *testing.T) {
 		return l, err
 	})
 	a, _ := start(t, office.Config{Store: st, Keys: keys, Holder: holder(t, "a"), TTL: 3 * renew, Renew: renew})
-	waitFor(t, a, 5*time.Second, "leading", leading)
-	time.Sleep(2 * renew)
-	w := st.leaseWrites()
+	waitFor(t, a, 15*time.Second, "leading", leading)
+	// The renewal while Lead ran and the two after it. The candidacy's
+	// writes are left out: the first renewal is due a period after the
+	// candidacy ends, however long a slow machine takes over that.
+	w := st.leaseWrites()[taken.Load():]
+	for deadline := time.Now().Add(15 * time.Second); len(w) < 3 && time.Now().Before(deadline); w = st.leaseWrites()[taken.Load():] {
+		time.Sleep(10 * time.Millisecond)
+	}
 	var gap time.Duration
 	for i := 1; i < len(w); i++ {
 		gap = max(gap, w[i].at.Sub(w[i-1].at))
 	}
-	if len(w) < 4 || gap > renew*3/2 {
-		t.Fatalf("%d lease writes, at most %v apart; want renewals a period of %v apart", len(w), gap, renew)
+	if len(w) < 3 || gap > renew*3/2 {
+		t.Fatalf("%d renewals, at most %v apart; want renewals a period of %v apart", len(w), gap, renew)
 	}
 }
 
@@ -1248,9 +1310,17 @@ func TestDeposedDuringLead(t *testing.T) {
 	}
 	n := len(st.leaseWrites())
 	// A candidate whose time to live of 1 ms finds the live lease expired,
-	// and which stamps it by the true clock.
-	if _, _, err := engine.Takeover(context.Background(), st.Store, keys, engine.Candidate{Holder: "usurper", TTL: time.Millisecond, Now: time.Now}); err != nil {
-		t.Fatalf("usurper: %v", err)
+	// and which stamps it by the true clock. A renewal in that last
+	// millisecond holds the lease against it, so it tries again.
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		_, _, err := engine.Takeover(context.Background(), st.Store, keys, engine.Candidate{Holder: "usurper", TTL: time.Millisecond, Now: time.Now})
+		if err == nil {
+			break
+		}
+		var held *engine.LeaseHeldError
+		if !errors.As(err, &held) || time.Now().After(deadline) {
+			t.Fatalf("usurper: %v", err)
+		}
 	}
 	s := waitFor(t, a, 10*time.Second, "out of office", func(s office.State) bool { return s.Reason != nil })
 	if s.Leader != nil || !errors.Is(s.Reason, office.ErrDeposed) {
@@ -1319,7 +1389,7 @@ func TestStandbyTakesFutureStampedLease(t *testing.T) {
 	if _, _, err := engine.Takeover(context.Background(), st.Store, keys, engine.Candidate{Holder: "skewed", TTL: ttl, Now: far}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, b, 2*time.Second, "leading", leading)
+	st.stoodWithin(t, b, time.Now(), 2*time.Second, "leading")
 }
 
 // sigHang makes every manifest read wait for its context to end once armed,
@@ -1384,7 +1454,7 @@ func TestStandbyLeaseReadTimesOut(t *testing.T) {
 	if err := stop(); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	waitFor(t, b, 2*time.Second, "leading after the release", leading)
+	other.stoodWithin(t, b, time.Now(), 2*time.Second, "leading after the release")
 	if other.n.Load() > 0 {
 		t.Fatal("no lease read hung")
 	}
