@@ -42,8 +42,9 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// serve builds skylite from this tree, serves database "gorm" from a local
-// store with a key it generates, and runs the tests against it.
+// serve builds skylite from this tree, serves database "gorm" from the
+// store perfStorage picks with a key it generates, and runs the tests
+// against it.
 func serve(m *testing.M) (int, error) {
 	dir, err := os.MkdirTemp("", "skylite-gorm-")
 	if err != nil {
@@ -96,8 +97,9 @@ func serve(m *testing.M) (int, error) {
 	return m.Run(), nil
 }
 
-// config writes a plaintext configuration with a JWKS file and a local
-// store in dir, sets token to an admin token, and returns the path.
+// config writes a plaintext configuration with a JWKS file in dir and the
+// store of perfStorage(dir), sets token to an admin token, and returns the
+// path.
 func config(dir string) (string, error) {
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -122,7 +124,7 @@ func config(dir string) (string, error) {
 			"issuers": []any{map[string]any{"issuer": iss, "audience": "skylite", "jwks_file": filepath.Join(dir, "jwks.json")}},
 			"rules":   []any{map[string]any{"issuer": iss, "subject": "gorm", "database": "*", "role": "admin"}},
 		},
-		"storage": map[string]any{"localfs": map[string]any{"path": filepath.Join(dir, "store")}},
+		"storage": perfStorage(dir),
 	})
 	if err != nil {
 		return "", err

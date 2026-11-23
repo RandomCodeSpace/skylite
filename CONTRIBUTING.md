@@ -68,6 +68,20 @@ needs Python 3, which it uses to pick the port. The durability kill test runs 20
 GitHub's default setup, which is managed at the organisation level, so there is
 no CodeQL workflow in this repository.
 
+`make perf` runs the load generator, `TestPerf` in `driver/acceptance`,
+against a `skylite serve` built from this tree, through the Go driver with one
+principal: autocommit inserts at 1 to 64 workers, transactions of 100
+inserts, an 8 MiB transaction, point selects at 1 to 64 workers and a full
+scan. It prints one `PERF` line per phase with ops/s, errors and latency
+percentiles, and takes about three minutes. It uses a local store; to run it
+on Azure, set `SKYLITE_PERF_PREFIX` to a fresh prefix, `SKYLITE_PERF_CONTAINER`
+to an existing container, `SKYLITE_TEST_AZURE_ACCOUNT_URL` to
+`https://<account>.blob.core.windows.net/`, and a service principal with
+Storage Blob Data Contributor on the container in `AZURE_TENANT_ID`,
+`AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET`. The test leaves its objects
+under that prefix; delete them afterwards. Without `SKYLITE_PERF=1` the test
+skips, so `make test` and CI never run it.
+
 Pure-Go builds are a project requirement: skylite must not depend on cgo, and
 `CGO_ENABLED=0 go build ./...` must pass.
 
