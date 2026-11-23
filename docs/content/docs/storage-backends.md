@@ -190,6 +190,8 @@ Run by hand against the real Azure Blob Storage service on 2026-11-23, not in CI
 - this backend's integration tests above, the conformance suite and the fault tests included: all passed. With `SKYLITE_TEST_AZURE_ACCOUNT_URL=https://<account>.blob.core.windows.net/` and the service principal in `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET`, `go test -tags integration ./internal/storage/azureblob` creates a container for each test with that credential and a user delegation SAS for it, and deletes it afterwards;
 - the GORM acceptance suite on `skylite serve` with `entra: true`: all of its tests passed, and the objects were in the container afterwards.
 
+A 13-minute failover soak of three `skylite serve` processes on one machine, against a real account, lost no acknowledged write; [Azure Blob Storage](/docs/azure-blob/#failover-and-takeover) gives its timings.
+
 One difference from Azurite: the real service deletes a container in the background. For about 3 seconds after the deletion was accepted, requests through the container's SAS still succeeded, or found no blob, although the container's own properties already reported it missing; Azurite refuses them at once. A write acknowledged in that window is lost with the container. `TestMissingContainer` waits for the refusals before it checks them.
 
 Not tested: workload identity, managed identity, account keys of a real account, throttling, HTTP/2 against the service, a proxy between the backend and the service, and the assumption that an ETag never repeats for a key. Azurite derives its ETags from the time in milliseconds multiplied by a random factor, so on the emulator two writes in the same millisecond can, rarely, share one.

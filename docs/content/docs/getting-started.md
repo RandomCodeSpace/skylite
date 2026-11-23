@@ -15,7 +15,7 @@ You need Linux or macOS, `curl` and `openssl`. The Go example needs Go 1.26 or l
 Each [release](https://github.com/RandomCodeSpace/skylite/releases) has a `tar.gz` archive for Linux and macOS on amd64 and arm64, a `SHA256SUMS` file, an SBOM for each archive, and a [Cosign](https://docs.sigstore.dev/) signature of `SHA256SUMS`. No container image is published.
 
 ```sh
-VERSION=0.0.2
+VERSION=0.0.3
 gh release download "v$VERSION" -R RandomCodeSpace/skylite \
   -p "skylite_${VERSION}_linux_amd64.tar.gz" -p 'SHA256SUMS*'
 ```
@@ -38,7 +38,7 @@ tar -xzf "skylite_${VERSION}_linux_amd64.tar.gz"
 ./skylite version
 ```
 
-With a Go toolchain you can instead run `go install github.com/RandomCodeSpace/skylite/cmd/skylite@v0.0.2`, or build from a clone with `make build`, which writes `bin/skylite`.
+With a Go toolchain you can instead run `go install github.com/RandomCodeSpace/skylite/cmd/skylite@v0.0.3`, or build from a clone with `make build`, which writes `bin/skylite`.
 
 ## 2. Make a signing key and a token
 
@@ -92,7 +92,7 @@ The answer is `{"done":{"txn":1,"epoch":1}}`. The server takes office for the ne
 The Go driver is the package `github.com/RandomCodeSpace/skylite/driver` in the main module:
 
 ```sh
-go get github.com/RandomCodeSpace/skylite@v0.0.2
+go get github.com/RandomCodeSpace/skylite@v0.0.3
 ```
 
 ```go
