@@ -121,6 +121,7 @@ func TestLoadRefuses(t *testing.T) {
 		"azure without container": withStorage(`"storage": {"azure": {"account": "acct", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
 		"azure without cred":      withStorage(`"storage": {"azure": {"account": "acct", "container": "c"}}`),
 		"azure with both creds":   withStorage(`"storage": {"azure": {"account": "acct", "container": "c", "shared_key_file": "/etc/skylite/azure.key", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
+		"azure entra over http":   withStorage(`"storage": {"azure": {"account": "acct", "container": "c", "endpoint": "http://127.0.0.1:10000/acct", "entra": true}}`),
 		"azure key and entra":     withStorage(`"storage": {"azure": {"account": "acct", "container": "c", "shared_key_env": "AZURE_STORAGE_KEY", "entra": true}}`),
 		"azure bad account":       withStorage(`"storage": {"azure": {"account": "u:hunter2@evil", "container": "c", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
 		"azure bad container":     withStorage(`"storage": {"azure": {"account": "acct", "container": "a/b", "shared_key_env": "AZURE_STORAGE_KEY"}}`),

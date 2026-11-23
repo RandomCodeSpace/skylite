@@ -128,9 +128,11 @@ type Azure struct {
 	// account shared key. Exactly one of SharedKeyFile, SharedKeyEnv and Entra
 	// must be set.
 	SharedKeyEnv string `json:"shared_key_env"`
-	// Entra signs requests with an Entra ID token from azidentity's default
-	// credential chain: a service principal in the AZURE_* environment
-	// variables, workload identity, or a managed identity. Exactly one of
+	// Entra signs requests with an Entra ID token from azidentity's
+	// DefaultAzureCredential: a service principal in the AZURE_* environment
+	// variables, workload identity, a managed identity, then the Azure CLI,
+	// Azure Developer CLI and Azure PowerShell logins; AZURE_TOKEN_CREDENTIALS
+	// narrows the chain. It needs an https endpoint. Exactly one of
 	// SharedKeyFile, SharedKeyEnv and Entra must be set.
 	Entra bool `json:"entra"`
 }
@@ -243,6 +245,9 @@ func (a Azure) validate() error {
 		return errors.New("storage.azure.endpoint " + endpointRule)
 	case creds != 1:
 		return errors.New("storage.azure needs exactly one of shared_key_file, shared_key_env and entra")
+	case a.Entra && a.Endpoint != "" && !strings.HasPrefix(a.Endpoint, "https://"):
+		// azcore refuses to send a bearer token over plain HTTP.
+		return errors.New("storage.azure.entra needs an https endpoint")
 	case a.SharedKeyEnv != "" && !validEnvName(a.SharedKeyEnv):
 		return errors.New("storage.azure.shared_key_env must be an environment variable name")
 	}

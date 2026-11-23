@@ -183,8 +183,10 @@
 // that refuse a connection, report a re-send in the trace, or drop the trace
 // while a credential fails to reach a closed proxy, and a local HTTP/2 server
 // that resets a request's stream with PROTOCOL_ERROR after applying it. The
-// real service, working Entra ID credentials, real latency, HTTP/2 against
-// the service and a real proxy are not tested.
+// server's acceptance suite has been run once by hand against the real
+// service with an Entra ID service principal; this package's own tests have
+// not, and real throttling, HTTP/2 against the service and a real proxy are
+// not tested.
 package azureblob
 
 import (
