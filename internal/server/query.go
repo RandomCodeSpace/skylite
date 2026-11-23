@@ -439,6 +439,13 @@ func statementError(ctx context.Context, err error) (*wire.Error, error) {
 		e.SQLiteCode, e.SQLiteExtendedCode = int64(se.Code()), int64(se.ExtendedCode())
 		return e, nil
 	}
+	// ncruces reports some errors, such as SQLITE_READONLY under PRAGMA
+	// query_only, by their code alone.
+	if xc, ok := errors.AsType[sqlite3.ExtendedErrorCode](err); ok {
+		e := wire.NewError(wire.CodeSQLError, xc.Error())
+		e.SQLiteCode, e.SQLiteExtendedCode = int64(xc.Code()), int64(xc)
+		return e, nil
+	}
 	// The response could not be written, or the engine failed: nobody may
 	// be reading, and the connection is not trusted again.
 	return wire.NewError(wire.CodeInternal, "the statement failed"), errEnded

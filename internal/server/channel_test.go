@@ -805,9 +805,13 @@ func TestOpenAnswerRolesAndBounds(t *testing.T) {
 	if a := e.post(t, "channels", "reader", `{"mode":"write"}`); a.status != http.StatusForbidden {
 		t.Errorf("a reader's write open: %d %v", a.status, a.frames)
 	}
-	if a := e.post(t, "channels", "reader", `{"mode":"read_only"}`); a.status != http.StatusServiceUnavailable || a.code() != "not_serving" {
+	a = e.post(t, "channels", "reader", `{"mode":"read_only"}`)
+	rc, _ := a.done()["channel"].(map[string]any)
+	rtok, _ := rc["token"].(string)
+	if _, epoch := rc["epoch"]; a.status != 200 || rc["mode"] != "read_only" || epoch || !strings.HasPrefix(rtok, readTokenPrefix+"."+e.s.instance+".") {
 		t.Errorf("read-only open: %d %v", a.status, a.frames)
 	}
+	e.post(t, "channel/close", "reader", closeBody(rtok))
 	e.s.chMu.Lock()
 	e.s.chl.perPrincipal, e.s.chl.perDB, e.s.chl.channels = 2, 3, 3
 	e.s.chMu.Unlock()

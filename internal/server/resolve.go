@@ -110,10 +110,12 @@ func (s *Server) resolve(ctx context.Context, d *database, leader *engine.Leader
 }
 
 // openHead returns the open head that token carries, if it is a channel
-// token that names t's database.
+// token that names t's database. A read-only channel never commits, and
+// its resolve answers what it would for a write channel's request that
+// never committed.
 func openHead(token string, t *table) (uint64, bool) {
 	parts := strings.Split(token, ".")
-	if len(parts) != 5 || parts[0] != channelTokenPrefix || parts[2] != hex.EncodeToString(t.office.DB[:]) {
+	if len(parts) != 5 || parts[0] != channelTokenPrefix && parts[0] != readTokenPrefix || parts[2] != hex.EncodeToString(t.office.DB[:]) {
 		return 0, false
 	}
 	o, err := strconv.ParseUint(parts[3], 10, 64)

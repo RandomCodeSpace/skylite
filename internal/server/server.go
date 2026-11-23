@@ -787,7 +787,8 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	// on a write channel but close and cancel, which only stop work,
 	// checked again on each, since a token's claims can change, and a
 	// resolve, which needs what a write open needs (ADR 0005 decision 4).
-	if kind == wire.KindChannel || kind == wire.KindResolve || kind == wire.KindOpen && req.Mode == wire.ModeWrite {
+	// A read-only channel's token never matches a write channel's.
+	if kind == wire.KindChannel && !strings.HasPrefix(req.Channel, readTokenPrefix+".") || kind == wire.KindResolve || kind == wire.KindOpen && req.Mode == wire.ModeWrite {
 		if e := authorize(auth.RoleWrite); e != nil {
 			return nil, e, true
 		}
@@ -796,8 +797,7 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	// without noticing yet must not answer channel_lost for a channel of
 	// the leader in office. A token naming another process goes there.
 	if !hop && s.peer != nil && leader != nil && (kind == wire.KindChannel || kind == wire.KindCancel || kind == wire.KindClose) {
-		inst, _, _ := strings.Cut(strings.TrimPrefix(req.Channel, channelTokenPrefix+"."), ".")
-		forward = inst != s.instance
+		forward = tokenInstance(req.Channel) != s.instance
 	}
 	if forward && (!stateless || follower == nil) {
 		return nil, s.forward(st, r, kind, db, req, body, id, arrived, log), true
