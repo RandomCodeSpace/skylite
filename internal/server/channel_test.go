@@ -888,7 +888,9 @@ func (l *lockEnv) busy(t *testing.T, subject, tok, msg string) {
 }
 
 func TestWriteLockFIFOAndBusy(t *testing.T) {
-	l := newLockEnv(t, func(e *env) { e.s.chl.waiters, e.s.chl.waitersBy = 2, 1 })
+	// A long lock wait: on a slow runner the default 5 s can expire before
+	// the hold is released, and the test is about order, not the wait.
+	l := newLockEnv(t, func(e *env) { e.s.chl.waiters, e.s.chl.waitersBy, e.s.limits.LockWaitMS = 2, 1, 60000 })
 	e := l.e
 	release := l.hold(t)
 	w := e.postAsync(t, "channel", "writer", ex(l.toks["writer"][0], 1, "INSERT INTO t VALUES (1)"))
@@ -901,9 +903,10 @@ func TestWriteLockFIFOAndBusy(t *testing.T) {
 	e.s.chMu.Unlock()
 	l.busy(t, "admin", l.toks["admin"][1], "too many writers") // the database's bound
 	release()
-	tw, ta := num((<-w).done(), "txn"), num((<-a).done(), "txn")
+	aw, aa := <-w, <-a
+	tw, ta := num(aw.done(), "txn"), num(aa.done(), "txn")
 	if tw == 0 || ta != tw+1 {
-		t.Errorf("transactions %d then %d, want first in, first out", tw, ta)
+		t.Errorf("transactions %d then %d, want first in, first out (writer %v, admin %v)", tw, ta, aw.err(), aa.err())
 	}
 	l.waiting(t, 0)
 }
@@ -918,6 +921,128 @@ func TestLockWait(t *testing.T) {
 		t.Errorf("busy after %v, want the lock wait", d)
 	}
 	l.waiting(t, 0)
+}
+
+// who is the principal of the channel of tok, as the pool counts it.
+func (e *env) who(tok string) string {
+	e.s.chMu.Lock()
+	defer e.s.chMu.Unlock()
+	return e.s.dbs["d"].chans.chans[tok].who
+}
+
+// TestWritersBeyondConnectionQuota: writers of one principal that outnumber
+// its SQLite connection quota all wait for the write lock first in, first
+// out, holding no connection while they wait, and each commits or gets
+// busy; none is refused overloaded for want of a connection.
+func TestWritersBeyondConnectionQuota(t *testing.T) {
+	l := newLockEnv(t, func(e *env) { e.s.limits.LockWaitMS = 1000 })
+	e := l.e
+	n := 3 * e.s.pool.perPrincipal
+	toks := make([]string, n)
+	for i := range toks {
+		toks[i] = e.open(t, "writer")
+	}
+	release := l.hold(t)
+	start := time.Now()
+	answers := make([]<-chan answer, n)
+	for i, tok := range toks {
+		answers[i] = e.postAsync(t, "channel", "writer", ex(tok, 1, fmt.Sprintf("INSERT INTO t VALUES (%d)", i+1)))
+	}
+	// Not l.waiting, whose Fatalf would leave the holder holding the lock.
+	queued := 0
+	for deadline := time.Now().Add(3 * time.Second); queued < n && time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		e.s.chMu.Lock()
+		queued = len(e.s.dbs["d"].chans.lock.queue)
+		e.s.chMu.Unlock()
+	}
+	e.s.pool.mu.Lock()
+	busy := e.s.pool.busy[e.who(l.holder)]
+	e.s.pool.mu.Unlock()
+	if queued != n || busy != 1 {
+		t.Errorf("%d writers waiting with %d connections of the principal in use; want %d, and the holder's alone", queued, busy, n)
+	}
+	release()
+	for i, c := range answers {
+		a := <-c
+		switch {
+		case a.done() != nil:
+		case a.status == 200 && a.code() == "busy" && a.err()["final"] == true:
+		default:
+			t.Errorf("writer %d: %d %v, want done or a recorded busy", i, a.status, a.frames)
+		}
+	}
+	if d := time.Since(start); d > time.Second+5*time.Second {
+		t.Errorf("writers took %v, want about the lock wait", d)
+	}
+	e.quiet(t, "after the writers")
+}
+
+// TestCancelWhileWaitingForLock: a cancel or close of a write waiting for
+// the lock records it cancelled and leaves no lock or connection behind.
+func TestCancelWhileWaitingForLock(t *testing.T) {
+	l := newLockEnv(t, nil)
+	e := l.e
+	release := l.hold(t)
+	w := e.postAsync(t, "channel", "admin", ex(l.toks["admin"][0], 1, "INSERT INTO t VALUES (1)"))
+	b := e.postAsync(t, "channel", "admin", sq(l.toks["admin"][1], 1, "begin"))
+	l.waiting(t, 2)
+	if c := e.post(t, "channel/cancel", "admin", cancelBody(l.toks["admin"][0], 1)); c.done() == nil {
+		t.Errorf("cancel: %d %v", c.status, c.frames)
+	}
+	if c := e.post(t, "channel/close", "admin", closeBody(l.toks["admin"][1])); c.done() == nil {
+		t.Errorf("close: %d %v", c.status, c.frames)
+	}
+	for _, a := range []answer{<-w, <-b} {
+		if a.status != 200 || a.code() != "cancelled" || a.err()["final"] != true || a.err()["not_executed"] != true {
+			t.Errorf("%d %v, want a recorded cancelled", a.status, a.frames)
+		}
+	}
+	l.waiting(t, 0)
+	release()
+	if a := e.post(t, "channel", "admin", ex(l.toks["admin"][0], 2, "INSERT INTO t VALUES (2)")); a.done() == nil {
+		t.Errorf("next write: %d %v", a.status, a.frames)
+	}
+	e.quiet(t, "after the cancels")
+}
+
+// TestNoConnectionAtGrant: a write granted the lock when its principal's
+// connections are all in use records overloaded, final and not executed,
+// and passes the lock on; its resend replays that receipt.
+func TestNoConnectionAtGrant(t *testing.T) {
+	l := newLockEnv(t, nil)
+	e := l.e
+	release := l.hold(t)
+	w := e.postAsync(t, "channel", "admin", ex(l.toks["admin"][0], 1, "INSERT INTO t VALUES (1)"))
+	b := e.postAsync(t, "channel", "admin", sq(l.toks["admin"][1], 1, "begin"))
+	l.waiting(t, 2)
+	admin := e.who(l.toks["admin"][0])
+	taken := 0
+	for ; taken < e.s.pool.perPrincipal; taken++ {
+		if _, _, ok := e.s.pool.take(nil, admin); !ok {
+			t.Error("the waiting writers hold the principal's connections")
+			break
+		}
+	}
+	release()
+	first := <-w
+	for _, a := range []answer{first, <-b} {
+		if a.status != 200 || a.code() != "overloaded" || a.err()["final"] != true || a.err()["not_executed"] != true || a.err()["txn_state"] != "none" {
+			t.Errorf("%d %v, want a recorded overloaded", a.status, a.frames)
+		}
+	}
+	if r := e.post(t, "channel", "admin", ex(l.toks["admin"][0], 1, "INSERT INTO t VALUES (1)")); frameText(r) != frameText(first) {
+		t.Errorf("resend %v, want the receipt %v", r.frames, first.frames)
+	}
+	for range taken {
+		e.s.pool.release(admin, nil, false)
+	}
+	if a := e.post(t, "channel", "admin", ex(l.toks["admin"][0], 2, "INSERT INTO t VALUES (2)")); a.done() == nil {
+		t.Errorf("next write: %d %v", a.status, a.frames)
+	}
+	if got := e.count(t, "SELECT count(*) FROM t WHERE a = 1"); got != "[0]" {
+		t.Errorf("rows %s, want none of the refused write", got)
+	}
+	e.quiet(t, "after the refusals")
 }
 
 func TestUnsupportedOpsAndPing(t *testing.T) {

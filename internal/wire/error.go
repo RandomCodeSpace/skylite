@@ -92,7 +92,7 @@ func (c Code) Recordable() bool {
 	switch c {
 	case CodeInvalidRequest, CodeStatementForbidden, CodeInvalidState, CodeTransactionAborted, CodeBusy,
 		CodeTimeout, CodeCancelled, CodeResultTooLarge, CodeSQLError, CodeCommitFailed, CodeMaintenance,
-		CodeInternal:
+		CodeInternal, CodeOverloaded:
 		return true
 	}
 	return false
