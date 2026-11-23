@@ -1,8 +1,9 @@
 ---
 title: Storage backends
-description: The storage interface's backends, how each maps the interface onto its service, and what has been tested.
-weight: 25
+description: How each storage backend (local filesystem, Amazon S3, Google Cloud Storage, Azure Blob Storage) implements skylite's storage contract, and exactly what has been tested.
+weight: 75
 status: current
+navgroup: reference
 ---
 
 Every durable byte in skylite goes through one interface, the `storage.Store` of package `internal/storage`. Its package documentation is the contract: create-if-absent and compare-and-swap as the only writes, version tokens that never repeat for a key, strongly consistent reads and listings, and a rule for writes whose outcome is unknown. Package `internal/storage/storagetest` is the conformance suite every backend must pass.
