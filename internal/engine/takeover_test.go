@@ -990,6 +990,7 @@ func TestFailedTakeBackKeepsWinner(t *testing.T) {
 // try, not at every step of the walk, and its failure does not end the
 // takeover.
 func TestFailedRenewalTriedOncePerThird(t *testing.T) {
+	walkReads(t, 1, firstRead) // the actor steps one call at a time
 	e := newEnv(t, 304)
 	for range 30 {
 		if out := e.l.commit(bg); out != committed {

@@ -152,6 +152,7 @@ func runModel(t *testing.T, seed uint64, budget int64, ps, gs uint32) error {
 // that, and one page record.
 // None of it depends on how many groups the database has.
 func TestBoundedWork(t *testing.T) {
+	walkReads(t, 1, format.CommitHeaderSize) // exact accounting: a header read, then a table read
 	ctx := context.Background()
 	for _, groups := range []uint32{2000, 8000} {
 		st, keys := newStore(t)
