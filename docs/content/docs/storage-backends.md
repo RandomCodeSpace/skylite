@@ -8,6 +8,8 @@ navgroup: reference
 
 Every durable byte in skylite goes through one interface, the `storage.Store` of package `internal/storage`. Its package documentation is the contract: create-if-absent and compare-and-swap as the only writes, version tokens that never repeat for a key, strongly consistent reads and listings, and a rule for writes whose outcome is unknown. Package `internal/storage/storagetest` is the conformance suite every backend must pass.
 
+The HTTP transports of the S3 and GCS backends, and the one the server builds for Azure, wait at most 10 seconds (`storage.ResponseHeaderTimeout`) for a response's headers once a request is written, so a service that accepts a connection and goes silent fails the request instead of holding it until its context ends; for a write that failure is `ErrOutcomeUnknown`. Reads are retried by each SDK: S3 and Azure a few times, GCS until the call's context ends, so on GCS the timeout bounds each attempt of a read but not the read.
+
 Each cloud backend is tested against an emulator (RustFS, fake-gcs-server, Azurite). The Azure backend has also been run by hand against the real service. The [server](/docs/server/) can be configured to use `localfs`, `s3`, `gcs` or `azure`.
 
 | Package | Service | Status |

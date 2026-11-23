@@ -21,6 +21,7 @@ import (
 )
 
 func TestFollowerPoll(t *testing.T) {
+	walkReads(t, 1, firstRead) // one read per commit, in order
 	ctx := t.Context()
 	st, keys := newStore(t)
 	h := newHistory(t, st.Store, keys, 1, 512, 4)
@@ -50,12 +51,12 @@ func TestFollowerPoll(t *testing.T) {
 	manifest := keys.Manifest()
 	log := func(txn uint64) string { return keys.Commit(h.db, txn) }
 
-	check("get "+manifest, "getrange "+log(1), "getrange "+log(1), "getrange "+log(2), "head "+log(3))
+	check("get "+manifest, "getrange "+log(1), "getrange "+log(2), "head "+log(3))
 	check("head "+manifest, "getrange "+log(2), "head "+log(3))
 
 	old := f.current
 	h.commit(2, map[uint32][]byte{1: h.bytes(512), 2: h.bytes(512)})
-	check("head "+manifest, "getrange "+log(2), "getrange "+log(2), "getrange "+log(3), "head "+log(4))
+	check("head "+manifest, "getrange "+log(2), "getrange "+log(3), "head "+log(4))
 	if old.Txn() != 1 || f.current.Txn() != 2 {
 		t.Fatalf("published transactions old=%d new=%d", old.Txn(), f.current.Txn())
 	}
@@ -332,6 +333,7 @@ func TestFollowerCompaction(t *testing.T) {
 }
 
 func TestFollowerWalk(t *testing.T) {
+	walkReads(t, 1, format.CommitHeaderSize) // a change between the header and the table
 	t.Run("retired table", func(t *testing.T) {
 		st, keys := newStore(t)
 		h := newHistory(t, st.Store, keys, 1, 512, 4)

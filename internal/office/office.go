@@ -284,9 +284,8 @@ func (l *Loop) Run(ctx context.Context) error {
 		// One ticker for the whole term, so that a renewal is due a period
 		// after the last one wherever Lead's end falls between them.
 		renewal := time.NewTicker(l.cfg.Renew)
-		if stopFollower != nil {
-			stopFollower()
-		}
+		// The follower serves reads until the leader can: it reads only
+		// committed history, which the takeover does not change.
 		leader, err := l.start(ctx, t, renewal.C)
 		if err != nil {
 			renewal.Stop()
@@ -307,6 +306,9 @@ func (l *Loop) Run(ctx context.Context) error {
 		backoff = first
 		l.log.Info("office: leading", "epoch", t.office.Epoch, "head", t.office.Head)
 		l.set(leader, t.office, nil)
+		if stopFollower != nil {
+			stopFollower() // after the leader is published, so reads never lack both
+		}
 		done, err := l.lead(ctx, t, leader, renewal.C)
 		renewal.Stop()
 		if done {

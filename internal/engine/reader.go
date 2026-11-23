@@ -11,10 +11,11 @@
 // transaction number. Open reads the manifest, which names the base, the
 // group objects the database's pages were last compacted into, current to
 // the manifest's transaction number. It then reads the commit log above
-// that number by direct reads of consecutive names, the header and then the
-// page table of each commit, up to the requested transaction or, for the
-// head, until a name is absent. The log is never listed. From those it
-// keeps an index from page number to the newest commit that holds the page;
+// that number by direct reads of consecutive names, the header and page
+// table of each commit in one read of its first 4 KiB (two for a longer
+// table), up to the requested transaction or, for the head, until a name
+// is absent, with up to 32 reads in flight. The log is never listed. From
+// those it keeps an index from page number to the newest commit that holds the page;
 // it takes memory in proportion to the pages in the log above the manifest,
 // which compaction keeps short, not to the size of the database.
 //
@@ -63,6 +64,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 	"unique"
 
@@ -374,6 +376,8 @@ func entryCount(cs []*commit) int {
 func (r *Reader) walk(ctx context.Context, a anchor, cs []*commit, target uint64) (anchor, []*commit, error) {
 	entries := entryCount(cs)
 	var retried uint64 // the name Head and GetRange last disagreed on
+	var p *prefetch    // reads ahead from next while the walk goes on
+	defer func() { p.stop() }()
 	for {
 		last := a.m.Txn + uint64(len(cs))
 		if target != 0 && last >= target {
@@ -387,8 +391,19 @@ func (r *Reader) walk(ctx context.Context, a anchor, cs []*commit, target uint64
 		if len(cs) > 0 {
 			prevSize = cs[len(cs)-1].h.DBSize
 		}
-		started := time.Now()
-		c, err := r.fetchCommit(ctx, a.m, next, prevSize)
+		if p == nil {
+			p = r.startPrefetch(ctx, a.m, next, cmp.Or(target, math.MaxUint64-1))
+		}
+		f := p.take()
+		c, err, started := f.c, f.err, f.started
+		if err == nil && c.h.EpochBump && c.h.DBSize != prevSize {
+			err = fmt.Errorf("%w: epoch bump %d has database size %d after %d", ErrCorrupt, next, c.h.DBSize, prevSize)
+		}
+		if err != nil {
+			// Whatever comes next starts again from a fresh read.
+			p.stop()
+			p = nil
+		}
 		var stale *staleError
 		switch {
 		case err == nil:
@@ -445,14 +460,20 @@ func (r *Reader) walk(ctx context.Context, a anchor, cs []*commit, target uint64
 	}
 }
 
-// fetchCommit reads and checks the header and page table of commit txn,
-// which follows a commit of prevSize pages.
-func (r *Reader) fetchCommit(ctx context.Context, m format.Manifest, txn uint64, prevSize uint32) (*commit, error) {
+// firstRead is how many bytes the first read of a commit takes: its header
+// and the page table of a commit of up to 247 pages, so that one ranged
+// read usually serves both. A variable so that tests can change it.
+var firstRead int64 = 4096
+
+// fetchCommit reads and checks the header and page table of commit txn.
+// The caller checks an epoch bump's size against the commit before it.
+func (r *Reader) fetchCommit(ctx context.Context, m format.Manifest, txn uint64) (*commit, error) {
 	key := r.keys.Commit(m.DB, txn)
-	b, info, err := r.getRange(ctx, key, 0, format.CommitHeaderSize)
+	first, info, err := r.getRange(ctx, key, 0, firstRead)
 	if err != nil {
 		return nil, err
 	}
+	b := first[:min(len(first), format.CommitHeaderSize)]
 	h, err := format.DecodeCommitHeader(b, m.DB)
 	if err == nil {
 		err = h.CheckKey(m.DB, txn)
@@ -467,26 +488,91 @@ func (r *Reader) fetchCommit(ctx context.Context, m format.Manifest, txn uint64,
 		return nil, fmt.Errorf("%w: commit %d has page size %d, database %d", ErrCorrupt, txn, h.PageSize, m.PageSize)
 	case info.Size != h.Size():
 		return nil, fmt.Errorf("%w: commit %d is %d bytes, header says %d", ErrCorrupt, txn, info.Size, h.Size())
-	case h.EpochBump && h.DBSize != prevSize:
-		return nil, fmt.Errorf("%w: epoch bump %d has database size %d after %d", ErrCorrupt, txn, h.DBSize, prevSize)
 	}
 	c := &commit{key: key, version: info.Version, h: h}
 	if h.EpochBump {
 		return c, nil
 	}
-	b, info, err = r.getRange(ctx, key, format.CommitHeaderSize, h.TableSize())
-	switch {
-	case errors.Is(err, storage.ErrNotFound):
-		return nil, fmt.Errorf("%w: commit %d deleted", ErrCorrupt, txn)
-	case err != nil:
-		return nil, err
-	case info.Version != c.version:
-		return nil, &staleError{txn: txn}
+	if end := format.CommitHeaderSize + h.TableSize(); int64(len(first)) >= end {
+		b = first[format.CommitHeaderSize:end]
+	} else {
+		b, info, err = r.getRange(ctx, key, format.CommitHeaderSize, h.TableSize())
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			return nil, fmt.Errorf("%w: commit %d deleted", ErrCorrupt, txn)
+		case err != nil:
+			return nil, err
+		case info.Version != c.version:
+			return nil, &staleError{txn: txn}
+		}
 	}
 	if c.entries, err = format.DecodeCommitTable(h, b); err != nil {
 		return nil, fmt.Errorf("engine: commit %d: %w", txn, err)
 	}
 	return c, nil
+}
+
+// fetchWindow is the most commit reads a walk keeps in flight. A variable
+// so that tests can change it.
+var fetchWindow = 32
+
+// fetched is the outcome of one read of a commit, and when the read began.
+type fetched struct {
+	c       *commit
+	err     error
+	started time.Time
+}
+
+// prefetch reads consecutive commits ahead of a walk, which takes them in
+// order, so that a long tail costs about one round trip per window rather
+// than per commit. It starts with one read in flight and doubles the
+// window, up to fetchWindow, with each commit found, so that a walk that
+// finds the head at once reads only the name it asks for. The walk still
+// checks every commit in order; a read above the first absent name is
+// never used.
+type prefetch struct {
+	r     *Reader
+	ctx   context.Context //nolint:containedctx // the walk's, for the reads it starts
+	m     format.Manifest
+	next  uint64 // the name the next call to take returns
+	left  uint64 // names not yet read, up to the walk's last
+	width int
+	queue []chan fetched // the reads in flight, from next on
+	wg    sync.WaitGroup
+}
+
+// startPrefetch reads commits from first to last, inclusive.
+func (r *Reader) startPrefetch(ctx context.Context, m format.Manifest, first, last uint64) *prefetch {
+	return &prefetch{r: r, ctx: ctx, m: m, next: first, left: last - first + 1, width: 1}
+}
+
+// take returns the read of the next name.
+func (p *prefetch) take() fetched {
+	for p.left > 0 && len(p.queue) < p.width {
+		ch := make(chan fetched, 1)
+		txn := p.next + uint64(len(p.queue))
+		p.queue = append(p.queue, ch)
+		p.left--
+		p.wg.Go(func() {
+			started := time.Now()
+			c, err := p.r.fetchCommit(p.ctx, p.m, txn)
+			ch <- fetched{c, err, started}
+		})
+	}
+	f := <-p.queue[0]
+	p.queue = p.queue[1:]
+	p.next++
+	if f.err == nil {
+		p.width = min(2*p.width, fetchWindow)
+	}
+	return f
+}
+
+// stop waits for the reads in flight, so that none outlives the walk.
+func (p *prefetch) stop() {
+	if p != nil {
+		p.wg.Wait()
+	}
 }
 
 // source is where a page is read from: a commit's entry, a base object, or

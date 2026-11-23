@@ -132,6 +132,7 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 		return release(fmt.Errorf("%w: the manifest at epoch %d was replaced first", ErrLost, o.Epoch-1))
 	}
 
+	var last anchor // the manifest held last read
 	held := func() error {
 		cur, err := r.readManifest(ctx, anchor{m: m}, nil)
 		switch {
@@ -140,12 +141,25 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 		case !o.Holds(cur.m):
 			return fmt.Errorf("%w: the manifest is at epoch %d, this candidacy's is %d", ErrLost, cur.m.Epoch, o.Epoch)
 		}
+		last = cur
 		return nil
+	}
+	// The commits the walk checked, kept for Lead within a reader's limits.
+	var cs []*commit
+	entries, kept := 0, true
+	keep := func(c *commit) {
+		if entries += len(c.entries); !kept || len(cs) >= maxTail || entries > maxTailPages {
+			cs, kept = nil, false
+			return
+		}
+		cs = append(cs, c)
 	}
 	head, size := m.Txn, m.DBSize
 	var occupied uint64 // the name the last bump attempt found another object at
+	var bump []byte
+	var bumpVersion string
 	for {
-		if head, size, err = walk(ctx, r, lease, m, o.Epoch, head, size); err != nil {
+		if head, size, err = walk(ctx, r, lease, m, o.Epoch, head, size, keep); err != nil {
 			var stale *staleError
 			if !errors.As(err, &stale) {
 				return Office{}, nil, err
@@ -165,7 +179,7 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 		case math.MaxUint64:
 			return Office{}, nil, fmt.Errorf("%w: transaction %d", ErrExhausted, head)
 		}
-		bump, err := encodeBump(o, m.PageSize, head+1, size)
+		bump, err = encodeBump(o, m.PageSize, head+1, size)
 		if err != nil {
 			return Office{}, nil, err
 		}
@@ -173,11 +187,13 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 		occupied = head + 1
 		own, err := settle(ctx, held,
 			func() error {
-				_, err := st.Create(ctx, bkey, bytes.NewReader(bump))
+				v, err := st.Create(ctx, bkey, bytes.NewReader(bump))
+				bumpVersion = v
 				return err
 			},
 			func() (bool, error) {
-				b, _, err := readObject(ctx, st, bkey, len(bump)+1)
+				b, info, err := readObject(ctx, st, bkey, len(bump)+1)
+				bumpVersion = info.Version
 				return bytes.Equal(b, bump), err
 			})
 		if err != nil {
@@ -192,6 +208,9 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 		return Office{}, nil, err
 	}
 	o.Head = head + 1
+	if h, err := format.DecodeCommitHeader(bump, o.DB); err == nil && kept {
+		o.tail = &tail{version: last.version, commits: append(cs, &commit{key: keys.Commit(o.DB, o.Head), version: bumpVersion, h: h})}
+	}
 	// Without a renewal in the walk the lease goes unchecked: this candidacy
 	// wrote it less than a third of its time to live ago, so another holder
 	// took it only with a clock off by most of the time to live or under the
@@ -211,10 +230,19 @@ func Takeover(ctx context.Context, st storage.Store, keys format.Keys, c Candida
 // and size. Every object is checked as a reader checks it; one that carries
 // epoch, which only this candidacy's bump may, breaks invariant 1. Between
 // reads it tries to keep lease renewed.
-func walk(ctx context.Context, r *Reader, lease *Lease, m format.Manifest, epoch, head uint64, size uint32) (uint64, uint32, error) {
+//
+// It reads ahead of the commit it checks, as a reader's walk does, and
+// passes each commit it checks to keep, in order.
+func walk(ctx context.Context, r *Reader, lease *Lease, m format.Manifest, epoch, head uint64, size uint32, keep func(*commit)) (uint64, uint32, error) {
+	if head == math.MaxUint64 {
+		return head, size, nil
+	}
+	p := r.startPrefetch(ctx, m, head+1, math.MaxUint64)
+	defer p.stop()
 	for head < math.MaxUint64 {
 		lease.keep(ctx)
-		c, err := r.fetchCommit(ctx, m, head+1, size)
+		f := p.take()
+		c, err := f.c, f.err
 		switch {
 		case errors.Is(err, storage.ErrNotFound):
 			return head, size, nil
@@ -222,7 +250,10 @@ func walk(ctx context.Context, r *Reader, lease *Lease, m format.Manifest, epoch
 			return 0, 0, err
 		case c.h.Epoch == epoch:
 			return 0, 0, fmt.Errorf("%w: commit %d already carries epoch %d", ErrCorrupt, head+1, epoch)
+		case c.h.EpochBump && c.h.DBSize != size:
+			return 0, 0, fmt.Errorf("%w: epoch bump %d has database size %d after %d", ErrCorrupt, head+1, c.h.DBSize, size)
 		}
+		keep(c)
 		head, size = head+1, c.h.DBSize
 	}
 	return head, size, nil
