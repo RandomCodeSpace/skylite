@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1315,34 +1316,41 @@ func TestBodySharePerPrincipal(t *testing.T) {
 	}
 }
 
-// TestMemoryBudgetHolds: whatever the number of databases, the body share,
-// the channels' share and the SQLite connections at their ceiling, the
-// leaders' included, stay within the memory budget, and clients keep a
-// connection.
+// TestMemoryBudgetHolds: whatever the budget and the number of databases,
+// the body share, the control capacity, the channels' share and the SQLite
+// connections at their ceiling, the leaders' included, stay within the
+// memory budget; clients keep a connection, and a principal's quarter of the
+// body share holds one body of the largest size.
 func TestMemoryBudgetHolds(t *testing.T) {
-	for n := range maxDatabases + 1 {
-		cfg := testConfig(t, jwksFile(t, newSigner(t, "k1")))
-		for i := range n {
-			cfg.Databases = append(cfg.Databases, fmt.Sprint("d", i))
-		}
-		if n == maxDatabases {
-			if cfg.Validate() == nil {
-				t.Errorf("%d databases accepted", n)
+	base := testConfig(t, jwksFile(t, newSigner(t, "k1")))
+	for _, budget := range []int64{0, minBudget, minBudget + 1, 3<<30 + 12345, 33 << 30, maxBudget} {
+		_, conns := shares(cmp.Or(budget, defaultBudget))
+		for n := range conns + 1 {
+			cfg := base
+			cfg.MemoryBudget = budget
+			for i := range n {
+				cfg.Databases = append(cfg.Databases, fmt.Sprint("d", i))
 			}
-			continue
+			s, err := newServer(cfg, nil, nil)
+			if n == conns {
+				if err == nil || cfg.Validate() == nil && budget != 0 {
+					t.Errorf("budget %d: %d databases accepted", budget, n)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("budget %d, %d databases: %v", budget, n, err)
+			}
+			// The channels' share: a receipt per channel, held rows and replay data.
+			channels := int64(s.chl.channels)*receiptBytes + s.chl.held + s.chl.replay
+			total := s.bodyShare + controlBytes + channels + int64(s.pool.capacity+n)*connCeiling
+			if total > s.budget || s.pool.capacity < 1 || s.bodyShare/4 < 8*s.limits.RequestBodyBytes {
+				t.Errorf("budget %d, %d databases: %d bytes charged at most, %d client connections, body share %d", s.budget, n, total, s.pool.capacity, s.bodyShare)
+			}
 		}
-		if err := cfg.Validate(); err != nil {
-			t.Fatalf("%d databases: %v", n, err)
-		}
-		s, err := newServer(cfg, nil, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// The channels' share: a receipt per channel, held rows and replay data.
-		channels := int64(s.chl.channels)*receiptBytes + s.chl.held + s.chl.replay
-		if total := s.bodyShare + channels + int64(s.pool.capacity+n)*connCeiling; total > memoryBudget || s.pool.capacity < 1 {
-			t.Errorf("%d databases: %d bytes charged at most, %d client connections; budget %d", n, total, s.pool.capacity, memoryBudget)
-		}
+	}
+	if _, conns := shares(defaultBudget); conns != 14 {
+		t.Errorf("%d connections at 2 GiB, want ADR 0005's 14", conns)
 	}
 }
 

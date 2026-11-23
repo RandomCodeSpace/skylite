@@ -54,10 +54,11 @@ A server with TLS, an OIDC issuer, Azure Blob Storage with Entra ID, two pods th
 | `plaintext` | boolean | `false` | `true` serves HTTP/1.1 and HTTP/2 (prior-knowledge h2c) without TLS, for a server behind a mesh or proxy that terminates TLS, or for a local trial. |
 | `auth` | object | required | Token issuers and access rules; see [`auth`](#auth). |
 | `storage` | object | required | The object store that holds the databases; see [`storage`](#storage). |
-| `databases` | array of strings | empty | The databases this server leads, or follows, and answers queries for. At most 13 names, each listed once. A name is 1 to 63 characters from `a-z`, `0-9` and `-`, and starts with a letter or digit. A listed database need not exist yet: once it is created, the server takes office within about 20 seconds. With no databases the server only creates databases (`PUT`). |
+| `databases` | array of strings | empty | The databases this server leads, or follows, and answers queries for. At most one fewer than the SQLite connections the memory budget holds (13 at 2 GiB), each listed once. A name is 1 to 63 characters from `a-z`, `0-9` and `-`, and starts with a letter or digit. A listed database need not exist yet: once it is created, the server takes office within about 20 seconds. With no databases the server only creates databases (`PUT`). |
 | `follower_reads` | boolean | `true` when `peer` is set, otherwise `false` | Lets a pod that does not lead a database answer stateless reads for it from a fresh local follower. Set it to `false` to serve reads only on the leader. |
 | `peer` | object | none | The pod-to-pod listener; see [`peer`](#peer). Without it, a pod answers `not_serving` for a database it does not serve, instead of forwarding the request. |
 | `probe_listen` | string | none | TCP address of a plain HTTP listener that answers `GET /readyz`, without authentication: `200` while the server leads at least one configured database or has a fresh follower for one, `503` otherwise and from the start of shutdown. See [Readiness](/docs/server/#readiness). |
+| `memory_budget` | integer | three quarters of the memory limit | The memory budget in bytes, from 1,026 MiB (1075838976) to 64 GiB. Without it the server takes three quarters of the container's memory limit, or of `GOMEMLIMIT` if that is lower, and 2 GiB when neither is set; it does not start if that is below 1,026 MiB. Set it when the memory limit also holds other things, such as a memory-backed temporary directory. See [Sizing](/docs/sizing/#memory). |
 
 ## `tls`
 
