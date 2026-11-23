@@ -191,6 +191,7 @@ func (failingBody) Read([]byte) (int, error) { return 0, errBody }
 // failure must surface as an error from the call that made the request;
 // the same call then succeeds, and the scenario ends with every page right.
 func TestStorageFailures(t *testing.T) {
+	walkReads(t, 1, firstRead) // requests one at a time, so that each can be failed in turn
 	// The two states of storage the scenario sees, built once.
 	st, keys := newStore(t)
 	h := newHistory(t, st.Store, keys, 41, 512, 4)

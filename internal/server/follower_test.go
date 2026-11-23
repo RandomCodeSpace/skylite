@@ -526,13 +526,14 @@ func TestReplicaOfficeTransitions(t *testing.T) {
 		t.Fatal(err)
 	}
 	l := replica.leader(t)
-	if f := d.loop.State().Follower; f != nil {
-		t.Error("replica still publishes a follower after promotion")
-	}
+	// The follower serves until the leader is published, then stops.
 	select {
 	case <-initial.Done():
-	default:
+	case <-time.After(2 * time.Second):
 		t.Error("promoted replica did not stop its follower")
+	}
+	if f := d.loop.State().Follower; f != nil {
+		t.Error("replica still publishes a follower after promotion")
 	}
 	if err := l.Close(); err != nil {
 		t.Fatal(err)

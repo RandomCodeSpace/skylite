@@ -317,14 +317,20 @@ func TestShortBodyIsStorageError(t *testing.T) {
 		},
 		"base page": func(k string, off int64) bool { return k == h.baseKey(0) && off >= format.BaseHeaderSize },
 	} {
-		for _, end := range []error{io.ErrUnexpectedEOF, nil} {
-			ss := shortStore{st, on, end}
-			r, err := Open(ctx, ss, keys, NewCache(0), 0)
-			for p := uint32(1); err == nil && p <= r.Size(); p++ {
-				_, err = r.ReadPage(ctx, p)
+		for _, first := range []int64{firstRead, format.CommitHeaderSize} {
+			if name == "table" && first != format.CommitHeaderSize {
+				continue // one read holds the header and the table
 			}
-			if !errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrCorrupt) || errors.Is(err, format.ErrInvalid) || errors.Is(err, format.ErrChecksum) {
-				t.Errorf("%s ending with %v: %v", name, end, err)
+			walkReads(t, 1, first)
+			for _, end := range []error{io.ErrUnexpectedEOF, nil} {
+				ss := shortStore{st, on, end}
+				r, err := Open(ctx, ss, keys, NewCache(0), 0)
+				for p := uint32(1); err == nil && p <= r.Size(); p++ {
+					_, err = r.ReadPage(ctx, p)
+				}
+				if !errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrCorrupt) || errors.Is(err, format.ErrInvalid) || errors.Is(err, format.ErrChecksum) {
+					t.Errorf("%s ending with %v, first read %d: %v", name, end, first, err)
+				}
 			}
 		}
 	}

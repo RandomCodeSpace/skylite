@@ -225,13 +225,14 @@ type walState struct {
 // directory for cache files: Lead keeps this database's files in a
 // subdirectory named after its identifier, deletes whatever that
 // subdirectory held, and deletes it again at Close. Lead reads the manifest
-// and the log tail up to office.Head, never the database's pages.
+// and, unless office's takeover read it and the manifest has not changed
+// since, the log tail up to office.Head; never the database's pages.
 func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, office Office, cfg Config) (*Leader, error) {
 	if cfg.WALBound <= 0 || cfg.TailBound == 0 || cfg.TailBound > uint64(maxTail/2) || cfg.MaxMemory <= 0 || cfg.TempBudget <= 0 || cfg.Cache == nil || //nolint:gosec // maxTail is a small positive constant
 		cfg.CompactBytes < 0 || cfg.CompactInterval < 0 || cfg.Grace < 0 {
 		return nil, fmt.Errorf("engine: Config needs a WAL bound, a tail bound from 1 to %d, a memory ceiling, a temporary-file budget and a cache, and no negative compaction setting", maxTail/2)
 	}
-	tmpl, err := Open(ctx, st, keys, cfg.Cache, office.Head)
+	tmpl, err := openTail(ctx, st, keys, cfg.Cache, office)
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +299,29 @@ func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, o
 	l.wg.Add(1)
 	go l.compactLoop()
 	return l, nil
+}
+
+// openTail opens the database as of office.Head, from the commits office's
+// takeover walked if the manifest is still the one it last read, and
+// otherwise by a walk of its own. It takes the walked commits once: copies
+// of office then carry none.
+func openTail(ctx context.Context, st storage.Store, keys format.Keys, cache *Cache, office Office) (*Reader, error) {
+	t := office.tail
+	if t == nil || len(t.commits) == 0 {
+		return Open(ctx, st, keys, cache, office.Head)
+	}
+	cs, version := t.commits, t.version
+	*t = tail{}
+	r := &Reader{st: st, keys: keys, cache: cache}
+	a, err := r.readManifest(ctx, anchor{}, nil)
+	if err != nil {
+		return nil, err
+	}
+	if a.version != version || cs[len(cs)-1].h.Txn != office.Head {
+		return Open(ctx, st, keys, cache, office.Head)
+	}
+	r.reset(a, cs)
+	return r, nil
 }
 
 // checkBump checks that office.Head holds office's own epoch bump.

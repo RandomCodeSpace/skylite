@@ -888,6 +888,7 @@ func TestLeaseRenewedDuringWalk(t *testing.T) {
 		return e, Candidate{Holder: "b", TTL: time.Minute, Now: clk.now}
 	}
 	t.Run("renewed", func(t *testing.T) {
+		walkReads(t, 4, firstRead)
 		e, c := setup(t)
 		if _, _, err := Takeover(bg, e.g, e.keys, c); err != nil {
 			t.Fatal(err)
@@ -902,9 +903,10 @@ func TestLeaseRenewedDuringWalk(t *testing.T) {
 				maxGap = max(maxGap, gap)
 			}
 		}
-		// The walk reads the clock once per commit, and a renewal reads it
-		// once more: 20s pass every four commits.
-		if writes < 8 || maxGap > 4 {
+		// The walk reads the clock once per commit it checks, and a renewal
+		// reads it once more: 20s pass every four commits. Reads run up to
+		// the window ahead of the commit checked.
+		if writes < 8 || maxGap > 4+fetchWindow {
 			t.Fatalf("%d lease writes, up to %d commits read between them", writes, maxGap)
 		}
 	})
@@ -988,6 +990,7 @@ func TestFailedTakeBackKeepsWinner(t *testing.T) {
 // try, not at every step of the walk, and its failure does not end the
 // takeover.
 func TestFailedRenewalTriedOncePerThird(t *testing.T) {
+	walkReads(t, 1, firstRead) // the actor steps one call at a time
 	e := newEnv(t, 304)
 	for range 30 {
 		if out := e.l.commit(bg); out != committed {
