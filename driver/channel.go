@@ -70,11 +70,12 @@ type answer struct {
 // pause grows from 100 ms to 2 s, with jitter. by bounds the whole request:
 // its token, its deliveries, their bodies and its resolve.
 //
-// After channel_lost or commit_outcome_unknown, an autocommit write or a
-// commit is resolved (ADR 0005 decision 4): committed is a success, or for
-// a write the committed, result-unavailable error; not_committed sends a
-// write once more on a new channel as a new request, and fails a commit
-// with ErrTransactionLost. Everything else leaves the outcome unknown: an
+// After channel_lost or commit_outcome_unknown, a begin, which commits
+// nothing, fails not executed and matching driver.ErrBadConn, and an
+// autocommit write or a commit is resolved (ADR 0005 decision 4):
+// committed is a success, or for a write the committed,
+// result-unavailable error; not_committed sends a write once more on a new
+// channel as a new request, and fails a commit with ErrTransactionLost. Everything else leaves the outcome unknown: an
 // unsettled resolve, any other request lost with its channel, a receipt
 // that contradicts the request or itself (read-only with rows affected),
 // an ended context and the end of by. A request refused with behind is sent
@@ -128,6 +129,9 @@ func (cn *conn) do(ctx context.Context, by time.Time, call *wire.Call, kind wire
 			cn.c.raise(a.done.Txn)
 			return a, nil
 		case e.Code == CodeChannelLost || e.Code == CodeCommitOutcomeUnknown:
+			if call.Op == wire.OpBegin {
+				return nil, cn.lostBegin(call, e)
+			}
 			if !cn.resolvable(call) || ctx.Err() != nil {
 				return nil, cn.unknown(ctx, call, e)
 			}
@@ -462,6 +466,21 @@ func (cn *conn) unknown(ctx context.Context, call *wire.Call, last *wire.Error) 
 		e.is = append(e.is, ErrTransactionLost)
 	}
 	return e
+}
+
+// lostBegin abandons the channel of a begin lost with it, discards the
+// connection and returns a not-executed error that matches
+// driver.ErrBadConn, so that database/sql begins again on another
+// connection. A begin commits nothing: its transaction, and the first
+// statement it may carry, commit only at commit (ADR 0005 decisions 4 and
+// 6), and everything sent before it on the channel was settled.
+func (cn *conn) lostBegin(call *wire.Call, e *wire.Error) *Error {
+	cn.c.abandonLater(cn.ch.token, call.Seq)
+	cn.ch, cn.lost = nil, true
+	se := serverError(e)
+	se.NotExecuted, se.is = true, []error{driver.ErrBadConn}
+	se.Message = "the begin's channel was lost; no transaction is open: " + se.Message
+	return se
 }
 
 // closeProves closes the channel, which has no transaction, and reports

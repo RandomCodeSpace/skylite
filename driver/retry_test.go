@@ -702,3 +702,185 @@ func TestPauseJitter(t *testing.T) {
 		}
 	}
 }
+
+// TestCloseDrainIsBounded checks that Close reads on for the done frame
+// only up to drainBytes: past them the watermark stays where it was.
+func TestCloseDrainIsBounded(t *testing.T) {
+	big := strings.Repeat("x", 1<<10)
+	rows := make([][]any, 512) // 512 KiB, which arrives well within drainWait
+	for i := range rows {
+		rows[i] = []any{int64(i), big}
+	}
+	f := newFake(t, true, answerRows(bookColumns[:2], rows, 0, 99))
+	db := openDB(t, f.config())
+	var id int64
+	var title string
+	for range 2 {
+		if err := db.QueryRow("SELECT id, title FROM books").Scan(&id, &title); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls := f.lastCalls(); calls[1].req.MinTxn != 0 {
+		t.Fatalf("second read min_txn %d; want 0: the done frame lies past the drain bound", calls[1].req.MinTxn)
+	}
+}
+
+// TestResolveStopsAtTheRequestsBounds checks that a resolve answered
+// pending forever ends as soon as the caller cancels, at the caller's
+// deadline, and at the end of the request's own time, not at resolveWait.
+func TestResolveStopsAtTheRequestsBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		cancel, limit time.Duration // the caller's cancel and deadline, if set
+		slow          time.Duration // how long the lost write ran before its answer
+		want          time.Duration
+		ctxErr        error // the context error the outcome must match, if any
+	}{
+		{"cancel", 2 * time.Second, 0, 0, 2 * time.Second, context.Canceled},
+		{"deadline", 0, 5 * time.Second, 0, 5 * time.Second, nil}, // it stops when the next pause would pass the deadline
+		{"the request's time", 0, 0, resendWindow - 10*time.Second, resendWindow, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s := &script{}
+				cn := channelConn(t, s.rt(t, func(kind wire.Kind, _ *wire.Request, ww *wire.Writer) error {
+					switch kind {
+					case wire.KindChannel:
+						time.Sleep(tc.slow)
+						return ww.Error(lost())
+					case wire.KindResolve:
+						return resolved(ww, wire.ResolutionPending, 2)
+					}
+					return ww.Done(&wire.Done{Kind: wire.DoneClose})
+				}))
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if tc.cancel > 0 {
+					time.AfterFunc(tc.cancel, cancel)
+				}
+				if tc.limit > 0 {
+					var stop context.CancelFunc
+					ctx, stop = context.WithTimeout(ctx, tc.limit)
+					defer stop()
+				}
+				start := time.Now()
+				_, err := cn.ExecContext(ctx, "INSERT INTO t VALUES (1)", nil)
+				took := time.Since(start)
+				if took > tc.want || took < tc.want-2*time.Second || s.kinds(wire.KindResolve) == "" {
+					t.Fatalf("returned after %s, calls %q; want about %s, after a resolve", took, s.kinds(), tc.want)
+				}
+				if !errors.Is(err, ErrOutcomeUnknown) || tc.ctxErr != nil && !errors.Is(err, tc.ctxErr) {
+					t.Fatalf("err %v; want unknown, matching %v", err, tc.ctxErr)
+				}
+				time.Sleep(abandonWait)
+			})
+		})
+	}
+}
+
+// TestFinalErrorRaisesTheWatermark checks that the txn of a recorded
+// failure reaches the watermark.
+func TestFinalErrorRaisesTheWatermark(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := &script{}
+		cn := channelConn(t, s.rt(t, func(_ wire.Kind, req *wire.Request, ww *wire.Writer) error {
+			e := recorded(wire.CodeSQLError, req, false, wire.TxnNone)
+			e.Txn = 42
+			return ww.Error(e)
+		}))
+		var se *Error
+		if _, err := cn.ExecContext(context.Background(), "INSERT INTO t VALUES (1)", nil); !errors.As(err, &se) || se.Code != CodeSQLError {
+			t.Fatalf("err %v; want sql_error", err)
+		}
+		if got := cn.c.watermark.Load(); got != 42 {
+			t.Fatalf("watermark %d; want 42, the failure's txn", got)
+		}
+	})
+}
+
+// TestReadOnlyCommitFailure checks that a read-only commit's settled
+// failure is reported: only an unknown outcome is passed over.
+func TestReadOnlyCommitFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := &script{}
+		cn := channelConn(t, s.rt(t, func(kind wire.Kind, req *wire.Request, ww *wire.Writer) error {
+			switch {
+			case kind == wire.KindOpen:
+				return ww.Done(&wire.Done{Kind: wire.DoneOpen, Txn: 1, Channel: &wire.Channel{
+					Token: testReadChannel, ID: testChannelID, Mode: wire.ModeReadOnly, Limits: wire.DefaultLimits(),
+				}})
+			case kind == wire.KindChannel && req.Op == wire.OpBegin:
+				return ww.Done(&wire.Done{Kind: wire.DoneBegin, Seq: req.Seq, TxnState: wire.TxnOpen, Txn: 1})
+			case kind == wire.KindChannel:
+				return ww.Error(recorded(wire.CodeTransactionAborted, req, false, wire.TxnNone))
+			}
+			return ww.Done(&wire.Done{Kind: wire.DoneClose})
+		}))
+		tx, err := cn.BeginTx(context.Background(), driver.TxOptions{ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var se *Error
+		if err := tx.Commit(); !errors.As(err, &se) || se.Code != CodeTransactionAborted {
+			t.Fatalf("commit: %v; want transaction_aborted", err)
+		}
+	})
+}
+
+// TestLostBeginIsBegunAgain checks that a begin lost with its channel, as
+// after a failover, fails as not executed and matching driver.ErrBadConn,
+// discards the connection, and is begun again by database/sql on a new
+// connection and channel, without a resolve.
+func TestLostBeginIsBegunAgain(t *testing.T) {
+	var begins atomic.Int32
+	f := newFake(t, true, channels(func(w http.ResponseWriter, ww *wire.Writer, c call, _ *http.Request) {
+		switch c.req.Op {
+		case wire.OpBegin:
+			if begins.Add(1) == 1 {
+				e := wire.NewError(wire.CodeChannelLost, "the leader stopped")
+				e.NotExecuted = false
+				refuse(w, ww, e)
+				return
+			}
+			_ = ww.Done(&wire.Done{Kind: wire.DoneBegin, Seq: c.req.Seq, TxnState: wire.TxnOpen, Txn: 2})
+		case wire.OpCommit:
+			_ = ww.Done(&wire.Done{Kind: wire.DoneCommit, Seq: c.req.Seq, TxnState: wire.TxnNone, Txn: 2})
+		default:
+			_ = ww.Done(execDone(c, wire.TxnNone, 1, 1, 1))
+		}
+	}))
+	db := openDB(t, f.config())
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v; want it begun again on a new connection", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range f.lastCalls() {
+		if c.kind != wire.KindClose && c.kind != wire.KindCancel {
+			got = append(got, kinds([]call{c}))
+		}
+	}
+	if s := strings.Join(got, " "); s != "open execute begin open begin commit" {
+		t.Fatalf("calls %q", s)
+	}
+	cn := channelConn(t, func(r *http.Request) (*http.Response, error) {
+		return frames(func(ww *wire.Writer) error {
+			if strings.HasSuffix(r.URL.Path, "/channel") {
+				return ww.Error(lost())
+			}
+			return ww.Done(&wire.Done{Kind: wire.DoneClose})
+		})
+	})
+	_, err = cn.BeginTx(context.Background(), driver.TxOptions{})
+	var se *Error
+	if !errors.Is(err, driver.ErrBadConn) || !errors.As(err, &se) || !se.NotExecuted || se.Code != CodeChannelLost || errors.Is(err, ErrOutcomeUnknown) || cn.IsValid() {
+		t.Fatalf("err %v, valid %t; want not executed, a bad connection", err, cn.IsValid())
+	}
+}
