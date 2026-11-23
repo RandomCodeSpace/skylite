@@ -93,6 +93,10 @@ const (
 	maxControlBy   = 16
 	maxResolves    = 64
 	maxResolvesBy  = 16
+	// maxRefreshWaits bounds the requests waiting for a refresh of an
+	// issuer's signing keys, which hold no place in the bounds above while
+	// they wait: a refresh may take its whole fetch timeout.
+	maxRefreshWaits = 64
 )
 
 // engineConfig is each leader's configuration. The tail bound is the
@@ -141,6 +145,7 @@ type Server struct {
 	// admMu guards the concurrency bounds (admit).
 	admMu                                   sync.Mutex
 	requests, stateless, controls, resolves bound
+	refreshes                               bound // pod only: no principal is known yet
 
 	// The constants above, and the response deadline of limits, as set by
 	// New; tests shorten them.
@@ -214,7 +219,7 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 		cfg: cfg, log: log, guard: g, store: st, limits: l,
 		policy: policy, pool: newPool(conns - len(cfg.Databases)), engine: engineConfig(), budget: budget, bodyShare: body, bodyBy: map[string]int64{}, statementTime: stmt,
 		requests: newBound(maxRequests, maxRequestsBy), stateless: newBound(maxStateless, maxStatelessBy),
-		controls: newBound(maxControl, maxControlBy), resolves: newBound(maxResolves, maxResolvesBy),
+		controls: newBound(maxControl, maxControlBy), resolves: newBound(maxResolves, maxResolvesBy), refreshes: newBound(maxRefreshWaits, 0),
 		instance: rand.Text(), chl: defaultChLimits(),
 		headerDeadline: headerDeadline, bodyDeadline: bodyDeadline, responseDeadline: time.Duration(l.ResponseMS) * time.Millisecond,
 		idleTimeout: idleTimeout, createTimeout: createTimeout, shutdownTimeout: shutdownTimeout, hopSlack: hopSlack, maxConns: maxConns,
@@ -733,7 +738,18 @@ func (s *Server) handle(st *stream, r *http.Request, t *ticket, id string, log *
 	token, err := auth.BearerToken(r.Header)
 	var p *auth.Principal
 	if err == nil {
-		p, err = s.guard.Verify(r.Context(), token)
+		// A request that must wait for another's refresh of signing keys
+		// trades its places for one among the refreshes' waiters meanwhile.
+		var busy *wire.Error
+		ctx := auth.WithRefreshWait(r.Context(), func() (func(), bool) {
+			resume, e := s.waitRefresh(t)
+			busy = e
+			return func() { busy = resume() }, e == nil
+		})
+		p, err = s.guard.Verify(ctx, token)
+		if busy != nil {
+			return nil, busy, false
+		}
 	}
 	if err != nil {
 		ae, ok := errors.AsType[*auth.Error](err)
@@ -886,6 +902,11 @@ func (s *Server) admit(t *ticket, kind wire.Kind) *wire.Error {
 	default:
 		bs = []*bound{&s.requests}
 	}
+	return s.take(t, bs)
+}
+
+// take gives t a place in each of the pod's bounds bs, or none.
+func (s *Server) take(t *ticket, bs []*bound) *wire.Error {
 	s.admMu.Lock()
 	defer s.admMu.Unlock()
 	for _, b := range bs {
@@ -898,6 +919,30 @@ func (s *Server) admit(t *ticket, kind wire.Kind) *wire.Error {
 	}
 	t.bounds = bs
 	return nil
+}
+
+// waitRefresh trades t's places in the pod's bounds, taken by admit and
+// none of its principal's yet, for one among the requests waiting for a
+// refresh of signing keys. resume trades them back, or reports overloaded
+// if the pod's bounds are full by then.
+func (s *Server) waitRefresh(t *ticket) (resume func() *wire.Error, e *wire.Error) {
+	s.admMu.Lock()
+	defer s.admMu.Unlock()
+	if s.refreshes.n >= s.refreshes.pod {
+		return nil, wire.NewError(wire.CodeOverloaded, "the server is at its bound on requests waiting for signing keys; retry later")
+	}
+	s.refreshes.n++
+	bs := t.bounds
+	for _, b := range bs {
+		b.n--
+	}
+	t.bounds = nil
+	return func() *wire.Error {
+		s.admMu.Lock()
+		s.refreshes.n--
+		s.admMu.Unlock()
+		return s.take(t, bs)
+	}, nil
 }
 
 // admitPrincipal applies the per-principal bounds of the request's kind,
@@ -972,7 +1017,15 @@ func (s *Server) limitPreAuth(srv *http.Server) {
 		switch state {
 		case http.StateIdle:
 			if !a.authed.Load() {
-				a.idle = time.AfterFunc(s.headerDeadline, func() { _ = c.Close() })
+				var idle *time.Timer
+				idle = time.AfterFunc(s.headerDeadline, func() {
+					a.mu.Lock()
+					defer a.mu.Unlock()
+					if a.idle == idle { // not stopped by a request that began as it fired
+						_ = c.Close()
+					}
+				})
+				a.idle = idle
 			}
 		case http.StateClosed, http.StateHijacked:
 			conns.Delete(c)
