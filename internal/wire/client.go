@@ -63,7 +63,7 @@ type NamedArg struct {
 
 // AppendCall appends the body of a request of kind k, which Parse accepts:
 // a query, a describe, an open, a channel request with op begin, execute,
-// commit, rollback or ping, a cancel or a close. It refuses a Call with
+// commit, rollback or ping, a cancel, a close or a resolve. It refuses a Call with
 // fields k (and its op) does not allow, SQL that is empty, holds U+0000 or
 // is not valid UTF-8, an empty, invalid or repeated parameter name, and a
 // value AppendValue refuses. Its errors never hold a value or a token.
@@ -94,7 +94,7 @@ func AppendCall(dst []byte, k Kind, c *Call) ([]byte, error) {
 		default:
 			return dst, fmt.Errorf("wire: AppendCall does not write op %d", c.Op)
 		}
-	case KindCancel:
+	case KindCancel, KindResolve:
 		allow = fChannel | fSeq
 	case KindClose:
 		allow = fChannel
@@ -240,6 +240,7 @@ const (
 	dCommitted
 	dWrote
 	dLastSeq
+	dResolution
 )
 
 // doneRequired lists, for each done kind a Reader reads, the members it must
@@ -253,6 +254,7 @@ var doneRequired = map[DoneKind]int{
 	DoneCommit:   dSeq | dTxnState | dTxn | dCommitted | dWrote,
 	DoneRollback: dSeq | dTxnState | dTxn,
 	DoneClose:    dLastSeq, // its outcome is skipped
+	DoneResolve:  dResolution | dTxn,
 }
 
 // terminalFrameBytes bounds a terminal frame, newline included: ADR 0005
@@ -295,6 +297,10 @@ func NewReader(r io.Reader, k DoneKind, maxFrame int) (*Reader, error) {
 	}
 	return &Reader{br: bufio.NewReaderSize(r, 64<<10), kind: k, maxFrame: maxFrame}, nil
 }
+
+// Result returns the bytes of the frames before the terminal frame read so
+// far, newlines included: what LimitResult bounds.
+func (r *Reader) Result() int64 { return r.result }
 
 // Next returns the next frame. After the terminal frame it returns io.EOF.
 func (r *Reader) Next() (*Frame, error) {
@@ -638,6 +644,13 @@ func (r *Reader) done() error {
 		case "last_seq":
 			d.LastSeq, ok, err = r.p.integer(0, math.MaxInt64)
 			seen |= dLastSeq
+		case "resolution":
+			var s string
+			s, ok, err = r.p.str()
+			d.Resolution = Resolution(s)
+			ok = ok && (d.Resolution == ResolutionCommitted || d.Resolution == ResolutionNotCommitted ||
+				d.Resolution == ResolutionPending || d.Resolution == ResolutionUnknown)
+			seen |= dResolution
 		default:
 			return r.skip()
 		}
