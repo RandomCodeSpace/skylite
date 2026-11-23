@@ -1005,6 +1005,39 @@ func TestCancelWhileWaitingForLock(t *testing.T) {
 	e.quiet(t, "after the cancels")
 }
 
+// TestWriteAheadOfWaitingReaders: a write granted the lock while its
+// principal's readers wait for its connections waits ahead of them, takes
+// the first connection freed, and commits.
+func TestWriteAheadOfWaitingReaders(t *testing.T) {
+	l := newLockEnv(t, func(e *env) { e.s.pool.maxWait = 10 * time.Second })
+	e := l.e
+	free := e.occupy(t, "admin", e.s.pool.perPrincipal)
+	var readers []<-chan answer
+	for i := range 4 {
+		readers = append(readers, e.postAsync(t, "query", "admin", q("SELECT 1")))
+		e.waiting(t, i+1)
+	}
+	w := e.postAsync(t, "channel", "admin", ex(l.toks["admin"][0], 1, "INSERT INTO t VALUES (1)"))
+	e.waiting(t, 5)
+	e.s.pool.mu.Lock()
+	first := e.s.pool.queue[0].write
+	e.s.pool.mu.Unlock()
+	if !first {
+		t.Error("the write waits behind the readers")
+	}
+	free()
+	if a := <-w; a.done() == nil {
+		t.Errorf("the write: %d %v, want done", a.status, a.frames)
+	}
+	for i, c := range readers {
+		if a := <-c; a.status != 200 || a.done() == nil {
+			t.Errorf("reader %d: %d %v, want rows", i, a.status, a.last())
+		}
+	}
+	e.settled(t)
+	e.quiet(t, "after the write")
+}
+
 // TestNoConnectionAtGrant: a write granted the lock when its principal's
 // connections are all in use records overloaded, final and not executed,
 // and passes the lock on; its resend replays that receipt.

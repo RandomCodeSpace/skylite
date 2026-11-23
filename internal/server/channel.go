@@ -790,14 +790,22 @@ func (s *Server) closeChannel(d *database, leader *engine.Leader, req *wire.Requ
 }
 
 // writeConn reserves a SQLite connection for who and opens a fresh one on
-// t's leader, for a write that holds t's write lock (ADR 0005 decision 9).
-// A write that gets none returns its receipt, a recorded overloaded when
-// the pod's or who's connections are all in use, or the unrecorded error
-// that ends the channel.
+// t's leader, for a write that holds t's write lock (ADR 0005 decision 9),
+// waiting for it ahead of the stateless requests for at most the pool's
+// maxWait. A write that gets none returns its receipt, a recorded
+// overloaded when the pod's or who's connections stayed in use, or the
+// unrecorded error that ends the channel.
 func (s *Server) writeConn(ctx context.Context, d *database, t *table, who string, limit time.Duration, log *slog.Logger) (*pconn, *wire.Receipt, *wire.Error) {
-	_, evict, ok := s.pool.take(nil, who)
+	_, evict, ok := s.pool.await(ctx, nil, who, true)
 	if !ok {
-		return nil, &wire.Receipt{Error: wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later").Recorded(false)}, nil
+		e := wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later")
+		switch {
+		case cancelled(ctx):
+			e = wire.NewError(wire.CodeCancelled, "cancelled before it ran")
+		case ctx.Err() != nil:
+			e = s.timeout(ctx, limit)
+		}
+		return nil, &wire.Receipt{Error: e.Recorded(false)}, nil
 	}
 	if evict != nil {
 		_ = evict.ec.Close()

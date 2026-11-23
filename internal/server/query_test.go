@@ -728,21 +728,39 @@ func (e *env) settled(t *testing.T) {
 	}
 }
 
+// occupy takes n of subject's connections from the pool until the returned
+// function gives them back.
+func (e *env) occupy(t *testing.T, subject string, n int) func() {
+	t.Helper()
+	who := testIssuer + "\x00" + subject // as principal makes it
+	for i := range n {
+		_, evict, ok := e.s.pool.take(nil, who)
+		if !ok {
+			t.Fatalf("%s's connection %d is not free", subject, i)
+		}
+		if evict != nil {
+			_ = evict.ec.Close()
+		}
+	}
+	return func() {
+		for range n {
+			e.s.pool.release(who, nil, false)
+		}
+	}
+}
+
 func TestReadersBeyondQuotaWait(t *testing.T) {
 	e := newQueryEnv(t, func(e *env) {
 		e.s.pool = newPool(4) // one per principal
 		e.s.pool.maxWait = 10 * time.Second
 	})
-	held := e.postAsync(t, "query", "reader", fmt.Sprintf(`{"sql":%q,"timeout_ms":300}`, cpuBound))
-	e.running(t, 1)
+	free := e.occupy(t, "reader", 1)
 	var got []<-chan answer
 	for range 8 {
 		got = append(got, e.postAsync(t, "query", "reader", q("SELECT 1")))
 	}
 	e.waiting(t, 8)
-	if a := <-held; a.code() != "timeout" {
-		t.Errorf("the holder: %d %v, want timeout", a.status, a.last())
-	}
+	free()
 	for i, c := range got {
 		if a := <-c; a.status != 200 || a.done() == nil {
 			t.Errorf("waiting reader %d: %d %v, want rows", i, a.status, a.last())
@@ -779,8 +797,7 @@ func TestCancelWhileWaitingForConnection(t *testing.T) {
 		e.s.pool = newPool(4)
 		e.s.pool.maxWait = 10 * time.Second
 	})
-	held := e.postAsync(t, "query", "reader", fmt.Sprintf(`{"sql":%q,"timeout_ms":1000}`, cpuBound))
-	e.running(t, 1)
+	free := e.occupy(t, "reader", 1)
 	ctx, cancel := context.WithCancel(t.Context())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+e.addr+"/v1/databases/d/query", strings.NewReader(q("SELECT 1")))
 	if err != nil {
@@ -801,13 +818,8 @@ func TestCancelWhileWaitingForConnection(t *testing.T) {
 	if err := <-gone; !errors.Is(err, context.Canceled) {
 		t.Errorf("the cancelled request: %v, want context.Canceled", err)
 	}
-	e.waiting(t, 0) // long before the holder ends
-	select {
-	case a := <-held:
-		t.Fatalf("the holder ended first: %d %v", a.status, a.last())
-	default:
-	}
-	<-held
+	e.waiting(t, 0) // while the connection is still held
+	free()
 	e.settled(t)
 	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != 200 {
 		t.Errorf("after the cancel: %d %v, want rows", a.status, a.last())
@@ -820,9 +832,7 @@ func TestConnectionWaitFairness(t *testing.T) {
 		e.s.pool.maxWait = 10 * time.Second
 		e.s.pool.waiters, e.s.pool.waitersBy = 4, 2
 	})
-	long := e.postAsync(t, "query", "reader", fmt.Sprintf(`{"sql":%q,"timeout_ms":5000}`, cpuBound))
-	short := e.postAsync(t, "query", "writer", fmt.Sprintf(`{"sql":%q,"timeout_ms":500}`, cpuBound))
-	e.running(t, 2)
+	long, short := e.occupy(t, "reader", 1), e.occupy(t, "writer", 1)
 	var readers []<-chan answer
 	for i := range 2 {
 		readers = append(readers, e.postAsync(t, "query", "reader", q("SELECT 1")))
@@ -830,29 +840,108 @@ func TestConnectionWaitFairness(t *testing.T) {
 	}
 	// The principal's waiting bound refuses its third at once; another
 	// principal still waits.
-	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
-		t.Errorf("the principal's third waiter: %d %v, want overloaded", a.status, a.last())
-	}
+	e.refusedAtOnce(t, "reader", 2)
 	admin := e.postAsync(t, "query", "admin", q("SELECT 1"))
 	e.waiting(t, 3)
 	// The connection the writer frees goes to admin, behind the reader's
 	// waiters, which the reader's own quota holds back.
+	short()
 	if a := <-admin; a.status != 200 || a.done() == nil {
 		t.Errorf("admin: %d %v, want rows", a.status, a.last())
 	}
-	select {
-	case a := <-long:
-		t.Fatalf("the reader's holder ended before admin was served: %d %v", a.status, a.last())
-	default:
-	}
-	<-short
-	<-long
+	e.waiting(t, 2)
+	long()
 	for i, c := range readers {
 		if a := <-c; a.status != 200 || a.done() == nil {
 			t.Errorf("reader %d: %d %v, want rows", i, a.status, a.last())
 		}
 	}
 	e.settled(t)
+}
+
+// refusedAtOnce posts a query of subject and wants it refused overloaded
+// without its joining the n requests that wait for a connection.
+func (e *env) refusedAtOnce(t *testing.T, subject string, n int) {
+	t.Helper()
+	a := e.postAsync(t, "query", subject, q("SELECT 1"))
+	for {
+		select {
+		case a := <-a:
+			if a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
+				t.Errorf("%s's waiter past the bound: %d %v, want overloaded", subject, a.status, a.last())
+			}
+			return
+		case <-time.After(5 * time.Millisecond):
+		}
+		e.s.pool.mu.Lock()
+		got := len(e.s.pool.queue)
+		e.s.pool.mu.Unlock()
+		if got > n {
+			t.Errorf("%s's waiter past the bound waits, one of %d", subject, got)
+			return
+		}
+	}
+}
+
+func TestPodWaitingBound(t *testing.T) {
+	e := newQueryEnv(t, func(e *env) {
+		e.s.pool = newPool(2) // one per principal, two in all
+		e.s.pool.maxWait = 10 * time.Second
+		e.s.pool.waiters = 2
+	})
+	freeReader, freeAdmin := e.occupy(t, "reader", 1), e.occupy(t, "admin", 1)
+	var got []<-chan answer
+	for i, s := range []string{"reader", "admin"} {
+		got = append(got, e.postAsync(t, "query", s, q("SELECT 1")))
+		e.waiting(t, i+1)
+	}
+	// Each principal is below its own bound; the pod is at its own.
+	e.refusedAtOnce(t, "writer", 2)
+	freeReader()
+	freeAdmin()
+	for i, c := range got {
+		if a := <-c; a.status != 200 || a.done() == nil {
+			t.Errorf("waiter %d: %d %v, want rows", i, a.status, a.last())
+		}
+	}
+	e.settled(t)
+}
+
+// TestGrantAsWaitEnds: a waiter granted a connection as its wait ends takes
+// it, and the pool counts it back once released.
+func TestGrantAsWaitEnds(t *testing.T) {
+	p := newPool(4)
+	p.maxWait = time.Hour
+	if _, _, ok := p.take(nil, "a"); !ok {
+		t.Fatal("no connection for a")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	got := make(chan bool, 1)
+	go func() {
+		_, _, ok := p.await(ctx, nil, "a", false)
+		got <- ok
+	}()
+	for queued := 0; queued == 0; time.Sleep(time.Millisecond) {
+		p.mu.Lock()
+		queued = len(p.queue)
+		p.mu.Unlock()
+	}
+	p.mu.Lock()
+	cancel()
+	time.Sleep(50 * time.Millisecond) // the waiter wakes for the cancel and waits for p.mu
+	delete(p.busy, "a")               // release, with p.mu already held
+	p.open--
+	p.grantLocked()
+	p.mu.Unlock()
+	if !<-got {
+		t.Fatal("the waiter dropped the connection granted as its wait ended")
+	}
+	p.release("a", nil, false)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.open != 0 || len(p.busy) != 0 || len(p.queue) != 0 || len(p.waiting) != 0 {
+		t.Errorf("open %d, busy %v, %d queued, waiting %v; want none", p.open, p.busy, len(p.queue), p.waiting)
+	}
 }
 
 func TestBodyShareOverloaded(t *testing.T) {

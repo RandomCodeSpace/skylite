@@ -38,7 +38,8 @@ type pconn struct {
 // quarter of them at once (ADR 0005 decision 9). An admission that finds
 // the pool full closes an idle connection first. A stateless request that
 // finds no room waits for it first in, first out, within the waiting
-// bounds, for at most maxWait.
+// bounds, for at most maxWait; a write that holds its write lock waits too,
+// ahead of every stateless request.
 type pool struct {
 	mu           sync.Mutex
 	capacity     int
@@ -53,11 +54,12 @@ type pool struct {
 	maxWait            time.Duration
 }
 
-// connWaiter is a stateless request waiting for a connection; c and evict
-// are what take gave it once ready is closed.
+// connWaiter is a request waiting for a connection; c and evict are what
+// take gave it once ready is closed.
 type connWaiter struct {
 	leader   *engine.Leader
 	who      string
+	write    bool
 	c, evict *pconn
 	ready    chan struct{}
 }
@@ -86,18 +88,28 @@ func (p *pool) take(leader *engine.Leader, who string) (c, evict *pconn, ok bool
 }
 
 // await is take that, when who or the pool is at its limit, waits for room
-// first in, first out until ctx ends. ok is false if ctx ends first or a
-// waiting bound is reached.
-func (p *pool) await(ctx context.Context, leader *engine.Leader, who string) (c, evict *pconn, ok bool) {
+// first in, first out for at most maxWait within ctx. ok is false if the
+// wait ends first or a waiting bound is reached. A write, which holds its
+// write lock, waits ahead of every stateless request and past the waiting
+// bounds, which the write locks bound to one per database.
+func (p *pool) await(ctx context.Context, leader *engine.Leader, who string, write bool) (c, evict *pconn, ok bool) {
 	p.mu.Lock()
-	if c, evict, ok = p.takeLocked(leader, who); ok || len(p.queue) >= p.waiters || p.waiting[who] >= p.waitersBy {
+	if c, evict, ok = p.takeLocked(leader, who); ok || !write && (len(p.queue) >= p.waiters || p.waiting[who] >= p.waitersBy) {
 		p.mu.Unlock()
 		return c, evict, ok
 	}
-	w := &connWaiter{leader: leader, who: who, ready: make(chan struct{})}
-	p.queue = append(p.queue, w)
+	w := &connWaiter{leader: leader, who: who, write: write, ready: make(chan struct{})}
+	i := len(p.queue)
+	if write { // behind the writes already waiting
+		if i = slices.IndexFunc(p.queue, func(x *connWaiter) bool { return !x.write }); i < 0 {
+			i = len(p.queue)
+		}
+	}
+	p.queue = slices.Insert(p.queue, i, w)
 	p.waiting[who]++
 	p.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, p.maxWait) // only once waiting: a free connection costs no timer
+	defer cancel()
 	select {
 	case <-w.ready:
 		return w.c, w.evict, true
@@ -216,9 +228,7 @@ func (s *Server) conn(ctx context.Context, d *database, leader *engine.Leader, w
 // connection for at most the pool's maxWait within ctx, and is refused
 // overloaded if none comes.
 func (s *Server) reserve(ctx context.Context, leader *engine.Leader, who string) (*pconn, *wire.Error) {
-	wctx, cancel := context.WithTimeout(ctx, s.pool.maxWait)
-	c, evict, ok := s.pool.await(wctx, leader, who)
-	cancel()
+	c, evict, ok := s.pool.await(ctx, leader, who, false)
 	if !ok {
 		return nil, wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later")
 	}
