@@ -335,14 +335,25 @@ func TestRenewRetakesReleasedLease(t *testing.T) {
 			s := waitFor(t, a, 5*time.Second, "leading", leading)
 			e := epoch(t, st, keys)
 
-			cur, version := readLease(t, st, keys)
-			other := format.Lease{Holder: "other", Epoch: cur.Epoch + 1, Renewed: tc.renewed()}
-			b, err := format.EncodeLease(other)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := st.Store.Replace(context.Background(), keys.Lease(), version, bytes.NewReader(b)); err != nil {
-				t.Fatal(err)
+			// The leader renews every 50ms, so its write can land between this
+			// read and the conditional replace; the store then refuses the
+			// stale version, and the write is tried again on a fresh read.
+			var cur format.Lease
+			for {
+				var version string
+				cur, version = readLease(t, st, keys)
+				other := format.Lease{Holder: "other", Epoch: cur.Epoch + 1, Renewed: tc.renewed()}
+				b, err := format.EncodeLease(other)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = st.Store.Replace(context.Background(), keys.Lease(), version, bytes.NewReader(b))
+				if err == nil {
+					break
+				}
+				if !errors.Is(err, storage.ErrPreconditionFailed) {
+					t.Fatal(err)
+				}
 			}
 			deadline := time.Now().Add(2 * time.Second)
 			for {
