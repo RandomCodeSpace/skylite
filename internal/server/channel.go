@@ -452,31 +452,32 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 		}
 	}
 	// A pooled connection, released after the request unless a read-only
-	// transaction took it; keep says whether it goes back to the pool.
+	// transaction took it, which took then says, whatever ends the request;
+	// keep says whether it goes back to the pool.
 	var pc *pconn
-	keep := false
+	keep, took := false, false
 	// A read-only begin first reserves a place among the read-only
 	// transactions, which passes to its transaction if one begins.
 	reserved := starts && ch.ro && req.Op == wire.OpBegin
 	if reserved {
-		if !s.holdRead() {
-			return nil, s.ownedLocked(wire.NewError(wire.CodeOverloaded, "read-only transactions hold their share of the server's SQLite connections; retry later"), ch, seq)
+		if !s.pool.holdTxn(who) {
+			return nil, s.ownedLocked(wire.NewError(wire.CodeOverloaded, "read-only transactions hold their share of the server's or the principal's SQLite connections; retry later"), ch, seq)
 		}
 		defer func() {
-			if reserved {
-				s.readTxns.Add(-1)
+			if !took {
+				s.pool.unholdTxn(who)
 			}
 		}()
 	}
 	if pooled {
 		var e *wire.Error
 		var err error
-		if pc, e, err = s.conn(ctx, d, leader, who); e != nil {
+		if pc, e, err = s.conn(ctx, d, leader, who, reserved); e != nil {
 			logInternal(ctx, log, e, err)
 			return nil, s.ownedLocked(e, ch, seq)
 		}
 		defer func() {
-			if pc != nil {
+			if !took {
 				s.pool.release(who, pc, keep)
 			}
 		}()
@@ -559,11 +560,7 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 			next = wire.TxnNone
 		}
 	case req.Op == wire.OpBegin && state == wire.TxnNone && ch.ro:
-		var took bool
-		rec, lost, next, took = s.readBegin(rctx, d, t, ch, pc, req, sw, deadline, limit, log)
-		if took {
-			pc, reserved = nil, false
-		}
+		rec, lost, next = s.readBegin(rctx, d, t, ch, pc, &took, req, sw, deadline, limit, log)
 		keep = false
 	case req.Op == wire.OpBegin && state == wire.TxnNone:
 		rec, lost, next = s.begin(rctx, d, t, ch, req, sw, deadline, limit, log)
@@ -695,24 +692,11 @@ func (s *Server) dropTxn(ch *channel) func() {
 	return func() {
 		s.pool.release(who, tx.c, false)
 		if ro {
-			s.readTxns.Add(-1)
+			s.pool.unholdTxn(who)
 		} else {
 			s.release(t)
 		}
 	}
-}
-
-// holdRead reserves a connection for a read-only transaction, if they hold
-// fewer than half the pod's connections, rounded down. A transaction holds
-// its connection for up to its lifetime, and a write granted its lock waits
-// only for connections that stateless requests turn over, so the other half
-// stays with stateless requests and writes, which find one there.
-func (s *Server) holdRead() bool {
-	if s.readTxns.Add(1) > int64(s.pool.capacity/2) {
-		s.readTxns.Add(-1)
-		return false
-	}
-	return true
 }
 
 // endTxn ends ch's open transaction from the request running on ch.
@@ -893,7 +877,7 @@ func (s *Server) closeChannel(d *database, leader *engine.Leader, req *wire.Requ
 // returns its receipt, a recorded overloaded when the pod's or who's
 // connections stayed in use, or the unrecorded error that ends the channel.
 func (s *Server) writeConn(ctx context.Context, d *database, t *table, who string, limit time.Duration, log *slog.Logger) (*pconn, *wire.Receipt, *wire.Error) {
-	_, evict, ok := s.pool.await(ctx, nil, who, true)
+	_, evict, ok := s.pool.await(ctx, nil, who, true, false)
 	if !ok {
 		e := wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later")
 		switch {
@@ -1452,9 +1436,9 @@ func startRead(c *pconn, ictx context.Context) (uint64, error) {
 // pooled connection reserved before acceptance: a read transaction on a
 // connection that refuses writes, then the first statement, if any, with
 // its frames written to w. A transaction that began holds c as ch's open
-// transaction, and took is true; a begin that fails leaves no transaction,
-// and c to be closed (ADR 0005 decision 6).
-func (s *Server) readBegin(ctx context.Context, d *database, t *table, ch *channel, c *pconn, req *wire.Request, w io.Writer, deadline time.Time, limit time.Duration, log *slog.Logger) (_ *wire.Receipt, _ *wire.Error, _ wire.TxnState, took bool) {
+// transaction, and *took is set with it; a begin that fails leaves no
+// transaction, and c to be closed (ADR 0005 decision 6).
+func (s *Server) readBegin(ctx context.Context, d *database, t *table, ch *channel, c *pconn, took *bool, req *wire.Request, w io.Writer, deadline time.Time, limit time.Duration, log *slog.Logger) (*wire.Receipt, *wire.Error, wire.TxnState) {
 	began := time.Now()
 	ctx, cancel := s.txnContext(ctx, ch, began, deadline)
 	defer cancel()
@@ -1481,21 +1465,21 @@ func (s *Server) readBegin(ctx context.Context, d *database, t *table, ch *chann
 	})
 	if err != nil {
 		rec, lost := s.failure(ctx, d, t, err, e, limit, false, log)
-		return rec, lost, wire.TxnNone, false
+		return rec, lost, wire.TxnNone
 	}
 	if done == nil {
 		done = &wire.Done{Kind: wire.DoneBegin}
 	}
 	done.Txn = int64(snap) //nolint:gosec // as in openChannel
 	if auto {
-		return &wire.Receipt{Done: done}, nil, wire.TxnAborted, false
+		return &wire.Receipt{Done: done}, nil, wire.TxnAborted
 	}
 	tx := &txn{c: c, snap: snap, began: began}
 	s.chMu.Lock()
-	ch.tx = tx
+	ch.tx, *took = tx, true // together: from here dropTxn alone releases c and its place
 	s.chMu.Unlock()
 	go s.watch(ch, tx)
-	return &wire.Receipt{Done: done}, nil, wire.TxnOpen, true
+	return &wire.Receipt{Done: done}, nil, wire.TxnOpen
 }
 
 // read runs an accepted execute or batch on an idle read-only channel, on c,

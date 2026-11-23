@@ -946,7 +946,7 @@ func TestGrantAsWaitEnds(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	got := make(chan bool, 1)
 	go func() {
-		_, _, ok := p.await(ctx, nil, "a", false)
+		_, _, ok := p.await(ctx, nil, "a", false, false)
 		got <- ok
 	}()
 	for queued := 0; queued == 0; time.Sleep(time.Millisecond) {
@@ -1164,14 +1164,14 @@ func TestDeadlineBeforeTheStatement(t *testing.T) {
 	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 	// The pool is empty: Open and the policy's set-up meet the deadline.
-	if _, we, err := e.s.conn(expired, d, l, "x"); we == nil || we.Code != "timeout" {
+	if _, we, err := e.s.conn(expired, d, l, "x", false); we == nil || we.Code != "timeout" {
 		t.Errorf("open: %v (%v), want timeout", we, err)
 	}
 	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != 200 || len(e.s.pool.idle) != 1 {
 		t.Fatalf("%d %v, %d idle", a.status, a.last(), len(e.s.pool.idle))
 	}
 	// An idle connection: its Reset meets the deadline.
-	if _, we, err := e.s.conn(expired, d, l, "x"); we == nil || we.Code != "timeout" {
+	if _, we, err := e.s.conn(expired, d, l, "x", false); we == nil || we.Code != "timeout" {
 		t.Errorf("reset: %v (%v), want timeout", we, err)
 	}
 	if n := e.s.pool.open; n != 0 {

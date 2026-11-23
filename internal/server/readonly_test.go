@@ -168,38 +168,56 @@ func TestReadOnlyTxnLimits(t *testing.T) {
 	}
 }
 
-// TestReadOnlyWriteReserve: read-only transactions hold at most half the
-// pod's connections, so writes still find one when readers hold every
-// read-only transaction they can. "reader" stands for many principals with
-// only the read role: its quota is raised to the whole pool.
+// roBegins opens n read-only channels as subject and sends a begin on each.
+// It returns their tokens and how many transactions began; every other
+// begin must have been refused overloaded before acceptance.
+func (e *env) roBegins(t *testing.T, subject string, n int) (toks []string, open int) {
+	t.Helper()
+	for i := range n {
+		toks = append(toks, e.openRO(t, subject))
+		switch a := e.post(t, "channel", subject, sq(toks[i], 1, "begin")); {
+		case a.done() != nil && a.done()["txn_state"] == "open":
+			open++
+		case a.status != http.StatusTooManyRequests || a.code() != "overloaded" || a.err()["not_executed"] != true || a.err()["final"] != false || a.err()["txn_state"] != "none":
+			t.Fatalf("%s's begin %d: %d %v", subject, i, a.status, a.frames)
+		}
+	}
+	return toks, open
+}
+
+// noReadTxns checks that the pool counts no read-only transaction.
+func (e *env) noReadTxns(t *testing.T) {
+	t.Helper()
+	e.s.pool.mu.Lock()
+	defer e.s.pool.mu.Unlock()
+	if e.s.pool.txns != 0 || len(e.s.pool.txnsBy) != 0 {
+		t.Errorf("%d read-only transactions counted, %v by principal, with none open", e.s.pool.txns, e.s.pool.txnsBy)
+	}
+}
+
+// TestReadOnlyWriteReserve: with the default limits a principal's read-only
+// transactions leave one connection of its quota, so the same principal's
+// writes and stateless reads still find one when it holds every read-only
+// transaction it can.
 func TestReadOnlyWriteReserve(t *testing.T) {
-	e, _, wtok := newTxnEnv(t, func(e *env) { e.s.pool.perPrincipal = e.s.pool.capacity })
-	n := e.s.pool.capacity
-	if n < 4 {
-		t.Fatalf("capacity %d is too small for the test", n)
+	e, _, wtok := newTxnEnv(t, nil)
+	quota := e.s.pool.perPrincipal
+	if quota < 2 {
+		t.Fatalf("the default quota, %d, leaves no connection to keep back", quota)
 	}
 	// A begin that fails gives its place back.
-	bad := e.openRO(t, "reader")
-	for i := range n {
-		if a := e.post(t, "channel", "reader", sq(bad, int64(i+1), "begin", "execute", map[string]any{"sql": "SELECT nope"})); a.code() != "sql_error" {
+	bad := e.openRO(t, "writer")
+	for i := range quota {
+		if a := e.post(t, "channel", "writer", sq(bad, int64(i+1), "begin", "execute", map[string]any{"sql": "SELECT nope"})); a.code() != "sql_error" {
 			t.Fatalf("a failing begin: %v", a.frames)
 		}
 	}
-	toks := make([]string, n)
-	open := 0
-	for i := range toks {
-		toks[i] = e.openRO(t, "reader")
-		switch a := e.post(t, "channel", "reader", sq(toks[i], 1, "begin")); {
-		case a.done() != nil && a.done()["txn_state"] == "open":
-			open++
-		case a.code() != "overloaded" || a.err()["not_executed"] != true || a.err()["txn_state"] != "none":
-			t.Fatalf("begin %d: %d %v", i, a.status, a.frames)
-		}
+	toks, open := e.roBegins(t, "writer", quota)
+	if open != quota-1 {
+		t.Errorf("%d read-only transactions open for a quota of %d, want %d", open, quota, quota-1)
 	}
-	if open != n/2 {
-		t.Errorf("%d read-only transactions open of %d connections, want %d", open, n, n/2)
-	}
-	// Writes, autocommit and in a transaction, find a connection.
+	// The same principal's writes, autocommit and in a transaction, and its
+	// stateless reads find a connection.
 	if a := e.post(t, "channel", "writer", ex(wtok, 2, "INSERT INTO t VALUES (1)")); a.done() == nil {
 		t.Errorf("an autocommit write: %v", a.frames)
 	}
@@ -209,16 +227,126 @@ func TestReadOnlyWriteReserve(t *testing.T) {
 	if a := e.post(t, "channel", "writer", sq(wtok, 4, "commit")); a.done()["wrote"] != true {
 		t.Errorf("its commit: %v", a.frames)
 	}
+	if a := e.post(t, "query", "writer", q("SELECT count(*) FROM t")); a.status != http.StatusOK {
+		t.Errorf("a query: %d %v", a.status, a.frames)
+	}
 	// A read-only transaction that ends frees its place.
-	e.post(t, "channel", "reader", sq(toks[0], 2, "commit"))
-	if a := e.post(t, "channel", "reader", sq(toks[n-1], 1, "begin")); a.done()["txn_state"] != "open" {
+	e.post(t, "channel", "writer", sq(toks[0], 2, "commit"))
+	if a := e.post(t, "channel", "writer", sq(toks[quota-1], 1, "begin")); a.done()["txn_state"] != "open" {
 		t.Errorf("a begin after a commit: %v", a.frames)
 	}
 	for _, tok := range toks {
-		e.post(t, "channel/close", "reader", closeBody(tok))
+		e.post(t, "channel/close", "writer", closeBody(tok))
 	}
-	if got := e.s.readTxns.Load(); got != 0 {
-		t.Errorf("%d read-only transactions counted after every channel closed", got)
+	e.noReadTxns(t)
+}
+
+// TestReadOnlyPodReserve: read-only transactions of every principal
+// together hold at most half the pod's connections, so a principal within
+// its own bound is refused once they do, and writes still find a connection.
+func TestReadOnlyPodReserve(t *testing.T) {
+	// 16 connections: 4 a principal, 3 of them for read-only transactions,
+	// 8 for those of the pod.
+	e, _, wtok := newTxnEnv(t, func(e *env) { e.s.pool = newPool(16) })
+	by, pod := e.s.pool.perPrincipal-1, e.s.pool.capacity/2
+	wtoks, w := e.roBegins(t, "writer", by)
+	rtoks, r := e.roBegins(t, "reader", by)
+	atoks, a := e.roBegins(t, "admin", by)
+	if w != by || r != by || a != pod-2*by || a >= by {
+		t.Fatalf("%d, %d and %d read-only transactions open, want %d, %d and %d", w, r, a, by, by, pod-2*by)
+	}
+	if a := e.post(t, "channel", "writer", ex(wtok, 2, "INSERT INTO t VALUES (1)")); a.done() == nil {
+		t.Errorf("a write: %v", a.frames)
+	}
+	if a := e.post(t, "query", "admin", q("SELECT 1")); a.status != http.StatusOK {
+		t.Errorf("a query of the refused principal: %d %v", a.status, a.frames)
+	}
+	e.post(t, "channel", "reader", sq(rtoks[0], 2, "commit"))
+	if a := e.post(t, "channel", "admin", sq(atoks[by-1], 1, "begin")); a.done()["txn_state"] != "open" {
+		t.Errorf("a begin after another principal's commit: %v", a.frames)
+	}
+	for subject, toks := range map[string][]string{"writer": wtoks, "reader": rtoks, "admin": atoks} {
+		for _, tok := range toks {
+			e.post(t, "channel/close", subject, closeBody(tok))
+		}
+	}
+	e.noReadTxns(t)
+}
+
+// TestReadOnlySmallPools: a pod too small to keep a connection back still
+// serves a read-only transaction, one for a principal whose quota is 1 and
+// one for a pod of one connection, and what it refuses meanwhile is served
+// once that transaction ends: no begin is refused for good.
+func TestReadOnlySmallPools(t *testing.T) {
+	t.Run("capacity 4", func(t *testing.T) {
+		e, _, wtok := newTxnEnv(t, func(e *env) { // one per principal, two read-only transactions in all
+			e.s.pool = newPool(4)
+			e.s.pool.maxWait = 20 * time.Millisecond
+		})
+		wtoks, w := e.roBegins(t, "writer", 2)
+		_, r := e.roBegins(t, "reader", 1)
+		_, a := e.roBegins(t, "admin", 1)
+		if w != 1 || r != 1 || a != 0 {
+			t.Fatalf("%d, %d and %d read-only transactions open, want 1, 1 and 0", w, r, a)
+		}
+		// The transaction holds its principal's one connection, as a write
+		// transaction would; other principals are served.
+		if a := e.post(t, "channel", "writer", ex(wtok, 2, "INSERT INTO t VALUES (1)")); a.status != 200 || a.code() != "overloaded" || a.err()["final"] != true {
+			t.Errorf("the holder's write: %d %v, want a recorded overloaded", a.status, a.frames)
+		}
+		if a := e.post(t, "query", "writer", q("SELECT 1")); a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
+			t.Errorf("the holder's query: %d %v", a.status, a.frames)
+		}
+		if a := e.post(t, "query", "admin", q("SELECT 1")); a.status != http.StatusOK {
+			t.Errorf("another principal's query: %d %v", a.status, a.frames)
+		}
+		e.post(t, "channel", "writer", sq(wtoks[0], 2, "commit"))
+		if a := e.post(t, "channel", "writer", ex(wtok, 3, "INSERT INTO t VALUES (1)")); a.done() == nil {
+			t.Errorf("the write after the commit: %v", a.frames)
+		}
+	})
+	t.Run("capacity 1", func(t *testing.T) {
+		e, _, wtok := newTxnEnv(t, func(e *env) {
+			e.s.pool = newPool(1)
+			e.s.pool.maxWait = 20 * time.Millisecond
+		})
+		wtoks, w := e.roBegins(t, "writer", 1)
+		rtoks, r := e.roBegins(t, "reader", 1)
+		if w != 1 || r != 0 {
+			t.Fatalf("%d and %d read-only transactions open, want 1 and 0", w, r)
+		}
+		e.post(t, "channel", "writer", sq(wtoks[0], 2, "commit"))
+		if a := e.post(t, "channel", "reader", sq(rtoks[0], 1, "begin")); a.done()["txn_state"] != "open" {
+			t.Errorf("the refused begin, sent again after the commit: %v", a.frames)
+		}
+		e.post(t, "channel", "reader", sq(rtoks[0], 2, "commit"))
+		if a := e.post(t, "channel", "writer", ex(wtok, 2, "INSERT INTO t VALUES (1)")); a.done() == nil {
+			t.Errorf("a write after both: %v", a.frames)
+		}
+		e.noReadTxns(t)
+	})
+}
+
+// TestWriteBehindReadOnlyTxnRefusedAtOnce: a connection a read-only
+// transaction took is no turnover, so a write granted the lock that finds
+// its principal's connections held by read-only transactions records
+// overloaded at once, and does not hold the lock through a wait.
+func TestWriteBehindReadOnlyTxnRefusedAtOnce(t *testing.T) {
+	// A wait far past the test's patience: a write that waits fails it.
+	e, _, wtok := newTxnEnv(t, func(e *env) {
+		e.s.pool = newPool(4) // one per principal
+		e.s.pool.maxWait = 30 * time.Second
+	})
+	if _, open := e.roBegins(t, "writer", 1); open != 1 {
+		t.Fatal("the read-only transaction did not begin")
+	}
+	select {
+	case a := <-e.postAsync(t, "channel", "writer", ex(wtok, 2, "INSERT INTO t VALUES (1)")):
+		if a.status != 200 || a.code() != "overloaded" || a.err()["final"] != true || a.err()["not_executed"] != true {
+			t.Errorf("the write: %d %v, want a recorded overloaded", a.status, a.frames)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the write waits for a connection that a read-only transaction holds")
 	}
 }
 
