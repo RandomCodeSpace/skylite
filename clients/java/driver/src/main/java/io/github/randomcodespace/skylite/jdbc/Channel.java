@@ -33,7 +33,8 @@ import java.util.concurrent.TimeUnit;
  * commit, and for an executeUpdate whose count the close's receipt holds, and {@code SKR01} (committed, result
  * unavailable) for any other write; not committed sends an autocommit write once
  * more, on a new channel, and is {@code 40000} for a commit; otherwise the outcome is unknown, {@code 08007}, and the
- * connection is closed, as it is after any commit that needed settling. A statement's or a rollback's loss inside a
+ * connection is closed. A commit settled either way leaves the connection open: only the channel is gone, and the
+ * next request opens a new one (ADR 0005, amended 2026-11-23). A statement's or a rollback's loss inside a
  * transaction loses the transaction: its later statements and its commit fail with {@code SKR03} and send nothing, its
  * rollback succeeds locally, and the next statement after that opens a new channel.
  *
@@ -98,7 +99,6 @@ final class Channel {
     private final Slot read = new Slot(true);
     private long begun; // begins sent on the connection's channels; guarded by this
     private volatile boolean lost; // written under this: the connection was discarded after an unknown outcome
-    private volatile boolean settledCommit; // written under this: lost after a commit whose outcome was settled
     private volatile boolean dead; // written under this: the transaction was lost with its channel; rollback ends it
 
     Channel(SkyliteConnection conn) {
@@ -182,24 +182,10 @@ final class Channel {
                 + "roll it back", "SKR03", 0, cause);
     }
 
-    /** The error for any use of a connection discarded after an unknown outcome or a settled commit, or null. */
+    /** The error for any use of a connection discarded after an unknown outcome, or null if it was not. */
     SQLException discarded() {
-        if (!lost) {
-            return null;
-        }
-        return new SQLNonTransientConnectionException(settledCommit
-                ? "skylite: the connection was closed after its commit's answer was lost and the commit was settled, "
-                        + "as ADR 0005 requires; open a new connection"
-                : "skylite: the connection was closed after an unknown outcome on its write channel; open a new "
-                        + "connection", "08003");
-    }
-
-    /**
-     * Whether the connection was discarded after a commit whose outcome was settled and reported: a pool's reset of
-     * the closed connection is then no error, since nothing about its transaction is unknown.
-     */
-    boolean settled() {
-        return lost && settledCommit;
+        return lost ? new SQLNonTransientConnectionException("skylite: the connection was closed after an unknown "
+                + "outcome on its write channel; open a new connection", "08003") : null;
     }
 
     /**
@@ -475,12 +461,8 @@ final class Channel {
             String token = s.token;
             s.token = null; // given up; settle closes it
             s.state = "none";
+            // Settled, even a commit keeps the connection: the next request opens a new channel (ADR 0005, amended)
             Frame settled = settle(token, seq, d.gone, timeoutMillis > 0 ? deadline : 0);
-            if (mode == Mode.COMMIT) { // ADR 0005: discarded whatever the answer
-                settledCommit = settled != null;
-                lost = true;
-                conn.discard();
-            }
             switch (settled) {
                 case Done done when "committed".equals(done.resolution()) -> {
                     return List.of(mode == Mode.COMMIT ? done : done.omitted());

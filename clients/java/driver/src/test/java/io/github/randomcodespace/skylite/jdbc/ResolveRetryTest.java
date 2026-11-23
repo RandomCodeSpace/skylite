@@ -144,41 +144,61 @@ class ResolveRetryTest {
     }
 
     @Test
-    void aLostCommitResolvedCommittedSucceedsAndTheConnectionIsDiscarded() throws Exception {
-        server.on("channel", FakeServer.executed(1, "open", 1, 1), lost())
-                .on("resolve", FakeServer.resolved("committed", 9));
-        try (Connection c = server.connect(); Statement s = c.createStatement()) {
-            c.setAutoCommit(false);
-            s.executeUpdate(INSERT);
-            c.commit();
-            assertTrue(c.isClosed(), "ADR 0005: a commit that needed settling discards the connection");
-        }
-        assertEquals(List.of("{\"channel\":\"w1.1\",\"seq\":2}"), server.bodies("resolve"));
+    void aLostCommitResolvedCommittedSucceedsAndTheConnectionGoesOnOnANewChannel() throws Exception {
+        afterASettledCommit("committed");
     }
 
     @Test
-    void aLostCommitResolvedNotCommittedIsARollback() throws Exception {
-        server.on("channel", FakeServer.executed(1, "open", 1, 1), lost())
-                .on("resolve", FakeServer.resolved("not_committed", 9));
+    void aLostCommitResolvedNotCommittedIsARollbackAndTheConnectionGoesOnOnANewChannel() throws Exception {
+        afterASettledCommit("not_committed");
+    }
+
+    /**
+     * ADR 0005, amended 2026-11-23: a commit settled by resolve leaves nothing about the session unknown, so the
+     * connection stays open with its settings, and its next statement begins a transaction on a new channel at
+     * seq 1, at the connection's watermark, which the resolve raised.
+     */
+    private void afterASettledCommit(String resolution) throws Exception {
+        server.on("channel", FakeServer.executed(1, "open", 1, 1), lost(), FakeServer.executed(1, "open", 1, 1),
+                        FakeServer.stepped(2))
+                .on("resolve", FakeServer.resolved(resolution, 9));
         try (Connection c = server.connect(); Statement s = c.createStatement()) {
             c.setAutoCommit(false);
             s.executeUpdate(INSERT);
-            SQLException e = assertThrows(SQLTransactionRollbackException.class, c::commit);
-            assertEquals("40000", e.getSQLState());
-            assertTrue(c.isClosed());
+            if (resolution.equals("committed")) {
+                c.commit();
+            } else {
+                SQLException e = assertThrows(SQLTransactionRollbackException.class, c::commit);
+                assertEquals("40000", e.getSQLState());
+                c.rollback(); // nothing is open: sends nothing
+            }
+            assertFalse(c.isClosed(), "only the channel is gone");
+            assertFalse(c.getAutoCommit());
+            assertFalse(c.isReadOnly());
+            assertEquals(1, s.executeUpdate(INSERT), "the connection's statements stay open too");
+            c.commit();
         }
+        assertEquals(List.of("{\"channel\":\"w1.1\",\"seq\":2}"), server.bodies("resolve"));
+        List<String> sent = server.bodies("channel");
+        assertEquals(4, sent.size(), sent.toString());
+        assertTrue(sent.get(2).startsWith("{\"channel\":\"w1.2\",\"seq\":1,\"op\":\"begin\"")
+                && sent.get(2).contains("\"min_txn\":9"), sent.get(2));
+        assertTrue(sent.get(3).startsWith("{\"channel\":\"w1.2\",\"seq\":2,"), sent.get(3));
+        assertEquals(2, server.bodies("channels").size());
     }
 
     /**
      * A pool returns a connection by resetting it, as HikariCP's ProxyConnection.close does: rollback when its commit
-     * failed, the settings it changed, clearWarnings. After a settled commit that raises nothing, so that a commit
-     * reported as committed is not turned into a failed close; after an unknown one it raises 08003.
+     * failed, the settings it changed, clearWarnings; and it may lend it again without validating it. After a settled
+     * commit the connection is open, so that raises nothing and the next borrower's statement runs on a new channel;
+     * after an unknown one it is closed, isValid is false, and the reset and every use raise 08003.
      */
     @Test
-    void aConnectionClosedAfterASettledCommitIsResetQuietlyByItsPool() throws Throwable {
+    void aPoolResetsAndReusesAConnectionAfterASettledCommit() throws Throwable {
         for (String resolution : List.of("committed", "not_committed", "unknown")) {
-            server.on("channel", FakeServer.executed(1, "open", 1, 1), lost())
-                    .on("resolve", FakeServer.resolved(resolution, 9));
+            server.on("channel", FakeServer.executed(1, "open", 1, 1), lost(), INSERTED)
+                    .on("resolve", FakeServer.resolved(resolution, 9))
+                    .on("describe", "{\"columns\":[{\"name\":\"1\"}]}\n" + FakeServer.describeDone(4, 0));
             Connection c = server.connect();
             c.setAutoCommit(false);
             try (Statement s = c.createStatement()) {
@@ -189,25 +209,32 @@ class ResolveRetryTest {
             } else {
                 assertThrows(SQLException.class, c::commit);
             }
-            assertTrue(c.isClosed(), resolution);
-            assertFalse(c.isValid(1), "the pool drops it: " + resolution);
             List<org.junit.jupiter.api.function.Executable> reset = List.of(c::rollback, () -> c.setReadOnly(false),
                     () -> c.setAutoCommit(true), () -> c.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE),
                     () -> c.setCatalog("main"), () -> c.setNetworkTimeout(Runnable::run, 0), () -> c.setSchema("main"),
                     c::clearWarnings);
-            SQLException used = assertThrows(SQLException.class, c::createStatement);
-            assertEquals("08003", used.getSQLState());
             if (resolution.equals("unknown")) {
+                assertTrue(c.isClosed());
+                assertFalse(c.isValid(1), "the pool drops it");
                 for (var r : reset) {
                     assertEquals("08003", assertThrows(SQLException.class, r).getSQLState());
                 }
+                SQLException used = assertThrows(SQLException.class, c::createStatement);
+                assertEquals("08003", used.getSQLState());
                 assertTrue(used.getMessage().contains("unknown outcome"), used.getMessage());
             } else {
                 for (var r : reset) {
                     r.execute();
                 }
-                assertTrue(used.getMessage().contains("commit was settled") && !used.getMessage().contains("unknown"),
-                        used.getMessage());
+                assertFalse(c.isClosed(), resolution);
+                assertTrue(c.isValid(1), resolution);
+                int before = server.bodies("channel").size();
+                try (Statement s = c.createStatement()) {
+                    assertEquals(1, s.executeUpdate(INSERT), resolution);
+                }
+                List<String> sent = server.bodies("channel");
+                assertEquals(before + 1, sent.size(), resolution);
+                assertTrue(sent.get(before).contains("\"seq\":1,\"op\":\"execute\""), sent.get(before));
             }
             c.close();
         }
