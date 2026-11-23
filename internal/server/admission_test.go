@@ -299,6 +299,9 @@ func TestRefreshWaitHoldsNoPlace(t *testing.T) {
 	fetcher := send(k2) // refreshes, and holds its place while it does
 	<-stalled
 	waiter := send(k2)
+	// A waiter holds a pod place until it starts to wait: with the fetcher's,
+	// two arriving together would fill the pod's bound, and one be refused.
+	e.admitted(t, &e.s.refreshes, "", 1)
 	h := dialH2(t, e.addr) // a waiter whose client goes away
 	h.must(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndHeaders: true, BlockFragment: block(h2Put("w", k2.tokenFrom(t, iss.URL, "reader"), "content-type", "application/json", "content-length", "2")...)}))
 	e.admitted(t, &e.s.refreshes, "", 2)
