@@ -70,6 +70,7 @@ func TestAppendCallParses(t *testing.T) {
 		{"rollback", KindChannel, Call{Channel: "w1.x", Seq: 3, Op: OpRollback}, `{"channel":"w1.x","seq":3,"op":"rollback"}`, nil},
 		{"cancel", KindCancel, Call{Channel: "w1.x", Seq: 3}, `{"channel":"w1.x","seq":3}`, nil},
 		{"close", KindClose, Call{Channel: "w1.x"}, `{"channel":"w1.x"}`, nil},
+		{"resolve", KindResolve, Call{Channel: "w1.x", Seq: 13}, `{"channel":"w1.x","seq":13}`, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -106,7 +107,8 @@ func TestAppendCallRefuses(t *testing.T) {
 	}{
 		{"channel request without op", KindChannel, Call{Channel: "w1.x", Seq: 1, SQL: "SELECT 1"}},
 		{"batch", KindChannel, Call{Channel: "w1.x", Seq: 1, Op: OpBatch, SQL: "SELECT 1"}},
-		{"resolve", KindResolve, Call{Channel: "w1.x", Seq: 1}},
+		{"resolve with sql", KindResolve, Call{Channel: "w1.x", Seq: 1, SQL: "SELECT 1"}},
+		{"resolve without seq", KindResolve, Call{Channel: "w1.x"}},
 		{"execute without channel", KindChannel, Call{Seq: 1, Op: OpExecute, SQL: "SELECT 1"}},
 		{"execute without seq", KindChannel, Call{Channel: "w1.x", Op: OpExecute, SQL: "SELECT 1"}},
 		{"execute without sql", KindChannel, Call{Channel: "w1.x", Seq: 1, Op: OpExecute}},
@@ -258,6 +260,8 @@ func TestReaderRefuses(t *testing.T) {
 		{"read_only not a boolean", DoneQuery, `{"done":{"txn":1,"read_only":1,"rows_affected":0,"last_insert_rowid":0}}` + "\n", false},
 		{"done not an object", DoneQuery, `{"done":1}` + "\n", false},
 		{"bytes after the terminal frame", DoneQuery, qdone + "\n", false},
+		{"unknown resolution", DoneResolve, `{"done":{"resolution":"maybe","txn":1}}` + "\n", false},
+		{"resolve without txn", DoneResolve, `{"done":{"resolution":"committed"}}` + "\n", false},
 		{"params in a query", DoneQuery, cols + `{"params":{"from":0,"names":["a"]}}` + "\n" + qdone, false},
 		{"results in a query", DoneQuery, `{"results":{"from":0,"entries":[{"rows_affected":1,"last_insert_rowid":1}]}}` + "\n" + qdone, false},
 		{"row in a describe", DoneDescribe, cols + "[1]\n" + `{"done":{"txn":1,"param_count":0}}` + "\n", false},
@@ -304,6 +308,8 @@ func TestReaderReadsChannelAnswers(t *testing.T) {
 		{Kind: DoneExecute, Seq: 2, TxnState: TxnAborted, Txn: 7, RowsAffected: 1, LastInsertRowID: -3, DataOmitted: true},
 		{Kind: DoneCommit, Seq: 3, TxnState: TxnNone, Txn: 8, Wrote: true},
 		{Kind: DoneRollback, Seq: 4, TxnState: TxnNone, Txn: 8},
+		{Kind: DoneResolve, Resolution: ResolutionCommitted, Txn: 1301},
+		{Kind: DoneResolve, Resolution: ResolutionPending, Txn: 1302},
 	} {
 		var buf bytes.Buffer
 		w, _ := NewWriter(&buf, DefaultFrameBytes, l)

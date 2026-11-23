@@ -15,12 +15,14 @@ import (
 )
 
 // conn is a database/sql connection. Each query and describe outside a
-// transaction is one stateless request; everything else goes on its write
-// channel.
+// transaction is one stateless request; a read-only transaction goes on its
+// read-only channel, and everything else on its write channel.
 type conn struct {
 	c      *Connector
 	closed bool
-	ch     *channel // nil until a request needs one, and after it was abandoned
+	ch     *channel // the channel in use: nil until a request needs one, and after it was abandoned
+	other  *channel // the channel not in use: the write channel in a read-only transaction
+	ro     bool     // ch is the read-only channel, of a read-only transaction
 	inTx   bool     // a transaction is open, or lost and not yet rolled back
 	lost   bool     // an outcome was unknown: the connection is discarded
 }
@@ -36,14 +38,16 @@ var (
 	_ driver.SessionResetter    = (*conn)(nil)
 )
 
-// Close closes the write channel, if any, waiting for the answer up to
-// abandonWait, so that the server releases it at once.
+// Close closes the connection's channels, waiting for each answer up to
+// abandonWait, so that the server releases them at once.
 func (cn *conn) Close() error {
 	cn.closed = true
-	if cn.ch != nil {
-		cn.c.abandon(cn.ch.token, 0)
-		cn.ch = nil
+	for _, ch := range []*channel{cn.ch, cn.other} {
+		if ch != nil {
+			cn.c.abandon(ch.token, 0)
+		}
 	}
+	cn.ch, cn.other = nil, nil
 	return nil
 }
 
@@ -160,34 +164,45 @@ func (rs *response) next() (*wire.Frame, error) {
 
 // QueryContext sends a query outside a transaction to the stateless query
 // endpoint, and on to the write channel when the server answers that it is
-// not a pure read. Inside a transaction it goes on the channel.
+// not a pure read. Inside a transaction it goes on the channel. A query
+// refused before it ran, with a transient code, is sent again after a
+// pause, within the context and the statement time.
 func (cn *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if cn.inTx {
 		return cn.channelQuery(ctx, query, args)
 	}
-	rs, err := cn.send(ctx, wire.KindQuery, cn.call(query, args))
-	if err != nil {
-		return nil, err
-	}
-	f, err := rs.next()
-	if err == nil && f.Kind == wire.FrameError {
-		if f.Error.Code == CodeNeedsChannel { // refused before execution
-			_ = rs.body.Close()
-			return cn.channelQuery(ctx, query, args)
+	call, by := cn.call(query, args), time.Now().Add(statementTime)
+	var last *wire.Error
+	for n := 0; ; n++ {
+		qctx, cancel := context.WithCancel(ctx) // rows.Close ends a read it stops waiting for
+		rs, err := cn.send(qctx, wire.KindQuery, call)
+		if err != nil {
+			cancel()
+			return nil, failed(ctx, last, err)
 		}
-		err = serverError(f.Error)
+		f, err := rs.next()
+		if err != nil || f.Kind == wire.FrameError {
+			_ = rs.body.Close()
+			cancel()
+			switch {
+			case err != nil:
+				return nil, failed(ctx, last, err)
+			case f.Error.Code == CodeNeedsChannel: // refused before execution
+				return cn.channelQuery(ctx, query, args)
+			case transient(f.Error) && backoff(ctx, by, n):
+				last = f.Error
+				continue
+			}
+			return nil, refused(ctx, f.Error)
+		}
+		r := &rows{c: cn.c, rs: rs, cancel: cancel}
+		if f.Kind == wire.FrameColumns {
+			r.cols = f.Columns
+		} else {
+			r.end(f.Done) // a pure read without result columns
+		}
+		return r, nil
 	}
-	if err != nil {
-		_ = rs.body.Close()
-		return nil, err
-	}
-	r := &rows{c: cn.c, rs: rs}
-	if f.Kind == wire.FrameColumns {
-		r.cols = f.Columns
-	} else {
-		r.end(f.Done) // a pure read without result columns
-	}
-	return r, nil
 }
 
 // ExecContext runs the statement on the write channel: an autocommit
@@ -262,10 +277,11 @@ func (cn *conn) call(query string, args []driver.NamedValue) *wire.Call {
 }
 
 // PrepareContext describes the statement: the server compiles it, executes
-// nothing, and reports its parameter count. Inside a transaction it sends
-// nothing and the count is unknown: a stateless describe cannot see the
-// transaction's schema changes, and the server does not describe on a
-// channel yet. A lost transaction refuses it.
+// nothing, and reports its parameter count. A describe refused with a
+// transient code is sent again after a pause, within the context and the
+// statement time. Inside a transaction it sends nothing and the count is
+// unknown: a stateless describe cannot see the transaction's schema
+// changes. A lost transaction refuses it.
 func (cn *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	if cn.inTx {
 		if err := cn.usable(); err != nil {
@@ -273,22 +289,51 @@ func (cn *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, 
 		}
 		return &stmt{cn: cn, query: query, params: -1}, nil
 	}
+	by := time.Now().Add(statementTime)
+	var last *wire.Error
+	for n := 0; ; n++ {
+		params, e, err := cn.describe(ctx, query)
+		switch {
+		case err != nil:
+			return nil, failed(ctx, last, err)
+		case e == nil:
+			return &stmt{cn: cn, query: query, params: params}, nil
+		case !transient(e) || !backoff(ctx, by, n):
+			return nil, refused(ctx, e)
+		}
+		last = e
+	}
+}
+
+// failed is the error of a stateless request that failed with err: after a
+// transient refusal last, when the context ended during the next attempt,
+// that refusal, which also matches the context's error.
+func failed(ctx context.Context, last *wire.Error, err error) error {
+	if last != nil && ctx.Err() != nil {
+		return refused(ctx, last)
+	}
+	return err
+}
+
+// describe sends one stateless describe of query and returns its parameter
+// count, or the server's error.
+func (cn *conn) describe(ctx context.Context, query string) (int, *wire.Error, error) {
 	rs, err := cn.send(ctx, wire.KindDescribe, &wire.Call{SQL: query})
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	defer func() { _ = rs.body.Close() }()
 	for {
 		f, err := rs.next()
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		switch f.Kind {
 		case wire.FrameError:
-			return nil, serverError(f.Error)
+			return 0, f.Error, nil
 		case wire.FrameDone:
 			cn.c.raise(f.Done.Txn)
-			return &stmt{cn: cn, query: query, params: int(f.Done.ParamCount)}, nil
+			return int(f.Done.ParamCount), nil, nil
 		}
 	}
 }
@@ -346,14 +391,22 @@ func (r result) RowsAffected() (int64, error) { return r.d.RowsAffected, nil }
 // arrives, and Close releases the response, whether or not it has been read
 // to its end. A channel query's rows are in buf, and rs is nil.
 type rows struct {
-	c    *Connector
-	rs   *response
-	cols []wire.Column
-	done *wire.Done // the terminal frame, once read
-	buf  [][]driver.Value
+	c      *Connector
+	rs     *response
+	cancel context.CancelFunc // ends rs's request
+	cols   []wire.Column
+	done   *wire.Done // the terminal frame, once read
+	buf    [][]driver.Value
 }
 
 var _ driver.RowsColumnTypeDatabaseTypeName = (*rows)(nil)
+
+// drainBytes and drainWait bound how far Close reads on for the done frame
+// of a stateless query whose rows it closes before their end.
+const (
+	drainBytes = 64 << 10
+	drainWait  = 250 * time.Millisecond
+)
 
 func (r *rows) Columns() []string {
 	names := make([]string, len(r.cols))
@@ -363,9 +416,30 @@ func (r *rows) Columns() []string {
 	return names
 }
 
+// Close releases the response. Before its end, it first reads on, up to
+// drainBytes and drainWait, for the done frame: database/sql closes a
+// QueryRow's rows after the first, and only the done frame carries the txn
+// of the state read, which the watermark must reach so that no later read
+// of the pool sees an older state (ADR 0005 decision 5).
 func (r *rows) Close() error {
 	if r.rs == nil {
 		return nil
+	}
+	defer r.cancel()
+	if r.done == nil {
+		t := time.AfterFunc(drainWait, r.cancel)
+		r.rs.r.LimitResult(r.rs.r.Result() + drainBytes)
+		for {
+			f, err := r.rs.r.Next()
+			if err != nil || f.Kind == wire.FrameError {
+				break
+			}
+			if f.Kind == wire.FrameDone {
+				r.end(f.Done)
+				break
+			}
+		}
+		t.Stop()
 	}
 	return r.rs.body.Close()
 }
