@@ -96,11 +96,15 @@ func TestLoadRefuses(t *testing.T) {
 		}
 		return strings.Replace(goodConfig, old, repl, 1)
 	}
-	names := make([]string, maxDatabases)
-	for i := range names {
-		names[i] = fmt.Sprintf("%q", fmt.Sprint("d", i))
+	list := func(n int) string {
+		names := make([]string, n)
+		for i := range names {
+			names[i] = fmt.Sprintf("%q", fmt.Sprint("d", i))
+		}
+		return "[" + strings.Join(names, ", ") + "]"
 	}
-	many := "[" + strings.Join(names, ", ") + "]"
+	_, conns, _ := shares(2 << 30)
+	many := list(conns)
 	storageField := goodConfig[strings.Index(goodConfig, `"storage"`):strings.Index(goodConfig, `,
   "databases"`)]
 	withStorage := func(s string) string { return edit(storageField, s) }
@@ -136,7 +140,10 @@ func TestLoadRefuses(t *testing.T) {
 		"prefix too long":         edit(`"prod/skylite"`, `"`+strings.Repeat("p", 1000)+`"`),
 		"database name with _":    edit(`"users"`, `"us_ers"`),
 		"database twice":          edit(`"users"`, `"orders"`),
-		"too many databases":      edit(`["orders", "users"]`, many),
+		"too many databases":      edit(`["orders", "users"]`, many+`, "memory_budget": 2147483648`),
+		"too many for any budget": edit(`["orders", "users"]`, list(maxConnLimit)),
+		"budget below the floor":  edit(`"databases"`, `"memory_budget": 402653183, "databases"`),
+		"budget above the cap":    edit(`"databases"`, `"memory_budget": 68719476737, "databases"`),
 		"peer without ca":         edit(`, "ca_file": "/etc/skylite/peer-ca.crt"`, ""),
 		"peer without name":       edit(`, "server_name": "skylite-peer"`, ""),
 		"peer address not a name": edit(`"SKYLITE_PEER_ADDRESS"`, `"10.0.0.1:8444"`),

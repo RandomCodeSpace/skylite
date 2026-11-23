@@ -10,14 +10,14 @@
 // this server cannot serve is forwarded one hop to the pod that can (see
 // forward.go). resolve and GET status are answered by the leader (see
 // resolve.go); resolve is forwarded to it, and another pod answers status
-// with not_serving. Of the
-// admission control of ADR 0005 decision 9, the bound
-// on HTTP connections, the body share of the memory budget, the SQLite
-// connection limits and the channel bounds are implemented.
+// with not_serving. Admission control is that of ADR 0005 decision 9 (see
+// budget.go and admit), except that HTTP connections and response frames
+// are not charged to the memory budget.
 package server
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,24 +80,22 @@ const (
 	groupSize = 256
 )
 
-// The memory budget of ADR 0005 decision 9 and what it is divided into:
-// the body share; the channels' share, which holds a receipt for each
-// channel, held result rows and retained replay data; and SQLite
-// connections at their ceiling in what is left. Nothing else is charged;
-// see docs/content/docs/server.md.
-//
-// shortcut: the budget is the decision's default without a container limit;
-// derive it from the cgroup limit with the rest of admission.
+// The concurrency bounds of ADR 0005 decision 9, per pod and per
+// principal: requests other than cancel, close and resolve, stateless
+// requests among them, cancel and close, and resolve.
 const (
-	memoryBudget = 2 << 30
-	bodyShare    = memoryBudget / 2 // request bodies, charged at 8 × Content-Length
-	channelShare = maxChannels*receiptBytes + heldShare + replayShare
-	connCeiling  = 64 << 20 // SQLite connection memory ceiling
-	maxConnLimit = 256      // SQLite connections per pod
-	// maxDatabases is the SQLite connections the budget holds after the
-	// body share and the channels' share: each led database's engine
-	// connection is charged a ceiling, and one must stay for clients.
-	maxDatabases = min(maxConnLimit, (memoryBudget-bodyShare-channelShare)/connCeiling)
+	maxRequests    = 1024
+	maxRequestsBy  = 256
+	maxStateless   = 256
+	maxStatelessBy = 64
+	maxControl     = 64
+	maxControlBy   = 16
+	maxResolves    = 64
+	maxResolvesBy  = 16
+	// maxRefreshWaits bounds the requests waiting for a refresh of an
+	// issuer's signing keys, which hold no place in the bounds above while
+	// they wait: a refresh may take its whole fetch timeout.
+	maxRefreshWaits = 64
 )
 
 // engineConfig is each leader's configuration. The tail bound is the
@@ -141,10 +140,16 @@ type Server struct {
 	// its observation.
 	sweepGap, resolveGap func()
 
+	budget              int64 // the memory budget, divided by shares
 	bodyMu              sync.Mutex
 	bodyUsed, bodyShare int64            // request bodies' share of the memory budget, charged at 8 × Content-Length
 	bodyBy              map[string]int64 // the charge per principal, at most a quarter of the share
 	statementTime       time.Duration
+
+	// admMu guards the concurrency bounds (admit).
+	admMu                                   sync.Mutex
+	requests, stateless, controls, resolves bound
+	refreshes                               bound // pod only: no principal is known yet
 
 	// The constants above, and the response deadline of limits, as set by
 	// New; tests shorten them.
@@ -163,10 +168,24 @@ func New(cfg Config, log *slog.Logger) (*Server, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	from, container := "memory_budget", int64(0)
+	if cfg.MemoryBudget == 0 {
+		var err error
+		if cfg.MemoryBudget, from, err = memoryBudget(cgroupRoot, debug.SetMemoryLimit(-1)); err != nil {
+			return nil, err
+		}
+	} else {
+		container, _ = containerLimit(cgroupRoot) // only for the warning below
+	}
 	s, err := newServer(cfg, log, nil)
 	if err != nil {
 		return nil, err
 	}
+	if container > 0 && s.budget > container {
+		s.log.LogAttrs(context.Background(), slog.LevelWarn, "memory_budget exceeds the container's memory limit", slog.Int64("bytes", s.budget), slog.Int64("container_limit", container))
+	}
+	s.log.LogAttrs(context.Background(), slog.LevelInfo, "memory budget", slog.Int64("bytes", s.budget), slog.String("from", from),
+		slog.Int64("body_share", s.bodyShare), slog.Int64("request_body_bytes", s.limits.RequestBodyBytes), slog.Int("sqlite_connections", s.pool.capacity))
 	if s.store, err = openStore(context.Background(), cfg.Storage); err != nil {
 		return nil, err
 	}
@@ -180,10 +199,17 @@ func New(cfg Config, log *slog.Logger) (*Server, error) {
 }
 
 // newServer is New with the store given; New opens it after everything else
-// has succeeded.
+// has succeeded. Without cfg.MemoryBudget the budget is 2 GiB.
 func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
+	}
+	budget := cmp.Or(cfg.MemoryBudget, defaultBudget)
+	body, conns, bodyLimit := shares(budget)
+	if n := len(cfg.Databases); n >= conns {
+		least := budgetFor(n + 1)
+		return nil, fmt.Errorf("server: the memory budget of %d MiB holds %d SQLite connections, and %d listed databases and the clients need %d: set memory_budget to at least %d MiB, or the memory limit to at least %d MiB",
+			budget>>20, max(conns, 0), n, n+1, least>>20, (least/3*4+(1<<20)-1)>>20)
 	}
 	g, err := auth.New(cfg.Auth, nil, nil, log)
 	if err != nil {
@@ -193,6 +219,7 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 		return nil, fmt.Errorf("server: %w", err)
 	}
 	l := wire.DefaultLimits()
+	l.RequestBodyBytes = bodyLimit
 	stmt := time.Duration(l.StatementMS) * time.Millisecond
 	// The policy's time limit is the statement time; the request's deadline
 	// on the engine's Run context lowers it.
@@ -202,7 +229,9 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 	}
 	s := &Server{
 		cfg: cfg, log: log, guard: g, store: st, limits: l,
-		policy: policy, pool: newPool(maxDatabases - len(cfg.Databases)), engine: engineConfig(), bodyShare: bodyShare, bodyBy: map[string]int64{}, statementTime: stmt,
+		policy: policy, pool: newPool(conns - len(cfg.Databases)), engine: engineConfig(), budget: budget, bodyShare: body, bodyBy: map[string]int64{}, statementTime: stmt,
+		requests: newBound(maxRequests, maxRequestsBy), stateless: newBound(maxStateless, maxStatelessBy),
+		controls: newBound(maxControl, maxControlBy), resolves: newBound(maxResolves, maxResolvesBy), refreshes: newBound(maxRefreshWaits, 0),
 		instance: rand.Text(), chl: defaultChLimits(), hdrSem: make(chan struct{}, headerReadsPod),
 		headerDeadline: headerDeadline, bodyDeadline: bodyDeadline, responseDeadline: time.Duration(l.ResponseMS) * time.Millisecond,
 		idleTimeout: idleTimeout, createTimeout: createTimeout, shutdownTimeout: shutdownTimeout, hopSlack: hopSlack, maxConns: maxConns,
@@ -399,6 +428,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		Protocols: &p,
 		ErrorLog:  slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
 	}
+	s.limitPreAuth(srv)
 	ln = netutil.LimitListener(ln, s.maxConns)
 	serve := func() error { return srv.Serve(ln) }
 	if s.cert != nil {
@@ -607,7 +637,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, hop bool) {
 		return
 	}
 	st.out = out
-	done, e, bodyRead := s.handle(st, r, id, log, hop, arrived)
+	var t ticket // released once the response has ended
+	defer s.unadmit(&t)
+	done, e, bodyRead := s.handle(st, r, &t, id, log, hop, arrived)
 	if st.relayed {
 		return
 	}
@@ -690,16 +722,20 @@ func (st *stream) Write(p []byte) (int, error) {
 }
 
 // handle runs the checks before acceptance of ADR 0005 in their order, then
-// serves the request with request id id, or forwards it. Admission (check
-// 2) is not implemented. bodyRead reports whether the body was read to its
-// end. hop is set for a request another pod forwarded, which arrived then.
-func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger, hop bool, arrived time.Time) (done *wire.Done, e *wire.Error, bodyRead bool) {
+// serves the request with request id id, or forwards it. Its places in the
+// concurrency bounds go in t. bodyRead reports whether the body was read to
+// its end. hop is set for a request another pod forwarded, which arrived
+// then.
+func (s *Server) handle(st *stream, r *http.Request, t *ticket, id string, log *slog.Logger, hop bool, arrived time.Time) (done *wire.Done, e *wire.Error, bodyRead bool) {
 	kind, db, e := wire.Route(r.Method, r.URL.EscapedPath())
 	if e != nil {
 		return nil, e, false
 	}
 	if r.URL.RawQuery != "" {
 		return nil, wire.NewError(wire.CodeInvalidRequest, "the path must have no query"), false
+	}
+	if e := s.admit(t, kind); e != nil {
+		return nil, e, false
 	}
 	// The pod-to-pod headers are trusted only on the peer listener.
 	var budget int64
@@ -715,7 +751,18 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	token, err := auth.BearerToken(r.Header)
 	var p *auth.Principal
 	if err == nil {
-		p, err = s.guard.Verify(r.Context(), token)
+		// A request that must wait for another's refresh of signing keys
+		// trades its places for one among the refreshes' waiters meanwhile.
+		var busy *wire.Error
+		ctx := auth.WithRefreshWait(r.Context(), func() (func(), bool) {
+			resume, e := s.waitRefresh(t)
+			busy = e
+			return func() { busy = resume() }, e == nil
+		})
+		p, err = s.guard.Verify(ctx, token)
+		if busy != nil {
+			return nil, busy, false
+		}
 	}
 	if err != nil {
 		ae, ok := errors.AsType[*auth.Error](err)
@@ -724,6 +771,13 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 		}
 		log.LogAttrs(r.Context(), slog.LevelInfo, "authentication refused", auth.RefusalAttrs(ae, token)...)
 		return nil, wire.NewError(wire.CodeUnauthenticated, "the bearer token is missing, malformed, expired or unverifiable"), false
+	}
+	if a, ok := r.Context().Value(connAuthKey{}).(*connAuth); ok {
+		a.authed.Store(true)
+	}
+	who := principal(p)
+	if e := s.admitPrincipal(t, who); e != nil {
+		return nil, e, false
 	}
 	// Authorisation, before routing and before anything depends on whether
 	// the database exists. Every request needs read; a PUT needs admin.
@@ -767,15 +821,14 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	case kind != wire.KindPut && leader == nil && !forward && (follower == nil || !stateless):
 		return nil, wire.NewError(wire.CodeNotServing, "this server does not lead the database or serve this request on a follower"), false
 	}
-	who := principal(p)
-	release, e := s.chargeBody(r, who)
-	if e != nil {
-		return nil, e, false
-	}
-	defer release()
-	limit := s.limits.RequestBodyBytes
-	if kind == wire.KindClose || kind == wire.KindCancel || kind == wire.KindResolve {
-		limit = controlBodyBytes
+	// cancel, close and resolve are not charged to the body share: their
+	// memory is the control capacity's, reserved from it at start.
+	limit := int64(controlBodyBytes)
+	if kind != wire.KindClose && kind != wire.KindCancel && kind != wire.KindResolve {
+		if t.body, e = s.chargeBody(r, who); e != nil {
+			return nil, e, false
+		}
+		limit = s.limits.RequestBodyBytes
 	}
 	body, e := s.readBody(r, limit)
 	if e != nil {
@@ -834,6 +887,174 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 // principal identifies an authenticated principal in the per-principal
 // bounds: its issuer and subject.
 func principal(p *auth.Principal) string { return p.Issuer + "\x00" + p.Subject }
+
+// bound is one of ADR 0005's concurrency bounds: requests in flight per pod
+// and per principal. Server.admMu guards its counts.
+type bound struct {
+	pod, principal int
+	n              int
+	by             map[string]int
+}
+
+func newBound(pod, principal int) bound {
+	return bound{pod: pod, principal: principal, by: map[string]int{}}
+}
+
+// ticket is a request's places in the bounds it counts against: the pod's
+// from admit, and its principal's, who, from admitPrincipal.
+type ticket struct {
+	bounds []*bound
+	who    string
+	body   func() // releases the body's charge, held until the response ends too
+}
+
+// admit is check 2 of ADR 0005: a place in each of the pod's bounds for a
+// request of kind, held until its response ends. cancel and close have
+// their own capacity and resolve its own; every other request counts
+// against the request bound, and a stateless one against the stateless
+// bound too.
+func (s *Server) admit(t *ticket, kind wire.Kind) *wire.Error {
+	var bs []*bound
+	switch kind {
+	case wire.KindCancel, wire.KindClose:
+		bs = []*bound{&s.controls}
+	case wire.KindResolve:
+		bs = []*bound{&s.resolves}
+	case wire.KindQuery, wire.KindDescribe:
+		bs = []*bound{&s.requests, &s.stateless}
+	default:
+		bs = []*bound{&s.requests}
+	}
+	return s.take(t, bs)
+}
+
+// take gives t a place in each of the pod's bounds bs, or none.
+func (s *Server) take(t *ticket, bs []*bound) *wire.Error {
+	s.admMu.Lock()
+	defer s.admMu.Unlock()
+	for _, b := range bs {
+		if b.n >= b.pod {
+			return wire.NewError(wire.CodeOverloaded, "the server is at its bound on concurrent requests of this kind; retry later")
+		}
+	}
+	for _, b := range bs {
+		b.n++
+	}
+	t.bounds = bs
+	return nil
+}
+
+// waitRefresh trades t's places in the pod's bounds, taken by admit and
+// none of its principal's yet, for one among the requests waiting for a
+// refresh of signing keys. resume trades them back, or reports overloaded
+// if the pod's bounds are full by then.
+func (s *Server) waitRefresh(t *ticket) (resume func() *wire.Error, e *wire.Error) {
+	s.admMu.Lock()
+	defer s.admMu.Unlock()
+	if s.refreshes.n >= s.refreshes.pod {
+		return nil, wire.NewError(wire.CodeOverloaded, "the server is at its bound on requests waiting for signing keys; retry later")
+	}
+	s.refreshes.n++
+	bs := t.bounds
+	for _, b := range bs {
+		b.n--
+	}
+	t.bounds = nil
+	return func() *wire.Error {
+		s.admMu.Lock()
+		s.refreshes.n--
+		s.admMu.Unlock()
+		return s.take(t, bs)
+	}, nil
+}
+
+// admitPrincipal applies the per-principal bounds of the request's kind,
+// after authentication and before the body is read (ADR 0005, check 3).
+func (s *Server) admitPrincipal(t *ticket, who string) *wire.Error {
+	s.admMu.Lock()
+	defer s.admMu.Unlock()
+	for _, b := range t.bounds {
+		if b.by[who] >= b.principal {
+			return wire.NewError(wire.CodeOverloaded, "the principal is at its bound on concurrent requests of this kind; retry later")
+		}
+	}
+	for _, b := range t.bounds {
+		b.by[who]++
+	}
+	t.who = who
+	return nil
+}
+
+// unadmit gives up t's places.
+func (s *Server) unadmit(t *ticket) {
+	if t.body != nil {
+		t.body()
+	}
+	s.admMu.Lock()
+	defer s.admMu.Unlock()
+	for _, b := range t.bounds {
+		b.n--
+		if t.who == "" {
+			continue
+		}
+		if b.by[t.who]--; b.by[t.who] == 0 {
+			delete(b.by, t.who)
+		}
+	}
+}
+
+// connAuth is a client connection's state for the idle limit before
+// authentication.
+type connAuth struct {
+	authed atomic.Bool // the connection carried a request whose token verified
+	mu     sync.Mutex
+	idle   *time.Timer // closes the connection while idle before authed
+}
+
+type connAuthKey struct{}
+
+// limitPreAuth closes a client connection that is idle and has carried no
+// request with a verified token after the header deadline rather than the
+// idle timeout, so that a client without a token holds one of the pod's
+// connections for little longer than its requests (ADR 0005 leaves the idle
+// timeout to the server).
+func (s *Server) limitPreAuth(srv *http.Server) {
+	var conns sync.Map // net.Conn to *connAuth
+	srv.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+		a := &connAuth{}
+		conns.Store(c, a)
+		return context.WithValue(ctx, connAuthKey{}, a)
+	}
+	srv.ConnState = func(c net.Conn, state http.ConnState) {
+		v, ok := conns.Load(c)
+		if !ok {
+			return
+		}
+		a := v.(*connAuth) //nolint:forcetypeassert // only ConnContext stores
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.idle != nil {
+			a.idle.Stop()
+			a.idle = nil
+		}
+		switch state {
+		case http.StateIdle:
+			if !a.authed.Load() {
+				var idle *time.Timer
+				idle = time.AfterFunc(s.headerDeadline, func() {
+					a.mu.Lock()
+					defer a.mu.Unlock()
+					if a.idle == idle { // not stopped by a request that began as it fired
+						_ = c.Close()
+					}
+				})
+				a.idle = idle
+			}
+		case http.StateClosed, http.StateHijacked:
+			conns.Delete(c)
+		}
+	}
+}
 
 // chargeBody charges a body's 8 × Content-Length to the body share of the
 // memory budget before it is read (ADR 0005, checks 3 and 5), and returns

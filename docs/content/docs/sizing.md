@@ -10,15 +10,27 @@ A skylite server keeps no durable state on its own disk, so it needs no persiste
 
 ## Memory
 
-The server's memory budget is fixed at 2 GiB. It is **not** read from the container's memory limit, so a lower limit does not make the server use less: under load it can exceed the limit and be killed.
+The server's memory budget is three quarters of the container's memory limit, read at start from the cgroup (`memory.max` on cgroup v2, `memory.limit_in_bytes` on v1), or of `GOMEMLIMIT` if that is lower. Without either it is 2 GiB. The server logs the budget it chose at start, with where it came from, the request body limit and the SQLite connections, and warns when `memory_budget` is above the container's limit. The quarter left over is for what the budget does not hold:
 
 | Component | Size |
 |---|---|
-| Memory budget: request bodies (up to 1 GiB), channels and held results (128 MiB), SQLite connections (up to 64 MiB each, in the remaining 896 MiB) | 2 GiB at most |
+| Memory budget: request bodies (half the budget, less 1 MiB for closes, cancels and resolves), channels and held results (128 MiB), SQLite connections (64 MiB each, in the rest, at most 256) | three quarters of the limit |
 | Page cache for pages read from storage, shared by every database the server leads or follows | 64 MiB |
-| Go runtime, HTTP connections and response buffers | not budgeted; not measured separately |
+| Go runtime, HTTP connections and response buffers | not budgeted |
 
-Set the container's memory limit to about **2.5 GiB**, and the request to the same value so the pod is not evicted first under node pressure. If the temporary directory is memory-backed (a Kubernetes `emptyDir` with `medium: Memory`, or a tmpfs), its files count against the memory limit as well; see below.
+Under steady writes the server uses far less than its budget: on Azure Blob Storage at about 26 commits a second, a leader's resident memory was 215–242 MiB and a follower's 186–191 MiB. The budget is the worst case, with every body, channel and connection at its limit.
+
+| Container memory limit | Budget | Request body limit | SQLite connections, less one per led database | Per principal, with one led database |
+|---|---|---|---|---|
+| 512 MiB, the least the server starts with, leading no database | 384 MiB | 5.97 MiB | 1 | none: one led database needs 683 MiB |
+| 1 GiB | 768 MiB | 11.97 MiB | 4 | 1 |
+| 1,368 MiB | 1,026 MiB | 16 MiB | 6 | 1 |
+| 2 GiB | 1.5 GiB | 16 MiB | 10 | 2 |
+| 2,731 MiB (about 2.67 GiB) | 2 GiB | 16 MiB | 14 | 3 |
+| 4 GiB | 3 GiB | 16 MiB | 22 | 5 |
+| 8 GiB | 6 GiB | 16 MiB | 46 | 11 |
+
+Set the container's memory request to the same value as the limit, so the pod is not evicted first under node pressure. Below 1,368 MiB (a budget of 1,026 MiB) the request body limit is a 32nd of the body share instead of 16 MiB, so that a principal's quarter of the share still holds one body charged at 8 ×; clients read it from `request_body_bytes` in the `limits` object, and a larger body gets `413` `request_too_large`. The server does not start only when the budget cannot hold a SQLite connection for each database in `databases` and one for clients: that takes a budget of 384 MiB plus 128 MiB per listed database (a limit of 512 MiB plus about 171 MiB per database), and the error names both. `memory_budget` overrides the derived budget in general; it is for a pod whose memory limit also holds other things, such as a memory-backed temporary directory. If the temporary directory is memory-backed (a Kubernetes `emptyDir` with `medium: Memory`, or a tmpfs), its files count against the memory limit too, up to 320 MiB per led database (see below), and the quarter the budget leaves does not cover them: add them to the limit and set `memory_budget` to three quarters of what the limit would otherwise be.
 
 ## Local disk
 
@@ -38,15 +50,17 @@ CPU use has not been measured. Write throughput is bound by the round trip to ob
 
 ## Limits of one server
 
-These are fixed in this version; none is configurable.
+These are fixed in this version; none is configurable but through the memory budget, from which the first two follow.
 
 | Limit | Value |
 |---|---|
-| Databases one server lists in `databases` | 13 |
-| SQLite connections, shared by reads and writes | 14, less one for each led database |
+| Databases one server lists in `databases` | one fewer than the SQLite connections; 13 at a 2 GiB budget |
+| SQLite connections, shared by reads and writes | what the budget holds, 14 at 2 GiB and at most 256, less one for each led database |
 | Concurrent client connections | 1,024; more wait in the operating system's listen queue |
+| Concurrent requests: all but closes, cancels and resolves; of them, queries and describes | 1,024 and 256 per server; 256 and 64 per principal |
+| Concurrent closes and cancels; concurrent resolves | 64 each per server, 16 each per principal |
 | Concurrent streams on one HTTP/2 connection | 16 |
-| Request body | 16 MiB |
+| Request body | 16 MiB; less with a budget under 1,026 MiB (see the table above) |
 | Result of one query | 64 MiB |
 | Rows returned by one autocommit statement on a write channel | 1 MiB |
 | Statement time | 30 seconds; a client can lower it |

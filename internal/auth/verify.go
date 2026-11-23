@@ -103,7 +103,7 @@ func New(cfg Config, client *http.Client, now func() time.Time, log *slog.Logger
 	client = noRedirects(client)
 	g := &Guard{sources: make(map[string]*keySource, len(cfg.Issuers)), rules: cfg.Rules, now: now, log: log}
 	for _, iss := range cfg.Issuers {
-		g.sources[iss.Issuer] = &keySource{issuer: iss, client: client, now: now, log: log}
+		g.sources[iss.Issuer] = &keySource{issuer: iss, client: client, now: now, log: log, fetching: make(chan struct{}, 1)}
 	}
 	return g, nil
 }
