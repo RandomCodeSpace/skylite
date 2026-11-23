@@ -1007,9 +1007,10 @@ func TestCancelWhileWaitingForLock(t *testing.T) {
 
 // TestWriteAheadOfWaitingReaders: a write granted the lock while its
 // principal's readers wait for its connections waits ahead of them, takes
-// the first connection freed, and commits.
+// the first connection freed, and commits. The readers fill the waiting
+// bound, which does not apply to the write.
 func TestWriteAheadOfWaitingReaders(t *testing.T) {
-	l := newLockEnv(t, func(e *env) { e.s.pool.maxWait = 10 * time.Second })
+	l := newLockEnv(t, func(e *env) { e.s.pool.maxWait, e.s.pool.waiters = 10*time.Second, 4 })
 	e := l.e
 	free := e.occupy(t, "admin", e.s.pool.perPrincipal)
 	var readers []<-chan answer
@@ -1036,6 +1037,69 @@ func TestWriteAheadOfWaitingReaders(t *testing.T) {
 	}
 	e.settled(t)
 	e.quiet(t, "after the write")
+}
+
+// TestWriteWaitForConnectionEnds: a write that waits for a connection
+// holding the lock records cancelled if it is cancelled meanwhile and
+// timeout if its statement time ends, not overloaded.
+func TestWriteWaitForConnectionEnds(t *testing.T) {
+	l := newLockEnv(t, func(e *env) { e.s.pool.maxWait = 10 * time.Second })
+	e := l.e
+	free := e.occupy(t, "admin", e.s.pool.perPrincipal)
+	w := e.postAsync(t, "channel", "admin", ex(l.toks["admin"][0], 1, "INSERT INTO t VALUES (1)"))
+	e.waiting(t, 1)
+	if c := e.post(t, "channel/cancel", "admin", cancelBody(l.toks["admin"][0], 1)); c.done() == nil {
+		t.Errorf("cancel: %d %v", c.status, c.frames)
+	}
+	timed := e.post(t, "channel", "admin", ex(l.toks["admin"][1], 1, "INSERT INTO t VALUES (2)", "timeout_ms", 100))
+	for i, a := range []answer{<-w, timed} {
+		want := []string{"cancelled", "timeout"}[i]
+		if a.status != 200 || a.code() != want || a.err()["final"] != true || a.err()["not_executed"] != true || a.err()["txn_state"] != "none" {
+			t.Errorf("%d %v, want a recorded %s", a.status, a.frames, want)
+		}
+	}
+	e.waiting(t, 0)
+	free()
+	if got := e.count(t, "SELECT count(*) FROM t"); got != "[0]" {
+		t.Errorf("rows %s, want none", got)
+	}
+	e.settled(t)
+	e.quiet(t, "after the waits")
+}
+
+// TestWriteBehindHeldConnectionsRefusedAtOnce: writes of a principal whose
+// connections are all held, none of them by a recent stateless request, do
+// not wait for one holding the lock: each records overloaded at once, and
+// another principal's write behind them commits within its lock wait.
+func TestWriteBehindHeldConnectionsRefusedAtOnce(t *testing.T) {
+	// A wait far past the lock wait: a write that waits here makes the
+	// other principal's write busy.
+	l := newLockEnv(t, func(e *env) { e.s.pool.maxWait = time.Minute })
+	e := l.e
+	free := e.occupy(t, "admin", e.s.pool.perPrincipal)
+	e.s.pool.mu.Lock()
+	delete(e.s.pool.reads, e.who(l.toks["admin"][0])) // held as by transactions, not stateless requests
+	e.s.pool.mu.Unlock()
+	release := l.hold(t)
+	var admin []<-chan answer
+	for i, tok := range l.toks["admin"] {
+		admin = append(admin, e.postAsync(t, "channel", "admin", ex(tok, 1, "INSERT INTO t VALUES (1)")))
+		l.waiting(t, i+1)
+	}
+	other := e.postAsync(t, "channel", "writer", ex(l.toks["writer"][0], 1, "INSERT INTO t VALUES (2)"))
+	l.waiting(t, len(admin)+1)
+	release()
+	for i, c := range admin {
+		if a := <-c; a.status != 200 || a.code() != "overloaded" || a.err()["final"] != true || a.err()["not_executed"] != true {
+			t.Errorf("admin's write %d: %d %v, want a recorded overloaded", i, a.status, a.frames)
+		}
+	}
+	if a := <-other; a.done() == nil {
+		t.Errorf("the other principal's write: %d %v, want done", a.status, a.frames)
+	}
+	free()
+	e.settled(t)
+	e.quiet(t, "after the refusals")
 }
 
 // TestNoConnectionAtGrant: a write granted the lock when its principal's

@@ -774,22 +774,22 @@ func TestReadWaitExpires(t *testing.T) {
 		e.s.pool = newPool(4)
 		e.s.pool.maxWait = 100 * time.Millisecond
 	})
-	held := e.postAsync(t, "query", "reader", fmt.Sprintf(`{"sql":%q,"timeout_ms":5000}`, cpuBound))
-	e.running(t, 1)
+	free := e.occupy(t, "reader", 1)
+	start := time.Now()
 	if a := e.post(t, "query", "reader", q("SELECT 1")); a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
 		t.Errorf("after the wait: %d %v, want overloaded", a.status, a.last())
+	}
+	if d := time.Since(start); d < 100*time.Millisecond {
+		t.Errorf("refused after %v, want the wait first", d)
 	}
 	// The statement time bounds the wait too.
 	e.s.pool.maxWait = 10 * time.Second
 	if a := e.post(t, "query", "reader", `{"sql":"SELECT 1","timeout_ms":100}`); a.status != http.StatusTooManyRequests || a.code() != "overloaded" {
 		t.Errorf("after timeout_ms: %d %v, want overloaded", a.status, a.last())
 	}
-	select {
-	case a := <-held:
-		t.Fatalf("the holder ended first: %d %v", a.status, a.last())
-	default:
-	}
 	e.waiting(t, 0)
+	free()
+	e.settled(t)
 }
 
 func TestCancelWhileWaitingForConnection(t *testing.T) {
@@ -905,6 +905,34 @@ func TestPodWaitingBound(t *testing.T) {
 		}
 	}
 	e.settled(t)
+}
+
+// TestWriteWaitsForTurnover: a write waits for a connection only if a
+// stateless request got one of those it lacks within the wait: one of its
+// principal's at the principal's limit, and any when the pod is full.
+func TestWriteWaitsForTurnover(t *testing.T) {
+	p := newPool(4) // one per principal
+	for _, who := range []string{"a", "b", "c", "d"} {
+		if _, _, ok := p.take(nil, who); !ok {
+			t.Fatalf("no connection for %s", who)
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.turningLocked("a") || !p.turningLocked("w") {
+		t.Error("no wait behind connections just taken by stateless requests")
+	}
+	delete(p.reads, "a") // a's connection is a transaction's
+	if p.turningLocked("a") {
+		t.Error("a waits at its limit for the other principals' turnover")
+	}
+	if !p.turningLocked("w") {
+		t.Error("w, below its limit, does not wait for the pod's turnover")
+	}
+	p.read = time.Now().Add(-p.maxWait)
+	if p.turningLocked("w") {
+		t.Error("w waits for a pod whose stateless requests are older than the wait")
+	}
 }
 
 // TestGrantAsWaitEnds: a waiter granted a connection as its wait ends takes
