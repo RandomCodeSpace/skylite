@@ -15,23 +15,29 @@ import (
 )
 
 const (
-	testChannel   = "w1.inst.db.1.secret"
-	testChannelID = "0123456789abcdef0123456789abcdef"
+	testChannel     = "w1.inst.db.1.secret"
+	testReadChannel = "r1.inst.db.1.secret"
+	testChannelID   = "0123456789abcdef0123456789abcdef"
 )
 
-// channels answers opens with a channel of token testChannel, closes and
-// cancels with a done frame, and passes every other request to answer.
+// channels answers opens with a channel of token testChannel, closes with a
+// done frame, cancels with channel_lost and resolves with unknown, and
+// passes every other request to answer.
 func channels(answer func(http.ResponseWriter, *wire.Writer, call, *http.Request)) func(http.ResponseWriter, *wire.Writer, call, *http.Request) {
 	return func(w http.ResponseWriter, ww *wire.Writer, c call, r *http.Request) {
 		switch c.kind {
 		case wire.KindOpen:
-			_ = ww.Done(&wire.Done{Kind: wire.DoneOpen, Txn: 1, Channel: &wire.Channel{
-				Token: testChannel, ID: testChannelID, Mode: wire.ModeWrite, Epoch: 1, Limits: wire.DefaultLimits(),
-			}})
+			ch := &wire.Channel{Token: testChannel, ID: testChannelID, Mode: wire.ModeWrite, Epoch: 1, Limits: wire.DefaultLimits()}
+			if c.req.Mode == wire.ModeReadOnly {
+				ch.Token, ch.Mode, ch.Epoch = testReadChannel, wire.ModeReadOnly, 0
+			}
+			_ = ww.Done(&wire.Done{Kind: wire.DoneOpen, Txn: 1, Channel: ch})
 		case wire.KindClose:
 			_ = ww.Done(&wire.Done{Kind: wire.DoneClose})
 		case wire.KindCancel:
 			refuse(w, ww, wire.NewError(wire.CodeChannelLost, "ended"))
+		case wire.KindResolve:
+			_ = ww.Done(&wire.Done{Kind: wire.DoneResolve, Resolution: wire.ResolutionUnknown, Txn: 1})
 		default:
 			answer(w, ww, c, r)
 		}
@@ -49,6 +55,7 @@ func kinds(calls []call) string {
 	for _, c := range calls {
 		s := map[wire.Kind]string{
 			wire.KindQuery: "query", wire.KindDescribe: "describe", wire.KindOpen: "open", wire.KindCancel: "cancel", wire.KindClose: "close",
+			wire.KindResolve: "resolve",
 		}[c.kind]
 		if c.kind == wire.KindChannel {
 			s = map[wire.Op]string{wire.OpBegin: "begin", wire.OpExecute: "execute", wire.OpCommit: "commit", wire.OpRollback: "rollback"}[c.req.Op]
@@ -198,12 +205,12 @@ func TestUnknownOutcomes(t *testing.T) {
 			if strings.Contains(err.Error(), testChannel) {
 				t.Fatalf("error %q holds the channel token", err)
 			}
-			waitFor(t, f, "execute cancel close")
+			waitFor(t, f, "execute resolve cancel close")
 			// The connection was discarded: the next write opens a new channel.
 			if _, err := db.Exec("INSERT INTO t VALUES ('second')"); err != nil {
 				t.Fatal(err)
 			}
-			if got := kinds(f.lastCalls()); got != "open execute cancel close open execute" {
+			if got := kinds(f.lastCalls()); got != "open execute resolve cancel close open execute" {
 				t.Fatalf("calls %q", got)
 			}
 		})
@@ -277,13 +284,8 @@ func TestTransactions(t *testing.T) {
 	db := openDB(t, f.config())
 	db.SetMaxOpenConns(1)
 	ctx := context.Background()
-	for _, opts := range []*sql.TxOptions{{ReadOnly: true}, {Isolation: sql.LevelLinearizable}} {
-		if _, err := db.BeginTx(ctx, opts); err == nil {
-			t.Fatalf("BeginTx(%+v) succeeded", opts)
-		}
-	}
-	if _, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true}); !errors.Is(err, ErrReadOnlyUnsupported) || !errors.Is(err, errors.ErrUnsupported) {
-		t.Fatalf("read-only BeginTx: %v", err)
+	if _, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelLinearizable}); err == nil {
+		t.Fatal("BeginTx at LevelLinearizable succeeded")
 	}
 	if n := f.hits.Load(); n != 0 {
 		t.Fatalf("refused BeginTx sent %d requests", n)

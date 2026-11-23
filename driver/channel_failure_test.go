@@ -388,8 +388,8 @@ func TestRefusalWindow(t *testing.T) {
 		}
 		want := 100 * time.Millisecond
 		for i := 1; i < len(sent); i++ {
-			if gap := sent[i].Sub(sent[i-1]); gap != want {
-				t.Errorf("gap %d = %s, want %s", i, gap, want)
+			if gap := sent[i].Sub(sent[i-1]); gap < want/2 || gap > want {
+				t.Errorf("gap %d = %s, want %s less a jitter of up to half", i, gap, want)
 			}
 			want = min(2*want, 2*time.Second)
 		}
@@ -753,7 +753,8 @@ func TestReadOnlyReissue(t *testing.T) {
 
 // TestCancelAfterProvenBehind ends the caller's context while the driver
 // waits to send again a request refused with behind, which the close proved
-// never accepted: the error is the context's.
+// never accepted: the error is the context's, or the refusal, never an
+// unknown outcome.
 func TestCancelAfterProvenBehind(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cn := channelConn(t, func(r *http.Request) (*http.Response, error) {
@@ -774,8 +775,10 @@ func TestCancelAfterProvenBehind(t *testing.T) {
 		cn.c.raise(5)
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
-		if _, err := cn.ExecContext(ctx, "insert into t values(1)", nil); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("err %v; want the context's", err)
+		_, err := cn.ExecContext(ctx, "insert into t values(1)", nil)
+		var se *Error
+		if errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, context.DeadlineExceeded) && (!errors.As(err, &se) || se.Code != CodeBehind) {
+			t.Fatalf("err %v; want the context's, or the refusal when the next pause would pass it", err)
 		}
 	})
 }

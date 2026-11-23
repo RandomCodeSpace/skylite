@@ -5,12 +5,16 @@
 // A query outside a transaction goes to the server's stateless query
 // endpoint; one the server refuses there as not a pure read, every Exec,
 // and every statement of a transaction go on the connection's write
-// channel, which the driver opens on first use. A request on a channel
-// whose response is lost is sent again with the same sequence number and
-// the same body, which the server answers from its record: that is the
-// protocol's replay, and the driver retries nothing else. An outcome the
-// driver cannot learn is an error matching ErrOutcomeUnknown, never a
-// success, and the connection is then discarded.
+// channel, or for a read-only transaction its read-only channel, which the
+// driver opens on first use. A request on a channel whose response is lost
+// is sent again with the same sequence number and the same body, which the
+// server answers from its record: that is the protocol's replay. A request
+// the server refused before it ran, for a reason that passes (busy,
+// overloaded, no leader and the like), is sent again after a jittered
+// pause. An autocommit write or a commit whose channel was lost is settled
+// with resolve. An outcome the driver cannot learn is an error matching
+// ErrOutcomeUnknown, never a success, and the connection is then
+// discarded.
 //
 // Open a database with a Connector, which carries the token source:
 //
@@ -234,9 +238,9 @@ var ErrNoDSN = errors.New("skylite: a DSN cannot carry a token source; use NewCo
 func (Driver) Open(string) (driver.Conn, error) { return nil, ErrNoDSN }
 
 // ErrOutcomeUnknown is matched, with errors.Is, by the *Error of a request
-// on a write channel whose outcome the driver could not learn: it may or
-// may not have taken effect, a commit included. Do not run it again
-// without checking. The error also matches the context's error when the
+// on a write channel whose outcome the driver could not learn, resolve
+// included: it may or may not have taken effect, a commit included. Do not
+// run it again without checking. The error also matches the context's error when the
 // caller's context ended, and ErrTransactionLost when the request was a
 // statement inside a transaction. It never matches driver.ErrBadConn.
 var ErrOutcomeUnknown = errors.New("skylite: the outcome of the request is unknown")
@@ -244,18 +248,22 @@ var ErrOutcomeUnknown = errors.New("skylite: the outcome of the request is unkno
 // ErrTransactionLost is matched by the *Error of every statement and the
 // commit of a transaction whose channel was lost or abandoned: nothing is
 // sent for them, the transaction never commits, and its Rollback succeeds.
+// It is also matched by the error of a commit whose channel was lost and
+// that resolve proved did not commit; that error's NotExecuted is true.
 var ErrTransactionLost = errors.New("skylite: the transaction was lost with its channel and will not commit")
 
 // ErrResultUnavailable is matched by the *Error of a request whose
 // response was lost and whose rows the server could not keep for its
-// replay. Committed reports whether it was an autocommit write, which
-// committed; inside a transaction, the statement's effects are in the
-// transaction, which stays open.
+// replay, or of an autocommit write whose channel was lost and that resolve
+// found committed, at Txn. Committed reports whether it was an autocommit
+// write, which committed; inside a transaction, the statement's effects are
+// in the transaction, which stays open.
 var ErrResultUnavailable = errors.New("skylite: the request ran but its result is unavailable")
 
-// ErrReadOnlyUnsupported is BeginTx's error for a read-only transaction:
-// the server serves no read-only channels yet. It wraps
-// errors.ErrUnsupported.
+// ErrReadOnlyUnsupported wraps errors.ErrUnsupported.
+//
+// Deprecated: BeginTx serves read-only transactions on a read-only channel
+// and no longer returns it.
 var ErrReadOnlyUnsupported = fmt.Errorf("skylite: read-only transactions are not supported by this server version: %w", errors.ErrUnsupported)
 
 // Code is an ADR 0005 error code. The list is closed in protocol version 1;
