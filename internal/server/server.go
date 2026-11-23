@@ -164,19 +164,24 @@ func New(cfg Config, log *slog.Logger) (*Server, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	from := "memory_budget"
+	from, container := "memory_budget", int64(0)
 	if cfg.MemoryBudget == 0 {
 		var err error
 		if cfg.MemoryBudget, from, err = memoryBudget(cgroupRoot, debug.SetMemoryLimit(-1)); err != nil {
 			return nil, err
 		}
+	} else {
+		container, _ = containerLimit(cgroupRoot) // only for the warning below
 	}
 	s, err := newServer(cfg, log, nil)
 	if err != nil {
 		return nil, err
 	}
+	if container > 0 && s.budget > container {
+		s.log.LogAttrs(context.Background(), slog.LevelWarn, "memory_budget exceeds the container's memory limit", slog.Int64("bytes", s.budget), slog.Int64("container_limit", container))
+	}
 	s.log.LogAttrs(context.Background(), slog.LevelInfo, "memory budget", slog.Int64("bytes", s.budget), slog.String("from", from),
-		slog.Int64("body_share", s.bodyShare), slog.Int("sqlite_connections", s.pool.capacity))
+		slog.Int64("body_share", s.bodyShare), slog.Int64("request_body_bytes", s.limits.RequestBodyBytes), slog.Int("sqlite_connections", s.pool.capacity))
 	if s.store, err = openStore(context.Background(), cfg.Storage); err != nil {
 		return nil, err
 	}
@@ -196,9 +201,11 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 		log = slog.New(slog.DiscardHandler)
 	}
 	budget := cmp.Or(cfg.MemoryBudget, defaultBudget)
-	body, conns := shares(budget)
-	if len(cfg.Databases) >= conns {
-		return nil, fmt.Errorf("server: databases lists %d, want at most %d: each led database holds a connection of the memory budget, %d MiB", len(cfg.Databases), conns-1, budget>>20)
+	body, conns, bodyLimit := shares(budget)
+	if n := len(cfg.Databases); n >= conns {
+		least := budgetFor(n + 1)
+		return nil, fmt.Errorf("server: the memory budget of %d MiB holds %d SQLite connections, and %d listed databases and the clients need %d: set memory_budget to at least %d MiB, or the memory limit to at least %d MiB",
+			budget>>20, max(conns, 0), n, n+1, least>>20, (least/3*4+(1<<20)-1)>>20)
 	}
 	g, err := auth.New(cfg.Auth, nil, nil, log)
 	if err != nil {
@@ -208,6 +215,7 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 		return nil, fmt.Errorf("server: %w", err)
 	}
 	l := wire.DefaultLimits()
+	l.RequestBodyBytes = bodyLimit
 	stmt := time.Duration(l.StatementMS) * time.Millisecond
 	// The policy's time limit is the statement time; the request's deadline
 	// on the engine's Run context lowers it.

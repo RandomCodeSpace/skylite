@@ -26,20 +26,26 @@ const (
 	// reserved from the body share, so the connections keep what the
 	// record derives for them.
 	controlBytes = (maxControl + maxResolves) * 2 * controlBodyBytes
-	// minBudget is the smallest budget whose body share lets a principal's
-	// quarter of it hold one body of the largest size, 8 × 16 MiB: 1,026
-	// MiB, which holds 6 SQLite connections.
-	minBudget = 2 * (4*8*(16<<20) + controlBytes)
+	// minBudget is the smallest budget that holds one SQLite connection
+	// beside the channels' share: 384 MiB. A smaller budget than 1,026 MiB
+	// lowers the request body limit (shares).
+	minBudget = 2 * (channelShare + connCeiling)
 	// maxBudget bounds the budget: past about 32 GiB the connections are
 	// at their limit and only the body share grows.
 	maxBudget = 64 << 30
 )
 
-// shares divides a memory budget: the body share, and the SQLite
-// connections it holds at their ceiling, the led databases' own included.
-func shares(budget int64) (body int64, conns int) {
-	return budget/2 - controlBytes, int(min(maxConnLimit, (budget-budget/2-channelShare)/connCeiling))
+// shares divides a memory budget: the body share, the SQLite connections
+// it holds at their ceiling, the led databases' own included, and the
+// request body limit: 16 MiB, or less below a budget of 1,026 MiB, so that
+// a principal's quarter of the body share holds one body charged at 8 ×.
+func shares(budget int64) (body int64, conns int, bodyLimit int64) {
+	body = budget/2 - controlBytes
+	return body, int(min(maxConnLimit, (budget-budget/2-channelShare)/connCeiling)), min(16<<20, body/4/8)
 }
+
+// budgetFor is the least budget in whole MiB that holds conns SQLite connections.
+func budgetFor(conns int) int64 { return 2 * (channelShare + int64(conns)*connCeiling) }
 
 // cgroupRoot is where a container sees its own cgroup: on cgroup v2 a
 // Kubernetes container has a cgroup namespace of its own, and on v1 each
@@ -60,7 +66,7 @@ func containerLimit(root string) (int64, error) {
 			continue
 		}
 		if err != nil {
-			return 0, fmt.Errorf("server: memory limit: %w", err)
+			return 0, fmt.Errorf("server: memory limit: %w; set memory_budget to skip reading it", err)
 		}
 		v := strings.TrimSpace(string(b))
 		if v == "max" {
@@ -68,7 +74,7 @@ func containerLimit(root string) (int64, error) {
 		}
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n < 1 {
-			return 0, fmt.Errorf("server: memory limit: %s holds %.32q, not a size in bytes", name, v)
+			return 0, fmt.Errorf("server: memory limit: %s holds %.32q, not a size in bytes; set memory_budget to skip reading it", name, v)
 		}
 		if n >= 1<<62 { // v1 reports no limit as the largest multiple of the page size
 			return 0, nil
@@ -81,7 +87,8 @@ func containerLimit(root string) (int64, error) {
 // memoryBudget is ADR 0005's default budget: three quarters of the memory
 // limit, the container's or goLimit (GOMEMLIMIT, math.MaxInt64 when unset)
 // if that is lower, at most maxBudget; and 2 GiB without either. from says
-// where it came from. A budget below minBudget is an error.
+// where it came from. newServer refuses a budget too small for the
+// databases.
 func memoryBudget(root string, goLimit int64) (budget int64, from string, err error) {
 	limit, err := containerLimit(root)
 	if err != nil {
@@ -94,9 +101,5 @@ func memoryBudget(root string, goLimit int64) (budget int64, from string, err er
 	if limit == 0 {
 		return defaultBudget, "the default without a memory limit", nil
 	}
-	if budget = min(limit/4*3, maxBudget); budget < minBudget {
-		return 0, "", fmt.Errorf("server: the memory budget, %s of %d MiB, is below %d MiB: raise the limit to at least %d MiB, or set memory_budget",
-			from, limit>>20, minBudget>>20, (minBudget/3*4+(1<<20)-1)>>20)
-	}
-	return budget, from, nil
+	return min(limit/4*3, maxBudget), from, nil
 }

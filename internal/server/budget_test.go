@@ -60,7 +60,8 @@ func TestMemoryBudget(t *testing.T) {
 		"GOMEMLIMIT lower":          {root: v2("4294967296"), goLimit: 2 << 30, want: 3 << 29, from: "GOMEMLIMIT"},
 		"GOMEMLIMIT higher":         {root: v2("4294967296"), goLimit: 8 << 30, want: 3 << 30, from: "container"},
 		"GOMEMLIMIT alone":          {root: v2("max"), goLimit: 4 << 30, want: 3 << 30, from: "GOMEMLIMIT"},
-		"at the floor":              {root: v2("1434451968"), goLimit: math.MaxInt64, want: minBudget, from: "container"}, // 1,368 MiB
+		"a 1 GiB container":         {root: v2("1073741824"), goLimit: math.MaxInt64, want: 768 << 20, from: "container"},
+		"a 64 MiB container":        {root: v2("67108864"), goLimit: math.MaxInt64, want: 48 << 20, from: "container"}, // newServer refuses it
 		"above the cap":             {root: v2("137438953472"), goLimit: math.MaxInt64, want: maxBudget, from: "container"},
 		"the 2.5 GiB of old sizing": {root: v2("2684354560"), goLimit: math.MaxInt64, want: 1920 << 20, from: "container"},
 	} {
@@ -69,11 +70,7 @@ func TestMemoryBudget(t *testing.T) {
 			t.Errorf("%s: %d from %q, %v; want %d from %s", name, got, from, err, c.want, c.from)
 		}
 	}
-	// Below the floor the server does not start, and says what limit it needs.
-	if _, _, err := memoryBudget(v2("1434451967"), math.MaxInt64); err == nil || !strings.Contains(err.Error(), "1368 MiB") {
-		t.Errorf("below the floor: %v", err)
-	}
-	if _, _, err := memoryBudget(v2("lots"), math.MaxInt64); err == nil {
-		t.Error("an unreadable limit was taken for none")
+	if _, _, err := memoryBudget(v2("lots"), math.MaxInt64); err == nil || !strings.Contains(err.Error(), "memory_budget") {
+		t.Errorf("an unreadable limit: %v, want an error naming memory_budget", err)
 	}
 }

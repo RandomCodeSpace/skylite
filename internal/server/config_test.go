@@ -100,7 +100,7 @@ func TestLoadRefuses(t *testing.T) {
 		}
 		return "[" + strings.Join(names, ", ") + "]"
 	}
-	_, conns := shares(2 << 30)
+	_, conns, _ := shares(2 << 30)
 	many := list(conns)
 	storageField := goodConfig[strings.Index(goodConfig, `"storage"`):strings.Index(goodConfig, `,
   "databases"`)]
@@ -139,7 +139,7 @@ func TestLoadRefuses(t *testing.T) {
 		"database twice":          edit(`"users"`, `"orders"`),
 		"too many databases":      edit(`["orders", "users"]`, many+`, "memory_budget": 2147483648`),
 		"too many for any budget": edit(`["orders", "users"]`, list(maxConnLimit)),
-		"budget below the floor":  edit(`"databases"`, `"memory_budget": 1073741824, "databases"`),
+		"budget below the floor":  edit(`"databases"`, `"memory_budget": 402653183, "databases"`),
 		"budget above the cap":    edit(`"databases"`, `"memory_budget": 68719476737, "databases"`),
 		"peer without ca":         edit(`, "ca_file": "/etc/skylite/peer-ca.crt"`, ""),
 		"peer without name":       edit(`, "server_name": "skylite-peer"`, ""),

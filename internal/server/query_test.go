@@ -1323,8 +1323,8 @@ func TestBodySharePerPrincipal(t *testing.T) {
 // body share holds one body of the largest size.
 func TestMemoryBudgetHolds(t *testing.T) {
 	base := testConfig(t, jwksFile(t, newSigner(t, "k1")))
-	for _, budget := range []int64{0, minBudget, minBudget + 1, 3<<30 + 12345, 33 << 30, maxBudget} {
-		_, conns := shares(cmp.Or(budget, defaultBudget))
+	for _, budget := range []int64{0, minBudget, minBudget + 1, 768 << 20, 1026 << 20, 3<<30 + 12345, 33 << 30, maxBudget} {
+		_, conns, _ := shares(cmp.Or(budget, defaultBudget))
 		for n := range conns + 1 {
 			cfg := base
 			cfg.MemoryBudget = budget
@@ -1335,6 +1335,8 @@ func TestMemoryBudgetHolds(t *testing.T) {
 			if n == conns {
 				if err == nil || cfg.Validate() == nil && budget != 0 {
 					t.Errorf("budget %d: %d databases accepted", budget, n)
+				} else if least := fmt.Sprintf("memory_budget to at least %d MiB", budgetFor(n+1)>>20); !strings.Contains(err.Error(), least) {
+					t.Errorf("budget %d, %d databases: %v, want it to name %q", budget, n, err, least)
 				}
 				continue
 			}
@@ -1344,13 +1346,20 @@ func TestMemoryBudgetHolds(t *testing.T) {
 			// The channels' share: a receipt per channel, held rows and replay data.
 			channels := int64(s.chl.channels)*receiptBytes + s.chl.held + s.chl.replay
 			total := s.bodyShare + controlBytes + channels + int64(s.pool.capacity+n)*connCeiling
-			if total > s.budget || s.pool.capacity < 1 || s.bodyShare/4 < 8*s.limits.RequestBodyBytes {
+			if total > s.budget || s.pool.capacity < 1 || s.bodyShare/4 < 8*s.limits.RequestBodyBytes || s.limits.RequestBodyBytes != min(16<<20, s.bodyShare/32) {
 				t.Errorf("budget %d, %d databases: %d bytes charged at most, %d client connections, body share %d", s.budget, n, total, s.pool.capacity, s.bodyShare)
 			}
 		}
 	}
-	if _, conns := shares(defaultBudget); conns != 14 {
-		t.Errorf("%d connections at 2 GiB, want ADR 0005's 14", conns)
+	if _, conns, limit := shares(defaultBudget); conns != 14 || limit != 16<<20 {
+		t.Errorf("%d connections and %d-byte bodies at 2 GiB, want ADR 0005's 14 and 16 MiB", conns, limit)
+	}
+	// A 1 GiB container: a 768 MiB budget, 383 MiB / 32 bodies, 4 connections.
+	if _, conns, limit := shares(768 << 20); conns != 4 || limit != (383<<20)/32 {
+		t.Errorf("%d connections and %d-byte bodies at 768 MiB, want 4 and %d", conns, limit, (383<<20)/32)
+	}
+	if _, conns, _ := shares(minBudget - 2); conns != 0 {
+		t.Errorf("%d connections below the least budget, want none", conns)
 	}
 }
 

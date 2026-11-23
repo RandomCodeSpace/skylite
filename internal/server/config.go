@@ -50,7 +50,7 @@ type Config struct {
 	// database and no leader is blocked at its tail bound, 503 otherwise.
 	ProbeListen string `json:"probe_listen"`
 	// MemoryBudget, if set, is the memory budget of ADR 0005 decision 9 in
-	// bytes, from 1,026 MiB to 64 GiB. When it is 0, New takes three
+	// bytes, from 384 MiB to 64 GiB. When it is 0, New takes three
 	// quarters of the container's memory limit, or of GOMEMLIMIT if lower,
 	// and 2 GiB without either.
 	MemoryBudget int64 `json:"memory_budget"`
@@ -192,7 +192,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("memory_budget is %d, want 0 or from %d to %d bytes", c.MemoryBudget, int64(minBudget), int64(maxBudget))
 	}
 	// Without memory_budget, New checks the databases against the budget it derives.
-	if _, conns := shares(cmp.Or(c.MemoryBudget, maxBudget)); len(c.Databases) >= conns {
+	if _, conns, _ := shares(cmp.Or(c.MemoryBudget, maxBudget)); len(c.Databases) >= conns {
 		return fmt.Errorf("databases lists %d, want at most %d: each led database holds a connection of the memory budget", len(c.Databases), conns-1)
 	}
 	seen := map[string]bool{}
