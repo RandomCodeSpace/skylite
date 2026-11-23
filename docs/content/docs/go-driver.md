@@ -13,7 +13,7 @@ The Go driver is the package `github.com/RandomCodeSpace/skylite/driver` (packag
 The driver is part of the main module and needs Go 1.26 or later:
 
 ```sh
-go get github.com/RandomCodeSpace/skylite@v0.0.2
+go get github.com/RandomCodeSpace/skylite@v0.0.3
 ```
 
 ## Connect
