@@ -19,6 +19,17 @@ var cacheBudgets = map[string]int64{"none": 0, "tiny": 3 * 600, "large": 64 << 2
 // geometries are the page and group sizes the model runs rotate through.
 var geometries = [][2]uint32{{512, 4}, {512, 1}, {1024, 16}, {4096, 2}}
 
+// walkReads sets, for one test, how many commit reads a walk keeps in
+// flight and how many bytes the first read of a commit takes. A first read
+// of format.CommitHeaderSize reads the page table separately, as a commit
+// of more than 247 pages always does.
+func walkReads(t *testing.T, window int, first int64) {
+	t.Helper()
+	w, f := fetchWindow, firstRead
+	fetchWindow, firstRead = window, first
+	t.Cleanup(func() { fetchWindow, firstRead = w, f })
+}
+
 // TestReadAgainstModel generates random histories (commits that grow and
 // shrink the database, epoch bumps with any epoch, compactions, epoch
 // swaps, retirement and garbage collection), and checks readers opened at
@@ -326,6 +337,7 @@ func TestRetiredDuringWalk(t *testing.T) {
 	for _, nth := range []int{1, 2} {
 		for _, at := range []uint64{0, 5, 4} {
 			t.Run(fmt.Sprint(nth, "/", at), func(t *testing.T) {
+				walkReads(t, 1, format.CommitHeaderSize) // a retire between the header and the table
 				ctx := context.Background()
 				st, keys, h := corruptFixture(t)
 				// Opening at 4 never reads commit 5, so race it on commit 4.
