@@ -37,6 +37,8 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"golang.org/x/net/netutil"
@@ -252,13 +254,24 @@ func openStore(ctx context.Context, c Storage) (storage.Store, error) {
 }
 
 func openAzure(a *Azure) (storage.Store, error) {
-	key, err := readAzureSharedKey(a)
-	if err != nil {
-		return nil, err
-	}
-	cred, err := container.NewSharedKeyCredential(a.Account, key)
-	if err != nil {
-		return nil, errors.New("server: azure shared key is not valid base64")
+	var (
+		key  *container.SharedKeyCredential
+		cred azcore.TokenCredential
+	)
+	if a.Entra {
+		c, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return nil, fmt.Errorf("server: azure entra credential: %w", err)
+		}
+		cred = detachedCredential{c}
+	} else {
+		k, err := readAzureSharedKey(a)
+		if err != nil {
+			return nil, err
+		}
+		if key, err = container.NewSharedKeyCredential(a.Account, k); err != nil {
+			return nil, errors.New("server: azure shared key is not valid base64")
+		}
 	}
 	dt, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
@@ -268,14 +281,39 @@ func openAzure(a *Azure) (storage.Store, error) {
 	tr.IdleConnTimeout = azureIdleConnTimeout
 	// A redirect would resend a signed request, body included, elsewhere.
 	hc := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	c, err := container.NewClientWithSharedKeyCredential(a.containerURL(), cred, &container.ClientOptions{
-		ClientOptions: azcore.ClientOptions{Transport: hc},
-	})
+	opts := &container.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: hc}}
+	var (
+		c   *container.Client
+		err error
+	)
+	if cred != nil {
+		c, err = container.NewClient(a.containerURL(), cred, opts)
+	} else {
+		c, err = container.NewClientWithSharedKeyCredential(a.containerURL(), key, opts)
+	}
 	if err != nil {
 		tr.CloseIdleConnections()
 		return nil, fmt.Errorf("server: azure client: %w", err)
 	}
 	return azureStore{Store: azureblob.New(c, ""), close: tr.CloseIdleConnections}, nil
+}
+
+// detachedCredential fetches each token under a context that keeps the call's
+// deadline and cancellation but none of its values: azureblob proves a request
+// was sent once from net/http's client trace in the call's context, and a
+// token request made under it would add its own connections to that trace.
+type detachedCredential struct{ azcore.TokenCredential }
+
+func (d detachedCredential) GetToken(ctx context.Context, o policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	dctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer context.AfterFunc(ctx, cancel)()
+	if dl, ok := ctx.Deadline(); ok {
+		var stop context.CancelFunc
+		dctx, stop = context.WithDeadline(dctx, dl)
+		defer stop()
+	}
+	return d.TokenCredential.GetToken(dctx, o)
 }
 
 func readAzureSharedKey(a *Azure) (string, error) {

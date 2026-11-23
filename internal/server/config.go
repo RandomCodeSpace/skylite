@@ -121,12 +121,18 @@ type Azure struct {
 	// https://<account>.blob.core.windows.net is used.
 	Endpoint string `json:"endpoint"`
 	// SharedKeyFile is the path of a file holding the base64-encoded account
-	// shared key. Exactly one of SharedKeyFile and SharedKeyEnv must be set.
+	// shared key. Exactly one of SharedKeyFile, SharedKeyEnv and Entra must be
+	// set.
 	SharedKeyFile string `json:"shared_key_file"`
 	// SharedKeyEnv names an environment variable holding the base64-encoded
-	// account shared key. Exactly one of SharedKeyFile and SharedKeyEnv must
-	// be set.
+	// account shared key. Exactly one of SharedKeyFile, SharedKeyEnv and Entra
+	// must be set.
 	SharedKeyEnv string `json:"shared_key_env"`
+	// Entra signs requests with an Entra ID token from azidentity's default
+	// credential chain: a service principal in the AZURE_* environment
+	// variables, workload identity, or a managed identity. Exactly one of
+	// SharedKeyFile, SharedKeyEnv and Entra must be set.
+	Entra bool `json:"entra"`
 }
 
 // Load reads and validates the configuration file at path. Unknown fields
@@ -220,6 +226,12 @@ func (s Storage) validate() error {
 }
 
 func (a Azure) validate() error {
+	creds := 0
+	for _, set := range []bool{a.SharedKeyFile != "", a.SharedKeyEnv != "", a.Entra} {
+		if set {
+			creds++
+		}
+	}
 	switch {
 	case a.Account == "" || a.Container == "":
 		return errors.New("storage.azure needs account and container")
@@ -229,8 +241,8 @@ func (a Azure) validate() error {
 		return errors.New("storage.azure.container must be a single path segment with no /, ?, # or white space")
 	case !validEndpoint(a.Endpoint):
 		return errors.New("storage.azure.endpoint " + endpointRule)
-	case (a.SharedKeyFile == "") == (a.SharedKeyEnv == ""):
-		return errors.New("storage.azure needs exactly one of shared_key_file and shared_key_env")
+	case creds != 1:
+		return errors.New("storage.azure needs exactly one of shared_key_file, shared_key_env and entra")
 	case a.SharedKeyEnv != "" && !validEnvName(a.SharedKeyEnv):
 		return errors.New("storage.azure.shared_key_env must be an environment variable name")
 	}

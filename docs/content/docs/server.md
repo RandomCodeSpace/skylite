@@ -262,7 +262,7 @@ The configuration is one JSON file. Unknown fields are refused, and the server d
 | `storage.localfs.path` | A local directory. For trying the server out; a pod's local disk is not durable |
 | `storage.s3` | `bucket` and `region` (required), `endpoint` for an S3-compatible service, `path_style` to address the bucket in the path |
 | `storage.gcs` | `bucket` (required) and `endpoint` for an emulator, which then gets no credentials |
-| `storage.azure` | `account` and `container` (required), `endpoint` for Azurite or another blob account URL (empty means `https://<account>.blob.core.windows.net`), and exactly one of `shared_key_file` (path to a file holding the base64 shared key) and `shared_key_env` (name of an environment variable holding it) |
+| `storage.azure` | `account` and `container` (required), `endpoint` for Azurite or another blob account URL (empty means `https://<account>.blob.core.windows.net`), and exactly one of `shared_key_file` (path to a file holding the base64 shared key), `shared_key_env` (name of an environment variable holding it) and `entra: true` (an Entra ID token from `azidentity`'s default credential chain) |
 | `databases` | The databases this server leads and answers queries on: names of the `{db}` form, each once, at most 13. Optional; without it the server serves `PUT` alone. The leaders' local files go in a directory under the system's temporary directory (`TMPDIR`), removed on shutdown |
 | `follower_reads` | Serve stateless reads from a fresh local follower while in standby. Optional, defaults to `true` when `peer` is set and to `false` otherwise |
 | `peer.listen` | TCP address of the peer listener for [forwarded requests](#forwarding-between-pods). Without `peer`, nothing is forwarded |
@@ -274,7 +274,7 @@ The configuration is one JSON file. Unknown fields are refused, and the server d
 
 An `endpoint` must be an `http` or `https` URL with a host and no user information, query string or fragment, so that it carries no credential; the server does not start with one that breaks this, and the error does not repeat the value.
 
-`storage` holds exactly one of `localfs`, `s3`, `gcs` and `azure`. The [storage backends page](/docs/storage-backends/) says how each one has been tested. S3 credentials come from the AWS SDK's default chain (environment variables, shared files, web identity, the instance or task role), Google Cloud Storage credentials from Application Default Credentials, and Azure Blob Storage reads an account shared key from the file named by `shared_key_file` or the environment variable named by `shared_key_env` (Entra ID credentials via `azidentity` are not wired into the server yet).
+`storage` holds exactly one of `localfs`, `s3`, `gcs` and `azure`. The [storage backends page](/docs/storage-backends/) says how each one has been tested. S3 credentials come from the AWS SDK's default chain (environment variables, shared files, web identity, the instance or task role), Google Cloud Storage credentials from Application Default Credentials, and Azure Blob Storage either reads an account shared key from the file named by `shared_key_file` or the environment variable named by `shared_key_env`, or, with `entra: true`, uses `azidentity`'s default credential chain (a service principal in `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET`, workload identity, or a managed identity).
 
 ## Logs and shutdown
 
