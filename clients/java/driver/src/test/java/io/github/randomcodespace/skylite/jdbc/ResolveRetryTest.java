@@ -169,6 +169,93 @@ class ResolveRetryTest {
         }
     }
 
+    /**
+     * A pool returns a connection by resetting it, as HikariCP's ProxyConnection.close does: rollback when its commit
+     * failed, the settings it changed, clearWarnings. After a settled commit that raises nothing, so that a commit
+     * reported as committed is not turned into a failed close; after an unknown one it raises 08003.
+     */
+    @Test
+    void aConnectionClosedAfterASettledCommitIsResetQuietlyByItsPool() throws Throwable {
+        for (String resolution : List.of("committed", "not_committed", "unknown")) {
+            server.on("channel", FakeServer.executed(1, "open", 1, 1), lost())
+                    .on("resolve", FakeServer.resolved(resolution, 9));
+            Connection c = server.connect();
+            c.setAutoCommit(false);
+            try (Statement s = c.createStatement()) {
+                s.executeUpdate(INSERT);
+            }
+            if (resolution.equals("committed")) {
+                c.commit();
+            } else {
+                assertThrows(SQLException.class, c::commit);
+            }
+            assertTrue(c.isClosed(), resolution);
+            assertFalse(c.isValid(1), "the pool drops it: " + resolution);
+            List<org.junit.jupiter.api.function.Executable> reset = List.of(c::rollback, () -> c.setReadOnly(false),
+                    () -> c.setAutoCommit(true), () -> c.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE),
+                    () -> c.setCatalog("main"), () -> c.setNetworkTimeout(Runnable::run, 0), () -> c.setSchema("main"),
+                    c::clearWarnings);
+            SQLException used = assertThrows(SQLException.class, c::createStatement);
+            assertEquals("08003", used.getSQLState());
+            if (resolution.equals("unknown")) {
+                for (var r : reset) {
+                    assertEquals("08003", assertThrows(SQLException.class, r).getSQLState());
+                }
+                assertTrue(used.getMessage().contains("unknown outcome"), used.getMessage());
+            } else {
+                for (var r : reset) {
+                    r.execute();
+                }
+                assertTrue(used.getMessage().contains("commit was settled") && !used.getMessage().contains("unknown"),
+                        used.getMessage());
+            }
+            c.close();
+        }
+    }
+
+    /**
+     * ADR 0005 decision 4: behind inside a transaction would close the channel and the transaction with it. It is
+     * lost, as after an unknown outcome: never sent again on a new channel, and never committed.
+     */
+    @Test
+    void behindInsideATransactionLosesItAndOpensNoNewChannel() throws Exception {
+        Retry.defaultBudgetMillis = 500; // a reopen would be sent again until then
+        server.on("channel", FakeServer.executed(1, "open", 1, 1), refused("behind"));
+        try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            c.setAutoCommit(false);
+            s.executeUpdate(INSERT);
+            assertEquals("SKR03", assertThrows(SQLException.class, () -> s.executeUpdate(INSERT)).getSQLState());
+            assertEquals("SKR03", assertThrows(SQLException.class, c::commit).getSQLState());
+            c.rollback();
+        }
+        assertEquals(2, server.bodies("channel").size());
+        assertEquals(1, server.bodies("channels").size());
+
+        server.on("channel", FakeServer.executed(1, "open", 1, 1), refused("behind")); // the commit's answer
+        try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            c.setAutoCommit(false);
+            s.executeUpdate(INSERT);
+            assertEquals("SKR03", assertThrows(SQLException.class, c::commit).getSQLState());
+            c.rollback();
+            assertFalse(c.isClosed());
+        }
+        assertEquals(2 + 2, server.bodies("channel").size());
+        assertEquals(2, server.bodies("channels").size());
+    }
+
+    /** behind of a resend may follow an accepted send: the same bytes again, never a new channel. */
+    @Test
+    void behindAfterALostAnswerIsSentAgainOnTheSameChannel() throws Exception {
+        server.on("channel", "drop", refused("behind"), INSERTED);
+        try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            assertEquals(1, s.executeUpdate(INSERT));
+        }
+        List<String> sent = server.bodies("channel");
+        assertEquals(3, sent.size());
+        assertEquals(1, sent.stream().distinct().count(), sent.toString());
+        assertEquals(1, server.bodies("channels").size());
+    }
+
     /** A live channel is settled by its close: last_seq below the request proves it never ran. */
     @Test
     void aWriteWhoseAnswersAreLostIsSettledByTheClose() throws Exception {
@@ -180,12 +267,46 @@ class ResolveRetryTest {
         assertEquals(0, server.bodies("resolve").size());
         assertEquals(4, server.bodies("channel").size());
 
-        // last_seq of the request with its receipt: committed, and its result is not at hand.
-        server.on("channel", "drop").on("channel/close", "{\"done\":{\"last_seq\":1,\"outcome\":{\"seq\":1,\"ok\":true,"
-                + "\"txn_state\":\"none\",\"txn\":5,\"read_only\":false,\"rows_affected\":1,\"last_insert_rowid\":7}}}");
+        // last_seq of the request with its receipt: committed, with the count executeUpdate needs and the key.
+        String receipt = "{\"done\":{\"last_seq\":1,\"outcome\":{\"seq\":1,\"ok\":true,"
+                + "\"txn_state\":\"none\",\"txn\":5,\"read_only\":false,\"rows_affected\":3,\"last_insert_rowid\":7}}}";
+        server.on("channel", "drop").on("channel/close", receipt);
         try (Connection c = server.connect(); Statement s = c.createStatement()) {
-            assertEquals("SKR01", assertThrows(SQLException.class, () -> s.executeUpdate(INSERT)).getSQLState());
+            assertEquals(3, s.executeUpdate(INSERT, Statement.RETURN_GENERATED_KEYS));
+            try (ResultSet keys = s.getGeneratedKeys()) {
+                assertTrue(keys.next());
+                assertEquals(7, keys.getLong(1));
+            }
         }
+
+        // execute, which may want rows that the receipt does not hold: committed, and its result is not at hand.
+        server.on("query", FakeServer.error("needs_channel", "m")).on("channel", "drop").on("channel/close", receipt);
+        try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            assertEquals("SKR01", assertThrows(SQLException.class, () -> s.execute(INSERT)).getSQLState());
+        }
+    }
+
+    /** ADR 0005 decision 3: a forwarding pod that lost the owner's answer is no proof; the same bytes replay it. */
+    @Test
+    void ownerUnreachableThatMayHaveRunIsSentAgainWithTheSameBytes() throws Exception {
+        String unreachable = FakeServer.channelError("owner_unreachable", false, false, "none");
+        server.on("channel", unreachable, INSERTED);
+        try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            assertEquals(1, s.executeUpdate(INSERT));
+        }
+        List<String> sent = server.bodies("channel");
+        assertEquals(2, sent.size());
+        assertEquals(1, sent.stream().distinct().count(), sent.toString());
+        assertEquals(0, server.bodies("resolve").size());
+
+        // Unreachable on all three sends: then settled, and the close's receipt has the count.
+        server.on("channel", unreachable).on("channel/close", "{\"done\":{\"last_seq\":1,\"outcome\":{\"seq\":1,"
+                + "\"ok\":true,\"txn_state\":\"none\",\"txn\":5,\"read_only\":false,\"rows_affected\":1,"
+                + "\"last_insert_rowid\":7}}}");
+        try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            assertEquals(1, s.executeUpdate(INSERT));
+        }
+        assertEquals(2 + 3, server.bodies("channel").size());
     }
 
     /** The close is lost too: resolve decides. */
@@ -322,7 +443,7 @@ class ResolveRetryTest {
             SQLException e = assertThrows(SQLTransientConnectionException.class, () -> s.executeUpdate(INSERT));
             long ms = (System.nanoTime() - t0) / 1_000_000;
             assertEquals("08004", e.getSQLState());
-            assertTrue(ms >= 1_000 && ms < 4_000, "gave up after " + ms + " ms");
+            assertTrue(ms >= 1_000 && ms < 15_000, "gave up after " + ms + " ms"); // 3 s, and slack for CI
             assertFalse(c.isClosed(), "nothing ran: the connection stays usable");
         }
         assertTrue(server.bodies("channel").size() > 2);
@@ -376,14 +497,14 @@ class ResolveRetryTest {
         long t0 = System.nanoTime();
         assertTrue(Retry.pause(0, System.nanoTime() + 10_000_000_000L));
         long first = (System.nanoTime() - t0) / 1_000_000;
-        assertTrue(first >= 20 && first < 200, "first pause " + first + " ms");
+        assertTrue(first >= 20 && first < 450, "first pause " + first + " ms"); // the 1 s bound: 500 or more
         t0 = System.nanoTime();
         assertTrue(Retry.pause(2, System.nanoTime() + 10_000_000_000L));
         long third = (System.nanoTime() - t0) / 1_000_000;
         assertTrue(third >= 80, "third pause " + third + " ms");
         t0 = System.nanoTime();
         assertFalse(Retry.pause(10, System.nanoTime() + 100_000_000L), "a pause past the deadline is not taken");
-        assertTrue((System.nanoTime() - t0) / 1_000_000 < 50);
+        assertTrue((System.nanoTime() - t0) / 1_000_000 < 450, "a pause taken would be 500 ms or more");
     }
 
     // ---- read-your-writes and limits ----

@@ -142,7 +142,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         generatedKeys = List.of();
         this.keyLabel = keyLabel;
         if (!statelessOnly && conn.onChannel(update)) {
-            return onChannel(sql, params, keyLabel);
+            return onChannel(sql, params, keyLabel, update);
         }
         return stateless(sql, params, keyLabel);
     }
@@ -173,7 +173,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
                 case Failure e -> {
                     ex.close();
                     if (e.code().equals("needs_channel") && !conn.readOnly() && !statelessOnly) {
-                        return onChannel(sql, params, keyLabel); // refused before it ran
+                        return onChannel(sql, params, keyLabel, false); // refused before it ran
                     }
                     if (Retry.refused(e) && Retry.pause(attempt++, deadline)) {
                         continue;
@@ -196,8 +196,12 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         }
     }
 
-    /** Runs on the channel, or as a stateless read when the connection became read-only after it was chosen. */
-    private SkyliteResultSet onChannel(String sql, List<Object> params, String keyLabel) throws SQLException {
+    /**
+     * Runs on the channel, or as a stateless read when the connection became read-only after it was chosen. update:
+     * executeUpdate, which needs only the count, which a write settled by its channel's close has in the receipt.
+     */
+    private SkyliteResultSet onChannel(String sql, List<Object> params, String keyLabel, boolean update)
+            throws SQLException {
         List<Frame> frames = conn.execute(sql, params, queryTimeout, this);
         if (frames == null) {
             return stateless(sql, params, keyLabel);
@@ -214,7 +218,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
                         + "it changed nothing", null);
             }
         }
-        if (d.dataOmitted()) {
+        if (d.dataOmitted() && !(update && d.outcome() instanceof Done)) {
             throw Channel.omitted(d);
         }
         if (frames.get(0) instanceof Columns c) {
@@ -661,7 +665,8 @@ class SkyliteStatement implements Statement, Exchange.Owner {
      * Runs a batch on the channel ({@link Channel#batch}): sql once per entry of param_sets, or the statements in
      * entries when sql is null. Outside a transaction it is one autocommit write, all or nothing; inside one it stops
      * at its first failure. A failure is a {@link BatchUpdateException} holding the counts of the entries that ran,
-     * none for an autocommit batch, whose failure leaves nothing, and its cause as its next exception. With keyLabel,
+     * and its cause as its next exception. An autocommit batch's holds none: its failure leaves nothing, except
+     * {@code SKR01}, where the batch committed but its counts were lost. With keyLabel,
      * {@link #getGeneratedKeys} returns the rowid of each entry that ran and inserted a row.
      */
     long[] runBatch(String sql, List<String> entries, String keyLabel) throws SQLException {

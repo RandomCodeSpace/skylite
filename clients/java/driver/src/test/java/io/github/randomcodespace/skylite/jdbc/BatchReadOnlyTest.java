@@ -126,6 +126,40 @@ class BatchReadOnlyTest {
         assertTrue(sent.get(1).startsWith("{\"channel\":\"w1.1\",\"seq\":2,\"op\":\"batch\""), sent.get(1));
     }
 
+    /**
+     * A failed batch's replay is its receipt alone (ADR 0005 decision 3): the entries before batch_index ran in the
+     * transaction all the same, and count as SUCCESS_NO_INFO, so that an application re-adding the rest from
+     * getUpdateCounts().length does not run them twice.
+     */
+    @Test
+    void aReplayedFailedBatchInATransactionCountsTheEntriesBeforeItsFailedOne() throws Exception {
+        server.on("channel", begun(1), "drop", "{\"error\":{\"code\":\"sql_error\",\"not_executed\":false,"
+                + "\"final\":true,\"message\":\"m\",\"request_id\":\"r\",\"txn_state\":\"open\",\"sqlite_code\":19,"
+                + "\"batch_index\":2}}");
+        try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            c.setAutoCommit(false);
+            for (int i = 0; i < 4; i++) {
+                s.addBatch("INSERT INTO a VALUES (" + i + ")");
+            }
+            BatchUpdateException e = assertThrows(BatchUpdateException.class, s::executeBatch);
+            assertArrayEquals(new int[] {Statement.SUCCESS_NO_INFO, Statement.SUCCESS_NO_INFO}, e.getUpdateCounts());
+            assertEquals("23000", e.getSQLState());
+        }
+    }
+
+    /** An answer with more results than the request's entries breaks the protocol; it is no index overflow. */
+    @Test
+    void moreResultsThanEntriesIsAMalformedAnswer() throws Exception {
+        server.on("channel", FakeServer.results(0, 1, 1, 1) + "\n" + FakeServer.batched(1, "none", 3, 3));
+        try (Connection c = server.connect(); Statement s = c.createStatement()) {
+            s.addBatch("DELETE FROM a");
+            s.addBatch("DELETE FROM b");
+            BatchUpdateException e = assertThrows(BatchUpdateException.class, s::executeBatch);
+            assertEquals("08S01", e.getSQLState(), e.toString());
+            assertArrayEquals(new int[0], e.getUpdateCounts());
+        }
+    }
+
     /** Inside a transaction a batch above the entry limit is split; outside one it is refused, unsent. */
     @Test
     void aBatchAboveTheEntryLimitIsSplitOnlyInsideATransaction() throws Exception {

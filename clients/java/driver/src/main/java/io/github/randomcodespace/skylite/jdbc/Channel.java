@@ -10,6 +10,7 @@ import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
 import java.sql.SQLNonTransientException;
 import java.sql.SQLTransactionRollbackException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -29,7 +30,8 @@ import java.util.concurrent.TimeUnit;
  * <p>When the outcome of a sent autocommit write, batch or commit cannot be learnt, the driver settles it (ADR 0005
  * decision 4): it closes the channel, whose answer settles a request on a live channel, or, when the channel is lost
  * or the close does not answer, it sends {@code resolve} until the resolve wait ends. Committed is a success for a
- * commit and {@code SKR01} (committed, result unavailable) for a write; not committed sends an autocommit write once
+ * commit, and for an executeUpdate whose count the close's receipt holds, and {@code SKR01} (committed, result
+ * unavailable) for any other write; not committed sends an autocommit write once
  * more, on a new channel, and is {@code 40000} for a commit; otherwise the outcome is unknown, {@code 08007}, and the
  * connection is closed, as it is after any commit that needed settling. A statement's or a rollback's loss inside a
  * transaction loses the transaction: its later statements and its commit fail with {@code SKR03} and send nothing, its
@@ -96,6 +98,7 @@ final class Channel {
     private final Slot read = new Slot(true);
     private long begun; // begins sent on the connection's channels; guarded by this
     private volatile boolean lost; // written under this: the connection was discarded after an unknown outcome
+    private volatile boolean settledCommit; // written under this: lost after a commit whose outcome was settled
     private volatile boolean dead; // written under this: the transaction was lost with its channel; rollback ends it
 
     Channel(SkyliteConnection conn) {
@@ -169,16 +172,34 @@ final class Channel {
             return discarded();
         }
         if (dead) {
-            return new SQLException("skylite: the transaction was lost with its channel after an unknown "
-                    + "outcome, and nothing more of it is sent; roll it back", "SKR03", 0);
+            return transactionLost(null);
         }
         return null;
     }
 
-    /** The error for any use of a connection discarded after an unknown outcome, or null if it was not. */
+    private static SQLException transactionLost(SQLException cause) {
+        return new SQLException("skylite: the transaction was lost with its channel, and nothing more of it is sent; "
+                + "roll it back", "SKR03", 0, cause);
+    }
+
+    /** The error for any use of a connection discarded after an unknown outcome or a settled commit, or null. */
     SQLException discarded() {
-        return lost ? new SQLNonTransientConnectionException("skylite: the connection was closed after an unknown "
-                + "outcome on its write channel; open a new connection", "08003") : null;
+        if (!lost) {
+            return null;
+        }
+        return new SQLNonTransientConnectionException(settledCommit
+                ? "skylite: the connection was closed after its commit's answer was lost and the commit was settled, "
+                        + "as ADR 0005 requires; open a new connection"
+                : "skylite: the connection was closed after an unknown outcome on its write channel; open a new "
+                        + "connection", "08003");
+    }
+
+    /**
+     * Whether the connection was discarded after a commit whose outcome was settled and reported: a pool's reset of
+     * the closed connection is then no error, since nothing about its transaction is unknown.
+     */
+    boolean settled() {
+        return lost && settledCommit;
     }
 
     /**
@@ -247,13 +268,23 @@ final class Channel {
                         stmt, auto ? Mode.AUTOCOMMIT : Mode.TXN);
                 for (Frame f : frames) {
                     if (f instanceof Results r) {
+                        if (r.rowsAffected().length > end - from) {
+                            throw Errors.transport("malformed response: more results than the batch's "
+                                    + (end - start) + " entries", null);
+                        }
                         System.arraycopy(r.rowsAffected(), 0, rows, from, r.rowsAffected().length);
                         System.arraycopy(r.lastInsertRowids(), 0, ids, from, r.lastInsertRowids().length);
                         from += r.rowsAffected().length;
                     }
                 }
                 switch (frames.get(frames.size() - 1)) {
-                    case Failure e -> throw Errors.map(e);
+                    case Failure e -> {
+                        // In a transaction the entries before batch_index ran, though a replayed receipt has no results
+                        for (long ran = auto ? 0 : Math.min(start + e.batchIndex(), end); from < ran; from++) {
+                            rows[from] = Statement.SUCCESS_NO_INFO;
+                        }
+                        throw Errors.map(e);
+                    }
                     case Done d when d.dataOmitted() -> throw omitted(d);
                     default -> from = end;
                 }
@@ -423,6 +454,11 @@ final class Channel {
                 return d.frames;
             }
             if (d.behind != null) { // the channel was given up, which settles seq as not executed
+                if (mode != Mode.AUTOCOMMIT && mode != Mode.BEGIN) { // and loses the open transaction with it
+                    s.state = "none";
+                    dead = true;
+                    throw transactionLost(Errors.map(d.behind));
+                }
                 if (Retry.pause(attempt++, deadline)) {
                     continue;
                 }
@@ -441,6 +477,7 @@ final class Channel {
             s.state = "none";
             Frame settled = settle(token, seq, d.gone, timeoutMillis > 0 ? deadline : 0);
             if (mode == Mode.COMMIT) { // ADR 0005: discarded whatever the answer
+                settledCommit = settled != null;
                 lost = true;
                 conn.discard();
             }
@@ -475,7 +512,8 @@ final class Channel {
 
     /**
      * Sends seq's body, and again with the same bytes while its answer is lost in transport, the server reports it
-     * in_flight, or a refusal before acceptance may pass later, until deadline. mode TXN: an execute or batch sent
+     * in_flight, a refusal before acceptance may pass later, or a forwarding pod lost the owner's answer
+     * (owner_unreachable, not_executed false), until deadline. mode TXN: an execute or batch sent
      * while a transaction is open, whose recorded failure is its outcome.
      */
     private Delivery deliver(Slot s, long seq, Kind kind, byte[] body, long deadline, SkyliteStatement stmt, Mode mode)
@@ -561,6 +599,12 @@ final class Channel {
                     throw Errors.map(e); // refused before acceptance: seq is still free
                 }
             }
+            // The hop may have delivered seq, as a lost answer may have: the same bytes replay its outcome.
+            if (e.code().equals("owner_unreachable") && !e.notExecuted() && ++drops < SENDS
+                    && Retry.left(deadline) > 0) {
+                fresh = false;
+                continue;
+            }
             return new Delivery(null, null, Errors.map(e), false);
         }
     }
@@ -569,7 +613,8 @@ final class Channel {
      * Settles request seq of channel t, which this driver gave up (ADR 0005 decision 4): a close answer settles it
      * unless the channel is gone (gone, or the close is answered channel_lost or not at all); otherwise resolve is
      * sent until the resolve wait ends, or callerDeadline when it is set and later than the cancel wait. Returns a
-     * Done whose resolution is committed (the close's receipt, or a Done carrying the commit's txn) or not_committed,
+     * Done whose resolution is committed (the close's receipt, with its counts and itself as the outcome, or resolve's
+     * Done carrying the commit's txn) or not_committed,
      * a recorded Failure from the close's receipt, or null when the outcome stays unknown.
      */
     private Frame settle(String t, long seq, boolean gone, long callerDeadline) {
@@ -584,7 +629,7 @@ final class Channel {
                     if (d.outcome() instanceof Done r) {
                         session.raise(r.txn());
                         return new Done(r.txn(), r.readOnly(), r.rowsAffected(), r.lastInsertRowid(), 0, seq,
-                                "none", null, 0, null, false, r.entries(), "committed", null);
+                                "none", null, 0, r, false, r.entries(), "committed", null);
                     }
                     if (d.outcome() instanceof Failure r && r.isFinal() && r.notExecuted()) {
                         return r;

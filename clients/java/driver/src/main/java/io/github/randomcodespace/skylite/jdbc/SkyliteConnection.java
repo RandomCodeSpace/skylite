@@ -96,6 +96,19 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         }
     }
 
+    /**
+     * checkOpen for a setting that a pool resets when the connection is returned: true, with nothing to do, on a
+     * connection closed after a settled commit (ADR 0005), so that its return raises nothing for a transaction whose
+     * outcome was reported. Its isValid is false, so the pool drops it.
+     */
+    private boolean settledReset() throws SQLException {
+        if (closed && channel.settled()) {
+            return true;
+        }
+        checkOpen();
+        return false;
+    }
+
     /** The error for a use of the closed connection: 08003 when it was discarded after an unknown outcome. */
     SQLException closedError() {
         SQLException discarded = channel.discarded();
@@ -220,7 +233,9 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     /** Turning auto-commit on commits an open transaction, as JDBC requires. */
     @Override
     public void setAutoCommit(boolean autoCommit) throws SQLException {
-        checkOpen();
+        if (settledReset()) {
+            return;
+        }
         synchronized (channel) { // after a statement in flight, which may begin a transaction
             if (autoCommit && !this.autoCommit) {
                 channel.commit();
@@ -253,11 +268,15 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
 
     /**
      * Rolls back the open or aborted transaction; with none, nothing is sent. A transaction lost with its channel
-     * rolls back locally. After an unknown commit the connection is closed, and rollback raises {@code 08003}.
+     * rolls back locally. After an unknown commit the connection is closed, and rollback raises {@code 08003}; after
+     * a settled one it does nothing, since that transaction already ended.
      */
     @Override
     public void rollback() throws SQLException {
         if (closed) {
+            if (channel.settled()) {
+                return;
+            }
             throw closedError();
         }
         synchronized (channel) {
@@ -359,7 +378,9 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
      */
     @Override
     public void setReadOnly(boolean readOnly) throws SQLException {
-        checkOpen();
+        if (settledReset()) {
+            return;
+        }
         synchronized (channel) {
             if (readOnly != this.readOnly && !channel.state().equals("none")) {
                 throw new SQLNonTransientException("skylite: setReadOnly inside a transaction", "25000");
@@ -382,7 +403,7 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     /** Ignored: a skylite URL names one database, and there are no catalogs to switch. */
     @Override
     public void setCatalog(String catalog) throws SQLException {
-        checkOpen();
+        settledReset();
     }
 
     @Override
@@ -396,7 +417,9 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
      */
     @Override
     public void setTransactionIsolation(int level) throws SQLException {
-        checkOpen();
+        if (settledReset()) {
+            return;
+        }
         switch (level) {
             case TRANSACTION_READ_UNCOMMITTED, TRANSACTION_READ_COMMITTED, TRANSACTION_REPEATABLE_READ,
                     TRANSACTION_SERIALIZABLE -> {}
@@ -418,7 +441,7 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
 
     @Override
     public void clearWarnings() throws SQLException {
-        checkOpen();
+        settledReset();
     }
 
     @Override
@@ -661,7 +684,7 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     /** Ignored: a skylite database has no schemas to switch. */
     @Override
     public void setSchema(String schema) throws SQLException {
-        checkOpen();
+        settledReset();
     }
 
     @Override
@@ -688,7 +711,9 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
      */
     @Override
     public void setNetworkTimeout(Executor executor, int milliseconds) throws SQLException {
-        checkOpen();
+        if (settledReset()) {
+            return;
+        }
         if (executor == null) {
             throw new SQLNonTransientException("skylite: setNetworkTimeout needs an executor", "HY009");
         }
