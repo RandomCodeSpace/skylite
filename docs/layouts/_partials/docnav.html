@@ -1,8 +1,16 @@
 {{- /* Rendered twice by docs layouts: a disclosure for narrow screens and a sidebar for wide ones. CSS shows one. */ -}}
+{{- /* Top-level docs pages are grouped by their navgroup front matter, in this order. */ -}}
 {{- $docs := site.GetPage "/docs" -}}
+{{- $cur := . -}}
 <nav class="docnav" aria-label="Documentation">
   <ul>
     <li><a href="{{ $docs.RelPermalink }}"{{ if eq . $docs }} aria-current="page"{{ end }}>Overview</a></li>
   </ul>
-  {{ partial "docnav-tree.html" (dict "section" $docs "cur" .) }}
+  {{- range slice (slice "guides" "Guides") (slice "reference" "Reference") (slice "project" "Design and project") }}
+  {{- $title := index . 1 }}
+  {{- with where $docs.Pages.ByWeight "Params.navgroup" (index . 0) }}
+  <p class="docnav-group">{{ $title }}</p>
+  {{ partial "docnav-tree.html" (dict "pages" . "cur" $cur) }}
+  {{- end }}
+  {{- end }}
 </nav>

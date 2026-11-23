@@ -2,6 +2,7 @@
 title: Decisions
 description: Architecture decision records for skylite.
 weight: 40
+navgroup: project
 ---
 
 This section holds the project's architecture decision records (ADRs). Each record captures one decision: the context that forced it, what was chosen, what was rejected and what follows from it. Records are kept after they are superseded, so the history of the design stays readable.

@@ -2,6 +2,7 @@
 title: Contributing to docs
 description: Where the docs live, when to update them, and how to build them locally.
 weight: 60
+navgroup: project
 ---
 
 ## The docs live in the repository
@@ -13,6 +14,10 @@ Every page on this site is a Markdown file under `docs/content/` in the [skylite
 Any pull request that changes behaviour, configuration, the API or the CLI updates the docs in the same pull request. A reviewer should be able to read the diff and the docs change side by side.
 
 Keep the status honest. Pages that describe goals rather than working software carry `status: design` in their front matter, which shows the design-direction marker at the top of the page. When something described as a goal is built, update the page and its status in the same pull request.
+
+## Where a page appears in the menu
+
+The menu groups the pages directly under `docs/content/docs/` by their `navgroup` front matter, ordered by `weight`: `guides` (task-oriented pages for people who run skylite or connect an application), `reference` (exact behaviour and every option) or `project` (architecture, decision records, roadmap and these notes). A top-level page without `navgroup` is not listed in the menu. Pages inside a section, such as the decision records, are listed under their section.
 
 ## Reference pages are generated
 
