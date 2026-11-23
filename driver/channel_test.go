@@ -361,7 +361,10 @@ func TestTransactionLost(t *testing.T) {
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if got := kinds(f.lastCalls()); got != "open begin execute cancel close open begin rollback" {
+	// The fake answers the rollback channel_lost too, so the driver abandons
+	// the new channel in the background: wait for that before comparing.
+	waitFor(t, f, "rollback cancel close")
+	if got := kinds(f.lastCalls()); got != "open begin execute cancel close open begin rollback cancel close" {
 		t.Fatalf("calls %q", got)
 	}
 }
