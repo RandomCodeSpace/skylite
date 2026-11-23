@@ -2,16 +2,22 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 )
 
 const goodConfig = `{
@@ -53,6 +59,7 @@ func TestLoad(t *testing.T) {
 		`"storage": {"gcs": {"bucket": "b"}}`,
 		`"storage": {"azure": {"account": "acct", "container": "c", "shared_key_file": "/etc/skylite/azure.key"}}`,
 		`"storage": {"azure": {"account": "devstoreaccount1", "container": "c", "endpoint": "http://127.0.0.1:10000/devstoreaccount1", "shared_key_env": "AZURE_STORAGE_KEY"}}`,
+		`"storage": {"azure": {"account": "acct", "container": "c", "entra": true}}`,
 	} {
 		alt := strings.Replace(goodConfig, goodConfig[strings.Index(goodConfig, `"storage"`):strings.Index(goodConfig, `,
   "databases"`)], s, 1)
@@ -114,6 +121,8 @@ func TestLoadRefuses(t *testing.T) {
 		"azure without container": withStorage(`"storage": {"azure": {"account": "acct", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
 		"azure without cred":      withStorage(`"storage": {"azure": {"account": "acct", "container": "c"}}`),
 		"azure with both creds":   withStorage(`"storage": {"azure": {"account": "acct", "container": "c", "shared_key_file": "/etc/skylite/azure.key", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
+		"azure entra over http":   withStorage(`"storage": {"azure": {"account": "acct", "container": "c", "endpoint": "http://127.0.0.1:10000/acct", "entra": true}}`),
+		"azure key and entra":     withStorage(`"storage": {"azure": {"account": "acct", "container": "c", "shared_key_env": "AZURE_STORAGE_KEY", "entra": true}}`),
 		"azure bad account":       withStorage(`"storage": {"azure": {"account": "u:hunter2@evil", "container": "c", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
 		"azure bad container":     withStorage(`"storage": {"azure": {"account": "acct", "container": "a/b", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
 		"azure container dotdot":  withStorage(`"storage": {"azure": {"account": "acct", "container": "..", "shared_key_env": "AZURE_STORAGE_KEY"}}`),
@@ -286,5 +295,38 @@ func TestAzureRefusesRedirect(t *testing.T) {
 	}
 	if n := elsewhere.Load(); n != 0 {
 		t.Errorf("the redirect target got %d requests, want 0", n)
+	}
+}
+
+type traceProbe struct {
+	got func(ctx context.Context)
+}
+
+func (p traceProbe) GetToken(ctx context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	p.got(ctx)
+	return azcore.AccessToken{}, ctx.Err()
+}
+
+func TestDetachedCredential(t *testing.T) {
+	deadline := time.Now().Add(time.Hour)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) {}})
+	_, _ = detachedCredential{traceProbe{got: func(c context.Context) {
+		if httptrace.ContextClientTrace(c) != nil {
+			t.Error("the token request carries the call's client trace")
+		}
+		if d, ok := c.Deadline(); !ok || !d.Equal(deadline) {
+			t.Errorf("deadline = %v, %v; want %v", d, ok, deadline)
+		}
+	}}}.GetToken(ctx, policy.TokenRequestOptions{})
+
+	ctx, cancel = context.WithCancel(context.Background())
+	_, err := detachedCredential{traceProbe{got: func(c context.Context) {
+		cancel()
+		<-c.Done()
+	}}}.GetToken(ctx, policy.TokenRequestOptions{})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("after the call was cancelled, GetToken = %v, want context.Canceled", err)
 	}
 }

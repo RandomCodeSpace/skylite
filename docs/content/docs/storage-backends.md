@@ -7,14 +7,14 @@ status: current
 
 Every durable byte in skylite is to go through one interface, the `storage.Store` of package `internal/storage`. Its package documentation is the contract: create-if-absent and compare-and-swap as the only writes, version tokens that never repeat for a key, strongly consistent reads and listings, and a rule for writes whose outcome is unknown. Package `internal/storage/storagetest` is the conformance suite every backend must pass.
 
-Each cloud backend is tested against an emulator only (RustFS, fake-gcs-server, Azurite). The [server](/docs/server/) can be configured to use `localfs`, `s3`, `gcs` or `azure`.
+Each cloud backend is tested against an emulator (RustFS, fake-gcs-server, Azurite). The Azure backend has also been run once by hand against the real service. The [server](/docs/server/) can be configured to use `localfs`, `s3`, `gcs` or `azure`.
 
 | Package | Service | Status |
 |---|---|---|
 | `internal/storage/localfs` | a local directory (Linux and macOS) | reference backend |
 | `internal/storage/s3` | Amazon S3 and S3-compatible stores | tested against the RustFS emulator only; one conformance subtest is skipped there (see below) |
 | `internal/storage/gcs` | Google Cloud Storage | tested against the fake-gcs-server emulator only |
-| `internal/storage/azureblob` | Azure Blob Storage | tested against the Azurite emulator only |
+| `internal/storage/azureblob` | Azure Blob Storage | tested against the Azurite emulator; the GORM acceptance suite run once by hand against the real service |
 
 ## Amazon S3 and S3-compatible stores
 
@@ -159,11 +159,11 @@ The client's transport must pass the request's context on to `net/http`, as the 
 
 ### Configuration
 
-`azureblob.New(client, spoolDir)` takes a `*container.Client` from the Azure SDK for Go (`github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container`) and the spool directory (empty means the system temporary directory). The package does not choose a credential: a caller builds the client with a shared key, a SAS URL, or `container.NewClient` and any `azcore.TokenCredential`, which is how Entra ID, including workload identity, can be wired in later. The container must already exist and nothing else may write to it. Any transport works, with two limits: a refused connection is a definite error only if the transport returns net/http's dial error, and through a transport that hides it the failure is `ErrOutcomeUnknown`; and the transport must not send a request again on its own, except for net/http's own re-sends, which the backend detects only if the transport passes the request's context, with its connection trace, on to net/http.
+`azureblob.New(client, spoolDir)` takes a `*container.Client` from the Azure SDK for Go (`github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container`) and the spool directory (empty means the system temporary directory). The package does not choose a credential: a caller builds the client with a shared key, a SAS URL, or `container.NewClient` and any `azcore.TokenCredential`, which is how `skylite serve` uses Entra ID with `entra: true`. The container must already exist and nothing else may write to it. Any transport works, with two limits: a refused connection is a definite error only if the transport returns net/http's dial error, and through a transport that hides it the failure is `ErrOutcomeUnknown`; and the transport must not send a request again on its own, except for net/http's own re-sends, which the backend detects only if the transport passes the request's context, with its connection trace, on to net/http.
 
 The transport must also close an idle connection before the service, or a load balancer or proxy in between, does: set `http.Transport.IdleConnTimeout` below the shortest idle timeout on the path. The SDK's default transport keeps idle connections for 90 seconds, and Azurite closes them after 5. A mutation is never retried, so a write sent on a pooled connection that the other end is closing fails, often with `ErrOutcomeUnknown`. The server and the tests set 2 seconds.
 
-In `skylite serve`, `storage.azure` takes `account` and `container` (required), an optional `endpoint` (empty means `https://<account>.blob.core.windows.net`), and exactly one of `shared_key_file` (path to a file holding the base64 shared key) or `shared_key_env` (name of an environment variable holding it). Entra ID credentials via `azidentity` are not wired into `serve` yet.
+In `skylite serve`, `storage.azure` takes `account` and `container` (required), an optional `endpoint` (empty means `https://<account>.blob.core.windows.net`), and exactly one of `shared_key_file` (path to a file holding the base64 shared key), `shared_key_env` (name of an environment variable holding it) and `entra: true`. With `entra`, requests carry an Entra ID token from `azidentity`'s `DefaultAzureCredential`, which tries in order a service principal in `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET`, workload identity, a managed identity, and then the Azure CLI, Azure Developer CLI and Azure PowerShell logins of the user running the server. Set `AZURE_TOKEN_CREDENTIALS` to narrow the chain, for example to `prod`, which keeps only the service principal, workload identity and managed identity. `entra` needs an `https` endpoint. That identity needs the Storage Blob Data Contributor role on the container or its account.
 
 ### Limits
 
@@ -182,4 +182,6 @@ Tested against Azurite 3.37.0 (`mcr.microsoft.com/azure-storage/azurite`, pinned
 
 `make integration` runs them in CI, together with the server's `PUT` test against Azurite (`TestPutOnAzure`, with both a shared-key file and an environment variable). It keeps Azurite's data on the container's disk: Azurite frees the data of deleted blobs only every 10 minutes, and the suite writes more than its in-memory store holds on a CI runner.
 
-Not tested: the real Azure Blob Storage service, working real credentials (Entra ID, workload identity, managed identity, account keys of a real account), real latency and throttling, HTTP/2 against the service, a proxy between the backend and the service, and the assumption that an ETag never repeats for a key. Azurite derives its ETags from the time in milliseconds multiplied by a random factor, so on the emulator two writes in the same millisecond can, rarely, share one.
+Run once by hand against the real Azure Blob Storage service, not in CI: the GORM acceptance suite on `skylite serve` with `entra: true` and an Entra ID service principal (client secret) that holds Storage Blob Data Contributor. All of its tests passed, and the objects were in the container afterwards.
+
+Not tested: this backend's own conformance and fault tests against the real service, workload identity, managed identity, account keys of a real account, throttling, HTTP/2 against the service, a proxy between the backend and the service, and the assumption that an ETag never repeats for a key. Azurite derives its ETags from the time in milliseconds multiplied by a random factor, so on the emulator two writes in the same millisecond can, rarely, share one.
