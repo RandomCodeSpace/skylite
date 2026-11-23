@@ -22,7 +22,7 @@ text = "Full SQL from SQLite, carried over HTTPS so it passes through ingress an
 
 [[items]]
 title = "Drivers you already use"
-text = "A Go database/sql driver (target: works with GORM). A JDBC driver and Hibernate dialect (target: works with Spring Data JPA)."
+text = "A Go database/sql driver that works with GORM. A JDBC driver and Hibernate dialect that work with Spring Data JPA."
 
 [[items]]
 title = "Locked down by default"

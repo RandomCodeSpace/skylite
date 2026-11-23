@@ -399,4 +399,4 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 - A tail bound the leader cannot compact past is noticed when a request meets it, so a server that takes office there reports itself ready until its first query.
 - The header block deadline on HTTP/2 streams: there, only the idle timeout bounds a header block that never ends. The 431 answer is tested on HTTP/1.1 only.
 - Reloading a rotated TLS certificate without a restart.
-- Running behind a real mesh or ingress has not been tested.
+- Running on a Kubernetes cluster, or behind a real mesh or ingress, has not been tested.

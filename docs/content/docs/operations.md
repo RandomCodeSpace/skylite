@@ -6,7 +6,7 @@ navgroup: guides
 status: current
 ---
 
-skylite has not yet been run on a real Kubernetes cluster, behind a real service mesh or ingress, or with driver failover across several pods. What follows describes how the server behaves, as built and tested in one process and on one machine; check it in your own environment before relying on it.
+skylite has not yet been run on a real Kubernetes cluster, behind a real service mesh or ingress, or with driver failover across several pods. What follows describes how the server behaves, as built and tested in one process, and as measured with three server processes on one machine against a real Azure storage account; check it in your own environment before relying on it.
 
 ## One server or several
 
@@ -45,11 +45,22 @@ The leader holds a 60-second lease on each database and renews it every 20 secon
 | The leader shuts down cleanly (SIGTERM) | It stops accepting connections, finishes running requests for up to a minute, then releases its leases. A standby sees the released lease within about 5 seconds and takes office. |
 | The leader crashes or is cut off | Its lease expires within 60 seconds of its last renewal; then a standby takes office. A deposed leader cannot commit: every commit and manifest update is a conditional write that fails once another leader has taken office. |
 
-Taking office does not download the database: the new leader reads pages from storage as it needs them. It does read the commits written since the last compaction, up to 32 at a time, and reads them once. Measured on Azure Blob Storage, a log of 2,000 uncompacted commits took about 2.3 seconds from the start of the takeover to a serving leader. A standby with a follower keeps serving reads from it until its leader serves.
+Taking office does not download the database: the new leader reads pages from storage as it needs them. It does read the commits written since the last compaction, up to 32 at a time, and reads them once. Measured on Azure Blob Storage, a log of 2,000 uncompacted commits took about 2.3 seconds from the start of the takeover to a serving leader (94 seconds in v0.0.2, which read each commit twice, one at a time). A standby with a follower keeps serving reads from it until its leader serves.
+
+Measured in a 13-minute soak of three servers on one machine against a real Azure storage account, at about 26 commits a second with follower reads on. The time is the write outage: from the event to the first successful write.
+
+| Event | Write outage |
+|---|---|
+| SIGTERM to the leader | 5.6 and 8.8 seconds |
+| SIGKILL of the leader | 47.8 seconds |
+| SIGSTOP of the leader | 51.7 seconds |
+
+A killed or paused leader's outage is bounded by its lease: the lease expires 60 seconds after its last renewal, which came up to 20 seconds before the event, and a standby notices within its next read of the lease, at most 5 seconds later. No acknowledged write was lost, and a write that committed without being acknowledged was reported to its client as an unknown outcome, not as a failure. The lease time is fixed in this version and not configurable.
 
 ### What clients see
 
-- **Reads** keep working on standbys with fresh followers. Reads that must go to the leader fail with `503` (`no_leader`, `not_serving`, `owner_unreachable` or `behind`) until a new leader is in office.
+- **Reads** keep working on standbys with fresh followers, during the takeover too. Reads that must go to the leader fail with `503` (`no_leader`, `not_serving`, `owner_unreachable` or `behind`) until a new leader is in office.
+- **A deposed leader**, such as one that was paused and resumes after another has taken office, stops when it finds the new leader's writes in storage, and from then answers `503` `not_serving`, not executed. It cannot commit: its conditional writes fail.
 - **Writes and transactions** run on write channels, which belong to the leader that opened them. When that leader stops, its channels end: an open transaction is rolled back, and a write that was running when it stopped has an **unknown outcome** (`channel_lost`). It may or may not have committed. New writes fail with `503` until a leader is in office, then succeed on a new channel.
 - The [Go driver](/docs/go-driver/#errors-and-retries) sends refused requests again with backoff, and asks the new leader with `resolve` whether a lost write committed; it reports an unknown outcome only when that does not settle it. The [JDBC driver's guide](/docs/jdbc-driver/#errors-and-retries) says what it does. For an outcome that stays unknown, your application decides: retry operations that are safe to repeat, and check the data before repeating one that is not.
 
@@ -74,15 +85,17 @@ Every error carries a `code`, a `message`, a `request_id` (log it; the server lo
 
 | Code | HTTP | Meaning |
 |---|---|---|
-| `overloaded` | 429 | The server is at capacity: connections, memory or the principal's share. Retry with backoff. |
+| `overloaded` | 429 | The server or the principal is at a bound: concurrent requests ([request bounds](/docs/server/#request-bounds)), the request body share of the memory budget, SQLite connections, the share of connections read-only transactions may hold, or the requests waiting for an issuer's signing keys (below). Retry with backoff. |
 | `too_many_channels` | 429 | A write channel limit was reached. Close idle connections, or retry later. |
-| `busy` | final frame | The database's write lock was not granted within 5 seconds, or too many writers were waiting. Another transaction is holding it; keep transactions short. |
+| `busy` | final frame | The database's write lock was not granted within 5 seconds, or too many writers were waiting (64 per database, 16 per principal). Another transaction is holding it; keep transactions short. Recorded on the channel as not executed; the Go driver sends a `begin` or autocommit write refused this way again under a new sequence number. |
 | `no_leader` | 503 | No leader is in office for the database, as during failover. |
-| `not_serving` | 503 | This server does not serve the database now. Also the answer until the server takes office for a new database. |
+| `not_serving` | 503 | This server does not serve the database now: it does not lead it and cannot forward the request, it is stopping, or it has been deposed. Also the answer until the server takes office for a new database. |
 | `owner_unreachable` | 503 | The pod that owns the channel did not answer the pod that forwarded the request. |
-| `behind` | 503 | The server has not caught up to a transaction this client already saw. |
+| `behind` | 503 | The server has not caught up to a transaction this client already saw (`min_txn`), or a `resolve` reached a leader that has not yet learned it was deposed. |
 | `maintenance` | 503 | The leader is in maintenance, for example compacting a commit log that reached its limit. |
 | `transaction_aborted` with `cause: "maintenance"` | final frame | Maintenance rolled the transaction back; rerun the whole transaction. |
+
+An issuer whose keys come through OIDC discovery has them fetched on the first request that needs them, and again when a token names a key id the server does not have, as after the issuer rotates its key. While one request fetches them, up to the 10-second fetch timeout, the others for that issuer wait, at most 64 per server; beyond that they get `429` `overloaded`. A burst of requests at start or right after a rotation can therefore see a few `429`s. With `jwks_file` the keys come from a local file, so the wait is short.
 
 **Outcome unknown.** The request may have taken effect. Check before you repeat it.
 
@@ -90,6 +103,17 @@ Every error carries a `code`, a `message`, a `request_id` (log it; the server lo
 |---|---|---|
 | `channel_lost` | 410 | The write channel ended, for example because its leader stopped. A write that was running may have committed. |
 | `commit_outcome_unknown` | final frame | The commit's upload had no definite answer from storage. The server stops serving the database. |
+
+To settle a write whose channel was lost, send `resolve` with the channel's token and the write's sequence number to the leader, or with a peer listener to any pod; the [Go driver](/docs/go-driver/#errors-and-retries) does this itself. The leader answers one of:
+
+| `resolution` | Meaning |
+|---|---|
+| `committed` | The write committed; `txn` is its commit. |
+| `not_committed` | The write had no effect. It is safe to send it again on a new channel. |
+| `pending` | The channel is still live or its last request is still running. Ask again. |
+| `unknown` | The leader cannot tell, for example because the channel was opened more than 100,000 transactions before its head or the leader stopped. A resolve that stopped at its limit of header reads continues where it left off when sent again; otherwise check the data. |
+
+A `resolve` refused with `503` `behind`, or with any code in the first table, can be sent again. The [server reference](/docs/server/#resolve) gives the exact rules.
 
 **Fix the request.** Retrying the same request fails the same way.
 
