@@ -424,6 +424,23 @@ func (l *Leader) Err() error {
 	return l.stopped
 }
 
+// Admits returns the error a client connection's Run would fail with now,
+// before it reaches SQLite: the leader stopped, its tail bound, or
+// maintenance; nil if it would run.
+func (l *Leader) Admits() error {
+	l.cmu.Lock()
+	defer l.cmu.Unlock()
+	switch {
+	case l.stopped != nil:
+		return fmt.Errorf("%w: %w", ErrNotCommitted, l.stopped)
+	case l.admitClosed && l.tailFullLocked():
+		return l.tailErrLocked()
+	case l.admitClosed:
+		return fmt.Errorf("%w: %w: maintenance is running", ErrNotCommitted, ErrRetry)
+	}
+	return nil
+}
+
 // Close stops serving, closes every connection once its Run has returned,
 // and deletes the database's local files.
 func (l *Leader) Close() error {

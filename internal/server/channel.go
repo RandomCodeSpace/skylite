@@ -405,24 +405,19 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 	}
 
 	// Checks 11 and 12 for a request that would be accepted: the watermark,
-	// and the fresh connection. The statement time runs from here.
+	// and maintenance. A fresh write reserves its connection only once it
+	// holds the write lock. The statement time runs from here.
 	limit := s.statementTime
 	if req.TimeoutMS > 0 {
 		limit = min(limit, time.Duration(req.TimeoutMS)*time.Millisecond)
 	}
 	deadline := time.Now().Add(limit)
-	var c *pconn
 	if fresh {
 		if req.MinTxn > 0 && leader.Head() < uint64(req.MinTxn) { //nolint:gosec // min_txn is from 0 to 2^63-1
 			return nil, s.ownedLocked(wire.NewError(wire.CodeBehind, fmt.Sprintf("the leader's head, transaction %d, is below min_txn %d", leader.Head(), req.MinTxn)), ch, seq)
 		}
-		octx, cancel := context.WithDeadline(ctx, deadline)
-		var err error
-		c, e, err = s.writeConn(octx, d, leader, who)
-		cancel()
-		if e != nil {
-			logInternal(ctx, log, e, err)
-			return nil, s.ownedLocked(e, ch, seq)
+		if err := leader.Admits(); err != nil {
+			return nil, s.ownedLocked(s.engineError(d, leader, err), ch, seq)
 		}
 	}
 
@@ -437,9 +432,6 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 			done, e, data = replayed(ch)
 		}
 		s.chMu.Unlock()
-		if c != nil {
-			s.pool.release(who, c, false)
-		}
 		if v == replay {
 			s.send(st, data)
 		}
@@ -504,13 +496,11 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 			next = wire.TxnNone
 		}
 	case req.Op == wire.OpBegin && state == wire.TxnNone:
-		rec, lost, next = s.begin(rctx, d, t, ch, c, req, sw, deadline, limit, log)
-		c = nil
+		rec, lost, next = s.begin(rctx, d, t, ch, req, sw, deadline, limit, log)
 	case req.Op == wire.OpBegin:
 		rec = recorded(wire.NewError(wire.CodeInvalidState, "a transaction is open on the channel"), false)
 	case req.Op == wire.OpExecute && state == wire.TxnNone:
-		rec, lost = s.execute(rctx, d, t, c, req, held, deadline, limit, who, log)
-		c = nil
+		rec, lost = s.execute(rctx, d, t, req, held, deadline, limit, who, log)
 	case req.Op == wire.OpExecute:
 		rec, lost, next = s.inTxn(rctx, d, t, ch, tx, req, sw, deadline, limit, log)
 	case req.Op == wire.OpCommit && state == wire.TxnOpen:
@@ -527,9 +517,6 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 		rec = &wire.Receipt{Done: &wire.Done{Kind: wire.DoneRollback, Txn: int64(txn)}} //nolint:gosec // as above
 	default: // commit and rollback with no transaction open
 		rec = recorded(wire.NewError(wire.CodeInvalidState, "no transaction is open on the channel"), false)
-	}
-	if c != nil {
-		s.pool.release(who, c, false)
 	}
 	var data []byte
 	frames := false
@@ -803,19 +790,23 @@ func (s *Server) closeChannel(d *database, leader *engine.Leader, req *wire.Requ
 }
 
 // writeConn reserves a SQLite connection for who and opens a fresh one on
-// leader: check 12 of ADR 0005 for an execute.
-func (s *Server) writeConn(ctx context.Context, d *database, leader *engine.Leader, who string) (*pconn, *wire.Error, error) {
+// t's leader, for a write that holds t's write lock (ADR 0005 decision 9).
+// A write that gets none returns its receipt, a recorded overloaded when
+// the pod's or who's connections are all in use, or the unrecorded error
+// that ends the channel.
+func (s *Server) writeConn(ctx context.Context, d *database, t *table, who string, limit time.Duration, log *slog.Logger) (*pconn, *wire.Receipt, *wire.Error) {
 	_, evict, ok := s.pool.take(nil, who)
 	if !ok {
-		return nil, wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later"), nil
+		return nil, &wire.Receipt{Error: wire.NewError(wire.CodeOverloaded, "the server's or the principal's SQLite connections are all in use; retry later").Recorded(false)}, nil
 	}
 	if evict != nil {
 		_ = evict.ec.Close()
 	}
-	c, err := s.open(ctx, leader)
+	c, err := s.open(ctx, t.leader)
 	if err != nil {
 		s.pool.release(who, nil, false)
-		return nil, s.refusal(ctx, d, leader, err), err
+		rec, lost := s.failure(ctx, d, t, err, nil, limit, false, log)
+		return nil, rec, lost
 	}
 	return c, nil, nil
 }
@@ -913,18 +904,22 @@ func (h *heldRows) free() {
 	h.b.Reset()
 }
 
-// execute runs an accepted execute as an autocommit write on c, a fresh
+// execute runs an accepted execute as an autocommit write on a fresh
 // connection it closes, within limit from now, holding its frames in held,
 // which it empties unless the write committed or changed nothing. It
 // returns the receipt, or the unrecorded error that ends the channel.
-func (s *Server) execute(ctx context.Context, d *database, t *table, c *pconn, req *wire.Request, held *heldRows, deadline time.Time, limit time.Duration, who string, log *slog.Logger) (*wire.Receipt, *wire.Error) {
-	defer s.pool.release(who, c, false) // never reused after a write (ADR 0005 decision 6)
+func (s *Server) execute(ctx context.Context, d *database, t *table, req *wire.Request, held *heldRows, deadline time.Time, limit time.Duration, who string, log *slog.Logger) (*wire.Receipt, *wire.Error) {
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	if e := s.lock(ctx, t, who, limit); e != nil {
 		return &wire.Receipt{Error: e}, nil
 	}
 	defer s.release(t)
+	c, rec, lost := s.writeConn(ctx, d, t, who, limit, log)
+	if c == nil {
+		return rec, lost
+	}
+	defer s.pool.release(who, c, false) // never reused after a write (ADR 0005 decision 6)
 	var done *wire.Done
 	var e *wire.Error
 	var snap uint64
@@ -949,19 +944,22 @@ func (s *Server) execute(ctx context.Context, d *database, t *table, c *pconn, r
 	return s.failure(ctx, d, t, err, e, limit, false, log)
 }
 
-// begin runs an accepted begin on c, a fresh connection: it waits for the
-// write lock, then runs BEGIN IMMEDIATE and the first statement, if any,
-// with its frames written to w. A transaction that began holds c and the
-// lock as ch's open transaction; a begin that fails leaves neither, and no
-// transaction (ADR 0005 decision 6).
-func (s *Server) begin(ctx context.Context, d *database, t *table, ch *channel, c *pconn, req *wire.Request, w io.Writer, deadline time.Time, limit time.Duration, log *slog.Logger) (*wire.Receipt, *wire.Error, wire.TxnState) {
+// begin runs an accepted begin: it waits for the write lock, then runs
+// BEGIN IMMEDIATE and the first statement, if any, on a fresh connection,
+// with its frames written to w. A transaction that began holds the
+// connection and the lock as ch's open transaction; a begin that fails
+// leaves neither, and no transaction (ADR 0005 decision 6).
+func (s *Server) begin(ctx context.Context, d *database, t *table, ch *channel, req *wire.Request, w io.Writer, deadline time.Time, limit time.Duration, log *slog.Logger) (*wire.Receipt, *wire.Error, wire.TxnState) {
 	began := time.Now()
 	ctx, cancel := s.txnContext(ctx, began, deadline)
 	defer cancel()
+	var c *pconn
 	open, locked := false, false
 	defer func() {
 		if !open {
-			s.pool.release(ch.who, c, false) // rolls back what began
+			if c != nil {
+				s.pool.release(ch.who, c, false) // rolls back what began
+			}
 			if locked {
 				s.release(t)
 			}
@@ -971,6 +969,10 @@ func (s *Server) begin(ctx context.Context, d *database, t *table, ch *channel, 
 		return &wire.Receipt{Error: e}, nil, wire.TxnNone
 	}
 	locked = true
+	c, rec, lost := s.writeConn(ctx, d, t, ch.who, limit, log)
+	if c == nil {
+		return rec, lost, wire.TxnNone
+	}
 	var done *wire.Done
 	var e *wire.Error
 	var snap uint64

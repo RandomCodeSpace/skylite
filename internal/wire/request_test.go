@@ -424,7 +424,7 @@ func TestCodes(t *testing.T) {
 		{CodeChannelLost, 410, false},
 		{CodeRequestTooLarge, 413, false},
 		{CodeTooManyChannels, 429, false},
-		{CodeOverloaded, 429, false},
+		{CodeOverloaded, 429, true},
 		{CodeInvalidState, 409, true},
 		{CodeTransactionAborted, 200, true},
 		{CodeBusy, 200, true},
