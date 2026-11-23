@@ -1,7 +1,6 @@
 // Command skylite is the skylite server binary.
 //
-// The project is pre-alpha: the server creates databases and serves
-// nothing else yet.
+// The project is beta: see the roadmap in the README for what is left.
 package main
 
 import (
@@ -22,9 +21,9 @@ import (
 
 const usage = `skylite - a SQL database server where object storage is the source of truth.
 
-Status: pre-alpha. The server authenticates requests, creates databases,
-leads the databases its configuration lists and answers read-only queries
-on them; it runs no writes yet.
+Status: beta. The server authenticates requests, creates databases, leads
+the databases its configuration lists, answers read-only queries on them
+and on opt-in followers, and runs writes and transactions on write channels.
 
 Usage:
   skylite <command>

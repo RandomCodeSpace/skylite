@@ -8,7 +8,7 @@ listChildren: false
 
 skylite aims to be a SQL database server where object storage is the source of truth. It is a Go project, and the plan is to build it on SQLite. It is meant to run in Kubernetes pods that have no persistent volumes. In the design, all durable state lives in object storage, and pod disk is only a cache.
 
-The project is pre-alpha. The binary prints its version and help, and its server authenticates requests, creates databases, answers read-only SQL queries on the databases it leads and runs autocommit writes and transactions sent on write channels, which the Go and JDBC drivers use. Most of these pages describe design direction rather than behaviour. Pages that describe goals say so at the top.
+The project is beta. The binary prints its version and help, and its server authenticates requests, creates databases, leads the databases it is configured for, answers stateless reads on leaders and opt-in followers, runs autocommit writes and transactions sent on write channels, which the Go and JDBC drivers use, and forwards a request it cannot serve to the pod that can. Its cloud storage backends are tested against emulators only. Pages that describe goals or design rather than behaviour say so at the top.
 
 ## Where to start
 
@@ -17,7 +17,7 @@ The project is pre-alpha. The binary prints its version and help, and its server
 - [Go driver](/docs/go-driver/) describes the Go `database/sql` driver: queries, writes and transactions.
 - [JDBC driver](/docs/jdbc-driver/) describes the JDBC driver, its Hibernate dialect and their run of the Spring Data JPA acceptance suite.
 - [Storage backends](/docs/storage-backends/) describes the storage interface's backends, all four of which (`localfs`, `s3`, `gcs` and `azure`) the server can use.
-- [Roadmap and status](/docs/roadmap/) lists the planned milestones in order.
-- [Decisions](/docs/decisions/) is where architecture decision records will live.
+- [Roadmap and status](/docs/roadmap/) lists the milestones that are done and those still planned, in order.
+- [Decisions](/docs/decisions/) holds the architecture decision records.
 - [Reference](/docs/reference/) holds pages generated from the source, starting with the CLI.
 - [Contributing to docs](/docs/contributing-docs/) explains how these pages are written and built.

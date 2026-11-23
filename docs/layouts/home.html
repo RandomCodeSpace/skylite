@@ -6,8 +6,8 @@
 <section class="hero wrap" aria-labelledby="hero-title">
   <h1 id="hero-title">A SQL database server where object storage is the source of truth.</h1>
   <div class="hero-text">
-    <p class="lede">skylite is a pre-alpha Go project. The aim is a SQL server on SQLite for Kubernetes pods that have no persistent volumes. The design keeps all durable state in object storage and treats pod disk as a cache. Services will read and write through it over HTTPS.</p>
-    <p class="redmark"><strong>Pre-alpha.</strong> Today the server authenticates requests and creates databases, and runs no SQL. The drawing below is the target design, not working software.</p>
+    <p class="lede">skylite is a beta Go project: a SQL server on SQLite for Kubernetes pods that have no persistent volumes. It keeps all durable state in object storage and treats pod disk as a cache. Services read and write through it over HTTPS.</p>
+    <p class="redmark"><strong>Beta.</strong> The server runs reads, writes and transactions, with leader failover and follower reads. Its cloud backends are tested against emulators only, and it has not run on a real Kubernetes cluster yet. The roadmap below lists what is still planned.</p>
     <p class="actions">
       <a class="btn btn-primary" href="{{ $arch.RelPermalink }}">Read the design direction</a>
       <a class="btn" href="{{ site.Params.repo }}">Source on GitHub</a>
@@ -42,7 +42,7 @@
 <section class="band wrap" aria-labelledby="goals">
   <div class="band-head">
     <h2 id="goals">Design goals</h2>
-    <p class="marker">Goals, not features. None of these exist yet.</p>
+    <p class="marker">Goals. The roadmap below says which are built and what is left.</p>
   </div>
   <dl class="goals">
     {{- range hugo.Data.goals.items }}
@@ -55,7 +55,7 @@
   <div class="split split-even">
     <div class="prose">
       <h2 id="today">What runs today</h2>
-      <p>With a Go toolchain installed, install the binary and ask for its version. Its server, <code>skylite serve</code>, so far only creates databases; the <a href="{{ $start.RelPermalink }}">getting started guide</a> links to its configuration.</p>
+      <p>With a Go toolchain installed, install the binary and ask for its version. Its server, <code>skylite serve</code>, creates databases, answers queries and runs writes and transactions; the <a href="{{ $start.RelPermalink }}">getting started guide</a> links to its configuration.</p>
       <p>To build from a clone instead, run <code>make build</code> and then <code>./bin/skylite version</code>. The <a href="{{ $start.RelPermalink }}">getting started guide</a> has both paths.</p>
     </div>
     <div class="quick">
@@ -67,7 +67,7 @@
 <section class="band wrap" aria-labelledby="status">
   <div class="band-head">
     <h2 id="status">Status and roadmap</h2>
-    <p>One item is done. The rest is listed in planned order, and none of it is built.</p>
+    <p>Done items first, then what is planned, in order.</p>
   </div>
   {{ partial "roadmap.html" . }}
   <p class="more"><a href="{{ $roadmap.RelPermalink }}">Roadmap and status in the docs</a></p>

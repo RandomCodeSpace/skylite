@@ -5,7 +5,7 @@ weight: 25
 status: current
 ---
 
-Every durable byte in skylite is to go through one interface, the `storage.Store` of package `internal/storage`. Its package documentation is the contract: create-if-absent and compare-and-swap as the only writes, version tokens that never repeat for a key, strongly consistent reads and listings, and a rule for writes whose outcome is unknown. Package `internal/storage/storagetest` is the conformance suite every backend must pass.
+Every durable byte in skylite goes through one interface, the `storage.Store` of package `internal/storage`. Its package documentation is the contract: create-if-absent and compare-and-swap as the only writes, version tokens that never repeat for a key, strongly consistent reads and listings, and a rule for writes whose outcome is unknown. Package `internal/storage/storagetest` is the conformance suite every backend must pass.
 
 Each cloud backend is tested against an emulator only (RustFS, fake-gcs-server, Azurite). The [server](/docs/server/) can be configured to use `localfs`, `s3`, `gcs` or `azure`.
 

@@ -1,5 +1,5 @@
 # Single source for the roadmap on the landing page and the roadmap docs page.
-# status: "done" or "planned". Order is the planned order of work.
+# status: "done" or "planned". Order is the order of work: done items first, then planned ones.
 
 [[items]]
 title = "Bootstrap: repo, CI, docs site"
@@ -8,41 +8,71 @@ detail = "Project scaffolding, CI, this site, and a binary that prints its versi
 
 [[items]]
 title = "Evaluate Litebase and run a durability spike"
-status = "planned"
+status = "done"
 detail = "Evaluate Litebase, an existing MIT-licensed SQLite-on-object-storage database, as a base. Against Azurite: acknowledge only after upload, kill mid-write, restore on an empty disk, and prove that no acknowledged write is lost and a stale leader cannot commit."
-gate = "The storage architecture that follows from it is recorded in decision record 0004. It stays a plan until the storage engine's own tests prove it."
+gate = "The storage architecture that follows from it is recorded in decision record 0004, and the storage engine below implements it."
 
 [[items]]
 title = "Storage interface and four backends"
-status = "planned"
-detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators. So far the interface, its conformance suite, the local filesystem backend, the S3 backend, the Google Cloud Storage backend and the Azure Blob backend exist, each tested against an emulator only: the S3 backend against RustFS, the Google Cloud Storage backend against fake-gcs-server and the Azure Blob backend against Azurite. `skylite serve` can use all four backends (local filesystem, S3, Google Cloud Storage and Azure Blob Storage with a shared key; Entra ID is not wired into the server yet)."
+status = "done"
+detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators. The interface, its conformance suite and all four backends exist. Each cloud backend is tested against an emulator only, never against the real service: the S3 backend against RustFS, the Google Cloud Storage backend against fake-gcs-server and the Azure Blob backend against Azurite. `skylite serve` can use all four backends (local filesystem, S3, Google Cloud Storage and Azure Blob Storage with a shared key; Entra ID is not wired into the server yet)."
 
 [[items]]
 title = "Storage engine: commit log, paged reads, compaction"
-status = "planned"
-detail = "A storage layer under SQLite (ncruces/go-sqlite3) that uploads each commit from the write-ahead log as one create-if-absent object before acknowledging it, reads pages on demand from a paged base with a bounded cache, and folds the commit log into the base behind a compare-and-swap manifest. So far database creation, paged reads, the leader's commit path, and compaction with retirement and garbage collection exist as a library package, tested against the local filesystem backend. The server leads its configured databases through it, compaction included."
+status = "done"
+detail = "A storage layer under SQLite (ncruces/go-sqlite3) that uploads each commit from the write-ahead log as one create-if-absent object before acknowledging it, reads pages on demand from a paged base with a bounded cache, and folds the commit log into the base behind a compare-and-swap manifest. Database creation, paged reads, the leader's commit path, and compaction with retirement and garbage collection exist as a library package, tested against the local filesystem backend. The server leads its configured databases through it, compaction included."
 
 [[items]]
 title = "Leader lease and failover"
-status = "planned"
-detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader. So far the takeover, the lease and a loop that takes office, renews the lease, steps down when deposed or stopped, and drains and releases on shutdown exist, and skylite serve runs the loop for each database it is configured for. The server in office serves writes. A standby can serve stateless reads when enabled."
+status = "done"
+detail = "One leader per database. A lease object lets a new leader take over without downloading the database; create-if-absent commits and the manifest compare-and-swap fence a stale leader. The takeover, the lease and a loop that takes office, renews the lease, steps down when deposed or stopped, and drains and releases on shutdown exist, and skylite serve runs the loop for each database it is configured for. The server in office serves writes. A standby can serve stateless reads when enabled. Not yet run on a real Kubernetes cluster."
 
 [[items]]
 title = "Read replicas"
-status = "planned"
-detail = "The engine follower polls the durable log and pins each read-only SQLite connection to one transaction. It fetches pages on demand and supports a bounded page cache. With `follower_reads`, on by default when a peer listener is configured, a standby serves stateless query and describe requests while its snapshot is fresh, and with a peer listener forwards to the leader a read it cannot serve. Follower-owned read channels are planned."
+status = "done"
+detail = "The engine follower polls the durable log and pins each read-only SQLite connection to one transaction. It fetches pages on demand and supports a bounded page cache. With `follower_reads`, on by default when a peer listener is configured, a standby serves stateless query and describe requests while its snapshot is fresh, and with a peer listener forwards to the leader a read it cannot serve. Follower-owned read channels are planned, below."
 
 [[items]]
 title = "HTTPS query API and sessions"
-status = "planned"
-detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, database creation (PUT), the stateless query and describe requests on leaders and opt-in followers, and write channels on the leader: open, close, cancel, autocommit writes, ping and transactions (begin, commit, rollback, the aborted state and the transaction timers) on a channel, with sequence numbers, receipts and replay, so that a resent write never runs twice. With a peer listener, any pod takes any request and forwards it one hop, over mutual TLS, to the leader or the channel's owner, located through a leader record in object storage. Not yet: batch, read-only channels, resolve, admission control."
+status = "done"
+detail = "Relational SQL over HTTPS, so traffic passes through ingress and Istio without a raw TCP port, with sessions for transactions that span requests. Exists now: skylite serve with TLS or plaintext HTTP/1.1 and HTTP/2, bearer-token authentication, the checks before acceptance, database creation (PUT), the stateless query and describe requests on leaders and opt-in followers, and write channels on the leader: open, close, cancel, autocommit writes, ping and transactions (begin, commit, rollback, savepoints, the aborted state and the transaction timers) on a channel, with sequence numbers, receipts and replay, so that a resent write never runs twice. With a peer listener, any pod takes any request and forwards it one hop, over mutual TLS, to the leader or the channel's owner, located through a leader record in object storage. Not yet, planned below: batch, describe on a channel, read-only channels, resolve and the rest of admission control."
 
 [[items]]
 title = "Clients: Go driver, JDBC driver and Hibernate dialect"
-status = "planned"
-detail = "A Go database/sql driver (target: works with GORM) and a JDBC driver with a Hibernate dialect (target: works with Spring Data JPA). Exists now: the Go driver, with queries, prepared statements through describe and ping, autocommit writes, transactions and savepoints on write channels, resends under the same sequence number, and unknown outcomes reported as such, with a GORM acceptance test against the real server (AutoMigrate, CRUD, associations, transactions, nested transactions, batch create, errors); the JDBC driver, with reads, autocommit writes, transactions and savepoints on a write channel per connection, resends with the same sequence number, generated keys, batches run statement by statement, getTables and getColumns, cancel and query timeout, tested against an in-process fake server and against skylite serve; and a Hibernate dialect on the community SQLite dialect. The Spring Data JPA acceptance suite passes all 29 of its tests through the JDBC driver, the dialect, HikariCP and Hibernate against skylite serve, in CI. Not yet: read-only transactions in the Go driver, and resolve, so a write whose outcome is lost stays unknown."
+status = "done"
+detail = "A Go database/sql driver that works with GORM and a JDBC driver with a Hibernate dialect that work with Spring Data JPA. Exists now: the Go driver, with queries, prepared statements through describe and ping, autocommit writes, transactions and savepoints on write channels, resends under the same sequence number, and unknown outcomes reported as such, with a GORM acceptance test against the real server (AutoMigrate, CRUD, associations, transactions, nested transactions, batch create, errors); the JDBC driver, with reads, autocommit writes, transactions and savepoints on a write channel per connection, resends with the same sequence number, generated keys, batches run statement by statement, getTables and getColumns, cancel and query timeout, tested against an in-process fake server and against skylite serve; and a Hibernate dialect on the community SQLite dialect. The Spring Data JPA acceptance suite passes all 29 of its tests through the JDBC driver, the dialect, HikariCP and Hibernate against skylite serve, in CI. Not yet: read-only transactions in the Go driver, and resolve, so a write whose outcome is lost stays unknown. Driver failover across several pods has not been tested end to end."
 
 [[items]]
 title = "Endpoint auth and SQL lockdown"
+status = "done"
+detail = "Authentication and authorisation on the query endpoint; no extension loading, no attaching arbitrary files, query time and size limits. The server authenticates every request with OIDC JWT bearer tokens, authorises it by role, and runs every client statement under the SQL policy of decision record 0007 with the statement time and result size limits of 0005. Tested with locally signed tokens, not yet with a real Entra ID tenant as the issuer."
+
+[[items]]
+title = "Signed release binaries"
+status = "done"
+detail = "A version tag publishes tar.gz archives for Linux and macOS on amd64 and arm64, a SHA256SUMS file, an SBOM for each archive and a Cosign signature of SHA256SUMS. v0.0.1 is the first release."
+
+[[items]]
+title = "Channels: batch, describe, read-only channels, resolve"
 status = "planned"
-detail = "Authentication and authorisation on the query endpoint; no extension loading, no attaching arbitrary files, query time and size limits. So far the server authenticates every request, and runs every client statement under the SQL policy of decision record 0007 with the statement time and result size limits of 0005."
+detail = "The rest of decision record 0005 on the server: batch requests, describe on a channel, read-only channels, and resolve, so that a driver can settle a write whose outcome it lost."
+
+[[items]]
+title = "Admission control"
+status = "planned"
+detail = "The rest of decision record 0005's admission control. The bound on HTTP connections, the body share of the memory budget, the SQLite connection limits and the channel bounds exist."
+
+[[items]]
+title = "Follower-owned read channels"
+status = "planned"
+detail = "Read-only channels served by a follower rather than the leader."
+
+[[items]]
+title = "Container image"
+status = "planned"
+detail = "A container image of the server, published with each release."
+
+[[items]]
+title = "Verification beyond emulators"
+status = "planned"
+detail = "Runs against the real Azure Blob Storage, S3 and Google Cloud Storage services, on a real Kubernetes cluster, with a real Entra ID tenant as token issuer, driver failover across several pods end to end, and a 24-hour soak."
