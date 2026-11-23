@@ -1295,6 +1295,7 @@ func TestStandbyManifestReadKeepsLeaseBudget(t *testing.T) {
 	}
 	st.hang.Store(true) // a candidacy now hangs on its manifest read
 	leaseReads.Store(0)
+	deadline = time.Now().Add(30 * time.Second) // its own budget, not what the stand-by left
 	for leaseReads.Load() < 5 {
 		if time.Now().After(deadline) {
 			t.Fatalf("%d lease reads while the manifest reads hang", leaseReads.Load())
