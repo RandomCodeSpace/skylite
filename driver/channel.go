@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"time"
 
@@ -14,12 +15,18 @@ import (
 
 // The driver's own waits on a write channel, from ADR 0005's defaults.
 const (
-	// resendWindow bounds the resends of one request: T of ADR 0005
-	// decision 7, the statement limit (30 s), the engine's commit bound
-	// (20 s) and the response deadline (10 s).
+	// statementTime is ADR 0005's default statement time limit.
+	statementTime = 30 * time.Second
+	// resendWindow bounds one request on a channel, its resolve included: T
+	// of ADR 0005 decision 7, the statement limit (30 s), the engine's
+	// commit bound (20 s) and the response deadline (10 s).
 	resendWindow = 60 * time.Second
-	// commitWait bounds Commit and Rollback, which take no context.
-	commitWait = resendWindow
+	// commitWait bounds a Commit whose BeginTx context had no deadline, and
+	// every Rollback: the statement time, which covers a commit's way to its
+	// commit point and the engine's 20 s bound on learning its outcome.
+	commitWait = statementTime
+	// resolveWait is ADR 0005's driver wait for a resolution.
+	resolveWait = 30 * time.Second
 	// channelIdle is ADR 0005 decision 4's reopening rule: a channel with
 	// no answer for longer is replaced before its next use, outside a
 	// transaction.
@@ -52,17 +59,27 @@ type answer struct {
 	done *wire.Done
 }
 
-// do sends a sequenced request on the connection's write channel, opening
-// one first if needed, and reads its whole answer, keeping its rows if
-// keep. A delivery without a settled answer, a transport failure, a cut or
+// do sends a sequenced request on the connection's channel, opening one
+// first if needed, and reads its whole answer, keeping its rows if keep. A
+// delivery without a settled answer, a transport failure, a cut or
 // malformed response or a refusal before acceptance, is sent again with the
 // same sequence number and body, which the server answers from its record
-// (ADR 0005 decisions 2 and 3). by bounds the whole request: its token, its
-// deliveries and their bodies. channel_lost, commit_outcome_unknown, a
-// receipt that contradicts the request or itself (read-only with rows
-// affected), an ended context and the end of by leave the outcome unknown.
-// A request refused with behind is sent again on a new channel once the
-// close of the old one proves it was never accepted.
+// (ADR 0005 decisions 2 and 3). A recorded transient refusal of a begin or
+// an autocommit write (busy, overloaded or maintenance), which ran nothing,
+// is sent again as a new request under the next sequence number. Every
+// pause grows from 100 ms to 2 s, with jitter. by bounds the whole request:
+// its token, its deliveries, their bodies and its resolve.
+//
+// After channel_lost or commit_outcome_unknown, an autocommit write or a
+// commit is resolved (ADR 0005 decision 4): committed is a success, or for
+// a write the committed, result-unavailable error; not_committed sends a
+// write once more on a new channel as a new request, and fails a commit
+// with ErrTransactionLost. Everything else leaves the outcome unknown: an
+// unsettled resolve, any other request lost with its channel, a receipt
+// that contradicts the request or itself (read-only with rows affected),
+// an ended context and the end of by. A request refused with behind is sent
+// again on a new channel once the close of the old one proves it was never
+// accepted.
 func (cn *conn) do(ctx context.Context, by time.Time, call *wire.Call, kind wire.DoneKind, keep bool) (*answer, error) {
 	if err := cn.usable(); err != nil {
 		return nil, err
@@ -71,10 +88,14 @@ func (cn *conn) do(ctx context.Context, by time.Time, call *wire.Call, kind wire
 		return nil, err
 	}
 	dctx, cancel := context.WithDeadline(ctx, by)
+	if dl, ok := ctx.Deadline(); ok && !dl.After(by) { // ctx must end first, so that the error matches it
+		cancel()
+		dctx, cancel = context.WithCancel(ctx)
+	}
 	defer cancel()
 	var body []byte
-	var last *wire.Error // the last refusal, for the unknown outcome's error
-	wait, sent := 100*time.Millisecond, false
+	var last *wire.Error              // the last refusal, for the unknown outcome's error
+	n, sent, again := 0, false, false // again: a write resolve proved not committed was sent once more
 	for {
 		if !sent {
 			var err error
@@ -107,29 +128,163 @@ func (cn *conn) do(ctx context.Context, by time.Time, call *wire.Call, kind wire
 			cn.c.raise(a.done.Txn)
 			return a, nil
 		case e.Code == CodeChannelLost || e.Code == CodeCommitOutcomeUnknown:
-			return nil, cn.unknown(ctx, call, e)
+			if !cn.resolvable(call) || ctx.Err() != nil {
+				return nil, cn.unknown(ctx, call, e)
+			}
+			res, txn := cn.resolve(dctx, call)
+			switch {
+			case res == wire.ResolutionCommitted && call.Op == wire.OpCommit:
+				return &answer{done: &wire.Done{Kind: wire.DoneCommit, Seq: call.Seq, TxnState: wire.TxnNone, Txn: txn, Wrote: true}}, nil
+			case res == wire.ResolutionCommitted:
+				return nil, &Error{
+					Code: e.Code, Message: "the channel was lost and resolve found the write committed; its result is unavailable",
+					Seq: call.Seq, Txn: txn, committed: true, is: []error{ErrResultUnavailable},
+				}
+			case res == wire.ResolutionNotCommitted && call.Op == wire.OpCommit:
+				return nil, &Error{
+					Code: e.Code, NotExecuted: true, Final: true, Seq: call.Seq,
+					Message: "the channel was lost and resolve proved the commit did not happen: the transaction was rolled back",
+					is:      []error{ErrTransactionLost},
+				}
+			case res == wire.ResolutionNotCommitted && !again && time.Now().Before(by):
+				again, sent, last = true, false, nil // proven without effect: a new request, on a new channel
+				continue
+			case res == wire.ResolutionNotCommitted:
+				return nil, &Error{
+					Code: e.Code, NotExecuted: true, Final: true, Seq: call.Seq,
+					Message: "the channel was lost and resolve proved the write did not commit; it had no effect",
+				}
+			}
+			ue := cn.unknown(ctx, call, e)
+			ue.Message += "; resolve answered " + string(res)
+			return nil, ue
 		case e.Final:
 			if e.Seq != call.Seq || e.ChannelID != cn.ch.id || !cn.failedIn(call.Op, e.TxnState) {
 				return nil, cn.unknown(ctx, call, nil)
 			}
 			cn.ch.last, cn.ch.state = time.Now(), e.TxnState
-			return nil, serverError(e)
+			cn.c.raise(e.Txn)
+			if !transient(e) || call.Op != wire.OpBegin && (call.Op != wire.OpExecute || cn.inTx) {
+				return nil, serverError(e)
+			}
+			sent, last = false, e // it ran nothing: a new request, under the next sequence number
 		case e.Code == CodeBehind && call.MinTxn > 0 && cn.closeProves(dctx, call.Seq):
 			sent = false // proven never accepted: send it again on a new channel
 			last = e
 		default:
 			last = e
 		}
-		if time.Now().Add(wait).After(by) {
+		if !backoff(dctx, by, n) {
 			return nil, cn.giveUp(ctx, call, last, sent)
 		}
-		select {
-		case <-dctx.Done():
-			return nil, cn.giveUp(ctx, call, last, sent)
-		case <-time.After(wait):
-		}
-		wait = min(2*wait, 2*time.Second)
+		n++
 	}
+}
+
+// pause is the wait after the n-th refusal or failure of a request, from
+// 0: 100 ms doubling to 2 s, less a random part of up to half, so that
+// clients refused together come back apart.
+func pause(n int) time.Duration {
+	d := min(100*time.Millisecond<<min(n, 5), 2*time.Second)
+	return d - rand.N(d/2+1) //nolint:gosec // jitter, not a secret
+}
+
+// backoff waits pause(n) and reports true, or reports false at once when
+// the pause would pass by, if set, or ctx's deadline, and as soon as ctx
+// ends.
+func backoff(ctx context.Context, by time.Time, n int) bool {
+	d := pause(n)
+	if dl, ok := ctx.Deadline(); ok && (by.IsZero() || dl.Before(by)) {
+		by = dl
+	}
+	if !by.IsZero() && time.Now().Add(d).After(by) {
+		return false
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// transient reports whether e refused a request without running it, for a
+// reason that passes: a bound or a lock that frees, a leader or a pod that
+// comes back, a follower that catches up, or maintenance that ends (ADR 0005
+// decisions 4 and 9).
+func transient(e *wire.Error) bool {
+	switch e.Code {
+	case CodeOverloaded, CodeBusy, CodeTooManyChannels, CodeNoLeader, CodeNotServing, CodeOwnerUnreachable, CodeBehind, CodeMaintenance:
+		return e.NotExecuted
+	}
+	return false
+}
+
+// resolvable reports whether call is a request whose effect resolve can
+// find: a commit or an autocommit execute, on a write channel.
+func (cn *conn) resolvable(call *wire.Call) bool {
+	return !cn.ro && (call.Op == wire.OpCommit || call.Op == wire.OpExecute && !cn.inTx)
+}
+
+// resolve settles call, whose channel was lost, within ctx and resolveWait.
+// When the answer settles it, committed or not_committed, the channel,
+// which has ended, is dropped, and after a commit the connection is
+// discarded, as ADR 0005 decision 4 asks whatever the answer.
+func (cn *conn) resolve(ctx context.Context, call *wire.Call) (wire.Resolution, int64) {
+	rctx, cancel := context.WithTimeout(ctx, resolveWait)
+	defer cancel()
+	res, txn := cn.c.resolve(rctx, cn.ch.token, call.Seq)
+	cn.c.raise(txn) // the commit, or the leader's head
+	if res == wire.ResolutionCommitted || res == wire.ResolutionNotCommitted {
+		cn.ch = nil
+		cn.lost = cn.lost || call.Op == wire.OpCommit
+	}
+	return res, txn
+}
+
+// resolve asks the leader whether sequence number seq of the channel of
+// token committed, and asks again after pending, a transient refusal or a
+// failure, until it answers committed, not_committed or unknown or ctx
+// ends. It returns the last resolution, unknown if none came, and its txn.
+func (c *Connector) resolve(ctx context.Context, token string, seq int64) (wire.Resolution, int64) {
+	res, txn := wire.ResolutionUnknown, int64(0)
+	body, err := wire.AppendCall(nil, wire.KindResolve, &wire.Call{Channel: token, Seq: seq})
+	if err != nil {
+		return res, txn
+	}
+	for n := 0; ; n++ {
+		f, err := c.post(ctx, wire.KindResolve, body, wire.DoneResolve)
+		switch {
+		case err != nil:
+		case f.Kind == wire.FrameError:
+			if !transient(f.Error) {
+				return res, txn
+			}
+		case f.Done.Resolution != wire.ResolutionPending:
+			return f.Done.Resolution, f.Done.Txn
+		default:
+			res, txn = wire.ResolutionPending, f.Done.Txn
+		}
+		if !backoff(ctx, time.Time{}, n) {
+			return res, txn
+		}
+	}
+}
+
+// post sends a request whose answer is one terminal frame, and returns it.
+func (c *Connector) post(ctx context.Context, kind wire.Kind, body []byte, done wire.DoneKind) (*wire.Frame, error) {
+	req, err := c.request(ctx, kind, body)
+	if err != nil {
+		return nil, err
+	}
+	rs, err := c.roundTrip(req, done)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rs.body.Close() }()
+	return rs.next()
 }
 
 // prepare readies the channel, gives call its sequence number and returns
@@ -241,10 +396,12 @@ func (cn *conn) deliver(req *http.Request, kind wire.DoneKind, seq int64, keep b
 	}
 }
 
-// ready opens the connection's write channel if it has none, and replaces
-// one outside a transaction that has been idle past channelIdle or whose
-// next sequence number would pass 2^62 (ADR 0005 decision 2). An open is
-// never sent again: a lost open leaves only a channel that expires unused.
+// ready opens the connection's channel if it has none, a read-only one in
+// a read-only transaction and a write one otherwise, and replaces one
+// outside a transaction that has been idle past channelIdle or whose next
+// sequence number would pass 2^62 (ADR 0005 decision 2). An open refused
+// with a transient code is sent again after a pause, within ctx; a lost
+// open is never sent again: it leaves only a channel that expires unused.
 func (cn *conn) ready(ctx context.Context) error {
 	if cn.ch != nil && (cn.inTx || time.Since(cn.ch.last) <= channelIdle && cn.ch.seq < 1<<62) {
 		return nil
@@ -253,29 +410,29 @@ func (cn *conn) ready(ctx context.Context) error {
 		cn.c.abandonLater(cn.ch.token, 0) // the old channel's close must not hold up the caller's request
 		cn.ch = nil
 	}
-	body, err := wire.AppendCall(nil, wire.KindOpen, &wire.Call{Mode: wire.ModeWrite})
+	open := &wire.Call{Mode: wire.ModeWrite}
+	if cn.ro {
+		open = &wire.Call{Mode: wire.ModeReadOnly, MinTxn: cn.c.watermark.Load()}
+	}
+	body, err := wire.AppendCall(nil, wire.KindOpen, open)
 	if err != nil {
 		return fmt.Errorf("skylite: %w", err)
 	}
-	req, err := cn.c.request(ctx, wire.KindOpen, body)
-	if err != nil {
-		return err
-	}
-	rs, err := cn.c.roundTrip(req, wire.DoneOpen)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = rs.body.Close() }()
-	f, err := rs.next()
-	if err != nil {
-		return err
-	}
-	if f.Kind == wire.FrameError {
-		return serverError(f.Error)
+	var f *wire.Frame
+	for n := 0; ; n++ {
+		if f, err = cn.c.post(ctx, wire.KindOpen, body, wire.DoneOpen); err != nil {
+			return err
+		}
+		if f.Kind != wire.FrameError {
+			break
+		}
+		if !transient(f.Error) || !backoff(ctx, time.Time{}, n) {
+			return refused(ctx, f.Error)
+		}
 	}
 	c := f.Done.Channel
-	if c.Mode != wire.ModeWrite || c.Epoch < 1 {
-		return errors.New("skylite: the open answer lacks a write channel's mode or epoch")
+	if c.Mode != open.Mode || c.Mode == wire.ModeWrite && c.Epoch < 1 {
+		return errors.New("skylite: the open answer lacks the channel's mode, or a write channel's epoch")
 	}
 	cn.c.raise(f.Done.Txn)
 	cn.ch = &channel{token: c.Token, id: c.ID, epoch: c.Epoch, last: time.Now(), state: wire.TxnNone, limits: c.Limits}
@@ -287,7 +444,7 @@ func (cn *conn) ready(ctx context.Context) error {
 // sure nothing of it still runs are sent in the background; nothing waits
 // for them. The connection is discarded. The error matches the context's
 // error only when ctx, the caller's, ended.
-func (cn *conn) unknown(ctx context.Context, call *wire.Call, last *wire.Error) error {
+func (cn *conn) unknown(ctx context.Context, call *wire.Call, last *wire.Error) *Error {
 	ch := cn.ch
 	cn.ch, cn.lost = nil, true
 	cn.c.abandonLater(ch.token, call.Seq) // the request's context may have ended; the cancel and close outlive it
@@ -378,34 +535,61 @@ func (cn *conn) Begin() (driver.Tx, error) {
 	return cn.BeginTx(context.Background(), driver.TxOptions{})
 }
 
-// BeginTx begins a write transaction on the connection's channel. Every
-// isolation level that SQLite's serializable isolation satisfies is
-// accepted and served at serializable; sql.LevelLinearizable and values
-// outside database/sql's levels are refused, and so is a read-only
-// transaction, which needs a read-only channel that the server does not
-// serve yet (ErrReadOnlyUnsupported).
+// BeginTx begins a transaction: a write transaction on the connection's
+// write channel or, with opts.ReadOnly, a read-only one on its read-only
+// channel, which reads one snapshot and holds no lock. Every isolation
+// level that SQLite's serializable isolation satisfies is accepted and
+// served at serializable; sql.LevelLinearizable and values outside
+// database/sql's levels are refused.
 func (cn *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	if opts.ReadOnly {
-		return nil, ErrReadOnlyUnsupported
-	}
 	if lvl := sql.IsolationLevel(opts.Isolation); lvl < sql.LevelDefault || lvl > sql.LevelSerializable {
 		return nil, fmt.Errorf("skylite: isolation level %v is not supported; transactions are serializable", lvl)
 	}
+	if opts.ReadOnly {
+		cn.ch, cn.other, cn.ro = cn.other, cn.ch, true
+	}
 	if _, err := cn.do(ctx, time.Now().Add(resendWindow), &wire.Call{Op: wire.OpBegin}, wire.DoneBegin, false); err != nil {
+		cn.writes()
 		return nil, err
 	}
 	cn.inTx = true
-	return tx{cn}, nil
+	by, _ := ctx.Deadline()
+	return tx{cn, by}, nil
 }
 
-// tx is the open transaction of its connection.
-type tx struct{ cn *conn }
+// writes puts the write channel back in use after a read-only transaction.
+func (cn *conn) writes() {
+	if cn.ro {
+		cn.ch, cn.other, cn.ro = cn.other, cn.ch, false
+	}
+}
 
-// Commit commits, bounded by commitWait. A failed commit has rolled the
-// transaction back; one whose outcome is unknown matches ErrOutcomeUnknown.
+// tx is the open transaction of its connection, and the deadline of the
+// context that began it, if any.
+type tx struct {
+	cn *conn
+	by time.Time
+}
+
+// Commit commits, bounded by the deadline of BeginTx's context or, without
+// one, by commitWait: database/sql passes Commit no context. A failed
+// commit has rolled the transaction back. A commit whose channel was lost
+// is resolved: it succeeds if it committed, and matches ErrTransactionLost
+// if it did not; otherwise its error matches ErrOutcomeUnknown. A read-only
+// transaction has nothing to commit, so its commit succeeds then.
 func (t tx) Commit() error {
 	defer t.cn.ended()
-	_, err := t.cn.do(context.Background(), time.Now().Add(commitWait), &wire.Call{Op: wire.OpCommit}, wire.DoneCommit, false)
+	ctx, by := context.Background(), time.Now().Add(commitWait)
+	if !t.by.IsZero() { // the caller's deadline: its end is the caller's
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, t.by)
+		defer cancel()
+		by = t.by
+	}
+	_, err := t.cn.do(ctx, by, &wire.Call{Op: wire.OpCommit}, wire.DoneCommit, false)
+	if t.cn.ro && errors.Is(err, ErrOutcomeUnknown) {
+		return nil
+	}
 	return err
 }
 
@@ -436,4 +620,15 @@ func (cn *conn) ended() {
 		cn.c.abandon(cn.ch.token, 0)
 		cn.ch, cn.lost = nil, true
 	}
+	cn.writes()
+}
+
+// refused is the error of a stateless request or an open refused with e,
+// which ran nothing; it also matches the context's error once ctx ended.
+func refused(ctx context.Context, e *wire.Error) *Error {
+	se := serverError(e)
+	if err := ctx.Err(); err != nil {
+		se.is = append(se.is, err)
+	}
+	return se
 }

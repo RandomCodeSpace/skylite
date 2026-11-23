@@ -200,7 +200,11 @@ func TestEveryErrorCode(t *testing.T) {
 		t.Run(string(c), func(t *testing.T) {
 			code.Store(c)
 			before := f.hits.Load()
-			_, err := db.Query("SELECT 1")
+			// A transient refusal is sent again until the context ends.
+			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			defer cancel()
+			_, err := db.QueryContext(ctx, "SELECT 1")
+			retried := transient(wire.NewError(c, ""))
 			var se *Error
 			if !errors.As(err, &se) {
 				t.Fatalf("err = %v; want an *Error", err)
@@ -210,8 +214,8 @@ func TestEveryErrorCode(t *testing.T) {
 				se.RequestID != "req-"+string(c) || se.SQLiteCode != 5 || se.SQLiteExtendedCode != 517 || se.Txn != 12 || se.Epoch != 3 {
 				t.Fatalf("error %+v", se)
 			}
-			if errors.Is(err, driver.ErrBadConn) || f.hits.Load()-before != 1 {
-				t.Fatalf("err %v sent %d requests; want 1 and no ErrBadConn", err, f.hits.Load()-before)
+			if hits := f.hits.Load() - before; errors.Is(err, driver.ErrBadConn) || retried != (hits > 1) {
+				t.Fatalf("err %v sent %d requests; want more than 1 only for a transient code, and no ErrBadConn", err, hits)
 			}
 			if !strings.Contains(err.Error(), string(c)) || !strings.Contains(err.Error(), "req-"+string(c)) {
 				t.Fatalf("message %q lacks the code or request id", err)
@@ -915,7 +919,9 @@ func TestPingDuringMaintenance(t *testing.T) {
 		refuse(w, ww, wire.NewError(wire.CodeMaintenance, "maintenance"))
 	})
 	var se *Error
-	if err := openDB(t, f.config()).Ping(); !errors.As(err, &se) || se.Code != CodeMaintenance || errors.Is(err, driver.ErrBadConn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond) // maintenance is sent again until it ends
+	defer cancel()
+	if err := openDB(t, f.config()).PingContext(ctx); !errors.As(err, &se) || se.Code != CodeMaintenance || errors.Is(err, driver.ErrBadConn) {
 		t.Fatalf("ping during maintenance: %v; want maintenance, not ErrBadConn", err)
 	}
 }
@@ -952,7 +958,7 @@ func TestFailedAnswersReleaseTheirBody(t *testing.T) {
 	f := newFake(t, true, func(w http.ResponseWriter, ww *wire.Writer, _ call, _ *http.Request) {
 		switch mode.Load() {
 		case 0: // the first frame is an error
-			refuse(w, ww, wire.NewError(wire.CodeBusy, "busy"))
+			refuse(w, ww, wire.NewError(wire.CodeInvalidRequest, "refused"))
 		case 1: // the first frame breaks the protocol
 			_, _ = io.WriteString(w, "[1]\n")
 		case 2: // no protocol marker
