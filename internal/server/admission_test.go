@@ -129,8 +129,8 @@ func TestControlCapacity(t *testing.T) {
 	if a := e.post(t, "channel/close", "admin", `{"channel":"`+tok+`"}`); a.code() == "overloaded" {
 		t.Errorf("another principal's close: %v", a.frames)
 	}
-	// resolve is not served on a leader yet, but is admitted to its own capacity.
-	if a := e.post(t, "resolve", "writer", `{"channel":"`+tok+`","seq":1}`); a.code() != "not_serving" {
+	// resolve is admitted to its own capacity, not to cancel's and close's.
+	if a := e.post(t, "resolve", "writer", `{"channel":"`+tok+`","seq":1}`); a.done() == nil {
 		t.Errorf("resolve with cancel and close at their bound: %v", a.frames)
 	}
 	_ = held.Close()

@@ -176,3 +176,34 @@ func TestLeadChecksOffice(t *testing.T) {
 	}
 	lead(t, st, keys, o2, testConfig())
 }
+
+// TestOpenFailsStoppedWhenTheLeaderStops: an Open whose storage reads meet
+// a leader that stopped meanwhile, as one fenced by a later candidacy's
+// manifest does, fails with ErrStopped, which a caller can tell from a
+// failure of the database, not with the I/O error SQLite turns it into.
+func TestOpenFailsStoppedWhenTheLeaderStops(t *testing.T) {
+	st, keys, o := newDatabase(t, 4096)
+	cfg := testConfig()
+	cfg.Cache = NewCache(0) // every page read reaches storage
+	l := lead(t, st, keys, o, cfg)
+	c := open(t, l)
+	mustRun(t, c, "CREATE TABLE t(x)")
+	mustRun(t, c, "INSERT INTO t VALUES (1)")
+	l.tryCheckpoint() // the base version is the head: pages come from the log
+	gate := newGate()
+	st.setRule(nth("getrange", isCommit, 1, fault{before: gate}))
+	opened := make(chan error, 1)
+	go func() {
+		c, err := l.Open(context.Background())
+		if err == nil {
+			_ = c.Close()
+		}
+		opened <- err
+	}()
+	<-gate.reached
+	_ = l.stop(fmt.Errorf("%w: the manifest changed under the leader", ErrFenced))
+	gate.open()
+	if err := <-opened; !errors.Is(err, ErrStopped) {
+		t.Fatalf("Open across the leader's stop: %v", err)
+	}
+}

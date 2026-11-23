@@ -1164,7 +1164,7 @@ func TestUnsupportedOpsAndPing(t *testing.T) {
 	if a := op(3, "ping"); a.status != 200 || num(a.done(), "txn") != int64(e.leader(t).Head()) || a.done()["txn_state"] != "none" || num(a.done(), "seq") != 3 { //nolint:gosec // small
 		t.Errorf("ping: %d %v", a.status, a.frames)
 	}
-	if a := e.post(t, "resolve", "writer", fmt.Sprintf(`{"channel":%q,"seq":4}`, tok)); a.code() != "not_serving" {
+	if a := e.post(t, "resolve", "writer", fmt.Sprintf(`{"channel":%q,"seq":4}`, tok)); a.done()["resolution"] != "pending" {
 		t.Errorf("resolve: %v", a.frames)
 	}
 	if a := e.post(t, "channel/cancel", "writer", fmt.Sprintf(`{"channel":%q,"seq":1,"x":%q}`, tok, strings.Repeat("a", 4100))); a.status != http.StatusRequestEntityTooLarge {

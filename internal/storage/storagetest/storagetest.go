@@ -93,6 +93,7 @@ import (
 	"io"
 	"math"
 	"math/rand/v2"
+	"net"
 	"runtime"
 	"slices"
 	"strings"
@@ -2377,4 +2378,66 @@ func testBodyErrorText(t reporter, s storage.Store) {
 	}
 	expectContent(t, s, "k", "x", v)
 	expectMissing(t, s, "new")
+}
+
+// Silent returns the host:port of a server that accepts connections and
+// reads what they send but never answers, and lowers
+// storage.ResponseHeaderTimeout to d until the test ends, so that a backend
+// opened after it fails its requests to the server within about d. A test
+// that calls it must not run in parallel with others.
+func Silent(t *testing.T, d time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var conns []net.Conn
+	var closed bool
+	wg.Go(func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			if conns = append(conns, c); closed {
+				_ = c.Close()
+			}
+			mu.Unlock()
+			wg.Go(func() { _, _ = io.Copy(io.Discard, c) })
+		}
+	})
+	prev := storage.ResponseHeaderTimeout
+	storage.ResponseHeaderTimeout = d
+	t.Cleanup(func() {
+		storage.ResponseHeaderTimeout = prev
+		_ = ln.Close()
+		mu.Lock()
+		closed = true
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		mu.Unlock()
+		wg.Wait()
+	})
+	return ln.Addr().String()
+}
+
+// Returns runs call, which must return within limit, and returns its error.
+func Returns(t *testing.T, limit time.Duration, call func(ctx context.Context) error) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- call(ctx) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(limit):
+		cancel()
+		t.Fatalf("the call did not return within %v; cancelled, it returned %v", limit, <-done)
+		return nil
+	}
 }

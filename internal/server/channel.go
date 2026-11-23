@@ -32,9 +32,9 @@ import (
 // afterwards. A begin waits for the lock and runs BEGIN IMMEDIATE on a
 // fresh connection; the transaction holds both until its commit, its
 // rollback, or its abort by SQLite, a transaction limit or the engine, and
-// its connection is then closed. Batch, channel describe, read-only
-// channels and resolve are not built: batch and describe are refused with
-// not_serving before acceptance.
+// its connection is then closed. Batch, channel describe and read-only
+// channels are not built: batch and describe are refused with not_serving
+// before acceptance. Resolve is in resolve.go.
 
 // Channel bounds of ADR 0005 decision 9, and this server's shares of the
 // memory budget for channels: a receipt per channel, held result rows and
@@ -64,10 +64,11 @@ type chLimits struct {
 	waiters, waitersBy            int
 	held, replay                  int64
 	sweep                         time.Duration
+	resolveReads                  int // header reads one resolve may start (resolve.go)
 }
 
 func defaultChLimits() chLimits {
-	return chLimits{maxChannels, maxChannelsDB, maxChannelsPrincipal, maxWaiters, maxWaitersBy, heldShare, replayShare, sweepInterval}
+	return chLimits{maxChannels, maxChannelsDB, maxChannelsPrincipal, maxWaiters, maxWaitersBy, heldShare, replayShare, sweepInterval, headerReadsResolve}
 }
 
 // table holds the write channels of one leader, the database's leader on
@@ -80,6 +81,11 @@ type table struct {
 	by     map[string]int      // channels per principal
 	replay int64               // retained replay data
 	lock   writeLock
+	hdrs   map[uint64]*header // commit headers below the engine's index floor, read for resolves
+	hdrSem chan struct{}      // header reads in flight for resolves
+	// reading holds, per principal, the channel its one resolve that reads
+	// headers from storage closes when it is done.
+	reading map[string]chan struct{}
 }
 
 // channel is one write channel.
@@ -162,7 +168,7 @@ func (s *Server) table(d *database, leader *engine.Leader) *table {
 		}
 		s.endTable(t)
 	}
-	d.chans = &table{leader: leader, office: st.Office, chans: map[string]*channel{}, by: map[string]int{}, lock: writeLock{by: map[string]int{}}}
+	d.chans = &table{leader: leader, office: st.Office, chans: map[string]*channel{}, by: map[string]int{}, lock: writeLock{by: map[string]int{}}, hdrs: map[uint64]*header{}, hdrSem: make(chan struct{}, headerReadsDB), reading: map[string]chan struct{}{}}
 	return d.chans
 }
 
@@ -222,8 +228,13 @@ func (s *Server) sweep(ctx context.Context) {
 		txnIdle := time.Duration(s.limits.WriteTxnIdleMS) * time.Millisecond
 		life := time.Duration(s.limits.WriteTxnLifetimeMS) * time.Millisecond
 		for _, d := range s.dbs {
-			cur := d.leader()
+			if s.sweepGap != nil {
+				s.sweepGap()
+			}
 			s.chMu.Lock()
+			// The leader is read with s.chMu held: a table that table
+			// created for a leader taking office since is never ended here.
+			cur := d.leader()
 			if t := d.chans; t != nil && t.leader != cur {
 				s.endTable(t)
 				d.chans = nil

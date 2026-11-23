@@ -503,7 +503,8 @@ func (l *Leader) err() error {
 // storage reads fails with an error that matches ErrNotCommitted and
 // ErrRetry, whatever ended it: SQLite reports a failed read as an I/O error
 // without its cause, so a storage error during maintenance is told to retry
-// too.
+// too. One that fails without a panic on a leader that has stopped fails
+// with an error that matches ErrStopped, for the same reason.
 func (l *Leader) Open(ctx context.Context) (_ *Conn, err error) {
 	l.cmu.Lock()
 	if l.stopped != nil {
@@ -540,7 +541,11 @@ func (l *Leader) Open(ctx context.Context) (_ *Conn, err error) {
 		if err == nil {
 			return
 		}
-		if p == nil && octx.Err() != nil && ictx.Err() == nil {
+		switch stopped := l.err(); {
+		case p == nil && stopped != nil:
+			// SQLite reports the stop as an I/O error without its cause.
+			err = fmt.Errorf("%w: the Open failed: %w", stopped, err)
+		case p == nil && octx.Err() != nil && ictx.Err() == nil:
 			err = fmt.Errorf("%w: %w: maintenance interrupted the Open: %w", ErrNotCommitted, ErrRetry, err)
 		}
 		// A connection that panicked inside sqlite3.Open cannot be closed.
