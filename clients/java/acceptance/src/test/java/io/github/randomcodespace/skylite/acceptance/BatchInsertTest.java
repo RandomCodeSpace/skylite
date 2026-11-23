@@ -8,6 +8,7 @@ import jakarta.persistence.EntityManagerFactory;
 import java.sql.BatchUpdateException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.util.List;
 import java.util.stream.IntStream;
 import javax.sql.DataSource;
@@ -16,6 +17,7 @@ import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /** Several hundred inserts and deletes sent as JDBC batches, and a batch that fails inside a transaction. */
 @SpringBootTest(properties = "spring.jpa.properties.hibernate.generate_statistics=true")
@@ -25,6 +27,7 @@ class BatchInsertTest extends AcceptanceTestBase {
 
     @Autowired EntityManagerFactory emf;
     @Autowired DataSource dataSource;
+    @Autowired TransactionTemplate tx;
 
     @Test
     void insertsAreBatched() {
@@ -50,11 +53,15 @@ class BatchInsertTest extends AcceptanceTestBase {
     @Test
     void deletesAreBatched() {
         SessionFactory sf = emf.unwrap(SessionFactory.class);
-        List<Event> saved = events.saveAll(IntStream.range(0, ROWS).mapToObj(Event::new).toList());
+        events.saveAll(IntStream.range(0, ROWS).mapToObj(Event::new).toList());
         Statistics stats = sf.getStatistics();
-        stats.clear();
 
-        events.deleteAll(saved.subList(0, ROWS - 1)); // one transaction, an entity delete per row
+        // Loaded in the deleting transaction, so that Spring Data's find before each delete selects nothing.
+        tx.executeWithoutResult(status -> {
+            List<Event> loaded = events.findAll();
+            stats.clear();
+            events.deleteAll(loaded.stream().filter(e -> e.getSeq() != ROWS - 1).toList());
+        });
 
         assertThat(stats.getEntityDeleteCount()).isEqualTo(ROWS - 1);
         assertThat(stats.getPrepareStatementCount()).isLessThanOrEqualTo(ROWS / BATCH_SIZE + 1);
@@ -76,9 +83,11 @@ class BatchInsertTest extends AcceptanceTestBase {
                     insert.addBatch();
                 }
                 boolean skylite = c.getMetaData().getDriverName().startsWith("skylite");
-                assertThatThrownBy(insert::executeBatch).isInstanceOfSatisfying(BatchUpdateException.class, e -> {
-                    if (skylite) { // what sqlite-jdbc reports is not checked
-                        assertThat(e.getUpdateCounts()).containsExactly(1, 1);
+                // sqlite-jdbc raises the entry's own exception, not a BatchUpdateException, so only skylite's is checked
+                assertThatThrownBy(insert::executeBatch).isInstanceOfSatisfying(SQLException.class, e -> {
+                    if (skylite) {
+                        assertThat((Object) e).isInstanceOf(BatchUpdateException.class);
+                        assertThat(((BatchUpdateException) e).getUpdateCounts()).containsExactly(1, 1);
                     }
                 });
             } finally {
