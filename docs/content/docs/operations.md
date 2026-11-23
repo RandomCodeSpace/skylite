@@ -45,7 +45,7 @@ The leader holds a 60-second lease on each database and renews it every 20 secon
 | The leader shuts down cleanly (SIGTERM) | It stops accepting connections, finishes running requests for up to a minute, then releases its leases. A standby sees the released lease within about 5 seconds and takes office. |
 | The leader crashes or is cut off | Its lease expires within 60 seconds of its last renewal; then a standby takes office. A deposed leader cannot commit: every commit and manifest update is a conditional write that fails once another leader has taken office. |
 
-Taking office does not download the database: the new leader reads pages from storage as it needs them.
+Taking office does not download the database: the new leader reads pages from storage as it needs them. It does read the commits written since the last compaction, up to 32 at a time, and reads them once. Measured on Azure Blob Storage, a log of 2,000 uncompacted commits took about 2.3 seconds from the start of the takeover to a serving leader. A standby with a follower keeps serving reads from it until its leader serves.
 
 ### What clients see
 

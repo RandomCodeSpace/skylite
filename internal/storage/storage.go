@@ -327,7 +327,18 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
+
+// ResponseHeaderTimeout is how long the HTTP transports of the network
+// backends wait for a response's headers once a request is written, so that
+// a service that accepts a connection and goes silent fails the request
+// instead of hanging it until its context ends. Such a failure of a mutation
+// is an unknown outcome, as any timeout after sending. 10 s leaves room
+// within the engine's 20 s bound on resolving a commit (ADR 0005,
+// requirement 14) for a resolving read, and within a lease's 60 s life for
+// renewals tried again every 20 s (ADR 0004). Tests lower it.
+var ResponseHeaderTimeout = 10 * time.Second
 
 // MaxKeyLen is the maximum key length in bytes. 1024 is the smallest limit
 // among Azure Blob Storage, Amazon S3 and Google Cloud Storage.

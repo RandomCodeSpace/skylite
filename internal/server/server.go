@@ -8,9 +8,9 @@
 // and cancel on leaders (see channel.go). Each configured database has an
 // office loop (internal/office). With a peer listener configured, a request
 // this server cannot serve is forwarded one hop to the pod that can (see
-// forward.go). resolve is authenticated, forwarded to the leader if this
-// server does not lead, and answered there with not_serving; GET status is
-// authenticated and answered with not_serving on every pod. Of the
+// forward.go). resolve and GET status are answered by the leader (see
+// resolve.go); resolve is forwarded to it, and another pod answers status
+// with not_serving. Of the
 // admission control of ADR 0005 decision 9, the bound
 // on HTTP connections, the body share of the memory budget, the SQLite
 // connection limits and the channel bounds are implemented.
@@ -134,7 +134,12 @@ type Server struct {
 	nChans       int   // channels on this server, ended but unsettled ones included
 	held, replay int64 // held result rows, retained replay data
 	chl          chLimits
-	afterCommit  func() error // nil; a test sets it to fail a write after its COMMIT
+	afterCommit  func() error  // nil; a test sets it to fail a write after its COMMIT
+	hdrSem       chan struct{} // header reads in flight for resolves (resolve.go)
+	// nil; a test sets them to act between the sweep's start on a database
+	// and its look at the channel table, and between a resolve's step 1 and
+	// its observation.
+	sweepGap, resolveGap func()
 
 	bodyMu              sync.Mutex
 	bodyUsed, bodyShare int64            // request bodies' share of the memory budget, charged at 8 × Content-Length
@@ -198,7 +203,7 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 	s := &Server{
 		cfg: cfg, log: log, guard: g, store: st, limits: l,
 		policy: policy, pool: newPool(maxDatabases - len(cfg.Databases)), engine: engineConfig(), bodyShare: bodyShare, bodyBy: map[string]int64{}, statementTime: stmt,
-		instance: rand.Text(), chl: defaultChLimits(),
+		instance: rand.Text(), chl: defaultChLimits(), hdrSem: make(chan struct{}, headerReadsPod),
 		headerDeadline: headerDeadline, bodyDeadline: bodyDeadline, responseDeadline: time.Duration(l.ResponseMS) * time.Millisecond,
 		idleTimeout: idleTimeout, createTimeout: createTimeout, shutdownTimeout: shutdownTimeout, hopSlack: hopSlack, maxConns: maxConns,
 	}
@@ -279,6 +284,7 @@ func openAzure(a *Azure) (storage.Store, error) {
 	}
 	tr := dt.Clone()
 	tr.IdleConnTimeout = azureIdleConnTimeout
+	tr.ResponseHeaderTimeout = storage.ResponseHeaderTimeout
 	// A redirect would resend a signed request, body included, elsewhere.
 	hc := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	opts := &container.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: hc}}
@@ -749,8 +755,15 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	forward := !hop && s.peer != nil && d != nil && kind != wire.KindPut && leader == nil
 	stateless := kind == wire.KindQuery || kind == wire.KindDescribe
 	switch {
-	case kind == wire.KindStatus || kind == wire.KindResolve && !forward:
-		return nil, wire.NewError(wire.CodeNotServing, "resolve and status are not served in this version"), false
+	case kind == wire.KindStatus && leader == nil:
+		// Only a POST with a body is forwarded (forward.go).
+		return nil, wire.NewError(wire.CodeNotServing, "status is answered by the database's leader, and this server does not lead it"), false
+	case kind == wire.KindStatus:
+		if r.ContentLength != 0 || len(r.TransferEncoding) > 0 || r.Header.Get("Transfer-Encoding") != "" {
+			return nil, wire.NewError(wire.CodeInvalidRequest, "a GET carries no body"), false
+		}
+		done, e = s.status(d, leader)
+		return done, e, true
 	case kind != wire.KindPut && leader == nil && !forward && (follower == nil || !stateless):
 		return nil, wire.NewError(wire.CodeNotServing, "this server does not lead the database or serve this request on a follower"), false
 	}
@@ -775,10 +788,11 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 	if budget > 0 && budget < s.statementTime.Milliseconds() && (req.TimeoutMS == 0 || budget < req.TimeoutMS) {
 		req.TimeoutMS = budget // the forwarding pod's budget only lowers the statement time
 	}
-	// Writes need the write role (ADR 0006): a write open, and every
-	// request on a write channel but close and cancel, which only stop
-	// work, checked again on each, since a token's claims can change.
-	if kind == wire.KindChannel || kind == wire.KindOpen && req.Mode == wire.ModeWrite {
+	// Writes need the write role (ADR 0006): a write open, every request
+	// on a write channel but close and cancel, which only stop work,
+	// checked again on each, since a token's claims can change, and a
+	// resolve, which needs what a write open needs (ADR 0005 decision 4).
+	if kind == wire.KindChannel || kind == wire.KindResolve || kind == wire.KindOpen && req.Mode == wire.ModeWrite {
 		if e := authorize(auth.RoleWrite); e != nil {
 			return nil, e, true
 		}
@@ -804,6 +818,8 @@ func (s *Server) handle(st *stream, r *http.Request, id string, log *slog.Logger
 		done, e = s.closeChannel(d, leader, req, who)
 	case wire.KindCancel:
 		done, e = s.cancelRequest(d, leader, req, who, id)
+	case wire.KindResolve:
+		done, e = s.resolve(r.Context(), d, leader, req, who)
 	default:
 		done, e = s.statement(r.Context(), st, d, leader, follower, req, who, log)
 		// A follower that cannot serve the read before its answer starts

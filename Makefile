@@ -103,6 +103,13 @@ integration-gcs:
 	if [ $$rc -ne 0 ]; then echo "integration-gcs: last fake-gcs-server log lines:" >&2; docker logs --tail 50 "$$name" >&2 || true; fi; \
 	exit $$rc
 
+# The load generator (TestPerf in driver/acceptance) against a skylite serve
+# built from this tree, on a local store, or on Azure with SKYLITE_PERF_PREFIX
+# set (see CONTRIBUTING.md). It prints a PERF line per phase.
+.PHONY: perf
+perf:
+	cd driver/acceptance && SKYLITE_PERF=1 go test -count=1 -v -timeout 30m -run '^TestPerf$$' .
+
 # Documentation site (Hugo). Run from the repository root.
 #
 #   make docs-gen        write generated reference pages (docs/content/docs/reference/cli.md)

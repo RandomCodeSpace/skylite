@@ -121,6 +121,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
@@ -169,9 +170,12 @@ type Store struct {
 
 var _ storage.Store = (*Store)(nil)
 
-// New returns a Store for cfg. It sends no request.
+// New returns a Store for cfg. It sends no request. Its HTTP client waits
+// storage.ResponseHeaderTimeout for each response's headers.
 func New(cfg Config) (*Store, error) {
-	return newStore(cfg, nil)
+	return newStore(cfg, awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+		tr.ResponseHeaderTimeout = storage.ResponseHeaderTimeout
+	}))
 }
 
 // newStore is New with the HTTP client tests put between the SDK and the
