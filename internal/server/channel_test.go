@@ -1148,20 +1148,18 @@ func TestUnsupportedOpsAndPing(t *testing.T) {
 	op := func(seq int64, op string) answer {
 		return e.post(t, "channel", "writer", fmt.Sprintf(`{"channel":%q,"seq":%d,"op":%q}`, tok, seq, op))
 	}
-	for _, o := range []string{"batch", "describe"} {
-		if a := op(1, o); a.status != http.StatusServiceUnavailable || a.code() != "not_serving" {
+	// A batch or describe without its fields is accepted and recorded.
+	for i, o := range []string{"batch", "describe"} {
+		if a := op(int64(i+1), o); a.status != 200 || a.code() != "invalid_request" || a.err()["final"] != true || a.err()["not_executed"] != true {
 			t.Errorf("%s: %d %v", o, a.status, a.frames)
 		}
 	}
-	if s, _ := e.chState(tok); s.last != 0 {
-		t.Errorf("a refused op took sequence number %d", s.last)
-	}
 	for i, o := range []string{"commit", "rollback"} {
-		if a := op(int64(i+1), o); a.status != 200 || a.code() != "invalid_state" || a.err()["final"] != true || a.err()["not_executed"] != true {
+		if a := op(int64(i+3), o); a.status != 200 || a.code() != "invalid_state" || a.err()["final"] != true || a.err()["not_executed"] != true {
 			t.Errorf("%s with no transaction: %d %v", o, a.status, a.frames)
 		}
 	}
-	if a := op(3, "ping"); a.status != 200 || num(a.done(), "txn") != int64(e.leader(t).Head()) || a.done()["txn_state"] != "none" || num(a.done(), "seq") != 3 { //nolint:gosec // small
+	if a := op(5, "ping"); a.status != 200 || num(a.done(), "txn") != int64(e.leader(t).Head()) || a.done()["txn_state"] != "none" || num(a.done(), "seq") != 5 { //nolint:gosec // small
 		t.Errorf("ping: %d %v", a.status, a.frames)
 	}
 	if a := e.post(t, "resolve", "writer", fmt.Sprintf(`{"channel":%q,"seq":4}`, tok)); a.done()["resolution"] != "pending" {
