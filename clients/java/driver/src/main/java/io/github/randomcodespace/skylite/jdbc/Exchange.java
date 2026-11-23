@@ -118,14 +118,15 @@ final class Exchange implements FrameReader.Frames {
     /**
      * Sends a request of a channel to path. No timer stops a request that carries an outcome: a write's answer is its
      * outcome, and the server ends the statement at its timeout_ms. The network timeout, or else waitMillis, bounds
-     * the wait for the headers. A cancel or a close, whose answer the driver only waits for, is stopped waitMillis
-     * after it is sent, body included.
+     * the wait for the headers. A cancel, a close or a resolve, which changes nothing, is stopped waitMillis after it
+     * is sent, body included.
      */
     static Exchange channel(Session s, String path, FrameReader.Kind kind, byte[] body, long waitMillis, Owner owner)
             throws SQLException {
         int network = s.networkTimeoutMillis();
         String token = s.token();
-        boolean bounded = kind == FrameReader.Kind.CANCEL || kind == FrameReader.Kind.CLOSE;
+        boolean bounded = kind == FrameReader.Kind.CANCEL || kind == FrameReader.Kind.CLOSE
+                || kind == FrameReader.Kind.RESOLVE;
         return start(s, path, kind, body, token, owner, 0, network, bounded ? waitMillis : 0,
                 Duration.ofMillis(network > 0 ? network : waitMillis));
     }

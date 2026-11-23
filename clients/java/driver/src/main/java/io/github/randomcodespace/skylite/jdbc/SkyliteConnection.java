@@ -29,8 +29,8 @@ import java.util.concurrent.Executor;
 /**
  * A connection reads in auto-commit through stateless {@code query} requests, and writes through one write channel
  * of its own, opened on its first write and closed with it. With auto-commit off, the first statement begins a
- * transaction on the channel and every statement runs in it until commit or rollback; a read-only connection runs
- * every statement as a stateless read instead, each at the latest committed state. Savepoints are statements of the
+ * transaction on the channel and every statement runs in it until commit or rollback; on a read-only connection the
+ * transaction runs on a read-only channel instead, on one snapshot. Savepoints are statements of a write
  * transaction, sent as SAVEPOINT, ROLLBACK TO and RELEASE.
  */
 final class SkyliteConnection implements Connection, Exchange.Owner {
@@ -43,6 +43,7 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     private volatile boolean closed;
     private volatile boolean autoCommit = true;
     private volatile boolean readOnly;
+    private volatile boolean networkTimedOut; // closed by its network timeout, not by its user
     private final List<SkyliteSavepoint> savepoints = new ArrayList<>(); // oldest first; guarded by channel
     private long savepointTxn; // Channel.transaction() the savepoints belong to; guarded by channel
     private int savepointIds; // guarded by channel
@@ -57,9 +58,12 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         return channel;
     }
 
-    /** Whether a statement runs on the channel: with auto-commit off, or for an update, unless read-only. */
+    /**
+     * Whether a statement runs on a channel: with auto-commit off, on the read-only channel when read-only, or for an
+     * update unless read-only.
+     */
     boolean onChannel(boolean update) {
-        return !readOnly && (update || !autoCommit);
+        return !autoCommit || (update && !readOnly);
     }
 
     /** Runs a statement on the channel, in the transaction when auto-commit is off. */
@@ -275,8 +279,12 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
         channel.close();
     }
 
-    /** {@link #close}, except that the channel's close, which waits for its answer, runs on another thread. */
+    /**
+     * Closes the connection when its network timeout passed: as {@link #close}, except that the channel's close, which
+     * waits for its answer, runs on another thread, and a request whose answer was lost may still be settled.
+     */
     void closeLater() {
+        networkTimedOut = true;
         release();
         Exchange.async(channel::close);
     }
@@ -287,6 +295,11 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
      */
     void discard() {
         release();
+    }
+
+    /** Whether the network timeout closed the connection. */
+    boolean networkTimedOut() {
+        return networkTimedOut;
     }
 
     /** Marks the connection closed and closes its statements and validations, none of which waits. */
@@ -340,8 +353,9 @@ final class SkyliteConnection implements Connection, Exchange.Owner {
     }
 
     /**
-     * A read-only connection sends no writes: every statement is a stateless read, and one that is not a pure read
-     * fails with SQLState 25006. Refused while a transaction is open.
+     * A read-only connection sends no writes: in auto-commit every statement is a stateless read, and with auto-commit
+     * off its transactions run on a read-only channel, each on one snapshot. A write fails with SQLState 25006.
+     * Refused while a transaction is open.
      */
     @Override
     public void setReadOnly(boolean readOnly) throws SQLException {

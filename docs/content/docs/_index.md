@@ -24,7 +24,7 @@ What exists and is tested on every pull request:
 
 - The server: database creation, reads, autocommit writes and transactions, leader election with fencing, failover, follower reads, and forwarding between servers.
 - The Go driver, through a GORM acceptance suite against a real server.
-- The JDBC driver and Hibernate dialect, through a 29-test Spring Data JPA acceptance suite against a real server.
+- The JDBC driver and Hibernate dialect, through a 33-test Spring Data JPA acceptance suite against a real server.
 - The storage backends, against emulators: Azurite (Azure), RustFS (S3) and fake-gcs-server (Google Cloud Storage).
 
 Also verified by hand: the Azure backend's integration tests and the GORM suite against a real Azure storage account, authenticated with an Entra ID service principal.

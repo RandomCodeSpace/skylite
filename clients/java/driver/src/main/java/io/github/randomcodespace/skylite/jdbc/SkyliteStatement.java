@@ -46,7 +46,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     private String keyLabel;
     private final List<String> batch = new ArrayList<>();
     static final String ROWID_LABEL = "last_insert_rowid()";
-    private static final Done END = new Done(0, false, 0, 0, 0, 0, null, null, 0, null, false);
+    private static final Done END = new Done(0, false, 0, 0, 0, 0, null, null, 0, null, false, 0, null, null);
 
     SkyliteStatement(SkyliteConnection conn) {
         this.conn = conn;
@@ -147,31 +147,52 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         return stateless(sql, params, keyLabel);
     }
 
+    /**
+     * Sends a stateless query, and again after a pause, with the watermark read again, while it is refused before it
+     * ran with a code that may pass later ({@link Retry}), within the query timeout, or the default budget without
+     * one. Each send's timeout is what is left of it.
+     */
     private SkyliteResultSet stateless(String sql, List<Object> params, String keyLabel) throws SQLException {
         Session s = conn.session();
-        byte[] body = Request.query(sql, params, s.watermark(), queryTimeout * 1000L);
-        Exchange ex = Exchange.send(s, FrameReader.Kind.QUERY, body, queryTimeout, this);
-        switch (ex.next()) {
-            case Columns c -> {
-                return publish(new SkyliteResultSet(this, ex, c.columns(), maxRows, fetchSize));
-            }
-            case Done d -> {
-                ex.close();
-                s.raise(d.txn());
-                updateCount = d.rowsAffected();
-                return null;
-            }
-            case Failure e -> {
-                ex.close();
-                if (e.code().equals("needs_channel") && !conn.readOnly() && !statelessOnly) {
-                    return onChannel(sql, params, keyLabel); // refused before it ran
+        long deadline = Retry.deadline(queryTimeout * 1000L);
+        for (int attempt = 0;; ) {
+            long ms = queryTimeout > 0 ? attempt == 0 ? queryTimeout * 1000L : Math.max(1, Retry.left(deadline)) : 0;
+            byte[] body = Request.query(sql, params, s.watermark(), ms);
+            checkBody(body.length, conn.channel().bodyLimit());
+            Exchange ex = Exchange.send(s, FrameReader.Kind.QUERY, body, (int) Math.ceilDiv(ms, 1000), this);
+            switch (ex.next()) {
+                case Columns c -> {
+                    return publish(new SkyliteResultSet(this, ex, c.columns(), maxRows, fetchSize));
                 }
-                throw Errors.map(e);
+                case Done d -> {
+                    ex.close();
+                    s.raise(d.txn());
+                    updateCount = d.rowsAffected();
+                    return null;
+                }
+                case Failure e -> {
+                    ex.close();
+                    if (e.code().equals("needs_channel") && !conn.readOnly() && !statelessOnly) {
+                        return onChannel(sql, params, keyLabel); // refused before it ran
+                    }
+                    if (Retry.refused(e) && Retry.pause(attempt++, deadline)) {
+                        continue;
+                    }
+                    throw Errors.map(e);
+                }
+                case null, default -> {
+                    ex.close();
+                    throw Errors.transport("malformed response: an unexpected first frame", null);
+                }
             }
-            case null, default -> {
-                ex.close();
-                throw Errors.transport("malformed response: an unexpected first frame", null);
-            }
+        }
+    }
+
+    /** Refuses a body above the server's advertised limit, when one is known, before it is sent. */
+    static void checkBody(long length, long limit) throws SQLException {
+        if (limit > 0 && length > limit) {
+            throw new SQLNonTransientException("skylite: the request of " + length + " bytes is above the server's "
+                    + "request body limit of " + limit + " bytes", "54000");
         }
     }
 
@@ -194,14 +215,7 @@ class SkyliteStatement implements Statement, Exchange.Owner {
             }
         }
         if (d.dataOmitted()) {
-            // ADR 0005 decision 3: the base class, which Spring and Hibernate treat as non-transient.
-            if ("none".equals(d.txnState())) {
-                throw new SQLException("skylite: the statement committed as transaction " + d.txn() + ", but its "
-                        + "answer was lost in transport and the server kept no copy of its result", "SKR01", 0);
-            }
-            throw new SQLException("skylite: the statement ran inside the transaction, which is still open with its "
-                    + "effects, but its answer was lost in transport and the server kept no copy of its result",
-                    "SKR02", 0);
+            throw Channel.omitted(d);
         }
         if (frames.get(0) instanceof Columns c) {
             return publish(new SkyliteResultSet(this, FrameReader.Frames.of(frames.subList(1, frames.size())),
@@ -628,24 +642,49 @@ class SkyliteStatement implements Statement, Exchange.Owner {
         return out;
     }
 
-    /**
-     * Runs the batch's statements one after another, each a request of its own: the server does not serve batch yet.
-     * The first failure stops it with a {@link BatchUpdateException} holding the counts of those before it.
-     */
+    /** Runs the batch's statements as one channel batch of statements, as {@link #runBatch} says. */
     @Override
     public long[] executeLargeBatch() throws SQLException {
         checkOpen();
-        List<String> sqls = List.copyOf(batch);
-        batch.clear();
-        long[] counts = new long[sqls.size()];
-        for (int i = 0; i < counts.length; i++) {
-            try {
-                counts[i] = executeLargeUpdate(sqls.get(i));
-            } catch (SQLException e) {
-                throw batchFailed(e, java.util.Arrays.copyOf(counts, i));
+        List<String> entries = new ArrayList<>(batch.size());
+        try {
+            for (String sql : batch) {
+                entries.add(Request.statement(sql));
+            }
+        } finally {
+            batch.clear();
+        }
+        return runBatch(null, entries, null);
+    }
+
+    /**
+     * Runs a batch on the channel ({@link Channel#batch}): sql once per entry of param_sets, or the statements in
+     * entries when sql is null. Outside a transaction it is one autocommit write, all or nothing; inside one it stops
+     * at its first failure. A failure is a {@link BatchUpdateException} holding the counts of the entries that ran,
+     * none for an autocommit batch, whose failure leaves nothing, and its cause as its next exception. With keyLabel,
+     * {@link #getGeneratedKeys} returns the rowid of each entry that ran and inserted a row.
+     */
+    long[] runBatch(String sql, List<String> entries, String keyLabel) throws SQLException {
+        closeResult();
+        closeKeys();
+        begin();
+        generatedKeys = List.of();
+        this.keyLabel = keyLabel;
+        if (entries.isEmpty()) {
+            return new long[0];
+        }
+        Channel.Batched b = conn.channel().batch(sql, entries, queryTimeout, this);
+        List<Long> keys = new ArrayList<>();
+        for (int i = 0; keyLabel != null && sql != null && inserts(sql) && i < b.rows().length; i++) {
+            if (b.rows()[i] > 0) {
+                keys.add(b.rowids()[i]);
             }
         }
-        return counts;
+        generatedKeys = keys;
+        if (b.failure() != null) {
+            throw batchFailed(b.failure(), b.rows());
+        }
+        return b.rows();
     }
 
     static BatchUpdateException batchFailed(SQLException e, long[] counts) {
@@ -658,15 +697,6 @@ class SkyliteStatement implements Statement, Exchange.Owner {
     public Connection getConnection() throws SQLException {
         checkOpen();
         return conn;
-    }
-
-    /** The rowids of a batch's inserts, for {@link #getGeneratedKeys}. */
-    List<Long> generatedKeys() {
-        return generatedKeys;
-    }
-
-    void generatedKeys(List<Long> keys) {
-        generatedKeys = keys;
     }
 
     /**

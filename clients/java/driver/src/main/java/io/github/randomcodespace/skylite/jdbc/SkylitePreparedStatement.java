@@ -124,17 +124,28 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
         List<Column> cols = List.of();
         int params = 0;
         begin();
-        try (Exchange ex = Exchange.send(
-                s, FrameReader.Kind.DESCRIBE, Request.describe(sql, s.watermark()), getQueryTimeout(), this)) {
-            Frame f;
-            while ((f = ex.next()) != null) {
-                switch (f) {
-                    case Columns c -> cols = c.columns();
-                    case Params p -> params += p.names().size();
-                    case Done d -> s.raise(d.txn());
-                    case Failure e -> throw Errors.map(e);
-                    default -> throw Errors.transport("malformed response: a row in a describe answer", null);
+        long deadline = Retry.deadline(getQueryTimeout() * 1000L);
+        for (int attempt = 0;; ) { // sent again as a query is, after a refusal that may pass later
+            Failure refused = null;
+            try (Exchange ex = Exchange.send(
+                    s, FrameReader.Kind.DESCRIBE, Request.describe(sql, s.watermark()), getQueryTimeout(), this)) {
+                Frame f;
+                while ((f = ex.next()) != null) {
+                    switch (f) {
+                        case Columns c -> cols = c.columns();
+                        case Params p -> params += p.names().size();
+                        case Done d -> s.raise(d.txn());
+                        case Failure e when Retry.refused(e) -> refused = e;
+                        case Failure e -> throw Errors.map(e);
+                        default -> throw Errors.transport("malformed response: a row in a describe answer", null);
+                    }
                 }
+            }
+            if (refused == null) {
+                break;
+            }
+            if (!Retry.pause(attempt++, deadline)) {
+                throw Errors.map(refused);
             }
         }
         describedColumns = cols;
@@ -462,25 +473,19 @@ final class SkylitePreparedStatement extends SkyliteStatement implements Prepare
         batch.clear();
     }
 
-    /** Runs each parameter set as a statement of its own, in order, as {@link SkyliteStatement#executeLargeBatch}. */
+    /** Runs the statement once per parameter set as one channel batch, as {@link SkyliteStatement#runBatch} says. */
     @Override
     public long[] executeLargeBatch() throws SQLException {
         checkOpen();
-        List<List<Object>> sets = List.copyOf(batch);
-        batch.clear();
-        long[] counts = new long[sets.size()];
-        List<Long> keys = new ArrayList<>();
-        for (int i = 0; i < counts.length; i++) {
-            try {
-                counts[i] = update(run(sql, sets.get(i), !conn.readOnly(), keyLabel) != null);
-            } catch (SQLException e) {
-                generatedKeys(keys); // the keys of the entries before it, as its update counts are
-                throw batchFailed(e, Arrays.copyOf(counts, i));
+        List<String> entries = new ArrayList<>(batch.size());
+        try {
+            for (List<Object> set : batch) {
+                entries.add(Request.paramSet(set));
             }
-            keys.addAll(generatedKeys());
+        } finally {
+            batch.clear();
         }
-        generatedKeys(keys);
-        return counts;
+        return runBatch(sql, entries, keyLabel);
     }
 
     // ---- not supported ----

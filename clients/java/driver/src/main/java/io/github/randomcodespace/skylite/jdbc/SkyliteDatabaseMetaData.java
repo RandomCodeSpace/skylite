@@ -366,7 +366,7 @@ final class SkyliteDatabaseMetaData implements DatabaseMetaData {
                 }
             }
         }
-        rows.add(new Done(0, true, 0, 0, 0, 0, null, null, 0, null, false));
+        rows.add(new Done(0, true, 0, 0, 0, 0, null, null, 0, null, false, 0, null, null));
         List<Column> cols = new ArrayList<>();
         for (String name : COLUMNS) {
             boolean number = name.equals("DATA_TYPE") || name.endsWith("_SIZE") || name.endsWith("_LENGTH")

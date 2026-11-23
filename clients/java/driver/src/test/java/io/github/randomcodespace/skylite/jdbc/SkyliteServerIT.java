@@ -415,6 +415,48 @@ class SkyliteServerIT {
     }
 
     /**
+     * A batch is one request: all or nothing in auto-commit, and inside a transaction it stops at its first failure,
+     * reporting the counts and keys of the entries before it.
+     */
+    @Test
+    void runsBatches() throws Exception {
+        try (Connection c = connect(); Statement s = c.createStatement();
+                PreparedStatement ins = c.prepareStatement("INSERT INTO w_batch (v) VALUES (?)",
+                        Statement.RETURN_GENERATED_KEYS)) {
+            s.executeUpdate("CREATE TABLE w_batch (id INTEGER PRIMARY KEY, v TEXT UNIQUE)");
+            for (String v : java.util.List.of("a", "b", "a")) {
+                ins.setString(1, v);
+                ins.addBatch();
+            }
+            java.sql.BatchUpdateException auto = assertThrows(java.sql.BatchUpdateException.class, ins::executeBatch);
+            assertEquals("23000", auto.getSQLState(), auto.toString());
+            assertArrayEquals(new int[0], auto.getUpdateCounts(), "an autocommit batch leaves nothing");
+            assertEquals(0, count(c, "w_batch"));
+
+            c.setAutoCommit(false);
+            for (String v : java.util.List.of("a", "b", "a", "c")) {
+                ins.setString(1, v);
+                ins.addBatch();
+            }
+            java.sql.BatchUpdateException txn = assertThrows(java.sql.BatchUpdateException.class, ins::executeBatch);
+            assertArrayEquals(new int[] {1, 1}, txn.getUpdateCounts());
+            try (ResultSet keys = ins.getGeneratedKeys()) {
+                assertTrue(keys.next());
+                assertTrue(keys.next());
+                assertFalse(keys.next());
+            }
+            c.commit();
+            assertEquals(2, count(c, "w_batch"), "the entries before the failure, committed");
+
+            c.setAutoCommit(true);
+            s.addBatch("UPDATE w_batch SET v = v || '!'");
+            s.addBatch("DELETE FROM w_batch WHERE v = 'a!'");
+            assertArrayEquals(new long[] {2, 1}, s.executeLargeBatch());
+            assertEquals(1, count(c, "w_batch"));
+        }
+    }
+
+    /**
      * Closing a connection with its transaction open rolls it back and releases the write lock: another connection
      * writes at once.
      */

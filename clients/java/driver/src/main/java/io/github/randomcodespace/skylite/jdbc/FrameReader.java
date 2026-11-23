@@ -19,7 +19,8 @@ import tools.jackson.core.JsonToken;
  * unknown, and unknown members of known objects are skipped. Mirrors internal/wire's Reader.
  *
  * <p>The kinds are the answers the driver reads: a stateless query or describe; on a write channel an execute (a
- * statement, alone or as a begin's first), a step (begin, commit or rollback), and the open, cancel and close answers.
+ * statement, alone or as a begin's first), a batch, a step (begin, commit or rollback), the open, cancel and close
+ * answers, and a resolve's.
  */
 final class FrameReader {
     /** The largest frame read, newline included: a row may be as large as the default result limit, 64 MiB. */
@@ -29,7 +30,7 @@ final class FrameReader {
     /** The most entries in one params frame. */
     private static final int MAX_FRAME_ENTRIES = 1024;
 
-    enum Kind { QUERY, DESCRIBE, EXECUTE, STEP, OPEN, CANCEL, CLOSE }
+    enum Kind { QUERY, DESCRIBE, EXECUTE, BATCH, STEP, OPEN, CANCEL, CLOSE, RESOLVE }
 
     /** Frames to read in order: a response as it arrives, or one read in full. */
     interface Frames extends AutoCloseable {
@@ -56,7 +57,7 @@ final class FrameReader {
 
     record Column(String name, String declType, String database, String table, String origin) {}
 
-    sealed interface Frame permits Columns, Row, Params, Done, Failure {}
+    sealed interface Frame permits Columns, Row, Params, Results, Done, Failure {}
 
     record Columns(List<Column> columns) implements Frame {}
 
@@ -64,15 +65,36 @@ final class FrameReader {
 
     record Params(List<String> names) implements Frame {}
 
+    /** A batch's results frame: each entry's rows_affected and last_insert_rowid, in order. */
+    record Results(long[] rowsAffected, long[] lastInsertRowids) implements Frame {}
+
     /**
-     * A done frame, or a successful receipt; fields the request kind does not carry are 0, false or null. token is an
-     * open answer's channel token; lastSeq a close answer's; outcome a cancel or close answer's receipt, a Done or a
-     * Failure.
+     * The limits of an open answer that the driver acts on (ADR 0005, the limits object); a member left out keeps
+     * the protocol's default.
+     */
+    record Limits(long requestBodyBytes, long batchEntries, long statementMs, long resolveBound) {
+        static final Limits DEFAULT = new Limits(16 << 20, 10_000, 30_000, 100_000);
+    }
+
+    /**
+     * A done frame, or a successful receipt; fields the request kind does not carry are 0, false or null. token and
+     * limits are an open answer's; lastSeq a close answer's; outcome a cancel or close answer's receipt, a Done or a
+     * Failure; entries a batch's; resolution a resolve's.
      */
     record Done(long txn, boolean readOnly, long rowsAffected, long lastInsertRowid, long paramCount, long seq,
-            String txnState, String token, long lastSeq, Frame outcome, boolean dataOmitted) implements Frame {}
+            String txnState, String token, long lastSeq, Frame outcome, boolean dataOmitted, long entries,
+            String resolution, Limits limits) implements Frame {
+        /** The same answer, marked as one whose data the driver does not have. */
+        Done omitted() {
+            return new Done(txn, readOnly, rowsAffected, lastInsertRowid, paramCount, seq, txnState, token, lastSeq,
+                    outcome, true, entries, resolution, limits);
+        }
+    }
 
-    /** An error frame, or a failed receipt. Optional integers are -1 when absent, txnState null. */
+    /**
+     * An error frame, or a failed receipt. Optional integers are -1 when absent, txnState null; batchIndex is a
+     * failed batch entry's index.
+     */
     record Failure(
             String code,
             boolean notExecuted,
@@ -84,10 +106,11 @@ final class FrameReader {
             String cause,
             long txn,
             long epoch,
-            String txnState)
+            String txnState,
+            long batchIndex)
             implements Frame {}
 
-    private enum State { START, ROWS, PARAMS, ENDED }
+    private enum State { START, ROWS, PARAMS, RESULTS, ENDED }
 
     private final InputStream in;
     private final Kind kind;
@@ -99,6 +122,7 @@ final class FrameReader {
     private State state = State.START;
     private int columns;
     private long params;
+    private long results;
 
     FrameReader(InputStream in, Kind kind, int maxFrame) {
         this.in = in;
@@ -215,7 +239,13 @@ final class FrameReader {
                 columns = cols.size();
                 f = new Columns(cols);
             }
-            case "results" -> throw new Malformed("a results frame in this response");
+            case "results" -> {
+                if (kind != Kind.BATCH) {
+                    throw new Malformed("a results frame in this response");
+                }
+                f = resultsFrame(p);
+                state = State.RESULTS;
+            }
             case "params" -> {
                 if (kind != Kind.DESCRIBE || (state != State.ROWS && state != State.PARAMS)) {
                     throw new Malformed("a params frame in this response or before its columns");
@@ -254,6 +284,64 @@ final class FrameReader {
             throw new Malformed("a row has " + n + " values for " + columns + " columns");
         }
         return new Row(vals);
+    }
+
+    private Results resultsFrame(JsonParser p) throws Malformed {
+        if (p.currentToken() != JsonToken.START_OBJECT) {
+            throw new Malformed("results is not an object");
+        }
+        long from = -1;
+        List<long[]> entries = null;
+        String m;
+        while ((m = p.nextName()) != null) {
+            p.nextToken();
+            switch (m) {
+                case "from" -> from = integer(p, m, 0, Long.MAX_VALUE);
+                case "entries" -> {
+                    if (p.currentToken() != JsonToken.START_ARRAY) {
+                        throw new Malformed("entries is not an array");
+                    }
+                    entries = new ArrayList<>();
+                    while (p.nextToken() != JsonToken.END_ARRAY) {
+                        if (entries.size() == MAX_FRAME_ENTRIES || p.currentToken() != JsonToken.START_OBJECT) {
+                            throw new Malformed("a results frame holds 1 to " + MAX_FRAME_ENTRIES + " objects");
+                        }
+                        long rows = -1, rowid = 0;
+                        boolean seen = false;
+                        String e;
+                        while ((e = p.nextName()) != null) {
+                            p.nextToken();
+                            switch (e) {
+                                case "rows_affected" -> rows = integer(p, e, 0, Long.MAX_VALUE);
+                                case "last_insert_rowid" -> {
+                                    rowid = integer(p, e, Long.MIN_VALUE, Long.MAX_VALUE);
+                                    seen = true;
+                                }
+                                default -> p.skipChildren();
+                            }
+                        }
+                        if (rows < 0 || !seen) {
+                            throw new Malformed("a results entry lacks rows_affected or last_insert_rowid");
+                        }
+                        entries.add(new long[] {rows, rowid});
+                    }
+                }
+                default -> p.skipChildren();
+            }
+        }
+        if (from != results) {
+            throw new Malformed("results entries from " + from + " where " + results + " was next");
+        }
+        if (entries == null || entries.isEmpty()) {
+            throw new Malformed("a results frame holds 1 to " + MAX_FRAME_ENTRIES + " entries");
+        }
+        results += entries.size();
+        long[] rows = new long[entries.size()], ids = new long[entries.size()];
+        for (int i = 0; i < rows.length; i++) {
+            rows[i] = entries.get(i)[0];
+            ids[i] = entries.get(i)[1];
+        }
+        return new Results(rows, ids);
     }
 
     private List<Column> columnsFrame(JsonParser p) throws Malformed {
@@ -324,12 +412,13 @@ final class FrameReader {
 
     /** The members of a done object or a receipt, as read; absent integers are -1. */
     private static final class Fields {
-        long txn = -1, rows = -1, paramCount = -1, seq = -1, lastSeq = -1;
+        long txn = -1, rows = -1, paramCount = -1, seq = -1, lastSeq = -1, entries = -1;
         long lastId;
         boolean lastIdSeen, dataOmitted, hasChannel;
         Boolean readOnly, ok;
-        String txnState, token;
+        String txnState, token, resolution;
         Frame outcome;
+        Limits limits;
     }
 
     private static Fields fields(JsonParser p) throws Malformed {
@@ -353,6 +442,13 @@ final class FrameReader {
                 case "last_seq" -> d.lastSeq = integer(p, m, 0, Long.MAX_VALUE);
                 case "txn_state" -> d.txnState = txnState(p);
                 case "data_omitted" -> d.dataOmitted = bool(p, m);
+                case "entries" -> d.entries = integer(p, m, 1, 10_000);
+                case "resolution" -> {
+                    d.resolution = str(p, m);
+                    if (!List.of("committed", "not_committed", "pending", "unknown").contains(d.resolution)) {
+                        throw new Malformed("resolution is not committed, not_committed, pending or unknown");
+                    }
+                }
                 case "ok" -> d.ok = bool(p, m);
                 case "error" -> d.outcome = failure(p);
                 case "outcome" -> d.outcome = receipt(p);
@@ -366,6 +462,8 @@ final class FrameReader {
                         p.nextToken();
                         if (c.equals("token")) {
                             d.token = str(p, c);
+                        } else if (c.equals("limits")) {
+                            d.limits = limits(p);
                         } else {
                             p.skipChildren();
                         }
@@ -377,10 +475,31 @@ final class FrameReader {
         return d;
     }
 
+    /** The limits object: the members the driver acts on, each 1 or more. */
+    private static Limits limits(JsonParser p) throws Malformed {
+        if (p.currentToken() != JsonToken.START_OBJECT) {
+            throw new Malformed("limits is not an object");
+        }
+        Limits l = Limits.DEFAULT;
+        long body = l.requestBodyBytes(), batch = l.batchEntries(), stmt = l.statementMs(), bound = l.resolveBound();
+        String m;
+        while ((m = p.nextName()) != null) {
+            p.nextToken();
+            switch (m) {
+                case "request_body_bytes" -> body = integer(p, m, 1, Long.MAX_VALUE);
+                case "batch_entries" -> batch = integer(p, m, 1, 10_000);
+                case "statement_ms" -> stmt = integer(p, m, 1, Integer.MAX_VALUE);
+                case "resolve_bound" -> bound = integer(p, m, 1, Long.MAX_VALUE);
+                default -> p.skipChildren();
+            }
+        }
+        return new Limits(body, batch, stmt, bound);
+    }
+
     private static Done done(Fields d) {
         return new Done(Math.max(d.txn, 0), d.readOnly != null && d.readOnly, Math.max(d.rows, 0), d.lastId,
                 Math.max(d.paramCount, 0), Math.max(d.seq, 0), d.txnState, d.token, Math.max(d.lastSeq, 0), d.outcome,
-                d.dataOmitted);
+                d.dataOmitted, Math.max(d.entries, 0), d.resolution, d.limits != null ? d.limits : Limits.DEFAULT);
     }
 
     /** A receipt, as a cancel or close answer embeds it: a Done when ok, else its Failure. */
@@ -400,6 +519,8 @@ final class FrameReader {
             case QUERY -> d.txn > 0 && query;
             case DESCRIBE -> d.txn > 0 && d.paramCount >= 0;
             case EXECUTE -> step && query;
+            case BATCH -> step && d.rows >= 0 && d.lastIdSeen && d.entries > 0;
+            case RESOLVE -> d.txn > 0 && d.resolution != null;
             case STEP -> step;
             case OPEN -> d.txn > 0 && d.token != null;
             case CANCEL -> d.seq > 0 && d.txnState != null && d.outcome != null;
@@ -407,6 +528,9 @@ final class FrameReader {
         };
         if (!complete || (d.outcome != null && kind != Kind.CANCEL && kind != Kind.CLOSE)) {
             throw new Malformed("the done frame lacks a member its request's answer carries");
+        }
+        if (kind == Kind.BATCH && results != (d.dataOmitted ? 0 : d.entries)) { // a replay without its data has none
+            throw new Malformed(results + " results entries for " + d.entries + " batch entries");
         }
         if (kind == Kind.DESCRIBE) {
             if (state == State.START) {
@@ -425,7 +549,7 @@ final class FrameReader {
         }
         String code = null, message = null, requestId = null, cause = null, txnState = null;
         Boolean notExecuted = null, fin = null;
-        long sqlite = -1, extended = -1, txn = -1, epoch = -1;
+        long sqlite = -1, extended = -1, txn = -1, epoch = -1, batchIndex = -1;
         String m;
         while ((m = p.nextName()) != null) {
             p.nextToken();
@@ -440,7 +564,7 @@ final class FrameReader {
                 case "seq" -> integer(p, m, 1, Long.MAX_VALUE);
                 case "sqlite_code" -> sqlite = integer(p, m, 0, 255);
                 case "sqlite_extended_code" -> extended = integer(p, m, 0, Integer.MAX_VALUE);
-                case "batch_index" -> integer(p, m, 0, 9999);
+                case "batch_index" -> batchIndex = integer(p, m, 0, 9999);
                 case "cause" -> cause = str(p, m);
                 case "txn" -> txn = integer(p, m, 1, Long.MAX_VALUE);
                 case "epoch" -> epoch = integer(p, m, 1, Long.MAX_VALUE);
@@ -450,7 +574,8 @@ final class FrameReader {
         if (code == null || notExecuted == null || fin == null || message == null || requestId == null) {
             throw new Malformed("the error lacks code, not_executed, final, message or request_id");
         }
-        return new Failure(code, notExecuted, fin, message, requestId, sqlite, extended, cause, txn, epoch, txnState);
+        return new Failure(code, notExecuted, fin, message, requestId, sqlite, extended, cause, txn, epoch, txnState,
+                batchIndex);
     }
 
     private static String txnState(JsonParser p) throws Malformed {
