@@ -26,6 +26,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
@@ -37,6 +38,13 @@ import (
 // endpointEnv names the Azurite blob endpoint, for example
 // http://127.0.0.1:10000/devstoreaccount1. `make integration` sets it.
 const endpointEnv = "SKYLITE_TEST_AZURITE_BLOB_ENDPOINT"
+
+// realAccountEnv, if set, names a real account URL such as
+// https://<account>.blob.core.windows.net/ instead of Azurite. Each test then
+// creates its own container there with an Entra ID credential from
+// azidentity's DefaultAzureCredential, which needs Storage Blob Data
+// Contributor on the account.
+const realAccountEnv = "SKYLITE_TEST_AZURE_ACCOUNT_URL"
 
 // Azurite's documented default development account. The key is public and
 // only works against the emulator.
@@ -51,6 +59,9 @@ const (
 // is a secret that errors must not show.
 func newContainer(t *testing.T) string {
 	t.Helper()
+	if real := os.Getenv(realAccountEnv); real != "" {
+		return newRealContainer(t, real)
+	}
 	ep := os.Getenv(endpointEnv)
 	if ep == "" {
 		t.Skipf("%s is not set; run `make integration` or point it at an Azurite blob endpoint", endpointEnv)
@@ -1105,17 +1116,23 @@ func TestMissingContainer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cred, err := container.NewSharedKeyCredential(azuriteAccount, azuriteKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	base, _, _ := strings.Cut(u, "?")
-	admin, err := container.NewClientWithSharedKeyCredential(base, cred, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	admin := adminContainer(t, base)
 	if _, err := admin.Delete(context.Background(), nil); err != nil {
 		t.Fatal(redact(err))
+	}
+	if os.Getenv(realAccountEnv) != "" {
+		// The real service deletes a container in the background: for a
+		// while, requests through the SAS still succeed or find no blob,
+		// although the container's own properties already say it is gone.
+		for deadline := time.Now().Add(3 * time.Minute); ; time.Sleep(2 * time.Second) {
+			if _, err := s.Head(context.Background(), "k"); err != nil && !errors.Is(err, storage.ErrNotFound) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the container still exists 3 minutes after its deletion")
+			}
+		}
 	}
 	ctx := context.Background()
 	for op, call := range map[string]func() error{
@@ -1216,4 +1233,71 @@ func entryKeys(entries []storage.Entry) []string {
 		keys[i] = e.Key
 	}
 	return keys
+}
+
+// newRealContainer creates a container unique to the test in a real account
+// with an Entra ID credential from the environment, removes it after the test
+// and returns a user delegation SAS URL for it.
+func newRealContainer(t *testing.T, accountURL string) string {
+	t.Helper()
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := service.NewClient(accountURL, cred, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	name := "azureblob-" + hex.EncodeToString(b)
+	ctx := context.Background()
+	if _, err := svc.CreateContainer(ctx, name, nil); err != nil {
+		t.Fatal(redact(err))
+	}
+	t.Cleanup(func() { _, _ = svc.DeleteContainer(context.Background(), name, nil) })
+	now := time.Now().UTC().Add(-time.Minute)
+	expiry := now.Add(6 * time.Hour)
+	st, ex := now.Format(sas.TimeFormat), expiry.Format(sas.TimeFormat)
+	udc, err := svc.GetUserDelegationCredential(ctx, service.KeyInfo{Start: &st, Expiry: &ex}, nil)
+	if err != nil {
+		t.Fatal(redact(err))
+	}
+	qp, err := sas.BlobSignatureValues{
+		Protocol:      sas.ProtocolHTTPS,
+		StartTime:     now,
+		ExpiryTime:    expiry,
+		Permissions:   (&sas.ContainerPermissions{Read: true, Add: true, Create: true, Write: true, Delete: true, List: true}).String(),
+		ContainerName: name,
+	}.SignWithUserDelegation(udc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimRight(accountURL, "/") + "/" + name + "?" + qp.Encode()
+}
+
+// adminContainer returns a client for the container at base that is not
+// limited by the test's SAS: Entra ID against a real account, Azurite's key
+// otherwise.
+func adminContainer(t *testing.T, base string) *container.Client {
+	t.Helper()
+	var (
+		c   *container.Client
+		err error
+	)
+	if os.Getenv(realAccountEnv) != "" {
+		var cred *azidentity.DefaultAzureCredential
+		if cred, err = azidentity.NewDefaultAzureCredential(nil); err == nil {
+			c, err = container.NewClient(base, cred, nil)
+		}
+	} else {
+		var cred *container.SharedKeyCredential
+		if cred, err = container.NewSharedKeyCredential(azuriteAccount, azuriteKey); err == nil {
+			c, err = container.NewClientWithSharedKeyCredential(base, cred, nil)
+		}
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }

@@ -15,7 +15,7 @@ gate = "The storage architecture that follows from it is recorded in decision re
 [[items]]
 title = "Storage interface and four backends"
 status = "done"
-detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators. The interface, its conformance suite and all four backends exist. Each cloud backend is tested against an emulator only, never against the real service: the S3 backend against RustFS, the Google Cloud Storage backend against fake-gcs-server and the Azure Blob backend against Azurite. `skylite serve` can use all four backends (local filesystem, S3, Google Cloud Storage and Azure Blob Storage with a shared key; Entra ID is not wired into the server yet)."
+detail = "One storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete, with Azure Blob, AWS S3, Google Cloud Storage and local filesystem backends, plus a test suite that runs against emulators. The interface, its conformance suite and all four backends exist. Each cloud backend is tested against an emulator only, never against the real service: the S3 backend against RustFS, the Google Cloud Storage backend against fake-gcs-server and the Azure Blob backend against Azurite. `skylite serve` can use all four backends (local filesystem, S3, Google Cloud Storage and Azure Blob Storage with a shared key or Entra ID)."
 
 [[items]]
 title = "Storage engine: commit log, paged reads, compaction"
@@ -75,4 +75,4 @@ detail = "A container image of the server, published with each release."
 [[items]]
 title = "Verification beyond emulators"
 status = "planned"
-detail = "Runs against the real Azure Blob Storage, S3 and Google Cloud Storage services, on a real Kubernetes cluster, with a real Entra ID tenant as token issuer, driver failover across several pods end to end, and a 24-hour soak."
+detail = "Runs against the real S3 and Google Cloud Storage services (the Azure Blob backend has been run by hand against the real service, not yet in CI), on a real Kubernetes cluster, with a real Entra ID tenant as token issuer, driver failover across several pods end to end, and a 24-hour soak."
