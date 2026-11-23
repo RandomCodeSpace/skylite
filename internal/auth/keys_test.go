@@ -212,10 +212,12 @@ func TestRefreshPanicReleasesTheLock(t *testing.T) {
 		_, _ = g.Verify(context.Background(), sign(t, k, ti.claims(c)))
 	}()
 	src := g.sources[ti.url]
-	if !src.fetchMu.TryLock() {
+	select {
+	case src.fetching <- struct{}{}:
+		<-src.fetching
+	default:
 		t.Fatal("the refresh lock is still held after a panic")
 	}
-	src.fetchMu.Unlock()
 	panics.Store(false)
 	c.Add(time.Minute)
 	verifyOK(t, g, ti, c, k, "token after the panic")
@@ -229,12 +231,41 @@ func TestStaleKeyDoesNotWaitForARefresh(t *testing.T) {
 	verifyOK(t, g, ti, c, k, "first token")
 	c.Add(2 * time.Hour)
 	src := g.sources[ti.url]
-	src.fetchMu.Lock() // another request is refreshing; a blocking refresh would deadlock here
-	defer src.fetchMu.Unlock()
+	src.fetching <- struct{}{} // another request is refreshing; a blocking refresh would deadlock here
+	defer func() { <-src.fetching }()
 	verifyOK(t, g, ti, c, k, "stale key while a refresh runs")
 	if n := ti.jwksHits.Load(); n != 1 {
 		t.Errorf("%d JWKS fetches, want 1", n)
 	}
+}
+
+// TestRefreshWaiter: a request that must wait for another's refresh calls
+// its wait hook first, does not wait if the hook refuses, and gives up when
+// its context ends, after which the hook's resume runs.
+func TestRefreshWaiter(t *testing.T) {
+	c := newClock()
+	k := newKey(t, "k", jose.ES256)
+	ti := newIssuer(t, k)
+	g := newGuard(t, c, ti)
+	verifyOK(t, g, ti, c, k, "first token")
+	c.Add(2 * minRefreshInterval)
+	src := g.sources[ti.url]
+	src.fetching <- struct{}{} // another request is refreshing
+	defer func() { <-src.fetching }()
+	unknown := sign(t, newKey(t, "other", jose.ES256), ti.claims(c))
+	var waits, resumes int
+	refuse := WithRefreshWait(context.Background(), func() (func(), bool) { waits++; return nil, false })
+	_, err := g.Verify(refuse, unknown)
+	wantCode(t, unknown, err, CodeUnknownKey)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	ctx = WithRefreshWait(ctx, func() (func(), bool) { waits++; return func() { resumes++ }, true })
+	_, err = g.Verify(ctx, unknown)
+	wantCode(t, unknown, err, CodeUnknownKey)
+	if waits != 2 || resumes != 1 {
+		t.Errorf("%d waits and %d resumes, want 2 and 1", waits, resumes)
+	}
+	verifyOK(t, g, ti, c, k, "a known key while a refresh runs") // calls no hook: it has none and does not wait
 }
 
 // padded returns jwks padded with trailing white space to exactly n bytes.

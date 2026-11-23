@@ -67,7 +67,7 @@ type keySource struct {
 	now    func() time.Time
 	log    *slog.Logger
 
-	fetchMu sync.Mutex // held for the duration of a fetch
+	fetching chan struct{} // holds a token for the duration of a fetch
 
 	mu        sync.Mutex
 	keys      map[string]jose.JSONWebKey
@@ -98,17 +98,43 @@ func (s *keySource) key(ctx context.Context, kid string) (jose.JSONWebKey, Code)
 	return k, ""
 }
 
-// refreshExclusive runs refresh while holding fetchMu, and releases it on
-// every path, a panic included. With try set, it does nothing if another
-// request holds fetchMu.
+// refreshExclusive runs refresh while holding fetching's token, and
+// releases it on every path, a panic included. With try set, it does
+// nothing if another request holds it. A request that must wait for it
+// calls ctx's wait hook (WithRefreshWait) first, and gives up when ctx ends.
 func (s *keySource) refreshExclusive(ctx context.Context, try bool) {
-	if !try {
-		s.fetchMu.Lock()
-	} else if !s.fetchMu.TryLock() {
-		return
+	select {
+	case s.fetching <- struct{}{}:
+	default:
+		if try {
+			return
+		}
+		if wait, ok := ctx.Value(waitKey{}).(func() (func(), bool)); ok {
+			resume, ok := wait()
+			if !ok {
+				return
+			}
+			defer resume()
+		}
+		select {
+		case s.fetching <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 	}
-	defer s.fetchMu.Unlock()
+	defer func() { <-s.fetching }()
 	s.refresh(ctx)
+}
+
+type waitKey struct{}
+
+// WithRefreshWait returns ctx with wait, which Verify calls before it waits
+// for another request's refresh of an issuer's signing keys, a wait as long
+// as that fetch. If wait reports false Verify does not wait, and refuses the
+// token as it would without the key; otherwise it calls resume once the wait,
+// and any refresh it then runs, have ended.
+func WithRefreshWait(ctx context.Context, wait func() (resume func(), ok bool)) context.Context {
+	return context.WithValue(ctx, waitKey{}, wait)
 }
 
 func (s *keySource) lookup(kid string) (k jose.JSONWebKey, found, fresh, usable bool) {
@@ -121,7 +147,7 @@ func (s *keySource) lookup(kid string) (k jose.JSONWebKey, found, fresh, usable 
 }
 
 // refresh fetches the key set unless an attempt was made within
-// minRefreshInterval. A failed fetch keeps the previous keys. The caller holds fetchMu.
+// minRefreshInterval. A failed fetch keeps the previous keys. The caller holds fetching's token.
 func (s *keySource) refresh(ctx context.Context) {
 	now := s.now()
 	s.mu.Lock()

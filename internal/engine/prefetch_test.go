@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"slices"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/skylite/internal/format"
+	"github.com/RandomCodeSpace/skylite/internal/storage"
 )
 
 // usurper is a candidate whose clock runs far enough ahead that every
@@ -116,6 +118,50 @@ func TestTakeoverLongTail(t *testing.T) {
 				t.Fatalf("rows %v", got)
 			}
 		})
+	}
+}
+
+// hangOne hangs the ranged reads of key alone, as hangStore hangs reads.
+type hangOne struct {
+	*hangStore
+	key string
+}
+
+func (s hangOne) GetRange(ctx context.Context, key string, off, n int64) (io.ReadCloser, storage.Info, error) {
+	if key == s.key {
+		return s.hangStore.GetRange(ctx, key, off, n)
+	}
+	return s.Store.GetRange(ctx, key, off, n)
+}
+
+// TestTakeoverCancelsReadAhead: once the walk finds the name after the head
+// absent, a takeover does not wait on a read ahead of it, which the walk
+// never uses, even one that would hang until the storage timeout.
+func TestTakeoverCancelsReadAhead(t *testing.T) {
+	st, keys := tailDatabase(t, 4)
+	r, err := Open(context.Background(), st.Store, keys, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := newHangStore(st, func(_ context.Context, op string) bool { return op == "getrange" })
+	defer hs.open()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := Takeover(context.Background(), hangOne{hs, keys.Commit(r.a.m.DB, r.Txn()+2)}, keys, usurper("b", 2*time.Minute))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("takeover waits on a read ahead of the head")
+	}
+	select {
+	case <-hs.reached:
+	default:
+		t.Fatal("the walk never read ahead of the head")
 	}
 }
 

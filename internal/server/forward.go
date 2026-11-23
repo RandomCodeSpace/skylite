@@ -238,9 +238,10 @@ func (s *Server) forward(st *stream, r *http.Request, kind wire.Kind, db string,
 	}
 	addr := rec.Address
 	if owner {
-		// The token is w1.<instance>.<database id>.<open head>.<secret>.
+		// The token is w1.<instance>.<database id>.<open head>.<secret>, or
+		// r1 for a read-only channel, which the leader owns in this version.
 		parts := strings.Split(req.Channel, ".")
-		if len(parts) != 5 || parts[0] != channelTokenPrefix {
+		if len(parts) != 5 || parts[0] != channelTokenPrefix && parts[0] != readTokenPrefix {
 			return wire.NewError(wire.CodeInvalidRequest, "the token does not name this database")
 		}
 		head, herr := strconv.ParseUint(parts[3], 10, 64)

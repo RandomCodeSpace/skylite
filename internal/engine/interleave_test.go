@@ -481,6 +481,11 @@ func TestCandidatePausedAtEachStep(t *testing.T) {
 		e := newEnv(t, 32)
 		c := e.g.candidate(t, e.keys, e.cand("c"))
 		c.run(k)
+		if c.finished() {
+			// It made fewer calls than the solo takeover traced: reads ahead
+			// of the head, cancelled once the walk decides, need no grant.
+			break
+		}
 		b, _ := mustTakeover(t, e, "b")
 		nb := newLeader(e.h, e.g, b)
 		nb.commit(bg)

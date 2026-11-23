@@ -112,6 +112,19 @@ type Config struct {
 	TempBudget int64
 	// Cache holds pages read from storage; it may be shared.
 	Cache *Cache
+	// Seen is what this node read of the manifest before it took office,
+	// oldest first. Retirement measures the grace period of a manifest
+	// from the first time this node read it, so the period need not start
+	// again with each new leader.
+	Seen []Seen
+}
+
+// Seen is a manifest's database and transaction number and a time the
+// manifest was current: a read of it from storage had begun by then.
+type Seen struct {
+	DB  format.DatabaseID
+	Txn uint64
+	At  time.Time
 }
 
 // Leader serves one database on this node while it holds office: SQLite in
@@ -290,8 +303,17 @@ func Lead(ctx context.Context, st storage.Store, keys format.Keys, dir string, o
 		_ = l.Close()
 		return nil, err
 	}
-	// The manifest Lead read covers the log up to it from now on.
-	l.covered = []coverage{{m.Txn, time.Now()}}
+	// The manifest Lead read covers the log up to it from now on, and the
+	// manifests this node read before covered the log up to theirs since.
+	// One of another database, or with no time or a time still to come, is
+	// no read of this log, and is ignored.
+	now := time.Now()
+	for _, s := range cfg.Seen {
+		if s.DB == m.DB && !s.At.IsZero() && !s.At.After(now) && s.Txn <= m.Txn && (len(l.covered) == 0 || s.Txn >= l.covered[len(l.covered)-1].txn && !s.At.Before(l.covered[len(l.covered)-1].at)) {
+			l.covered = append(l.covered, coverage{s.Txn, s.At})
+		}
+	}
+	l.covered = append(l.covered, coverage{m.Txn, time.Now()})
 	l.lastCompact = time.Now()
 	l.cmu.Lock()
 	l.wakeLocked()

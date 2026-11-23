@@ -532,7 +532,8 @@ type fetched struct {
 // never used.
 type prefetch struct {
 	r     *Reader
-	ctx   context.Context //nolint:containedctx // the walk's, for the reads it starts
+	ctx   context.Context //nolint:containedctx // derived from the walk's, for the reads it starts
+	stopc context.CancelFunc
 	m     format.Manifest
 	next  uint64 // the name the next call to take returns
 	left  uint64 // names not yet read, up to the walk's last
@@ -543,7 +544,8 @@ type prefetch struct {
 
 // startPrefetch reads commits from first to last, inclusive.
 func (r *Reader) startPrefetch(ctx context.Context, m format.Manifest, first, last uint64) *prefetch {
-	return &prefetch{r: r, ctx: ctx, m: m, next: first, left: last - first + 1, width: 1}
+	ctx, stopc := context.WithCancel(ctx)
+	return &prefetch{r: r, ctx: ctx, stopc: stopc, m: m, next: first, left: last - first + 1, width: 1}
 }
 
 // take returns the read of the next name.
@@ -568,9 +570,11 @@ func (p *prefetch) take() fetched {
 	return f
 }
 
-// stop waits for the reads in flight, so that none outlives the walk.
+// stop cancels the reads in flight, which the walk will not use, and waits
+// for them, so that none outlives the walk.
 func (p *prefetch) stop() {
 	if p != nil {
+		p.stopc()
 		p.wg.Wait()
 	}
 }
