@@ -455,6 +455,19 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 	// transaction took it; keep says whether it goes back to the pool.
 	var pc *pconn
 	keep := false
+	// A read-only begin first reserves a place among the read-only
+	// transactions, which passes to its transaction if one begins.
+	reserved := starts && ch.ro && req.Op == wire.OpBegin
+	if reserved {
+		if !s.holdRead() {
+			return nil, s.ownedLocked(wire.NewError(wire.CodeOverloaded, "read-only transactions hold their share of the server's SQLite connections; retry later"), ch, seq)
+		}
+		defer func() {
+			if reserved {
+				s.readTxns.Add(-1)
+			}
+		}()
+	}
 	if pooled {
 		var e *wire.Error
 		var err error
@@ -549,7 +562,7 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 		var took bool
 		rec, lost, next, took = s.readBegin(rctx, d, t, ch, pc, req, sw, deadline, limit, log)
 		if took {
-			pc = nil
+			pc, reserved = nil, false
 		}
 		keep = false
 	case req.Op == wire.OpBegin && state == wire.TxnNone:
@@ -681,10 +694,25 @@ func (s *Server) dropTxn(ch *channel) func() {
 	ch.tx = nil
 	return func() {
 		s.pool.release(who, tx.c, false)
-		if !ro {
+		if ro {
+			s.readTxns.Add(-1)
+		} else {
 			s.release(t)
 		}
 	}
+}
+
+// holdRead reserves a connection for a read-only transaction, if they hold
+// fewer than half the pod's connections, rounded down. A transaction holds
+// its connection for up to its lifetime, and a write granted its lock waits
+// only for connections that stateless requests turn over, so the other half
+// stays with stateless requests and writes, which find one there.
+func (s *Server) holdRead() bool {
+	if s.readTxns.Add(1) > int64(s.pool.capacity/2) {
+		s.readTxns.Add(-1)
+		return false
+	}
+	return true
 }
 
 // endTxn ends ch's open transaction from the request running on ch.
@@ -1363,6 +1391,7 @@ func (s *Server) describe(ctx context.Context, d *database, t *table, c *pconn, 
 	defer cancel()
 	var done *wire.Done
 	var e *wire.Error
+	trusted := false
 	_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
 		ictx := db.GetInterrupt()
 		out, err := wire.NewWriter(w, wire.DefaultFrameBytes, s.limits)
@@ -1374,6 +1403,7 @@ func (s *Server) describe(ctx context.Context, d *database, t *table, c *pconn, 
 		}
 		var berr error
 		e, berr = statementError(ictx, err)
+		trusted = berr == nil // statementError's errEnded: not trusted again
 		return cmp.Or(berr, errEnded)
 	})
 	if err == nil {
@@ -1381,7 +1411,7 @@ func (s *Server) describe(ctx context.Context, d *database, t *table, c *pconn, 
 		return &wire.Receipt{Done: done}, nil, true
 	}
 	rec, lost := s.failure(ctx, d, t, err, e, limit, false, log)
-	return rec, lost, keepable(err)
+	return rec, lost, trusted && keepable(err)
 }
 
 // keepable reports whether a pooled connection whose Run failed with err may
@@ -1479,7 +1509,7 @@ func (s *Server) read(ctx context.Context, d *database, t *table, c *pconn, req 
 	var done *wire.Done
 	var e *wire.Error
 	var snap uint64
-	clean := false
+	clean, trusted := false, false
 	_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
 		ictx := db.GetInterrupt()
 		var err error
@@ -1510,6 +1540,7 @@ func (s *Server) read(ctx context.Context, d *database, t *table, c *pconn, req 
 		}
 		var berr error
 		e, berr = entryError(ictx, err)
+		trusted = berr == nil // as in describe
 		return cmp.Or(berr, errEnded)
 	})
 	if err == nil {
@@ -1517,7 +1548,7 @@ func (s *Server) read(ctx context.Context, d *database, t *table, c *pconn, req 
 		return &wire.Receipt{Done: done}, nil, clean
 	}
 	rec, lost := s.failure(ctx, d, t, err, e, limit, false, log)
-	return rec, lost, clean && keepable(err)
+	return rec, lost, clean && trusted && keepable(err)
 }
 
 // describeOn writes the result columns and the parameter names of sql,

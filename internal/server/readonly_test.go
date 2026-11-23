@@ -50,16 +50,35 @@ func TestReadOnlyChannel(t *testing.T) {
 	tok := e.openRO(t, "reader")
 	post := func(body string) answer { return e.post(t, "channel", "reader", body) }
 
+	// The connection an autocommit read used, the most recently pooled,
+	// takes writes again.
+	writable := func(what string) {
+		t.Helper()
+		e.pooled(t, func(db *sqlite3.Conn) error {
+			st, _, err := db.Prepare("PRAGMA query_only")
+			if err != nil {
+				return err
+			}
+			defer func() { _ = st.Close() }()
+			if !st.Step() || st.ColumnInt(0) != 0 {
+				t.Errorf("the connection of %s is still query_only", what)
+			}
+			return st.Err()
+		})
+	}
+
 	// Autocommit: a read at the head, replayed; a write refused.
 	body := ex(tok, 1, "SELECT a FROM t", "min_txn", head)
 	a := post(body)
 	if d := a.done(); a.status != 200 || len(a.rows()) != 1 || num(d, "txn") != head || d["read_only"] != true || d["txn_state"] != "none" {
 		t.Fatalf("read: %d %v", a.status, a.frames)
 	}
+	writable("a read")
 	if r := post(body); frameText(r) != frameText(a) {
 		t.Errorf("replay %v, want %v", r.frames, a.frames)
 	}
 	readonly(t, "an autocommit write", post(ex(tok, 2, "INSERT INTO t VALUES (2)")), true, "none")
+	writable("a refused write")
 	readonly(t, "an autocommit batch", post(sq(tok, 3, "batch", "statements", stmts("DELETE FROM t"))), true, "none")
 	if a := post(ex(tok, 4, "SELECT 1", "min_txn", head+1)); a.code() != "behind" {
 		t.Errorf("an execute above the head: %v", a.frames)
@@ -102,18 +121,6 @@ func TestReadOnlyChannel(t *testing.T) {
 	if got := e.count(t, "SELECT group_concat(a) FROM t"); got != `["1,2"]` {
 		t.Errorf("rows %s", got)
 	}
-	// A pooled connection that served the channel takes writes again.
-	e.pooled(t, func(db *sqlite3.Conn) error {
-		st, _, err := db.Prepare("PRAGMA query_only")
-		if err != nil {
-			return err
-		}
-		defer func() { _ = st.Close() }()
-		if !st.Step() || st.ColumnInt(0) != 0 {
-			t.Error("a pooled connection is still query_only")
-		}
-		return st.Err()
-	})
 	if c := e.post(t, "channel/close", "reader", closeBody(tok)); num(c.done(), "last_seq") != 13 {
 		t.Errorf("close: %v", c.frames)
 	}
@@ -130,7 +137,7 @@ func TestReadOnlyChannel(t *testing.T) {
 // rolls an open read back.
 func TestReadOnlyTxnLimits(t *testing.T) {
 	e, _, _ := newTxnEnv(t, func(e *env) {
-		e.s.limits.ReadTxnIdleMS, e.s.limits.ReadTxnLifetimeMS, e.s.chl.sweep = 300, 1500, 20*time.Millisecond
+		e.s.limits.ReadTxnIdleMS, e.s.limits.ReadTxnLifetimeMS, e.s.chl.sweep = 1000, 4000, 20*time.Millisecond
 	})
 	tok := e.openRO(t, "reader")
 	post := func(body string) answer { return e.post(t, "channel", "reader", body) }
@@ -158,6 +165,60 @@ func TestReadOnlyTxnLimits(t *testing.T) {
 	}
 	if _, ok := e.chState(tok); ok {
 		t.Error("the channel stayed in the table")
+	}
+}
+
+// TestReadOnlyWriteReserve: read-only transactions hold at most half the
+// pod's connections, so writes still find one when readers hold every
+// read-only transaction they can. "reader" stands for many principals with
+// only the read role: its quota is raised to the whole pool.
+func TestReadOnlyWriteReserve(t *testing.T) {
+	e, _, wtok := newTxnEnv(t, func(e *env) { e.s.pool.perPrincipal = e.s.pool.capacity })
+	n := e.s.pool.capacity
+	if n < 4 {
+		t.Fatalf("capacity %d is too small for the test", n)
+	}
+	// A begin that fails gives its place back.
+	bad := e.openRO(t, "reader")
+	for i := range n {
+		if a := e.post(t, "channel", "reader", sq(bad, int64(i+1), "begin", "execute", map[string]any{"sql": "SELECT nope"})); a.code() != "sql_error" {
+			t.Fatalf("a failing begin: %v", a.frames)
+		}
+	}
+	toks := make([]string, n)
+	open := 0
+	for i := range toks {
+		toks[i] = e.openRO(t, "reader")
+		switch a := e.post(t, "channel", "reader", sq(toks[i], 1, "begin")); {
+		case a.done() != nil && a.done()["txn_state"] == "open":
+			open++
+		case a.code() != "overloaded" || a.err()["not_executed"] != true || a.err()["txn_state"] != "none":
+			t.Fatalf("begin %d: %d %v", i, a.status, a.frames)
+		}
+	}
+	if open != n/2 {
+		t.Errorf("%d read-only transactions open of %d connections, want %d", open, n, n/2)
+	}
+	// Writes, autocommit and in a transaction, find a connection.
+	if a := e.post(t, "channel", "writer", ex(wtok, 2, "INSERT INTO t VALUES (1)")); a.done() == nil {
+		t.Errorf("an autocommit write: %v", a.frames)
+	}
+	if a := e.post(t, "channel", "writer", sq(wtok, 3, "begin", "execute", map[string]any{"sql": "INSERT INTO t VALUES (2)"})); a.done() == nil {
+		t.Errorf("a write transaction: %v", a.frames)
+	}
+	if a := e.post(t, "channel", "writer", sq(wtok, 4, "commit")); a.done()["wrote"] != true {
+		t.Errorf("its commit: %v", a.frames)
+	}
+	// A read-only transaction that ends frees its place.
+	e.post(t, "channel", "reader", sq(toks[0], 2, "commit"))
+	if a := e.post(t, "channel", "reader", sq(toks[n-1], 1, "begin")); a.done()["txn_state"] != "open" {
+		t.Errorf("a begin after a commit: %v", a.frames)
+	}
+	for _, tok := range toks {
+		e.post(t, "channel/close", "reader", closeBody(tok))
+	}
+	if got := e.s.readTxns.Load(); got != 0 {
+		t.Errorf("%d read-only transactions counted after every channel closed", got)
 	}
 }
 
@@ -248,5 +309,42 @@ func TestForwardReadOnlyChannel(t *testing.T) {
 	}
 	if a := pod.post(t, "channel/close", "reader", closeBody(tok)); num(a.done(), "last_seq") != 1 {
 		t.Errorf("close through the pod: %v", a.frames)
+	}
+}
+
+// TestBareErrorCode: of the errors ncruces reports by their code alone,
+// only SQLITE_READONLY is the client's sql_error; any other, as
+// SQLITE_CORRUPT or SQLITE_IOERR, is internal and ends the connection's
+// use. On a read-only channel, a read that fails so closes its connection.
+func TestBareErrorCode(t *testing.T) {
+	for _, tc := range []struct {
+		err  sqlite3.ExtendedErrorCode
+		code wire.Code
+	}{
+		{sqlite3.ExtendedErrorCode(sqlite3.READONLY), wire.CodeSQLError},
+		{sqlite3.ExtendedErrorCode(sqlite3.CORRUPT), wire.CodeInternal},
+		{sqlite3.IOERR_READ, wire.CodeInternal},
+		{sqlite3.ExtendedErrorCode(sqlite3.TOOBIG), wire.CodeInternal},
+	} {
+		e, berr := statementError(t.Context(), tc.err)
+		if e.Code != tc.code || (berr == nil) != (tc.code == wire.CodeSQLError) {
+			t.Errorf("%v: %s and %v, want %s", tc.err, e.Code, berr, tc.code)
+		}
+	}
+	e, _, _ := newTxnEnv(t, nil)
+	tok := e.openRO(t, "reader")
+	e.count(t, "SELECT 1") // leaves a pooled connection idle
+	p := e.s.pool
+	p.mu.Lock()
+	open, idle := p.open, len(p.idle)
+	p.mu.Unlock()
+	// A value past the length limit fails with a bare SQLITE_TOOBIG.
+	if a := e.post(t, "channel", "reader", ex(tok, 1, "SELECT zeroblob(2000000000)")); a.code() != "internal" || a.err()["final"] != true {
+		t.Errorf("a bare SQLITE_TOOBIG: %d %v", a.status, a.frames)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.busy) != 0 || p.open != open-1 || len(p.idle) != idle-1 {
+		t.Errorf("%d principals busy, %d open and %d idle, want 0, %d and %d: the connection was kept", len(p.busy), p.open, len(p.idle), open-1, idle-1)
 	}
 }

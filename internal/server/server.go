@@ -136,6 +136,7 @@ type Server struct {
 	chl          chLimits
 	afterCommit  func() error  // nil; a test sets it to fail a write after its COMMIT
 	hdrSem       chan struct{} // header reads in flight for resolves (resolve.go)
+	readTxns     atomic.Int64  // connections read-only transactions hold or reserve (channel.go)
 	// nil; a test sets them to act between the sweep's start on a database
 	// and its look at the channel table, and between a resolve's step 1 and
 	// its observation.

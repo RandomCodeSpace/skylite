@@ -566,9 +566,10 @@ func statementError(ctx context.Context, err error) (*wire.Error, error) {
 		e.SQLiteCode, e.SQLiteExtendedCode = int64(se.Code()), int64(se.ExtendedCode())
 		return e, nil
 	}
-	// ncruces reports some errors, such as SQLITE_READONLY under PRAGMA
-	// query_only, by their code alone.
-	if xc, ok := errors.AsType[sqlite3.ExtendedErrorCode](err); ok {
+	// ncruces reports an error by its code alone when SQLite's message is
+	// the generic one, as for SQLITE_READONLY under PRAGMA query_only. Any
+	// other bare code, SQLITE_CORRUPT or SQLITE_IOERR among them, is internal.
+	if xc, ok := errors.AsType[sqlite3.ExtendedErrorCode](err); ok && errors.Is(xc, sqlite3.READONLY) {
 		e := wire.NewError(wire.CodeSQLError, xc.Error())
 		e.SQLiteCode, e.SQLiteExtendedCode = int64(xc.Code()), int64(xc)
 		return e, nil
