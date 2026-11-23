@@ -2,7 +2,7 @@
 <figure class="sheet" aria-labelledby="sheet-caption">
   <div class="sheet-draw">
     <svg class="dg dg-wide" viewBox="0 0 1136 500" role="img" aria-labelledby="dgw-t dgw-d">
-      <title id="dgw-t">Target architecture of skylite (planned design, not implemented)</title>
+      <title id="dgw-t">Architecture of skylite (the design of decision record 0004)</title>
       <desc id="dgw-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes, uploads each commit and reads pages on demand; followers forward writes to the leader and fetch pages on demand. Object storage holds the lease object, the commit log, the base page groups and the manifest. A write is acknowledged only after the upload is confirmed. Conditional writes fence a stale leader; the lease only helps a takeover make progress.</desc>
       <defs>
         <marker id="dgw-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="dg-head" d="M0 1 9 5 0 9z"/></marker>
@@ -78,7 +78,7 @@
     </svg>
 
     <svg class="dg dg-narrow" viewBox="0 0 340 830" role="img" aria-labelledby="dgn-t dgn-d">
-      <title id="dgn-t">Target architecture of skylite (planned design, not implemented)</title>
+      <title id="dgn-t">Architecture of skylite (the design of decision record 0004)</title>
       <desc id="dgn-d">Go and Java services call skylite over HTTPS through ingress or Istio. One database is served by a group of skylite pods without persistent volumes: one leader takes all writes, uploads each commit and reads pages on demand; followers forward writes to the leader and fetch pages on demand. Object storage holds the commit log, the base page groups, the manifest and the lease object. A write is acknowledged only after the upload is confirmed. Conditional writes fence a stale leader; the lease only helps a takeover make progress.</desc>
       <defs>
         <marker id="dgn-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="dg-head" d="M0 1 9 5 0 9z"/></marker>
@@ -146,9 +146,9 @@
   </div>
 
   <figcaption id="sheet-caption" class="titleblock">
-    <span class="tb-cell tb-name"><span class="tb-k">Drawing</span> Target architecture</span>
-    <span class="tb-cell tb-status"><span class="tb-k">Status</span> Not implemented</span>
-    <span class="tb-cell"><span class="tb-k">Revision</span> Planned design, see decision record 0004</span>
+    <span class="tb-cell tb-name"><span class="tb-k">Drawing</span> Architecture</span>
+    <span class="tb-cell tb-status"><span class="tb-k">Status</span> Beta, tested on emulators</span>
+    <span class="tb-cell"><span class="tb-k">Revision</span> Design of decision record 0004</span>
   </figcaption>
 
   <details class="sheet-alt">

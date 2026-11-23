@@ -1,6 +1,6 @@
 # Contributing to skylite
 
-skylite is pre-alpha. Read the [README](README.md) for the current status and
+skylite is beta. Read the [README](README.md) for the current status and
 roadmap before proposing larger changes; opening an issue first is the best way
 to check that a change fits.
 

@@ -5,7 +5,7 @@ weight: 10
 status: current
 ---
 
-skylite is pre-alpha. The binary prints its version and its help text, and `skylite serve` runs a server that authenticates requests, creates databases in object storage, answers read-only SQL queries on the databases it leads, and runs autocommit writes and transactions sent on write channels. This page covers everything that works today.
+skylite is beta. The binary prints its version and its help text, and `skylite serve` runs a server that authenticates requests, creates databases in object storage, answers read-only SQL queries on the databases it leads and on opt-in followers, and runs autocommit writes and transactions sent on write channels. This page covers everything that works today.
 
 ## Download a release
 
@@ -70,4 +70,4 @@ make build
 
 ## What comes next
 
-Writes and transactions run on write channels, which the [Go driver](/docs/go-driver/), GORM included, and the [JDBC driver](/docs/jdbc-driver/) use. To follow the work, read the [architecture direction](/docs/architecture/) and the [roadmap](/docs/roadmap/). The planned storage design is recorded in [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/).
+Writes and transactions run on write channels, which the [Go driver](/docs/go-driver/), GORM included, and the [JDBC driver](/docs/jdbc-driver/) use. To follow the work, read the [architecture direction](/docs/architecture/) and the [roadmap](/docs/roadmap/). The storage design is recorded in [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/).

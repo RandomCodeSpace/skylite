@@ -1,11 +1,11 @@
 ---
 title: Architecture
-description: The planned design for skylite, and the questions that are still open.
+description: The design of skylite, and the questions that are still open.
 weight: 20
 status: design
 ---
 
-Most of this page is not implemented. It records the design the project has decided on and plans to build. Parts of the storage engine exist as a library package: database creation, paged reads, the leader's commit path, takeover, compaction, retirement, garbage collection and follower snapshots. The server leads the databases it is configured for through it, compaction included, serves stateless reads on leaders and opt-in followers, and runs autocommit writes on leader-owned channels. The storage design follows [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/), which rests on the [durability spike](/docs/decisions/0002-durability-spike/) and on exploratory probes. The spike ran against an object-store emulator. The probes ran against in-memory models of storage, which is weaker evidence. The record is accepted on condition: the SQLite-side mechanisms must pass the engine's own tests at the pinned versions, or the design falls back to a single-connection mode or returns to the record. The record lists what those tests must prove before any of it is relied on.
+This page records the design the project has decided on. Most of it is built; the [roadmap](/docs/roadmap/) lists what is not. The storage engine exists as a library package: database creation, paged reads, the leader's commit path, takeover, compaction, retirement, garbage collection and follower snapshots. The server leads the databases it is configured for through it, compaction included, serves stateless reads on leaders and opt-in followers, runs autocommit writes and transactions on leader-owned channels, and forwards a request it cannot serve one hop to the pod that serves it. The storage design follows [0004: Build skylite's own storage engine](/docs/decisions/0004-storage-engine/), which rests on the [durability spike](/docs/decisions/0002-durability-spike/) and on exploratory probes. The spike ran against an object-store emulator. The probes ran against in-memory models of storage, which is weaker evidence. The record is accepted on condition: the SQLite-side mechanisms must pass the engine's own tests at the pinned versions, or the design falls back to a single-connection mode or returns to the record. The record lists what those tests must prove before any of it is relied on.
 
 ## The shape of the system
 
@@ -23,7 +23,7 @@ The cost is write latency. Every acknowledged write includes an object storage r
 
 ## Storage engine
 
-skylite plans its own storage engine under SQLite, using the pure-Go engine [`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3). Litestream is not used in the product. Each database is planned to have four kinds of object in storage:
+skylite has its own storage engine under SQLite, using the pure-Go engine [`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3). Litestream is not used in the product. Each database has four kinds of object in storage:
 
 - A **commit log**: one object per transaction, named by its transaction number and created only if absent. That create is the commit point and the acknowledgement point. A name in the log is never freed: once the base covers a commit, garbage collection replaces the object with a small retired form that keeps its header and drops its pages.
 - A **base**: the database's pages in fixed-size groups of consecutive page numbers, each an object whose content never changes once it is created. A compaction attempt references a base object only if it created it or read back exactly the bytes it would have written.
@@ -32,7 +32,7 @@ skylite plans its own storage engine under SQLite, using the pure-Go engine [`nc
 
 The database identifier is part of the key of every log and base object, so a delayed request from an old process lands in the namespace of the database it was working on.
 
-On the leader, SQLite is planned to run in WAL mode. The plan is for the storage engine to turn each commit in the write-ahead log into one commit object and upload it before `COMMIT` returns. A client is told one of three outcomes: committed, not committed, or unknown when the upload's result cannot be established. An upload known to have had no effect, followed by a successful truncation of the local log, rolls the transaction back and the pod keeps serving. After an unknown outcome, a failed truncation, or any other failure in the commit path once an upload may have started, the pod stops serving that database until a takeover reads the durable history. The leader folds the commit log into new base objects in the background and then swaps the manifest, rewriting only the groups the folded commits changed. After a grace period it retires the commits the new manifest covers and deletes the base objects no manifest can reference any more. Compaction keeps the uncompacted log under its bound, so a database keeps serving past it; it has been tested against the local filesystem backend only.
+On the leader, SQLite runs in WAL mode. The storage engine turns each commit in the write-ahead log into one commit object and uploads it before `COMMIT` returns. A client is told one of three outcomes: committed, not committed, or unknown when the upload's result cannot be established. An upload known to have had no effect, followed by a successful truncation of the local log, rolls the transaction back and the pod keeps serving. After an unknown outcome, a failed truncation, or any other failure in the commit path once an upload may have started, the pod stops serving that database until a takeover reads the durable history. The leader folds the commit log into new base objects in the background and then swaps the manifest, rewriting only the groups the folded commits changed. After a grace period it retires the commits the new manifest covers and deletes the base objects no manifest can reference any more. Compaction keeps the uncompacted log under its bound, so a database keeps serving past it; it has been tested against the local filesystem backend only.
 
 The first version accepts these limits: one upload per commit; a maximum transaction size, which makes `VACUUM` and large index builds unsupported on large databases; a maximum manifest size; bounds on the leader's local log and on its uncompacted commit log; one small retired object kept per transaction for the life of the database; takeover latency that is not bounded; and followers whose lag is not bounded by their polling interval. The [decision record](/docs/decisions/0004-storage-engine/#10-limits-accepted-in-the-first-version) states each one.
 
@@ -48,18 +48,18 @@ The engine's leader and follower both read pages from object storage on demand a
 
 ## Interface and clients
 
-The query interface is planned as full relational SQL, the SQL that SQLite provides, over HTTPS. SQLite remains the SQL engine; only the storage underneath it is skylite's own.
+The query interface is full relational SQL, the SQL that SQLite provides, over HTTPS. SQLite remains the SQL engine; only the storage underneath it is skylite's own.
 
-Two client libraries are planned:
+Two client libraries exist:
 
-- A Go `database/sql` driver. The target is that it works with GORM.
-- A JDBC driver and a Hibernate dialect. The target is that they work with Spring Data JPA.
+- A [Go `database/sql` driver](/docs/go-driver/), which passes a GORM acceptance test.
+- A [JDBC driver and a Hibernate dialect](/docs/jdbc-driver/), which pass a Spring Data JPA acceptance suite.
 
-Both drivers are planned to speak one protocol, specified in [0005: Client protocol](/docs/decisions/0005-client-protocol/): ordinary HTTP requests with JSON bodies under `/v1`, results as newline-delimited JSON with a required final frame, and channels with sequence numbers for every request that can write, so that, for a driver that alone holds its channel's token, no request takes effect twice and the driver reports an outcome only when it can prove it.
+Both drivers speak one protocol, specified in [0005: Client protocol](/docs/decisions/0005-client-protocol/): ordinary HTTP requests with JSON bodies under `/v1`, results as newline-delimited JSON with a required final frame, and channels with sequence numbers for every request that can write, so that, for a driver that alone holds its channel's token, no request takes effect twice and the driver reports an outcome only when it can prove it.
 
 ## Storage backends
 
-All storage access goes through one storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete; there is no unconditional put. Azure Blob Storage comes first, then AWS S3, Google Cloud Storage and the local filesystem. The backends are meant to share one test suite that runs against storage emulators.
+All storage access goes through one storage interface whose writes are create-if-absent, compare-and-swap and an unconditional delete; there is no unconditional put. There are four backends: Azure Blob Storage, AWS S3, Google Cloud Storage and the local filesystem. They share one conformance suite, which runs against storage emulators; no cloud backend has been tested against its real service.
 
 ## Cloud authentication
 
@@ -85,8 +85,8 @@ Settled by [0004: Build skylite's own storage engine](/docs/decisions/0004-stora
 
 ### Wire protocol for JDBC
 
-Settled by [0003: JDBC transport](/docs/decisions/0003-jdbc-transport/). skylite plans to ship its own JDBC driver, and a Hibernate dialect, over the same HTTPS API as everything else, rather than serve Arrow Flight SQL for the Apache Arrow Flight SQL JDBC driver, which did not pass the project's Spring Data JPA acceptance suite. That suite, in `clients/java/acceptance/`, is the requirement the planned driver and dialect have to meet.
+Settled by [0003: JDBC transport](/docs/decisions/0003-jdbc-transport/). skylite ships its own JDBC driver, and a Hibernate dialect, over the same HTTPS API as everything else, rather than serve Arrow Flight SQL for the Apache Arrow Flight SQL JDBC driver, which did not pass the project's Spring Data JPA acceptance suite. That suite, in `clients/java/acceptance/`, is the requirement the driver and dialect meet.
 
 ### Client authentication
 
-Settled by [0006: Authentication](/docs/decisions/0006-authentication/). Clients authenticate to the query endpoint with OIDC JWT bearer tokens only, from issuers in the server's configuration, such as a Kubernetes cluster's service-account issuer or Microsoft Entra ID. Access is denied by default and granted by rules that give a `read`, `write` or `admin` role on a database. Every pod that handles a request is planned to verify its token, including after another pod forwards it ([0005: Client protocol](/docs/decisions/0005-client-protocol/)). The [server](/docs/server/) verifies tokens on every request; forwarding does not exist yet.
+Settled by [0006: Authentication](/docs/decisions/0006-authentication/). Clients authenticate to the query endpoint with OIDC JWT bearer tokens only, from issuers in the server's configuration, such as a Kubernetes cluster's service-account issuer or Microsoft Entra ID. Access is denied by default and granted by rules that give a `read`, `write` or `admin` role on a database. Every pod that handles a request verifies its token, including after another pod forwards it ([0005: Client protocol](/docs/decisions/0005-client-protocol/), [Forwarding between pods](/docs/server/#forwarding-between-pods)). No real Entra ID tenant has been tested as an issuer yet.
