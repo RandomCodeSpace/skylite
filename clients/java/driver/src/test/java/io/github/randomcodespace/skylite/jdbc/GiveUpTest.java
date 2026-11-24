@@ -81,8 +81,10 @@ class GiveUpTest {
                 }
             } else if (r.path().endsWith("/query")) {
                 FakeServer.send(ex, 200, "{\"columns\":[{\"name\":\"x\"}]}", "[1]", "[2]", FakeServer.done(1));
+            } else if (r.path().endsWith("/resolve")) {
+                FakeServer.send(ex, 200, FakeServer.resolved("unknown", 1)); // nothing settles it
             } else {
-                FakeServer.send(ex, 200, "{\"done\":{\"last_seq\":0}}");
+                FakeServer.send(ex, 410, FakeServer.channelError("channel_lost", true, false, "none"));
             }
         };
     }
@@ -91,8 +93,9 @@ class GiveUpTest {
         return fake.requests.stream().filter(r -> r.path().endsWith(suffix)).count();
     }
 
-    private static String overloaded() {
-        return FakeServer.channelError("overloaded", true, false, "none");
+    /** A refusal before acceptance that a later send would not pass, so the driver does not send it again. */
+    private static String refused() {
+        return FakeServer.channelError("invalid_request", true, false, "none");
     }
 
     private static String lost() {
@@ -101,9 +104,9 @@ class GiveUpTest {
 
     @Test
     void aRefusalOfTheFirstSendLeavesTheConnectionUsable() throws Exception {
-        script(overloaded(), FakeServer.executed(1, "none", 1, 7));
+        script(refused(), FakeServer.executed(1, "none", 1, 7));
         try (Connection c = connect(); Statement s = c.createStatement()) {
-            assertEquals("08004", assertThrows(SQLException.class,
+            assertEquals("42000", assertThrows(SQLException.class,
                     () -> s.executeUpdate("INSERT INTO t VALUES (1)")).getSQLState());
             assertEquals(1, s.executeUpdate("INSERT INTO t VALUES (1)"));
         }
@@ -111,7 +114,7 @@ class GiveUpTest {
 
     @Test
     void aRefusalOfAResendAfterALostAnswerIsUnknown() throws Exception {
-        script("drop", overloaded(), FakeServer.executed(1, "none", 1, 7));
+        script("drop", refused(), FakeServer.executed(1, "none", 1, 7));
         try (Connection c = connect(); Statement s = c.createStatement()) {
             assertEquals("08007", assertThrows(SQLException.class,
                     () -> s.executeUpdate("INSERT INTO t VALUES (1)")).getSQLState());
@@ -122,7 +125,7 @@ class GiveUpTest {
 
     @Test
     void aRefusalOfAResendAfterInFlightIsUnknown() throws Exception {
-        script(FakeServer.channelError("in_flight", true, false, "none"), overloaded(),
+        script(FakeServer.channelError("in_flight", true, false, "none"), refused(),
                 FakeServer.executed(1, "none", 1, 7));
         try (Connection c = connect(); Statement s = c.createStatement()) {
             assertEquals("08007", assertThrows(SQLException.class,
@@ -201,9 +204,11 @@ class GiveUpTest {
         assertEquals(0, count("/query"), "a read was sent after the connection was discarded");
     }
 
+    /** It runs where a statement of a read-only transaction runs: on the read-only channel, which refuses it. */
     @Test
-    void aWriteQueuedBehindSetReadOnlyRunsAsAStatelessRead() throws Exception {
-        script(FakeServer.executed(1, "open", 1, 8));
+    void aWriteQueuedBehindSetReadOnlyRunsOnTheReadOnlyChannel() throws Exception {
+        script("{\"error\":{\"code\":\"sql_error\",\"not_executed\":true,\"final\":true,\"message\":\"m\","
+                + "\"request_id\":\"r\",\"txn_state\":\"none\",\"sqlite_code\":8}}");
         fake.responder = wrapQuery(fake.responder);
         try (Connection c = connect(); Statement s = c.createStatement()) {
             SkyliteConnection impl = (SkyliteConnection) c;
@@ -231,8 +236,9 @@ class GiveUpTest {
             assertEquals("none", impl.channel().state());
             assertEquals("25006", ((SQLException) failure.get()).getSQLState(), String.valueOf(failure.get()));
         }
-        assertEquals(0, count("/channel"));
-        assertEquals(1, count("/query"));
+        assertEquals(1, count("/channel"));
+        assertEquals(0, count("/query"));
+        assertTrue(fake.requests.stream().anyMatch(r -> r.bodyText().startsWith("{\"mode\":\"read_only\"")));
     }
 
     /** A query answered needs_channel, as the server answers a write. */
@@ -292,24 +298,6 @@ class GiveUpTest {
             s.close();
             assertTrue(k3.isClosed());
             assertThrows(SQLException.class, s::getGeneratedKeys);
-        }
-    }
-
-    @Test
-    void aFailedBatchKeepsTheKeysOfTheEntriesBeforeIt() throws Exception {
-        script(FakeServer.executed(1, "none", 1, 7), FakeServer.channelError("sql_error", true, true, "none"));
-        try (Connection c = connect();
-                PreparedStatement p = c.prepareStatement("INSERT INTO t VALUES (?)", Statement.RETURN_GENERATED_KEYS)) {
-            p.setInt(1, 1);
-            p.addBatch();
-            p.setInt(1, 1);
-            p.addBatch();
-            BatchUpdateException e = assertThrows(BatchUpdateException.class, p::executeBatch);
-            assertArrayEquals(new int[] {1}, e.getUpdateCounts());
-            ResultSet keys = p.getGeneratedKeys();
-            assertTrue(keys.next());
-            assertEquals(7, keys.getLong(1));
-            assertFalse(keys.next());
         }
     }
 

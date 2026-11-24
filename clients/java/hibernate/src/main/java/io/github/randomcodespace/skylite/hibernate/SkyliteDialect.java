@@ -16,7 +16,7 @@ import org.hibernate.tool.schema.internal.StandardTableExporter;
 import org.hibernate.tool.schema.spi.Exporter;
 
 /**
- * Hibernate's community SQLite dialect for skylite's JDBC driver, with two differences:
+ * Hibernate's community SQLite dialect for skylite's JDBC driver, with three differences:
  *
  * <ul>
  *   <li>Generated identifiers come from {@code getGeneratedKeys}, which the driver answers with the insert's rowid
@@ -25,9 +25,14 @@ import org.hibernate.tool.schema.spi.Exporter;
  *   <li>Foreign keys are declared inside {@code create table}, since SQLite has no {@code alter table add
  *       constraint}, and skylite's connections enforce them. Dropping a table first drops the tables that reference
  *       it, so that the implicit delete of a drop never fails on their rows.
+ *   <li>JDBC batching is on by default, {@value #BATCH_SIZE} statements a batch, because the driver sends a batch as
+ *       one request; {@code hibernate.jdbc.batch_size} still decides.
  * </ul>
  */
 public class SkyliteDialect extends SQLiteDialect {
+    /** The default JDBC batch size. */
+    static final int BATCH_SIZE = 50;
+
     private final Exporter<Table> tableExporter = new TableExporter(this);
 
     public SkyliteDialect() {}
@@ -39,6 +44,11 @@ public class SkyliteDialect extends SQLiteDialect {
     @Override
     public boolean getDefaultUseGetGeneratedKeys() {
         return true;
+    }
+
+    @Override
+    public int getDefaultStatementBatchSize() {
+        return BATCH_SIZE;
     }
 
     @Override

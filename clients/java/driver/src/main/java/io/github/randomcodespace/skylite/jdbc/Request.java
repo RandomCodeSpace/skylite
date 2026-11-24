@@ -5,7 +5,7 @@ import java.sql.SQLException;
 import java.sql.SQLNonTransientException;
 import java.util.List;
 
-/** The request bodies of ADR 0005: query, describe and the write channel's. Errors never hold a value. */
+/** The request bodies of ADR 0005: query, describe, a channel's and resolve. Errors never hold a value. */
 final class Request {
     private Request() {}
 
@@ -40,9 +40,11 @@ final class Request {
         return finish(sb);
     }
 
-    /** {@code {"mode":"write"}}: a write channel's open. */
-    static byte[] open() {
-        return "{\"mode\":\"write\"}".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    /** {@code {"mode":"write"}}, or {@code {"mode":"read_only","min_txn":n}}: a channel's open. */
+    static byte[] open(boolean readOnly, long minTxn) {
+        String s = !readOnly ? "{\"mode\":\"write\"}"
+                : minTxn > 0 ? "{\"mode\":\"read_only\",\"min_txn\":" + minTxn + "}" : "{\"mode\":\"read_only\"}";
+        return s.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
     }
 
     /**
@@ -72,7 +74,60 @@ final class Request {
         return finish(channel(channel, seq).append(",\"op\":\"").append(op).append('"'));
     }
 
-    /** {@code {"channel":t,"seq":n}}. */
+    /** {@code {"channel":t,"seq":n,"op":"begin","min_txn":n}}: a begin without a first statement. */
+    static byte[] begin(String channel, long seq, long minTxn) throws SQLException {
+        StringBuilder sb = channel(channel, seq).append(",\"op\":\"begin\"");
+        if (minTxn > 0) {
+            sb.append(",\"min_txn\":").append(minTxn);
+        }
+        return finish(sb);
+    }
+
+    /** A batch entry of param_sets: the parameter set as a JSON array. */
+    static String paramSet(List<Object> params) throws SQLException {
+        StringBuilder sb = new StringBuilder().append('[');
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            Values.append(sb, params.get(i));
+        }
+        return sb.append(']').toString();
+    }
+
+    /** A batch entry of statements: {@code {"sql":...}}. */
+    static String statement(String sql) throws SQLException {
+        StringBuilder sb = new StringBuilder(sql == null ? 16 : sql.length() + 16).append('{');
+        statement(sb, sql, List.of());
+        return sb.append('}').toString();
+    }
+
+    /**
+     * {@code {"channel":t,"seq":n,"op":"batch","sql":...,"param_sets":[...],"min_txn":n,"timeout_ms":n}}, or with
+     * {@code "statements":[...]} when sql is null; entries are those of {@link #paramSet} or {@link #statement}.
+     */
+    static byte[] batch(String channel, long seq, String sql, List<String> entries, long minTxn, long timeoutMs)
+            throws SQLException {
+        StringBuilder sb = channel(channel, seq).append(",\"op\":\"batch\",");
+        if (sql != null) {
+            checkSql(sql);
+            sb.append("\"sql\":");
+            Values.appendString(sb, sql);
+            sb.append(",\"param_sets\":[");
+        } else {
+            sb.append("\"statements\":[");
+        }
+        sb.append(String.join(",", entries)).append(']');
+        if (minTxn > 0) {
+            sb.append(",\"min_txn\":").append(minTxn);
+        }
+        if (timeoutMs > 0) {
+            sb.append(",\"timeout_ms\":").append(Math.min(timeoutMs, Integer.MAX_VALUE));
+        }
+        return finish(sb);
+    }
+
+    /** {@code {"channel":t,"seq":n}}: a cancel's body, and a resolve's. */
     static byte[] cancel(String channel, long seq) throws SQLException {
         return finish(channel(channel, seq));
     }

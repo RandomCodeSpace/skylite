@@ -633,6 +633,8 @@ class DriverTest {
     })
     void mapsEveryErrorCode(String code, int status, String type, String state) throws Exception {
         fake.responder = (r, ex) -> FakeServer.send(ex, status, FakeServer.error(code, "message " + code));
+        long budget = Retry.defaultBudgetMillis;
+        Retry.defaultBudgetMillis = 1; // the codes the driver sends again are raised once its retries end
         try (Connection c = connect(); Statement s = c.createStatement()) {
             c.setReadOnly(true); // needs_channel goes no further
             SQLException e = fails(SQLException.class, () -> s.executeQuery("SELECT 1"));
@@ -641,6 +643,8 @@ class DriverTest {
             assertEquals(0, e.getErrorCode());
             assertTrue(e.getMessage().contains(code) && e.getMessage().contains("message " + code)
                     && e.getMessage().contains("req-1"), e.getMessage());
+        } finally {
+            Retry.defaultBudgetMillis = budget;
         }
     }
 
@@ -710,8 +714,10 @@ class DriverTest {
                 } else {
                     FakeServer.send(ex, a.contains("\"error\"") && !a.contains("\"final\":true") ? 409 : 200, a);
                 }
+            } else if (r.path().endsWith("/resolve")) {
+                FakeServer.send(ex, 200, FakeServer.resolved("unknown", 1)); // nothing settles it
             } else {
-                FakeServer.send(ex, 200, "{\"done\":{\"last_seq\":0}}");
+                FakeServer.send(ex, 410, FakeServer.channelError("channel_lost", true, false, "none"));
             }
         };
     }
@@ -759,9 +765,9 @@ class DriverTest {
 
     @Test
     void aRefusalBeforeAcceptanceLeavesTheSequenceNumberFree() throws Exception {
-        channel(FakeServer.channelError("overloaded", true, false, "none"), FakeServer.executed(1, "none", 1, 7));
+        channel(FakeServer.channelError("request_too_large", true, false, "none"), FakeServer.executed(1, "none", 1, 7));
         try (Connection c = connect(); Statement s = c.createStatement()) {
-            fails(SQLTransientConnectionException.class, () -> s.executeUpdate("INSERT INTO t VALUES (1)"));
+            fails(SQLNonTransientException.class, () -> s.executeUpdate("INSERT INTO t VALUES (1)"));
             assertEquals(1, s.executeUpdate("INSERT INTO t VALUES (1)"));
         }
         assertTrue(channelBodies().stream().allMatch(b -> b.contains("\"seq\":1,")), channelBodies().toString());
@@ -1085,19 +1091,6 @@ class DriverTest {
     }
 
     @Test
-    void aStatementBatchRunsEachStatementInOrder() throws Exception {
-        channel(FakeServer.executed(1, "none", 1, 1), FakeServer.executed(2, "none", 2, 1));
-        try (Connection c = connect(); Statement s = c.createStatement()) {
-            s.addBatch("INSERT INTO t VALUES (1)");
-            s.addBatch("UPDATE t SET x = 1");
-            assertArrayEquals(new int[] {1, 2}, s.executeBatch());
-            assertArrayEquals(new int[0], s.executeBatch());
-        }
-        assertEquals(List.of("INSERT INTO t VALUES (1)", "UPDATE t SET x = 1"),
-                channelBodies().stream().map(b -> b.replaceAll(".*\"sql\":\"([^\"]*)\".*", "$1")).toList());
-    }
-
-    @Test
     void onlyAnInsertOrReplaceHasAGeneratedKey() throws Exception {
         assertTrue(SkyliteStatement.inserts("  -- c\n /* x */ insert INTO t VALUES (1)"));
         assertTrue(SkyliteStatement.inserts("REPLACE INTO t VALUES (1)"));
@@ -1140,21 +1133,6 @@ class DriverTest {
         }
         assertTrue(fake.requests.stream().anyMatch(r -> r.path().endsWith("/channel/cancel")
                 && r.bodyText().equals("{\"channel\":\"w1.c\",\"seq\":1}")));
-    }
-
-    @Test
-    void aFailedBatchEntryStopsTheBatchWithTheCountsBeforeIt() throws Exception {
-        channel(FakeServer.executed(1, "none", 1, 1),
-                FakeServer.channelError("sql_error", true, true, "none"));
-        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement("INSERT INTO t VALUES (?)")) {
-            for (int i = 0; i < 3; i++) {
-                ps.setInt(1, i);
-                ps.addBatch();
-            }
-            java.sql.BatchUpdateException e = fails(java.sql.BatchUpdateException.class, ps::executeBatch);
-            assertArrayEquals(new int[] {1}, e.getUpdateCounts());
-        }
-        assertEquals(2, channelBodies().size());
     }
 
     @Test

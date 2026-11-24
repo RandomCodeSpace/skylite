@@ -42,12 +42,14 @@ final class FakeServer implements AutoCloseable {
     }
 
     private static final Pattern PATH = Pattern.compile(
-            "/v1/databases/([a-z0-9][a-z0-9-]{0,62})/(query|describe|channels|channel|channel/cancel|channel/close)");
+            "/v1/databases/([a-z0-9][a-z0-9-]{0,62})/(query|describe|channels|channel|channel/cancel|channel/close|resolve)");
     private static final Map<String, Set<String>> FIELDS = Map.of(
             "query", Set.of("sql", "params", "named", "min_txn", "timeout_ms"),
             "describe", Set.of("sql", "min_txn"),
             "channels", Set.of("mode", "min_txn"),
-            "channel", Set.of("channel", "seq", "op", "sql", "params", "named", "min_txn", "timeout_ms", "execute"),
+            "channel", Set.of("channel", "seq", "op", "sql", "params", "named", "min_txn", "timeout_ms", "execute",
+                    "param_sets", "statements"),
+            "resolve", Set.of("channel", "seq"),
             "channel/cancel", Set.of("channel", "seq"),
             "channel/close", Set.of("channel"));
 
@@ -218,6 +220,27 @@ final class FakeServer implements AutoCloseable {
     static String channelError(String code, boolean notExecuted, boolean isFinal, String state) {
         return "{\"error\":{\"code\":\"" + code + "\",\"not_executed\":" + notExecuted + ",\"final\":" + isFinal
                 + ",\"message\":\"m\",\"request_id\":\"req-1\",\"txn_state\":\"" + state + "\"}}";
+    }
+
+    /** A resolve answer. */
+    static String resolved(String resolution, long txn) {
+        return "{\"done\":{\"resolution\":\"" + resolution + "\",\"txn\":" + txn + "}}";
+    }
+
+    /** A batch's results frame from index from, one entry per row count, each with rowid 100 + its index. */
+    static String results(int from, long... rows) {
+        StringBuilder sb = new StringBuilder("{\"results\":{\"from\":").append(from).append(",\"entries\":[");
+        for (int i = 0; i < rows.length; i++) {
+            sb.append(i > 0 ? "," : "").append("{\"rows_affected\":").append(rows[i])
+                    .append(",\"last_insert_rowid\":").append(100 + from + i).append('}');
+        }
+        return sb.append("]}}").toString();
+    }
+
+    /** The done frame of a batch of entries. */
+    static String batched(long seq, String state, long rows, int entries) {
+        return "{\"done\":{\"seq\":" + seq + ",\"txn_state\":\"" + state + "\",\"txn\":2,\"rows_affected\":" + rows
+                + ",\"last_insert_rowid\":0,\"entries\":" + entries + "}}";
     }
 
     static String describeDone(long txn, int params) {

@@ -79,4 +79,9 @@ class SkyliteDialectTest {
     void generatedKeysComeFromTheDriver() {
         assertTrue(new SkyliteDialect().getDefaultUseGetGeneratedKeys());
     }
+
+    @Test
+    void batchesByDefault() {
+        assertEquals(50, new SkyliteDialect().getDefaultStatementBatchSize());
+    }
 }

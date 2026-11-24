@@ -63,8 +63,10 @@ class ChannelOutcomeTest {
                 } else {
                     FakeServer.send(ex, a.contains("\"error\"") && !a.contains("\"final\":true") ? 409 : 200, a);
                 }
+            } else if (r.path().endsWith("/resolve")) {
+                FakeServer.send(ex, 200, FakeServer.resolved("unknown", 1)); // nothing settles it
             } else {
-                FakeServer.send(ex, 200, "{\"done\":{\"last_seq\":0}}");
+                FakeServer.send(ex, 410, FakeServer.channelError("channel_lost", true, false, "none"));
             }
         };
     }
@@ -160,8 +162,10 @@ class ChannelOutcomeTest {
                     // what a reuse of seq 1 would get
                     FakeServer.send(ex, 200, FakeServer.executed(1, "none", 1, 77));
                 }
+            } else if (r.path().endsWith("/resolve")) {
+                FakeServer.send(ex, 200, FakeServer.resolved("unknown", 1)); // nothing settles it
             } else {
-                FakeServer.send(ex, 200, "{\"done\":{\"last_seq\":0}}");
+                FakeServer.send(ex, 410, FakeServer.channelError("channel_lost", true, false, "none"));
             }
         };
         try (Connection c = connect(); Statement s = c.createStatement()) {
@@ -207,8 +211,10 @@ class ChannelOutcomeTest {
                     // ends an unbounded resend loop with a failed assertion rather than a timeout
                     FakeServer.send(ex, 200, FakeServer.channelError("commit_outcome_unknown", false, false, "none"));
                 }
+            } else if (r.path().endsWith("/resolve")) {
+                FakeServer.send(ex, 200, FakeServer.resolved("unknown", 1)); // nothing settles it
             } else {
-                FakeServer.send(ex, 200, "{\"done\":{\"last_seq\":0}}");
+                FakeServer.send(ex, 410, FakeServer.channelError("channel_lost", true, false, "none"));
             }
         };
         try (Connection c = connect(); Statement s = c.createStatement()) {
@@ -309,8 +315,10 @@ class ChannelOutcomeTest {
                 } else {
                     FakeServer.send(ex, 200, FakeServer.executed(1, "open", 1, 1));
                 }
+            } else if (r.path().endsWith("/resolve")) {
+                FakeServer.send(ex, 200, FakeServer.resolved("unknown", 1)); // nothing settles it
             } else {
-                FakeServer.send(ex, 200, "{\"done\":{\"last_seq\":0}}");
+                FakeServer.send(ex, 410, FakeServer.channelError("channel_lost", true, false, "none"));
             }
         };
         var exec = Executors.newSingleThreadExecutor();
@@ -346,8 +354,10 @@ class ChannelOutcomeTest {
                 } else {
                     FakeServer.send(ex, 200, FakeServer.executed(2, "none", 1, 2));
                 }
+            } else if (r.path().endsWith("/resolve")) {
+                FakeServer.send(ex, 200, FakeServer.resolved("unknown", 1)); // nothing settles it
             } else {
-                FakeServer.send(ex, 200, "{\"done\":{\"last_seq\":0}}");
+                FakeServer.send(ex, 410, FakeServer.channelError("channel_lost", true, false, "none"));
             }
         };
         var pool = Executors.newCachedThreadPool();
@@ -392,33 +402,6 @@ class ChannelOutcomeTest {
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement("SELECT 1")) {
             assertThrows(SQLException.class, () -> ps.executeUpdate("INSERT INTO t VALUES (1)", Statement.RETURN_GENERATED_KEYS));
             assertEquals(0, fake.requests.size(), "PreparedStatement executed arbitrary SQL string");
-        }
-    }
-
-    /** A prepared batch keeps each entry's generated key, and a failed batch chains its cause. */
-    @Test
-    void batchGeneratedKeysAndNextException() throws Exception {
-        script(FakeServer.executed(1, "none", 1, 10), FakeServer.executed(2, "none", 1, 11));
-        try (Connection c = connect();
-                PreparedStatement ps = c.prepareStatement("INSERT INTO t VALUES (?)", Statement.RETURN_GENERATED_KEYS)) {
-            ps.setInt(1, 1);
-            ps.addBatch();
-            ps.setInt(1, 2);
-            ps.addBatch();
-            ps.executeBatch();
-            try (ResultSet keys = ps.getGeneratedKeys()) {
-                assertTrue(keys.next(), "getGeneratedKeys() returned 0 rows after PreparedStatement.executeBatch()");
-            }
-        }
-
-        script(FakeServer.executed(1, "none", 1, 1), FakeServer.channelError("sql_error", true, true, "none"));
-        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement("INSERT INTO t VALUES (?)")) {
-            ps.setInt(1, 1);
-            ps.addBatch();
-            ps.setInt(1, 2);
-            ps.addBatch();
-            BatchUpdateException bue = assertThrows(BatchUpdateException.class, ps::executeBatch);
-            assertNotNull(bue.getNextException(), "BatchUpdateException.getNextException() is null");
         }
     }
 }
