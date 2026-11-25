@@ -59,8 +59,8 @@ detail = "The rest of the client protocol on the server: batch requests, describ
 
 [[items]]
 title = "Admission control"
-status = "planned"
-detail = "What remains of decision record 0005's admission control: charging HTTP connections, running responses and the headers a resolve reads from storage to the memory budget, and letting a frame larger than 1 MiB wait for room. The request bounds, the control capacity, the memory budget from the container's memory limit with the request body limit that scales with it, the SQLite connection limits and the channel bounds exist."
+status = "done"
+detail = "Request bounds per pod and per principal, separate capacity for closes, cancels and resolves, a memory budget from the container's memory limit with a request body limit that scales with it, SQLite connection limits, channel bounds, a reservation for resolve's commit headers, and large response frames that wait for room. HTTP connections and response frames up to 1 MiB stay outside the budget by design, bounded by the 1,024-connection limit."
 
 [[items]]
 title = "Follower-owned read channels"
