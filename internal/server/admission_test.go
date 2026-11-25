@@ -324,3 +324,51 @@ func TestRefreshWaitHoldsNoPlace(t *testing.T) {
 	e.admitted(t, &e.s.refreshes, "", 0)
 	e.admitted(t, &e.s.requests, "", 0)
 }
+
+// TestLargeFrameWaitsForRoom: a row larger than the frame size is charged
+// to the body share while it is written, waits for room, and fails with
+// timeout if none frees within the statement time, on a channel too; an
+// autocommit write's held rows refuse it without waiting.
+func TestLargeFrameWaitsForRoom(t *testing.T) {
+	e, _ := newChanEnv(t, nil)
+	const sql = "SELECT randomblob(1048576)" // a frame of about 1.4 MiB
+	timed := `{"sql":"` + sql + `","timeout_ms":200}`
+	hog := func(n int64) {
+		e.s.bodyMu.Lock()
+		e.s.bodyUsed += n
+		e.s.wakeLocked()
+		e.s.bodyMu.Unlock()
+	}
+	full := e.s.bodyShare - 64<<10 // room for the bodies, not for the frame
+	hog(full)
+	if a := e.post(t, "query", "reader", timed); a.code() != "timeout" || len(a.rows()) != 0 {
+		t.Errorf("query: %d %s, %d rows, want timeout", a.status, a.code(), len(a.rows()))
+	}
+	if a := e.post(t, "channel", "reader", ex(e.openRO(t, "reader"), 1, sql, "timeout_ms", 200)); a.code() != "timeout" || len(a.rows()) != 0 {
+		t.Errorf("read-only channel: %d %s, %d rows, want timeout", a.status, a.code(), len(a.rows()))
+	}
+	start := time.Now()
+	if a := e.post(t, "channel", "writer", ex(e.open(t, "writer"), 1, sql, "timeout_ms", 5000)); a.code() != "result_too_large" || time.Since(start) > 2*time.Second {
+		t.Errorf("autocommit write: %d %s after %v, want result_too_large at once", a.status, a.code(), time.Since(start))
+	}
+
+	got := e.postAsync(t, "query", "reader", q(sql))
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		e.s.bodyMu.Lock()
+		waiting := e.s.bodyFreed != nil
+		e.s.bodyMu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the frame never waited for room")
+		}
+	}
+	hog(-full)
+	if a := <-got; a.done() == nil || len(a.rows()) != 1 {
+		t.Errorf("once room freed: %d, %d rows, want served", a.status, len(a.rows()))
+	}
+	if used, _ := e.bodyCharge(); used != 0 {
+		t.Errorf("%d bytes still charged, want the frame's released", used)
+	}
+}

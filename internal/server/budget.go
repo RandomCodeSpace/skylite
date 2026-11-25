@@ -12,10 +12,10 @@ import (
 )
 
 // The memory budget of ADR 0005 decision 9 and what it is divided into:
-// the body share, less the control capacity; the channels' share, which
-// holds a receipt for each channel, held result rows and retained replay
-// data; and SQLite connections at their ceiling in what is left. Nothing
-// else is charged; see docs/content/docs/server.md.
+// the body share, less the control capacity and the header reservations;
+// the channels' share, which holds a receipt for each channel, held result
+// rows and retained replay data; and SQLite connections at their ceiling in
+// what is left. Nothing else is charged; see docs/content/docs/server.md.
 const (
 	defaultBudget = 2 << 30 // without a memory limit
 	channelShare  = maxChannels*receiptBytes + heldShare + replayShare
@@ -26,21 +26,28 @@ const (
 	// reserved from the body share, so the connections keep what the
 	// record derives for them.
 	controlBytes = (maxControl + maxResolves) * 2 * controlBodyBytes
+	// headerBytes is reserved for each listed database, from the body share
+	// as the control capacity is: the headers its leader keeps for resolves,
+	// the engine's index (at most about 98,304, 77 bytes each) and those read
+	// from storage (about the resolve bound, 100,000, 223 bytes each), as
+	// measured with the server's 24-byte commit identifiers: about 28 MiB.
+	headerBytes = 32 << 20
 	// minBudget is the smallest budget that holds one SQLite connection
-	// beside the channels' share: 384 MiB. A smaller budget than 1,026 MiB
-	// lowers the request body limit (shares).
+	// beside the channels' share: 384 MiB. A smaller budget than 1,026 MiB,
+	// plus 64 MiB per listed database, lowers the request body limit (shares).
 	minBudget = 2 * (channelShare + connCeiling)
 	// maxBudget bounds the budget: past about 32 GiB the connections are
 	// at their limit and only the body share grows.
 	maxBudget = 64 << 30
 )
 
-// shares divides a memory budget: the body share, the SQLite connections
-// it holds at their ceiling, the led databases' own included, and the
-// request body limit: 16 MiB, or less below a budget of 1,026 MiB, so that
-// a principal's quarter of the body share holds one body charged at 8 ×.
-func shares(budget int64) (body int64, conns int, bodyLimit int64) {
-	body = budget/2 - controlBytes
+// shares divides a memory budget of a server that lists dbs databases:
+// the body share, the SQLite connections it holds at their ceiling, the led
+// databases' own included, and the request body limit: 16 MiB, or less
+// below a budget of 1,026 MiB plus 64 MiB per database, so that a
+// principal's quarter of the body share holds one body charged at 8 ×.
+func shares(budget int64, dbs int) (body int64, conns int, bodyLimit int64) {
+	body = budget/2 - controlBytes - int64(dbs)*headerBytes
 	return body, int(min(maxConnLimit, (budget-budget/2-channelShare)/connCeiling)), min(16<<20, body/4/8)
 }
 

@@ -192,7 +192,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("memory_budget is %d, want 0 or from %d to %d bytes", c.MemoryBudget, int64(minBudget), int64(maxBudget))
 	}
 	// Without memory_budget, New checks the databases against the budget it derives.
-	if _, conns, _ := shares(cmp.Or(c.MemoryBudget, maxBudget)); len(c.Databases) >= conns {
+	if _, conns, _ := shares(cmp.Or(c.MemoryBudget, maxBudget), 0); len(c.Databases) >= conns {
 		return fmt.Errorf("databases lists %d, want at most %d: each led database holds a connection of the memory budget", len(c.Databases), conns-1)
 	}
 	seen := map[string]bool{}

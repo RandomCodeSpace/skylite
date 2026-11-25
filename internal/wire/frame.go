@@ -230,6 +230,12 @@ type Result struct {
 // Writer writes a response body: frames in the order ADR 0005's grammar
 // allows, ending with one terminal frame. It is not safe for concurrent use.
 type Writer struct {
+	// Room, if set, is called with the size of a frame before the terminal
+	// one that is larger than the frame size and within the result size,
+	// before the frame is written; release is called once it is. Its error
+	// is returned instead, and the writer stays usable for the terminal
+	// frame.
+	Room       func(n int) (release func(), err error)
 	w          io.Writer
 	frameBytes int
 	limits     Limits
@@ -287,6 +293,16 @@ func (w *Writer) emit(frame []byte, terminal bool) error {
 		return fmt.Errorf("wire: terminal frame of %d bytes exceeds its reservation", len(frame))
 	case !terminal && w.n+int64(len(frame)) > w.limits.ResultBytes:
 		return NewError(CodeResultTooLarge, fmt.Sprintf("the result exceeds %d bytes", w.limits.ResultBytes))
+	}
+	if !terminal && len(frame) > w.frameBytes {
+		w.buf = nil // the frame's memory goes with its charge
+		if w.Room != nil {
+			release, err := w.Room(len(frame))
+			if err != nil {
+				return err
+			}
+			defer release()
+		}
 	}
 	if _, err := w.w.Write(frame); err != nil {
 		return err

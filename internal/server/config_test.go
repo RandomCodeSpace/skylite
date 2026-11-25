@@ -103,7 +103,7 @@ func TestLoadRefuses(t *testing.T) {
 		}
 		return "[" + strings.Join(names, ", ") + "]"
 	}
-	_, conns, _ := shares(2 << 30)
+	_, conns, _ := shares(2<<30, 0)
 	many := list(conns)
 	storageField := goodConfig[strings.Index(goodConfig, `"storage"`):strings.Index(goodConfig, `,
   "databases"`)]

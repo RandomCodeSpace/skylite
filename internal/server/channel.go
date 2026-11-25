@@ -958,6 +958,17 @@ func (s *Server) releaseLocked(t *table) {
 	close(w.ready)
 }
 
+// writer is the wire.Writer of a channel request's frames to w, whose
+// frames larger than the frame size wait for room within ctx (frameRoom),
+// except held rows: the held-result bound refuses such a frame anyway.
+func (s *Server) writer(ctx context.Context, w io.Writer) (*wire.Writer, error) {
+	out, err := wire.NewWriter(w, wire.DefaultFrameBytes, s.limits)
+	if _, held := w.(*heldRows); err == nil && !held {
+		out.Room = s.frameRoom(ctx)
+	}
+	return out, err
+}
+
 // heldRows holds an autocommit write's frames until its commit has an
 // outcome, charged to the held-result bounds: limit for the request, and
 // the pod's share.
@@ -1285,7 +1296,7 @@ func (s *Server) write(db *sqlite3.Conn, c *pconn, req *wire.Request, stmt *wire
 	}
 	if stmt != nil {
 		var out *wire.Writer
-		out, err = wire.NewWriter(w, wire.DefaultFrameBytes, s.limits)
+		out, err = s.writer(ictx, w)
 		switch {
 		case err != nil:
 		case req.Op == wire.OpBatch:
@@ -1378,7 +1389,7 @@ func (s *Server) describe(ctx context.Context, d *database, t *table, c *pconn, 
 	trusted := false
 	_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
 		ictx := db.GetInterrupt()
-		out, err := wire.NewWriter(w, wire.DefaultFrameBytes, s.limits)
+		out, err := s.writer(ictx, w)
 		if err == nil {
 			done, err = describeOn(c, ictx, req.SQL, out, false)
 		}
@@ -1451,7 +1462,7 @@ func (s *Server) readBegin(ctx context.Context, d *database, t *table, ch *chann
 		var err error
 		if snap, err = startRead(c, ictx); err == nil && req.Execute != nil {
 			var out *wire.Writer
-			if out, err = wire.NewWriter(w, wire.DefaultFrameBytes, s.limits); err == nil {
+			if out, err = s.writer(ictx, w); err == nil {
 				done, err = statementOn(db, c, ictx, req, req.Execute, out, true)
 			}
 		}
@@ -1499,7 +1510,7 @@ func (s *Server) read(ctx context.Context, d *database, t *table, c *pconn, req 
 		var err error
 		if snap, err = startRead(c, ictx); err == nil {
 			var out *wire.Writer
-			out, err = wire.NewWriter(w, wire.DefaultFrameBytes, s.limits)
+			out, err = s.writer(ictx, w)
 			switch {
 			case err != nil:
 			case req.Op == wire.OpBatch:

@@ -493,6 +493,7 @@ func logInternal(ctx context.Context, log *slog.Logger, e *wire.Error, err error
 // or one that wraps engine.ErrBroken. keep is false if c must be closed.
 func (s *Server) run(db *sqlite3.Conn, pc *sqlpolicy.Conn, snapshot func(func() error) (uint64, error), req *wire.Request, st *stream) (done *wire.Done, e *wire.Error, keep bool, err error) {
 	ictx := db.GetInterrupt() // the Run's context: its deadline, Close and maintenance interrupt it
+	st.out.Room = s.frameRoom(ictx)
 	err = pc.Privileged(func(db *sqlite3.Conn) error { return db.Exec("BEGIN") })
 	var snap uint64
 	if err == nil {

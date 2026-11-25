@@ -11,8 +11,9 @@
 // forward.go). resolve and GET status are answered by the leader (see
 // resolve.go); resolve is forwarded to it, and another pod answers status
 // with not_serving. Admission control is that of ADR 0005 decision 9 (see
-// budget.go and admit), except that HTTP connections and response frames
-// are not charged to the memory budget.
+// budget.go and admit), except that HTTP connections and running responses
+// are not charged to the memory budget; a frame larger than the frame size
+// is (frameRoom).
 package server
 
 import (
@@ -144,6 +145,7 @@ type Server struct {
 	bodyMu              sync.Mutex
 	bodyUsed, bodyShare int64            // request bodies' share of the memory budget, charged at 8 × Content-Length
 	bodyBy              map[string]int64 // the charge per principal, at most a quarter of the share
+	bodyFreed           chan struct{}    // closed when a charge is released, if a frame waits for room (frameRoom)
 	statementTime       time.Duration
 
 	// admMu guards the concurrency bounds (admit).
@@ -205,7 +207,7 @@ func newServer(cfg Config, log *slog.Logger, st storage.Store) (*Server, error) 
 		log = slog.New(slog.DiscardHandler)
 	}
 	budget := cmp.Or(cfg.MemoryBudget, defaultBudget)
-	body, conns, bodyLimit := shares(budget)
+	body, conns, bodyLimit := shares(budget, len(cfg.Databases))
 	if n := len(cfg.Databases); n >= conns {
 		least := budgetFor(n + 1)
 		return nil, fmt.Errorf("server: the memory budget of %d MiB holds %d SQLite connections, and %d listed databases and the clients need %d: set memory_budget to at least %d MiB, or the memory limit to at least %d MiB",
@@ -1076,8 +1078,54 @@ func (s *Server) chargeBody(r *http.Request, who string) (release func(), e *wir
 		if s.bodyBy[who] -= n; s.bodyBy[who] == 0 {
 			delete(s.bodyBy, who)
 		}
+		s.wakeLocked()
 		s.bodyMu.Unlock()
 	}, nil
+}
+
+// frameRoom returns the Room of a response's wire.Writer: a frame larger
+// than the frame size is charged at its size to the body share, the pod's
+// alone, while it is written (ADR 0005 decision 9), and waits for room
+// until ctx, the statement's, ends, answering timeout at its deadline. The
+// result size bounds the frame at 64 MiB, below every body share.
+func (s *Server) frameRoom(ctx context.Context) func(int) (func(), error) {
+	return func(size int) (func(), error) {
+		n := int64(size)
+		s.bodyMu.Lock()
+		defer s.bodyMu.Unlock()
+		for s.bodyUsed+n > s.bodyShare {
+			if s.bodyFreed == nil {
+				s.bodyFreed = make(chan struct{})
+			}
+			freed := s.bodyFreed
+			s.bodyMu.Unlock()
+			select {
+			case <-freed:
+			case <-ctx.Done():
+				s.bodyMu.Lock()
+				if ctx.Err() == context.DeadlineExceeded { //nolint:errorlint // context.Err returns the sentinel itself
+					return nil, timeoutError(0)
+				}
+				return nil, ctx.Err()
+			}
+			s.bodyMu.Lock()
+		}
+		s.bodyUsed += n
+		return func() {
+			s.bodyMu.Lock()
+			s.bodyUsed -= n
+			s.wakeLocked()
+			s.bodyMu.Unlock()
+		}, nil
+	}
+}
+
+// wakeLocked, with bodyMu held, wakes the frames waiting for room.
+func (s *Server) wakeLocked() {
+	if s.bodyFreed != nil {
+		close(s.bodyFreed)
+		s.bodyFreed = nil
+	}
 }
 
 // readBody applies ADR 0005's body checks to a PUT or POST, whose body may
