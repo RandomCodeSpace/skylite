@@ -10,7 +10,7 @@ detail = "Project scaffolding, CI, this site, and a binary that prints its versi
 title = "Evaluate Litebase and run a durability spike"
 status = "done"
 detail = "Evaluate Litebase, an existing MIT-licensed SQLite-on-object-storage database, as a base. Against Azurite: acknowledge only after upload, kill mid-write, restore on an empty disk, and prove that no acknowledged write is lost and a stale leader cannot commit."
-gate = "The storage architecture that follows from it is recorded in decision record 0004, and the storage engine below implements it."
+gate = "skylite does not reuse Litebase or embed Litestream; it has its own storage engine, below."
 
 [[items]]
 title = "Storage interface and four backends"
@@ -45,7 +45,7 @@ detail = "A Go database/sql driver that works with GORM and a JDBC driver with a
 [[items]]
 title = "Endpoint auth and SQL lockdown"
 status = "done"
-detail = "Authentication and authorisation on the query endpoint; no extension loading, no attaching arbitrary files, query time and size limits. The server authenticates every request with OIDC JWT bearer tokens, authorises it by role, and runs every client statement under the SQL policy of decision record 0007 with the statement time and result size limits of 0005. Tested with locally signed tokens, not yet with a real Entra ID tenant as the issuer."
+detail = "Authentication and authorisation on the query endpoint; no extension loading, no attaching arbitrary files, query time and size limits. The server authenticates every request with OIDC JWT bearer tokens, authorises it by role, and runs every client statement under its SQL policy, with a statement time limit and a result size limit. Tested with locally signed tokens, not yet with a real Entra ID tenant as the issuer."
 
 [[items]]
 title = "Signed release binaries"
@@ -55,7 +55,7 @@ detail = "A version tag publishes tar.gz archives for Linux and macOS on amd64 a
 [[items]]
 title = "Channels: batch, describe, read-only channels, resolve"
 status = "done"
-detail = "The rest of decision record 0005 on the server: batch requests, describe on a channel, read-only channels, and resolve, so that a driver can settle a write whose outcome it lost. The leader serves all of them, and GET status. The Go driver uses read-only channels and resolve; the JDBC driver uses batch, read-only channels and resolve. Neither sends describe on a channel yet."
+detail = "The rest of the client protocol on the server: batch requests, describe on a channel, read-only channels, and resolve, so that a driver can settle a write whose outcome it lost. The leader serves all of them, and GET status. The Go driver uses read-only channels and resolve; the JDBC driver uses batch, read-only channels and resolve. Neither sends describe on a channel yet."
 
 [[items]]
 title = "Admission control"

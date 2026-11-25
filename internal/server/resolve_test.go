@@ -75,7 +75,14 @@ func TestResolveOnLeader(t *testing.T) {
 	resolution(t, "a write that changed nothing, channel ended", res(tok, 2), "not_committed", c3)
 	resolution(t, "a request never sent, channel ended", res(tok, 4), "not_committed", c3)
 	resolution(t, "the first write, channel ended", res(tok, 1), "committed", c1)
-	resolution(t, "an altered secret", res(tok[:len(tok)-2]+"AA", 1), "not_committed", c3)
+	// Alter a character well inside the secret: the last one carries bits the decoder ignores.
+	altered := []byte(tok)
+	if i := len(altered) - 10; altered[i] == 'A' {
+		altered[i] = 'B'
+	} else {
+		altered[i] = 'A'
+	}
+	resolution(t, "an altered secret", res(string(altered), 1), "not_committed", c3)
 
 	// Refusals before acceptance.
 	id := e.dbID(t)

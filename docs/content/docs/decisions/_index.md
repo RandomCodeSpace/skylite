@@ -7,7 +7,7 @@ navgroup: project
 
 This section holds the project's architecture decision records (ADRs). Each record captures one decision: the context that forced it, what was chosen, what was rejected and what follows from it. Records are kept after they are superseded, so the history of the design stays readable.
 
-The sidebar lists the records in order. Questions that no record has settled yet are listed under [open questions](/docs/architecture/#open-questions) on the architecture page.
+The sidebar lists the records in order. The [architecture page](/docs/architecture/#design-choices) summarises the choices they settled.
 
 ## Adding a record
 
