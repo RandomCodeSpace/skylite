@@ -81,8 +81,7 @@ to it from Go and from Java.
 - [Go driver](https://randomcodespace.github.io/skylite/docs/go-driver/) and
   [JDBC driver](https://randomcodespace.github.io/skylite/docs/jdbc-driver/)
 - [Configuration reference](https://randomcodespace.github.io/skylite/docs/configuration/)
-- Design: [architecture](https://randomcodespace.github.io/skylite/docs/architecture/)
-  and [decision records](https://randomcodespace.github.io/skylite/docs/decisions/)
+- [Architecture](https://randomcodespace.github.io/skylite/docs/architecture/)
 
 ## Links
 

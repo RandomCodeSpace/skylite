@@ -79,7 +79,7 @@ Two consequences:
 
 ## Errors to handle
 
-Every error carries a `code`, a `message`, a `request_id` (log it; the server logs the same id), and `not_executed`, which is `true` when the request had no effect. The drivers expose these as a Go `*skylite.Error` or a Java `SQLException`; see the [Go](/docs/go-driver/#errors-and-retries) and [JDBC](/docs/jdbc-driver/#errors-and-retries) guides for the mapping.
+Every error carries a `code`, a `message`, a `request_id` (log it; the server logs the same id), and `not_executed`, which is `true` when the request had no effect. `final: true` marks the request's settled outcome, recorded on its channel. An answer from a channel's owner also carries `channel_id`, `txn_state` and, for a request on the channel or a cancel, `seq`. An error SQLite produced carries `sqlite_code` and `sqlite_extended_code`, a failed batch entry `batch_index`, and `txn` and `epoch` appear when they are known. No error carries a token. The drivers expose these as a Go `*skylite.Error` or a Java `SQLException`; see the [Go](/docs/go-driver/#errors-and-retries) and [JDBC](/docs/jdbc-driver/#errors-and-retries) guides for the mapping.
 
 **Retry with backoff.** Nothing happened; the same request can succeed later.
 
@@ -121,14 +121,30 @@ A `resolve` refused with `503` `behind`, or with any code in the first table, ca
 |---|---|---|
 | `unauthenticated` | 401 | The token is missing, expired or not from a configured issuer. |
 | `forbidden` | 403 | No rule grants the needed role on this database. |
-| `statement_forbidden` | 403 | The server's [SQL policy](/docs/decisions/0007-sql-policy/) refuses the statement. |
+| `statement_forbidden` | 403 | The server's [SQL policy](/docs/server/#sql-policy) refuses the statement. |
+| `invalid_request` | 400 or final frame | The request is malformed: a bad body, field or value, a token for another database, more than one statement, or transaction control such as `BEGIN` in SQL. |
+| `database_not_found` | 404 | No such database. Only a principal with a role on the name gets this answer. |
+| `needs_channel` | 409 | A `query` for a statement that is not a pure read. Send it on a write channel. |
 | `sql_error` | 400 or final frame | SQLite reported an error, such as a constraint violation; its codes are in `sqlite_code` and `sqlite_extended_code`. |
 | `commit_failed` | final frame | The commit definitely did not happen, for example because it was too large for one commit. |
 | `timeout` | final frame | The statement reached its time limit (30 seconds) before committing. |
 | `request_too_large`, `result_too_large` | 413, final frame | The request or result passed its size limit. |
 | `database_exists` | 409 | `PUT` for a database that already exists. |
 
-The full list of codes and their exact semantics is in [0005: Client protocol](/docs/decisions/0005-client-protocol/#errors), and the server's own checks, in order, are in the [server reference](/docs/server/#checks-before-acceptance).
+**Channel and transaction state.** These say where the request stands on its channel.
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `channel_busy` | 409 | Another request on the channel is running. |
+| `in_flight` | 409 | This request is still running; sending it again later returns its outcome. |
+| `stale_sequence`, `sequence_gap` | 409 | The sequence number is below the last accepted one, or above it by more than one. |
+| `sequence_conflict` | 409 | The sequence number was taken by a different request body; `final: true`. |
+| `invalid_state` | 409 or final frame | The operation is not allowed in the channel's state, such as `commit` with no transaction open or `begin` inside one. |
+| `transaction_aborted` | final frame | SQLite, a limit or maintenance rolled the transaction back. Every request but `rollback` gets this answer until a `rollback` ends the aborted state. |
+| `cancelled` | final frame | A `cancel` or `close` stopped the request before its commit point. |
+| `internal` | 500 or final frame | An unexpected server failure, logged with the request id. |
+
+The server's own checks, in order, and which code each gives, are in the [server reference](/docs/server/#checks-before-acceptance).
 
 ## Logs
 
