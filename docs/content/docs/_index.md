@@ -14,7 +14,7 @@ skylite suits services that want a small relational database without running a s
 
 - **Writes wait for object storage.** Every commit is uploaded and confirmed before it is acknowledged. Against a real Azure account that measured a median of about 17 ms per commit with one writer, and about 50 to 70 commits per second per database ([measurements](/docs/azure-blob/#performance)).
 - **One writer per database.** Each database has one leader at a time; writes and transactions run on it, one after another. Other servers can answer reads and take over when the leader stops.
-- **SQLite's SQL**, behind a server-side [SQL policy](/docs/decisions/0007-sql-policy/) that limits what statements may do.
+- **SQLite's SQL**, behind a server-side [SQL policy](/docs/server/#sql-policy) that limits what statements may do.
 
 ## Status
 
