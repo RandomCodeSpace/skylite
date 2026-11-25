@@ -344,7 +344,7 @@ func TestLargeFrameWaitsForRoom(t *testing.T) {
 	// Bodies alone fill the share: the frame cannot wait on them, or requests
 	// whose own bodies fill it would all time out.
 	hog(full, 0)
-	if a := e.post(t, "query", "reader", timed); a.done() == nil || len(a.rows()) != 1 {
+	if a := e.post(t, "query", "reader", q(sql)); a.done() == nil || len(a.rows()) != 1 {
 		t.Errorf("no other frame charged: %d %s, %d rows, want served", a.status, a.code(), len(a.rows()))
 	}
 	hog(0, 1) // and another frame holds a charge: now it waits
