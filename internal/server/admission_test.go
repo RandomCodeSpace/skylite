@@ -333,14 +333,21 @@ func TestLargeFrameWaitsForRoom(t *testing.T) {
 	e, _ := newChanEnv(t, nil)
 	const sql = "SELECT randomblob(1048576)" // a frame of about 1.4 MiB
 	timed := `{"sql":"` + sql + `","timeout_ms":200}`
-	hog := func(n int64) {
+	hog := func(n int64, frames int) {
 		e.s.bodyMu.Lock()
 		e.s.bodyUsed += n
+		e.s.framesHeld += frames
 		e.s.wakeLocked()
 		e.s.bodyMu.Unlock()
 	}
 	full := e.s.bodyShare - 64<<10 // room for the bodies, not for the frame
-	hog(full)
+	// Bodies alone fill the share: the frame cannot wait on them, or requests
+	// whose own bodies fill it would all time out.
+	hog(full, 0)
+	if a := e.post(t, "query", "reader", timed); a.done() == nil || len(a.rows()) != 1 {
+		t.Errorf("no other frame charged: %d %s, %d rows, want served", a.status, a.code(), len(a.rows()))
+	}
+	hog(0, 1) // and another frame holds a charge: now it waits
 	if a := e.post(t, "query", "reader", timed); a.code() != "timeout" || len(a.rows()) != 0 {
 		t.Errorf("query: %d %s, %d rows, want timeout", a.status, a.code(), len(a.rows()))
 	}
@@ -364,7 +371,7 @@ func TestLargeFrameWaitsForRoom(t *testing.T) {
 			t.Fatal("the frame never waited for room")
 		}
 	}
-	hog(-full)
+	hog(-full, -1)
 	if a := <-got; a.done() == nil || len(a.rows()) != 1 {
 		t.Errorf("once room freed: %d, %d rows, want served", a.status, len(a.rows()))
 	}

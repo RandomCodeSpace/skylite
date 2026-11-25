@@ -146,6 +146,7 @@ type Server struct {
 	bodyUsed, bodyShare int64            // request bodies' share of the memory budget, charged at 8 × Content-Length
 	bodyBy              map[string]int64 // the charge per principal, at most a quarter of the share
 	bodyFreed           chan struct{}    // closed when a charge is released, if a frame waits for room (frameRoom)
+	framesHeld          int              // frames charged by frameRoom
 	statementTime       time.Duration
 
 	// admMu guards the concurrency bounds (admit).
@@ -1086,14 +1087,16 @@ func (s *Server) chargeBody(r *http.Request, who string) (release func(), e *wir
 // frameRoom returns the Room of a response's wire.Writer: a frame larger
 // than the frame size is charged at its size to the body share, the pod's
 // alone, while it is written (ADR 0005 decision 9), and waits for room
-// until ctx, the statement's, ends, answering timeout at its deadline. The
-// result size bounds the frame at 64 MiB, below every body share.
+// until ctx, the statement's, ends, answering timeout at its deadline. It
+// waits only while another frame is charged, so requests whose bodies fill
+// the share cannot wait on each other: the share is exceeded by at most one
+// frame, which the result size bounds at 64 MiB.
 func (s *Server) frameRoom(ctx context.Context) func(int) (func(), error) {
 	return func(size int) (func(), error) {
 		n := int64(size)
 		s.bodyMu.Lock()
 		defer s.bodyMu.Unlock()
-		for s.bodyUsed+n > s.bodyShare {
+		for s.bodyUsed+n > s.bodyShare && s.framesHeld > 0 {
 			if s.bodyFreed == nil {
 				s.bodyFreed = make(chan struct{})
 			}
@@ -1111,9 +1114,11 @@ func (s *Server) frameRoom(ctx context.Context) func(int) (func(), error) {
 			s.bodyMu.Lock()
 		}
 		s.bodyUsed += n
+		s.framesHeld++
 		return func() {
 			s.bodyMu.Lock()
 			s.bodyUsed -= n
+			s.framesHeld--
 			s.wakeLocked()
 			s.bodyMu.Unlock()
 		}, nil
