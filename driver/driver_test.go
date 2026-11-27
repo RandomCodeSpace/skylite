@@ -183,9 +183,16 @@ var allCodes = []Code{
 }
 
 func TestEveryErrorCode(t *testing.T) {
-	var code atomic.Value
-	f := newFake(t, true, func(w http.ResponseWriter, ww *wire.Writer, _ call, _ *http.Request) {
-		c := code.Load().(Code)
+	// Each code is answered for its own statement and counted by it: a
+	// transient code's last resend can reach the fake after its subtest ends.
+	const prefix = "SELECT 1 -- "
+	var mu sync.Mutex
+	hits := map[Code]int{}
+	f := newFake(t, true, func(w http.ResponseWriter, ww *wire.Writer, call call, _ *http.Request) {
+		c := Code(strings.TrimPrefix(call.req.SQL, prefix))
+		mu.Lock()
+		hits[c]++
+		mu.Unlock()
 		e := wire.NewError(c, "message of "+string(c))
 		e.RequestID, e.SQLiteCode, e.SQLiteExtendedCode, e.Txn, e.Epoch = "req-"+string(c), 5, 517, 12, 3
 		if ww.Error(e) != nil { // a code the writer does not know
@@ -198,12 +205,10 @@ func TestEveryErrorCode(t *testing.T) {
 			continue
 		}
 		t.Run(string(c), func(t *testing.T) {
-			code.Store(c)
-			before := f.hits.Load()
 			// A transient refusal is sent again until the context ends.
 			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 			defer cancel()
-			_, err := db.QueryContext(ctx, "SELECT 1")
+			_, err := db.QueryContext(ctx, prefix+string(c))
 			retried := transient(wire.NewError(c, ""))
 			var se *Error
 			if !errors.As(err, &se) {
@@ -214,7 +219,10 @@ func TestEveryErrorCode(t *testing.T) {
 				se.RequestID != "req-"+string(c) || se.SQLiteCode != 5 || se.SQLiteExtendedCode != 517 || se.Txn != 12 || se.Epoch != 3 {
 				t.Fatalf("error %+v", se)
 			}
-			if hits := f.hits.Load() - before; errors.Is(err, driver.ErrBadConn) || retried != (hits > 1) {
+			mu.Lock()
+			hits := hits[c]
+			mu.Unlock()
+			if errors.Is(err, driver.ErrBadConn) || retried != (hits > 1) {
 				t.Fatalf("err %v sent %d requests; want more than 1 only for a transient code, and no ErrBadConn", err, hits)
 			}
 			if !strings.Contains(err.Error(), string(c)) || !strings.Contains(err.Error(), "req-"+string(c)) {
