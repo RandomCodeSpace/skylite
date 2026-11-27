@@ -45,8 +45,9 @@ Not verified yet: Amazon S3 and Google Cloud Storage themselves (emulators
 only), a Kubernetes cluster, a service mesh or ingress, a real Entra ID tenant
 as token issuer, driver failover across several pods, and a 24-hour soak.
 
-Not available: a container image, a Helm chart, and published Maven artifacts
-(build the Java driver with `mvn install`). See the
+Releases are signed binaries; there is no container image or Helm chart, and none
+is planned. Maven artifacts are not published (build the Java driver with
+`mvn install`). See the
 [roadmap](https://randomcodespace.github.io/skylite/docs/roadmap/).
 
 ## Quick start
