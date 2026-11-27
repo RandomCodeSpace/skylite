@@ -551,7 +551,7 @@ func (s *Server) addDatabases() error {
 		keys, err := s.cfg.Storage.keys(name)
 		var loop *office.Loop
 		if err == nil {
-			loop, err = office.New(office.Config{Store: s.store, Keys: keys, Holder: holder, Dir: s.dir, Engine: s.engine, FollowerReads: s.cfg.FollowerReads, Logger: s.log.With(slog.String("database", name))})
+			loop, err = office.New(office.Config{Store: s.store, Keys: keys, Holder: holder, Dir: s.dir, Engine: s.engine, TTL: time.Duration(s.cfg.LeaseTTL) * time.Second, FollowerReads: s.cfg.FollowerReads, Logger: s.log.With(slog.String("database", name))})
 		}
 		if err != nil {
 			return fmt.Errorf("server: database %s: %w", name, err)

@@ -54,7 +54,25 @@ type Config struct {
 	// quarters of the container's memory limit, or of GOMEMLIMIT if lower,
 	// and 2 GiB without either.
 	MemoryBudget int64 `json:"memory_budget"`
+	// LeaseTTL, if set, is the time to live of this server's leases in
+	// seconds, from minLeaseTTL to maxLeaseTTL; office.DefaultTTL if 0.
+	// The office loop derives the renewal period and a standby's polling
+	// from it. The lease does not record it, so every pod that serves a
+	// database must use the same value.
+	LeaseTTL int64 `json:"lease_ttl"`
 }
+
+// Bounds of lease_ttl, in seconds. A renewal reads the manifest and writes
+// the lease under one timeout, its period, a third of the time to live. At
+// the minimum that is storage.ResponseHeaderTimeout, so one storage request
+// as slow as the transport allows fails at most one renewal, and the lease
+// outlives one failed renewal. Above the maximum, a crashed leader leaves
+// its databases unwritable for longer than any storage stall worth riding
+// out.
+const (
+	minLeaseTTL = 30
+	maxLeaseTTL = 300
+)
 
 // Peer is the pod-to-pod listener and its mutual TLS. Every pod of a
 // deployment presents a certificate issued by CAFile, which must issue
@@ -190,6 +208,9 @@ func (c Config) Validate() error {
 	}
 	if c.MemoryBudget != 0 && (c.MemoryBudget < minBudget || c.MemoryBudget > maxBudget) {
 		return fmt.Errorf("memory_budget is %d, want 0 or from %d to %d bytes", c.MemoryBudget, int64(minBudget), int64(maxBudget))
+	}
+	if c.LeaseTTL != 0 && (c.LeaseTTL < minLeaseTTL || c.LeaseTTL > maxLeaseTTL) {
+		return fmt.Errorf("lease_ttl is %d, want 0 or from %d to %d seconds", c.LeaseTTL, minLeaseTTL, maxLeaseTTL)
 	}
 	// Without memory_budget, New checks the databases against the budget it derives.
 	if _, conns, _ := shares(cmp.Or(c.MemoryBudget, maxBudget), 0); len(c.Databases) >= conns {

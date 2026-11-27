@@ -336,8 +336,9 @@ import (
 // instead of hanging it until its context ends. Such a failure of a mutation
 // is an unknown outcome, as any timeout after sending. 10 s leaves room
 // within the engine's 20 s bound on resolving a commit (ADR 0005,
-// requirement 14) for a resolving read, and within a lease's 60 s life for
-// renewals tried again every 20 s (ADR 0004). Tests lower it.
+// requirement 14) for a resolving read, and within a lease's life of at
+// least 30 s for renewals tried again every third of it (ADR 0004). Tests
+// lower it.
 var ResponseHeaderTimeout = 10 * time.Second
 
 // MaxKeyLen is the maximum key length in bytes. 1024 is the smallest limit

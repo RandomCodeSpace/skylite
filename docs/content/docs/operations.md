@@ -38,12 +38,12 @@ Without `peer`, a pod that does not lead a database answers `503` `not_serving` 
 
 ## Failover
 
-The leader holds a 60-second lease on each database and renews it every 20 seconds. A standby reads the lease at most every 5 seconds, and with it the manifest's version, so that once it takes office it can retire commits that older manifests have covered for the five-minute grace period without waiting that period again.
+The leader holds a lease on each database and renews it every third of its time to live: 60 seconds by default, renewed every 20 seconds, set by [`lease_ttl`](/docs/configuration/#top-level) from 30 to 300 seconds. A standby reads the lease at most every 5 seconds, and with it the manifest's version, so that once it takes office it can retire commits that older manifests have covered for the five-minute grace period without waiting that period again.
 
 | Event | What happens |
 |---|---|
 | The leader shuts down cleanly (SIGTERM) | It stops accepting connections, finishes running requests for up to a minute, then releases its leases. A standby sees the released lease within about 5 seconds and takes office. |
-| The leader crashes or is cut off | Its lease expires within 60 seconds of its last renewal; then a standby takes office. A deposed leader cannot commit: every commit and manifest update is a conditional write that fails once another leader has taken office. |
+| The leader crashes or is cut off | Its lease expires one time to live after its last renewal; then a standby takes office. A deposed leader cannot commit: every commit and manifest update is a conditional write that fails once another leader has taken office. |
 
 Taking office does not download the database: the new leader reads pages from storage as it needs them. It does read the commits written since the last compaction, up to 32 at a time, and reads them once. Measured on Azure Blob Storage, a log of 2,000 uncompacted commits took about 2.3 seconds from the start of the takeover to a serving leader (94 seconds in v0.0.2, which read each commit twice, one at a time). A standby with a follower keeps serving reads from it until its leader serves.
 
@@ -55,7 +55,9 @@ Measured in a 13-minute soak of three servers on one machine against a real Azur
 | SIGKILL of the leader | 47.8 seconds |
 | SIGSTOP of the leader | 51.7 seconds |
 
-A killed or paused leader's outage is bounded by its lease: the lease expires 60 seconds after its last renewal, which came up to 20 seconds before the event, and a standby notices within its next read of the lease, at most 5 seconds later. No acknowledged write was lost, and a write that committed without being acknowledged was reported to its client as an unknown outcome, not as a failure. The lease time is fixed in this version and not configurable.
+A killed or paused leader's outage is bounded by its lease: the lease expires 60 seconds after its last renewal, which came up to 20 seconds before the event, and a standby notices within its next read of the lease, at most 5 seconds later. No acknowledged write was lost, and a write that committed without being acknowledged was reported to its client as an unknown outcome, not as a failure.
+
+These timings are at the default `lease_ttl` of 60 seconds; the outage after a kill or pause scales with it, to between about two thirds of the value and the value plus 5 seconds, plus the takeover, and is not measured at other values. A clean shutdown does not depend on it. The cost of a shorter lease is in storage requests and in tolerance of slow storage: each leader sends a renewal of two requests every third of the value, 0.1 a second per database at 60 seconds and 0.2 at 30, and when storage requests keep taking more than a sixth of the value the leader can no longer renew and loses office. A standby's requests, every 5 seconds, do not change. Use the same value on every pod that serves a database; a pod with a shorter value can take office from a healthy leader.
 
 ### What clients see
 
