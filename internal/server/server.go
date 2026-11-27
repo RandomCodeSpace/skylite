@@ -572,6 +572,9 @@ func (s *Server) startOffice() (stop func()) {
 			wg.Go(func() { s.announce(lctx, name, d) })
 		}
 	}
+	if s.peer != nil && s.cfg.FollowerReads {
+		wg.Go(func() { s.announcePeer(lctx) })
+	}
 	return func() {
 		cancel()
 		wg.Wait()
