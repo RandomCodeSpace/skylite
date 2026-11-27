@@ -85,7 +85,7 @@ curl -s -X PUT -H "Authorization: Bearer $(cat token)" -H 'Content-Type: applica
   --data '{}' http://127.0.0.1:8080/v1/databases/orders
 ```
 
-The answer is `{"done":{"txn":1,"epoch":1}}`. The server takes office for the new database within about 20 seconds; until then, requests for it get `503` `not_serving`. Each field of the configuration file is described in the [configuration reference](/docs/configuration/).
+The answer is `{"done":{"txn":1,"epoch":1}}`. The server takes office for the new database within about 20 seconds by default (a third of `lease_ttl`); until then, requests for it get `503` `not_serving`. Each field of the configuration file is described in the [configuration reference](/docs/configuration/).
 
 ## 4. Connect from Go
 

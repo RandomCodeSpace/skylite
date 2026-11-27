@@ -67,7 +67,7 @@ The server accepts at most 1,024 client connections at a time; one beyond that w
 
 ### Leading a database
 
-For each name in `databases`, the server runs an office loop: it takes office when the database's lease is free, renews the lease every 20 seconds (a lease lives 60 seconds), and steps down when it is deposed or its leader stops. A server that does not hold office is a standby: it reads the lease at most every 5 seconds and runs a candidacy once the lease is released or expires. A database in `databases` need not exist: once a `PUT` has created it, the server takes office within its retry backoff, at most 20 seconds.
+For each name in `databases`, the server runs an office loop: it takes office when the database's lease is free, renews the lease every third of its time to live (`lease_ttl`, 60 seconds by default, so every 20 seconds), and steps down when it is deposed or its leader stops. A server that does not hold office is a standby: it reads the lease at most every 5 seconds and runs a candidacy once the lease is released or expires. A database in `databases` need not exist: once a `PUT` has created it, the server takes office within its retry backoff, at most a third of the lease's time to live.
 
 ### Reading on a follower
 
@@ -388,7 +388,7 @@ curl -i -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data '{"sql":"SELECT 1 + ? AS two","params":[1]}' http://127.0.0.1:8080/v1/databases/orders/query
 ```
 
-The query answers `503` `not_serving` until the server has taken office for the new database. Its office loop retries a candidacy that fails, as one does while the database does not exist, with a backoff that doubles up to 20 seconds, so that can take about 20 seconds after the `PUT`. A new database has no tables. To write, open a channel and send each statement with the next sequence number:
+The query answers `503` `not_serving` until the server has taken office for the new database. Its office loop retries a candidacy that fails, as one does while the database does not exist, with a backoff that doubles up to a third of `lease_ttl`, so that can take about 20 seconds after the `PUT` at the default. A new database has no tables. To write, open a channel and send each statement with the next sequence number:
 
 ```sh
 curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \

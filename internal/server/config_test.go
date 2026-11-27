@@ -83,6 +83,12 @@ func TestLoad(t *testing.T) {
 	if c, err := Load(writeConfig(t, noPeer)); err != nil || c.FollowerReads || c.Peer != nil {
 		t.Errorf("default follower_reads without peer = %t, %v", c.FollowerReads, err)
 	}
+	for _, ttl := range []int64{minLeaseTTL, maxLeaseTTL} {
+		lease := strings.Replace(goodConfig, `"databases"`, fmt.Sprintf(`"lease_ttl": %d, "databases"`, ttl), 1)
+		if c, err := Load(writeConfig(t, lease)); err != nil || c.LeaseTTL != ttl {
+			t.Errorf("lease_ttl %d = %d, %v", ttl, c.LeaseTTL, err)
+		}
+	}
 	offReads := strings.Replace(goodConfig, `"follower_reads": true`, `"follower_reads": false`, 1)
 	if c, err := Load(writeConfig(t, offReads)); err != nil || c.FollowerReads {
 		t.Errorf("follower_reads false = %t, %v", c.FollowerReads, err)
@@ -144,6 +150,9 @@ func TestLoadRefuses(t *testing.T) {
 		"too many for any budget": edit(`["orders", "users"]`, list(maxConnLimit)),
 		"budget below the floor":  edit(`"databases"`, `"memory_budget": 402653183, "databases"`),
 		"budget above the cap":    edit(`"databases"`, `"memory_budget": 68719476737, "databases"`),
+		"lease_ttl below floor":   edit(`"databases"`, `"lease_ttl": 29, "databases"`),
+		"lease_ttl above cap":     edit(`"databases"`, `"lease_ttl": 301, "databases"`),
+		"lease as a duration":     edit(`"databases"`, `"lease_ttl": "60s", "databases"`),
 		"peer without ca":         edit(`, "ca_file": "/etc/skylite/peer-ca.crt"`, ""),
 		"peer without name":       edit(`, "server_name": "skylite-peer"`, ""),
 		"peer address not a name": edit(`"SKYLITE_PEER_ADDRESS"`, `"10.0.0.1:8444"`),
@@ -152,6 +161,9 @@ func TestLoadRefuses(t *testing.T) {
 		if err == nil {
 			t.Errorf("%s: config accepted", name)
 			continue
+		}
+		if strings.HasPrefix(name, "lease_ttl") && !strings.Contains(err.Error(), "from 30 to 300 seconds") {
+			t.Errorf("%s: error %q does not name the bounds", name, err)
 		}
 		if strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "aHVudGVyMg==") {
 			t.Errorf("%s: error %q leaked value", name, err)

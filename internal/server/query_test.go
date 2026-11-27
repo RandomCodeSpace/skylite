@@ -78,6 +78,26 @@ func (e *env) leader(t *testing.T) *engine.Leader {
 	}
 }
 
+// lease_ttl is the time to live the server judges another holder's lease
+// by: a lease last renewed 35 s ago has expired at 30 s, so the server takes
+// office at once, where at the default 60 s it would wait 25 s, longer than
+// leader waits.
+func TestLeaseTTLShortensTakeover(t *testing.T) {
+	start := time.Now()
+	newLeaderEnv(t, nil, func(e *env) {
+		e.s.cfg.LeaseTTL = minLeaseTTL
+		keys, err := e.s.cfg.Storage.keys("d")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ghost := engine.Candidate{Holder: "ghost", TTL: time.Minute, Now: func() time.Time { return time.Now().Add(-35 * time.Second) }}
+		if _, _, err := engine.Takeover(context.Background(), e.store, keys, ghost); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Logf("took office %v after the start", time.Since(start).Round(time.Millisecond))
+}
+
 var commitIDs atomic.Int64
 
 // exec runs sql on "d" through the leader, without the policy, and commits
