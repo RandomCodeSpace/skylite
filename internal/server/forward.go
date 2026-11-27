@@ -31,10 +31,14 @@ import (
 // one hop and once, to the pod that can, over the peer listener's mutual
 // TLS. The leader in office publishes a leader record in the store; a write
 // channel lives on its leader, so the record also locates a channel's owner.
+// A pod with follower reads publishes a peer record, which locates the
+// process a read-only channel's token names when that is not the leader.
 
 // The pod-to-pod headers of ADR 0005 decision 7.
 const (
 	forwardedHeader = "Skylite-Forwarded"
+	// peerHop is forwardedHeader's value on a hop routed by a peer record.
+	peerHop         = "peer"
 	budgetHeader    = "Skylite-Budget-Ms"
 	requestIDHeader = "Skylite-Request-Id"
 )
@@ -169,6 +173,38 @@ func (s *Server) announce(ctx context.Context, name string, d *database) {
 	}
 }
 
+// announcePeer publishes this server's peer record, its process identifier
+// and peer address, until ctx ends, then deletes it. A failed write is tried
+// again every second. The record is not renewed: a process that ended
+// without deleting it leaves an address that refuses the hop or reaches
+// another process, and both end the channel.
+func (s *Server) announcePeer(ctx context.Context) {
+	key := s.cfg.Storage.peerKey(s.instance)
+	b, err := json.Marshal(leaderRecord{Instance: s.instance, Address: s.peer.address})
+	for err == nil {
+		cctx, cancel := context.WithTimeout(ctx, s.createTimeout)
+		_, err = s.store.Create(cctx, key, bytes.NewReader(b))
+		cancel()
+		// A record already there is this process's, from an attempt whose
+		// answer was lost.
+		if err == nil || errors.Is(err, storage.ErrPreconditionFailed) || ctx.Err() != nil {
+			break
+		}
+		s.log.LogAttrs(ctx, slog.LevelWarn, "peer record not published", slog.String("error", err.Error()))
+		select {
+		case <-ctx.Done():
+		case <-time.After(publishRetry):
+			err = nil
+		}
+	}
+	<-ctx.Done()
+	dctx, cancel := context.WithTimeout(context.Background(), s.createTimeout)
+	defer cancel()
+	if err := s.store.Delete(dctx, key); err != nil {
+		s.log.LogAttrs(dctx, slog.LevelWarn, "peer record not deleted", slog.String("error", err.Error()))
+	}
+}
+
 // publish writes rec at key unless the record there is of a later office.
 // It returns the version written, or "" if it left the record alone.
 func (s *Server) publish(ctx context.Context, key string, rec leaderRecord) (string, error) {
@@ -210,8 +246,9 @@ func (s *Server) withdraw(key string, rec leaderRecord, version string, log *slo
 // that pod's answer. It returns nil once it has relayed an answer, even one
 // cut short, and otherwise the refusal: no_leader or owner_unreachable, not
 // executed only when no connection to the other pod was obtained, or
-// channel_lost when the records show the token's channel has ended. It
-// never sends a request twice.
+// channel_lost when the records show the token's channel has ended or the
+// pod a peer record names for it could not be reached. It never sends a
+// request twice.
 func (s *Server) forward(st *stream, r *http.Request, kind wire.Kind, db string, req *wire.Request, body []byte, id string, arrived time.Time, log *slog.Logger) *wire.Error {
 	// net/http resends a request with no body, or a GET, by itself after
 	// some connection failures; a POST with a body and no GetBody it never
@@ -237,9 +274,10 @@ func (s *Server) forward(st *stream, r *http.Request, kind wire.Kind, db string,
 		log.LogAttrs(r.Context(), slog.LevelWarn, "leader record not read", slog.String("error", err.Error()))
 	}
 	addr := rec.Address
+	byPeer := false // addr is from the peer record of a read-only channel's process
 	if owner {
 		// The token is w1.<instance>.<database id>.<open head>.<secret>, or
-		// r1 for a read-only channel, which the leader owns in this version.
+		// r1 for a read-only channel, which the process it names owns.
 		parts := strings.Split(req.Channel, ".")
 		if len(parts) != 5 || parts[0] != channelTokenPrefix && parts[0] != readTokenPrefix {
 			return wire.NewError(wire.CodeInvalidRequest, "the token does not name this database")
@@ -251,6 +289,24 @@ func (s *Server) forward(st *stream, r *http.Request, kind wire.Kind, db string,
 			// when it left office.
 			return wire.NewError(wire.CodeChannelLost, "this server no longer leads the database, and its channels have ended")
 		case parts[1] != rec.Instance:
+			// A read-only channel of a process with a peer record lives
+			// there, whatever office it opened under. The instance is
+			// checked first, since it becomes part of a key.
+			if parts[0] == readTokenPrefix && validInstance(parts[1]) {
+				ctx, cancel := context.WithTimeout(r.Context(), s.createTimeout)
+				p, _, err := s.readRecord(ctx, s.cfg.Storage.peerKey(parts[1]))
+				cancel()
+				switch {
+				case err == nil && p.Address != "":
+					addr, byPeer = p.Address, true
+				case err != nil && !errors.Is(err, storage.ErrNotFound):
+					log.LogAttrs(r.Context(), slog.LevelWarn, "peer record not read", slog.String("error", err.Error()))
+					return unreachable("its peer record could not be read")
+				}
+			}
+			if byPeer {
+				break
+			}
 			// A channel opened before a later office's epoch bump ended
 			// with its own office.
 			if parts[2] == rec.DB && herr == nil && head < rec.Head {
@@ -283,7 +339,11 @@ func (s *Server) forward(st *stream, r *http.Request, kind wire.Kind, db string,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(&url.URL{Scheme: "https", Host: addr})
 			pr.Out.Body, pr.Out.ContentLength, pr.Out.GetBody = io.NopCloser(bytes.NewReader(body)), int64(len(body)), nil
-			pr.Out.Header.Set(forwardedHeader, "1")
+			if byPeer {
+				pr.Out.Header.Set(forwardedHeader, peerHop)
+			} else {
+				pr.Out.Header.Set(forwardedHeader, "1")
+			}
 			pr.Out.Header.Set(budgetHeader, strconv.FormatInt(max(remaining.Milliseconds(), 1), 10))
 			pr.Out.Header.Set(requestIDHeader, id)
 		},
@@ -314,8 +374,26 @@ func (s *Server) forward(st *stream, r *http.Request, kind wire.Kind, db string,
 	maps.Copy(h, own)
 	e := unreachable("the hop failed")
 	e.NotExecuted = !connected.Load()
+	if byPeer && e.NotExecuted {
+		// The process is gone, and its channels with it.
+		e = wire.NewError(wire.CodeChannelLost, "the pod that owned the read-only channel could not be reached, so the channel has ended")
+	}
 	log.LogAttrs(r.Context(), slog.LevelWarn, "forward failed", slog.Bool("connected", connected.Load()), slog.String("error", hopErr.Error()))
 	return e
+}
+
+// validInstance reports whether v looks like an instance identifier a
+// server draws (rand.Text), which is safe as a key segment.
+func validInstance(v string) bool {
+	if len(v) != 26 {
+		return false
+	}
+	for i := range len(v) {
+		if c := v[i]; (c < 'A' || c > 'Z') && (c < '2' || c > '7') {
+			return false
+		}
+	}
+	return true
 }
 
 // validRequestID reports whether a forwarded request id looks like one this

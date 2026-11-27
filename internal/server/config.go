@@ -340,3 +340,13 @@ func (s Storage) keys(db string) (format.Keys, error) {
 	}
 	return format.NewKeys(s.Prefix + "/" + db)
 }
+
+// peerKey returns the key of the peer record of server process instance,
+// which the caller has checked with validInstance. It sits beside the
+// databases under the prefix, in a segment no database name can take.
+func (s Storage) peerKey(instance string) string {
+	if s.Prefix == "" {
+		return "_peers/" + instance
+	}
+	return s.Prefix + "/_peers/" + instance
+}

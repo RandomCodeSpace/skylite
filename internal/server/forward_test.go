@@ -1053,6 +1053,16 @@ func TestForwardDeposedLeader(t *testing.T) {
 func otherOwner(t *testing.T, leader *env) (string, *atomic.Int64) {
 	t.Helper()
 	rec := waitRecord(t, leader, func(r leaderRecord) bool { return r.Instance == leader.s.instance && r.Address != "" })
+	addr, n := notServingPeer(t, leader)
+	leader.writeRecord(t, leaderRecord{Instance: "OTHER", Address: addr, DB: rec.DB, Epoch: rec.Epoch, Head: rec.Head})
+	return fmt.Sprintf("%s.OTHER.%s.%d.%s", channelTokenPrefix, rec.DB, rec.Head+5, strings.Repeat("A", 43)), n
+}
+
+// notServingPeer starts a peer server with e's certificate that answers
+// every request with not_serving, and returns its address and a count of
+// the requests it receives.
+func notServingPeer(t *testing.T, e *env) (string, *atomic.Int64) {
+	t.Helper()
 	n := new(atomic.Int64)
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n.Add(1)
@@ -1061,12 +1071,11 @@ func otherOwner(t *testing.T, leader *env) (string, *atomic.Int64) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = io.WriteString(w, notServingAnswer)
 	}))
-	srv.TLS = leader.s.peer.server.Clone()
+	srv.TLS = e.s.peer.server.Clone()
 	srv.EnableHTTP2 = true
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
-	leader.writeRecord(t, leaderRecord{Instance: "OTHER", Address: srv.Listener.Addr().String(), DB: rec.DB, Epoch: rec.Epoch, Head: rec.Head})
-	return fmt.Sprintf("%s.OTHER.%s.%d.%s", channelTokenPrefix, rec.DB, rec.Head+5, strings.Repeat("A", 43)), n
+	return srv.Listener.Addr().String(), n
 }
 
 // TestForwardHopAtLeaderStays: a hop that reaches a leader with a token of
@@ -1096,5 +1105,119 @@ func TestForwardLeaderRoutesCloseCancel(t *testing.T) {
 		if a := leader.post(t, tc.path, "writer", tc.body); n.Load()-before != 1 {
 			t.Errorf("%s with a token of another process: %d %v, forwarded %d times", tc.path, a.status, a.frames, n.Load()-before)
 		}
+	}
+}
+
+// TestPeerRecord: a pod with a peer listener and follower reads publishes
+// its process identifier and peer address once it starts, and deletes the
+// record when it shuts down; a pod without follower reads publishes none.
+func TestPeerRecord(t *testing.T) {
+	p := peerConfig(t)
+	leader, _ := newPeerLeader(t, p)
+	off := newPod(t, leader, p, nil, false, nil)
+	pod := newPod(t, leader, p, nil, true, nil)
+	ctx := context.Background()
+	key := pod.s.cfg.Storage.peerKey(pod.s.instance)
+	var rec leaderRecord
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		var err error
+		if rec, _, err = pod.s.readRecord(ctx, key); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no peer record: %v", err)
+		}
+	}
+	if rec.Instance != pod.s.instance || rec.Address != pod.s.peer.address {
+		t.Errorf("peer record %+v", rec)
+	}
+	if _, _, err := off.s.readRecord(ctx, off.s.cfg.Storage.peerKey(off.s.instance)); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("a pod without follower reads: %v", err)
+	}
+	if err := pod.halt(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := leader.s.readRecord(ctx, key); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("after shutdown: %v", err)
+	}
+}
+
+// TestForwardReadOnlyByPeerRecord: a read-only channel's request whose token
+// names a process other than the leader goes to the address in that
+// process's peer record, from a pod without office and from the leader,
+// whatever office the channel opened under. Without a record the leader
+// record decides, as before; a token whose process is not an identifier
+// never builds a key; an unreadable record is owner_unreachable; and an
+// address that refuses the hop means the channel has ended.
+func TestForwardReadOnlyByPeerRecord(t *testing.T) {
+	p := peerConfig(t)
+	leader, _ := newPeerLeader(t, p)
+	pod := newPod(t, leader, p, nil, false, nil)
+	rec := waitRecord(t, leader, func(r leaderRecord) bool { return r.Instance == leader.s.instance && r.Address != "" })
+	if rec.Head == 0 {
+		t.Fatalf("leader record %+v", rec)
+	}
+	addr, n := notServingPeer(t, leader)
+	// Open head 0 is below the leader's bump: by the leader record alone,
+	// the channel has ended.
+	tok := func(instance string) string {
+		return fmt.Sprintf("%s.%s.%s.0.%s", readTokenPrefix, instance, rec.DB, strings.Repeat("A", 43))
+	}
+	plant := func(instance, body string) {
+		t.Helper()
+		if _, err := leader.store.Create(context.Background(), leader.s.cfg.Storage.peerKey(instance), strings.NewReader(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := func(instance, address string) string {
+		return fmt.Sprintf(`{"instance":%q,"address":%q}`, instance, address)
+	}
+	owner := rand.Text()
+	plant(owner, at(owner, addr))
+	for _, e := range []*env{pod, leader} {
+		for _, tc := range []struct{ path, body string }{{"channel", ex(tok(owner), 1, "SELECT 1")}, {"channel/close", closeBody(tok(owner))}, {"channel/cancel", cancelBody(tok(owner), 1)}} {
+			before := n.Load()
+			if a := e.post(t, tc.path, "reader", tc.body); a.code() != "not_serving" || n.Load()-before != 1 {
+				t.Errorf("%s on the leader %t: %d %v, forwarded %d times", tc.path, e == leader, a.status, a.frames, n.Load()-before)
+			}
+		}
+	}
+
+	forged := "not-an-instance" // the token's form, not an identifier a server draws
+	plant(forged, at(forged, addr))
+	unreadable := rand.Text()
+	plant(unreadable, "not a record")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone := rand.Text()
+	plant(gone, at(gone, ln.Addr().String()))
+	_ = ln.Close()
+	// A record whose address is now a pod without office, as after the
+	// process lost office or ended and another took its address.
+	moved := rand.Text()
+	plant(moved, at(moved, pod.s.peer.address))
+	if a := leader.post(t, "channel", "reader", ex(tok(moved), 1, "SELECT 1")); a.code() != "channel_lost" || a.err()["not_executed"] != true {
+		t.Errorf("hop to a pod without office: %d %v", a.status, a.frames)
+	}
+	before := n.Load()
+	// A write channel's token never uses a peer record.
+	w := strings.Replace(tok(owner), readTokenPrefix+".", channelTokenPrefix+".", 1)
+	if a := pod.post(t, "channel", "writer", ex(w, 1, "SELECT 1")); a.code() != "channel_lost" || n.Load() != before {
+		t.Errorf("write token with a peer record: %d %v, forwarded %d times", a.status, a.frames, n.Load()-before)
+	}
+	for _, tc := range []struct{ name, instance, code string }{
+		{"no peer record", rand.Text(), "channel_lost"},
+		{"not an instance", forged, "channel_lost"},
+		{"unreadable record", unreadable, "owner_unreachable"},
+		{"address refuses the hop", gone, "channel_lost"},
+	} {
+		if a := pod.post(t, "channel", "reader", ex(tok(tc.instance), 1, "SELECT 1")); a.code() != tc.code || a.err()["not_executed"] != true {
+			t.Errorf("%s: %d %v", tc.name, a.status, a.frames)
+		}
+	}
+	if n.Load() != before {
+		t.Errorf("%d deliveries", n.Load()-before)
 	}
 }

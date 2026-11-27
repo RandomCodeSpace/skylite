@@ -572,6 +572,9 @@ func (s *Server) startOffice() (stop func()) {
 			wg.Go(func() { s.announce(lctx, name, d) })
 		}
 	}
+	if s.peer != nil && s.cfg.FollowerReads {
+		wg.Go(func() { s.announcePeer(lctx) })
+	}
 	return func() {
 		cancel()
 		wg.Wait()
@@ -821,6 +824,11 @@ func (s *Server) handle(st *stream, r *http.Request, t *ticket, id string, log *
 		}
 		done, e = s.status(d, leader)
 		return done, e, true
+	case hop && leader == nil && r.Header.Get(forwardedHeader) == peerHop:
+		// A hop by peer record names a read-only channel of this process,
+		// whose channels ended with its office, or of a process that held
+		// this address before; neither is served here.
+		return nil, wire.NewError(wire.CodeChannelLost, "the read-only channel's process no longer serves it"), false
 	case kind != wire.KindPut && leader == nil && !forward && (follower == nil || !stateless):
 		return nil, wire.NewError(wire.CodeNotServing, "this server does not lead the database or serve this request on a follower"), false
 	}
