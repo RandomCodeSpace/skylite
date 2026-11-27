@@ -37,6 +37,8 @@ import (
 // The pod-to-pod headers of ADR 0005 decision 7.
 const (
 	forwardedHeader = "Skylite-Forwarded"
+	// peerHop is forwardedHeader's value on a hop routed by a peer record.
+	peerHop = "peer"
 	budgetHeader    = "Skylite-Budget-Ms"
 	requestIDHeader = "Skylite-Request-Id"
 )
@@ -337,7 +339,11 @@ func (s *Server) forward(st *stream, r *http.Request, kind wire.Kind, db string,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(&url.URL{Scheme: "https", Host: addr})
 			pr.Out.Body, pr.Out.ContentLength, pr.Out.GetBody = io.NopCloser(bytes.NewReader(body)), int64(len(body)), nil
-			pr.Out.Header.Set(forwardedHeader, "1")
+			if byPeer {
+				pr.Out.Header.Set(forwardedHeader, peerHop)
+			} else {
+				pr.Out.Header.Set(forwardedHeader, "1")
+			}
 			pr.Out.Header.Set(budgetHeader, strconv.FormatInt(max(remaining.Milliseconds(), 1), 10))
 			pr.Out.Header.Set(requestIDHeader, id)
 		},

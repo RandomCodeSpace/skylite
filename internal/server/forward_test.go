@@ -1194,7 +1194,19 @@ func TestForwardReadOnlyByPeerRecord(t *testing.T) {
 	gone := rand.Text()
 	plant(gone, at(gone, ln.Addr().String()))
 	_ = ln.Close()
+	// A record whose address is now a pod without office, as after the
+	// process lost office or ended and another took its address.
+	moved := rand.Text()
+	plant(moved, at(moved, pod.s.peer.address))
+	if a := leader.post(t, "channel", "reader", ex(tok(moved), 1, "SELECT 1")); a.code() != "channel_lost" || a.err()["not_executed"] != true {
+		t.Errorf("hop to a pod without office: %d %v", a.status, a.frames)
+	}
 	before := n.Load()
+	// A write channel's token never uses a peer record.
+	w := strings.Replace(tok(owner), readTokenPrefix+".", channelTokenPrefix+".", 1)
+	if a := pod.post(t, "channel", "writer", ex(w, 1, "SELECT 1")); a.code() != "channel_lost" || n.Load() != before {
+		t.Errorf("write token with a peer record: %d %v, forwarded %d times", a.status, a.frames, n.Load()-before)
+	}
 	for _, tc := range []struct{ name, instance, code string }{
 		{"no peer record", rand.Text(), "channel_lost"},
 		{"not an instance", forged, "channel_lost"},
