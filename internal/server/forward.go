@@ -38,7 +38,7 @@ import (
 const (
 	forwardedHeader = "Skylite-Forwarded"
 	// peerHop is forwardedHeader's value on a hop routed by a peer record.
-	peerHop = "peer"
+	peerHop         = "peer"
 	budgetHeader    = "Skylite-Budget-Ms"
 	requestIDHeader = "Skylite-Request-Id"
 )
