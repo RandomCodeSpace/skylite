@@ -25,11 +25,11 @@ The server uses these Blob service operations on the container, and no others:
 
 | Operation | Used for |
 |---|---|
-| Put Blob, with `If-None-Match: *` or `If-Match` | Every write: commits, base objects, manifests, the lease, the leader record, and the rewrite of a compacted commit to its retired header (`If-Match`). Each write is one request; the server never stages blocks. |
+| Put Blob, with `If-None-Match: *` or `If-Match` | Every write: commits, base objects, manifests, the lease, the leader and peer records, and the rewrite of a compacted commit to its retired header (`If-Match`). Each write is one request; the server never stages blocks. |
 | Get Blob, including ranged reads | Reading pages, commits, the manifest and the lease. |
 | Get Blob Properties | Checking an object's size and version. |
 | List Blobs | Finding commits and compacted objects under a database. |
-| Delete Blob | Removing base objects that compaction has replaced. Commits are never deleted. |
+| Delete Blob | Removing base objects that compaction has replaced, and a pod's peer record when it shuts down. Commits are never deleted. |
 
 The built-in role **Storage Blob Data Contributor** covers all of them. **Storage Blob Data Reader** does not, because the server writes and deletes. Assign the role to the identity the server runs as, at the narrowest scope that works for you; the container scope looks like this:
 
@@ -107,6 +107,7 @@ Each database lives under `<prefix>/<database>/` in the container, or `<database
 | `<prefix>/<database>/manifest` | The database's current state: which compacted objects and which commits make it up. Only ever replaced with a conditional write. |
 | `<prefix>/<database>/lease` | Which server leads the database, and until when. |
 | `<prefix>/<database>/leader` | The leader's peer address, for request forwarding between pods. |
+| `<prefix>/_peers/<instance>` | One server process's peer address, for routing read-only channel requests. Written at start with `peer` set and follower reads on, deleted on a clean shutdown. |
 | `<prefix>/<database>/<id>/log/<txn>` | One commit, as uploaded before the write was acknowledged. `<id>` is the database's 32-hex-digit identifier, `<txn>` the 20-digit transaction number. |
 | `<prefix>/<database>/<id>/base/<group>-<txn>-<tag>` | Compacted pages, 256 pages of 4 KiB per object. |
 
