@@ -34,10 +34,15 @@ import (
 	"github.com/RandomCodeSpace/skylite/internal/storage"
 )
 
+// DefaultGrace is the grace period a leader uses when its Config sets none:
+// commits are retired no sooner than this after a manifest covering them
+// became current, and garbage is deleted no sooner than this after it was
+// found.
+const DefaultGrace = 5 * time.Minute
+
 const (
 	defaultCompactBytes    = 256 << 20
 	defaultCompactInterval = time.Minute
-	defaultGrace           = 5 * time.Minute
 	// passBatch is how many commits one retirement pass reads, and how many
 	// garbage keys one collection pass deletes, before the pass releases
 	// the compaction lock to a compaction or maintenance step 7.
@@ -462,7 +467,7 @@ func (l *Leader) compactWantedLocked() bool {
 
 func (l *Leader) compactBytes() int64 { return cmp.Or(l.cfg.CompactBytes, defaultCompactBytes) }
 
-func (l *Leader) grace() time.Duration { return cmp.Or(l.cfg.Grace, defaultGrace) }
+func (l *Leader) grace() time.Duration { return cmp.Or(l.cfg.Grace, DefaultGrace) }
 
 // tend does the compaction, retirement and collection work that is due.
 func (l *Leader) tend() {

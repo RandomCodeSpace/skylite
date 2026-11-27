@@ -127,6 +127,7 @@ type Server struct {
 	dir      string               // the leaders' local files
 	stopping atomic.Bool          // Serve is shutting down: not ready
 	instance string               // this process's instance identifier, which channel tokens name
+	peered   atomic.Bool          // this process's peer record is published (announcePeer)
 
 	// chMu guards the channel tables, their channels and write locks, and
 	// the counts below (channel.go).
@@ -503,12 +504,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 
 // database is a configured database: its office loop, the leader that last
 // met a tail bound it cannot compact past, which leaves this server not
-// ready while it leads, and the channel table of its current leader, guarded
-// by Server.chMu.
+// ready while it leads, and the channel tables of its current leader and of
+// its follower's read-only channels, guarded by Server.chMu.
 type database struct {
 	loop  *office.Loop
 	tail  atomic.Pointer[engine.Leader]
 	chans *table
+	reads *table
 }
 
 // leader returns the database's leader while this server serves it, or nil.
@@ -814,6 +816,11 @@ func (s *Server) handle(st *stream, r *http.Request, t *ticket, id string, log *
 	}
 	forward := !hop && s.peer != nil && d != nil && kind != wire.KindPut && leader == nil
 	stateless := kind == wire.KindQuery || kind == wire.KindDescribe
+	owned := kind == wire.KindChannel || kind == wire.KindCancel || kind == wire.KindClose
+	// A standby with follower reads and a peer listener owns the read-only
+	// channels opened on it; other pods reach them by its peer record.
+	standby := leader == nil && follower != nil && s.peer != nil
+	byPeer := hop && leader == nil && r.Header.Get(forwardedHeader) == peerHop
 	switch {
 	case kind == wire.KindStatus && leader == nil:
 		// Only a POST with a body is forwarded (forward.go).
@@ -824,12 +831,12 @@ func (s *Server) handle(st *stream, r *http.Request, t *ticket, id string, log *
 		}
 		done, e = s.status(d, leader)
 		return done, e, true
-	case hop && leader == nil && r.Header.Get(forwardedHeader) == peerHop:
+	case byPeer && !standby:
 		// A hop by peer record names a read-only channel of this process,
-		// whose channels ended with its office, or of a process that held
+		// whose channels ended with its follower, or of a process that held
 		// this address before; neither is served here.
 		return nil, wire.NewError(wire.CodeChannelLost, "the read-only channel's process no longer serves it"), false
-	case kind != wire.KindPut && leader == nil && !forward && (follower == nil || !stateless):
+	case kind != wire.KindPut && leader == nil && !forward && (!byPeer || !owned) && (follower == nil || !stateless):
 		return nil, wire.NewError(wire.CodeNotServing, "this server does not lead the database or serve this request on a follower"), false
 	}
 	// cancel, close and resolve are not charged to the body share: their
@@ -865,17 +872,24 @@ func (s *Server) handle(st *stream, r *http.Request, t *ticket, id string, log *
 	// Check 8 before the local lookup, on a leader too: a leader deposed
 	// without noticing yet must not answer channel_lost for a channel of
 	// the leader in office. A token naming another process goes there.
-	if !hop && s.peer != nil && leader != nil && (kind == wire.KindChannel || kind == wire.KindCancel || kind == wire.KindClose) {
+	if !hop && s.peer != nil && leader != nil && owned {
 		forward = tokenInstance(req.Channel) != s.instance
 	}
-	if forward && (!stateless || follower == nil) {
+	// A standby serves a read-only open itself, and a request on a token
+	// naming this process, or sent here by its peer record, from its table.
+	local := standby && (kind == wire.KindOpen && req.Mode == wire.ModeReadOnly || owned && (byPeer || tokenInstance(req.Channel) == s.instance))
+	if forward && !local && (!stateless || follower == nil) {
 		return nil, s.forward(st, r, kind, db, req, body, id, arrived, log), true
 	}
 	switch kind {
 	case wire.KindPut:
 		done, e = s.create(r.Context(), db, p, log)
 	case wire.KindOpen:
-		done, e = s.openChannel(d, leader, req, who)
+		done, e = s.openChannel(r.Context(), d, leader, follower, req, who)
+		// A standby that cannot own the channel hands the open to the leader.
+		if forward && e != nil && (e.Code == wire.CodeNotServing || e.Code == wire.CodeBehind || e.Code == wire.CodeOverloaded || e.Code == wire.CodeTooManyChannels) {
+			return nil, s.forward(st, r, kind, db, req, body, id, arrived, log), true
+		}
 	case wire.KindChannel:
 		done, e = s.channelRequest(r.Context(), st, d, leader, req, body, who, id, log)
 	case wire.KindClose:

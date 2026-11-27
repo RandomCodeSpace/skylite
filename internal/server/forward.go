@@ -197,7 +197,11 @@ func (s *Server) announcePeer(ctx context.Context) {
 			err = nil
 		}
 	}
+	// Until then other pods cannot route to this process, so it owns no
+	// read-only channel.
+	s.peered.Store(err == nil || errors.Is(err, storage.ErrPreconditionFailed))
 	<-ctx.Done()
+	s.peered.Store(false)
 	dctx, cancel := context.WithTimeout(context.Background(), s.createTimeout)
 	defer cancel()
 	if err := s.store.Delete(dctx, key); err != nil {

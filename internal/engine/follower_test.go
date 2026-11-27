@@ -102,7 +102,7 @@ func TestFollowerWait(t *testing.T) {
 		defer cancel()
 		check(short, 3, context.DeadlineExceeded, 20*time.Millisecond)
 
-		time.Sleep(followerFreshness)
+		time.Sleep(FollowerFreshness)
 		check(ctx, 3, ErrStale, 500*time.Millisecond)
 		f.current = &Reader{txn: 2, observedAt: time.Now()}
 		stop()

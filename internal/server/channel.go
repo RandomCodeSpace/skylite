@@ -35,7 +35,8 @@ import (
 // both until its commit, its rollback, or its abort by SQLite, a
 // transaction limit or the engine, and its connection is then closed. A
 // describe with no transaction open runs on a pooled connection. Read-only
-// channels are not built. Resolve is in resolve.go.
+// channels are below: on the leader, and on a standby whose follower serves
+// them. Resolve is in resolve.go.
 
 // Channel bounds of ADR 0005 decision 9, and this server's shares of the
 // memory budget for channels: a receipt per channel, held result rows and
@@ -74,11 +75,13 @@ func defaultChLimits() chLimits {
 }
 
 // table holds the write channels of one leader, the database's leader on
-// this server at one epoch. Every field of a table and of its channels is
-// guarded by Server.chMu.
+// this server at one epoch; or, with follower set and leader nil, the
+// read-only channels of one follower of a database this server stands by
+// for. Every field of a table and of its channels is guarded by
+// Server.chMu.
 type table struct {
 	leader *engine.Leader
-	office engine.Office
+	office engine.Office       // a follower's table's has only DB
 	chans  map[string]*channel // by token
 	by     map[string]int      // channels per principal
 	replay int64               // retained replay data
@@ -88,6 +91,9 @@ type table struct {
 	// reading holds, per principal, the channel its one resolve that reads
 	// headers from storage closes when it is done.
 	reading map[string]chan struct{}
+	// follower, set with a nil leader, is the follower whose read-only
+	// channels the table holds.
+	follower *engine.Follower
 }
 
 // channel is one write channel.
@@ -177,6 +183,67 @@ func (s *Server) table(d *database, leader *engine.Leader) *table {
 	return d.chans
 }
 
+// readTable returns the table of the read-only channels of follower f, which
+// serves d while this server stands by for it, or nil if f no longer serves
+// d or it has no table and pin is nil. With pin, a snapshot of f, it creates
+// the table if there is none. A table of an earlier follower is ended, and a
+// table ends when its follower stops: when this server takes office, shuts
+// down, or stops following.
+func (s *Server) readTable(d *database, f *engine.Follower, pin *engine.ReadPin) *table {
+	if l, cur := d.serving(); l != nil || cur != f || f == nil || closed(f.Done()) {
+		return nil
+	}
+	s.chMu.Lock()
+	defer s.chMu.Unlock()
+	if t := d.reads; t != nil {
+		if t.follower == f {
+			return t
+		}
+		s.endTable(t)
+		d.reads = nil
+	}
+	if pin == nil {
+		return nil
+	}
+	t := &table{follower: f, office: engine.Office{DB: pin.DB()}, chans: map[string]*channel{}, by: map[string]int{}}
+	d.reads = t
+	go func() {
+		<-f.Done()
+		s.chMu.Lock()
+		defer s.chMu.Unlock()
+		if d.reads == t {
+			s.endTable(t)
+			d.reads = nil
+		}
+	}()
+	return t
+}
+
+// owner returns the table of d's channels this server serves: leader's, or
+// with no leader, the read-only channels of d's follower here.
+func (s *Server) owner(d *database, leader *engine.Leader) (*table, *wire.Error) {
+	if leader == nil {
+		_, f := d.serving()
+		if t := s.readTable(d, f, nil); t != nil {
+			return t, nil
+		}
+		return nil, wire.NewError(wire.CodeChannelLost, "the channel does not exist on this server, belongs to another principal, or has ended")
+	}
+	if t := s.table(d, leader); t != nil {
+		return t, nil
+	}
+	return nil, wire.NewError(wire.CodeNotServing, "the leader stopped serving the database")
+}
+
+// head is the transaction number t answers with outside a transaction: its
+// leader's head, or its follower's latest snapshot.
+func (t *table) head() uint64 {
+	if t.leader != nil {
+		return t.leader.Head()
+	}
+	return t.follower.Txn()
+}
+
 // endTable ends every channel of t, with s.chMu held.
 func (s *Server) endTable(t *table) {
 	for _, ch := range t.chans {
@@ -241,8 +308,12 @@ func (s *Server) sweep(ctx context.Context) {
 			if t := d.chans; t != nil && t.leader != cur {
 				s.endTable(t)
 				d.chans = nil
-			} else if t != nil {
-				now := time.Now()
+			}
+			now := time.Now()
+			for _, t := range []*table{d.chans, d.reads} { // readTable ends d.reads
+				if t == nil {
+					continue
+				}
 				for _, ch := range t.chans {
 					switch {
 					case ch.running:
@@ -261,23 +332,44 @@ func (s *Server) sweep(ctx context.Context) {
 	}
 }
 
-// openChannel serves an open on d, which leader leads. In this version the
-// leader owns read-only channels too.
-func (s *Server) openChannel(d *database, leader *engine.Leader, req *wire.Request, who string) (*wire.Done, *wire.Error) {
+// openChannel serves an open on d, which leader leads, or, with no leader, a
+// read-only open on d's follower, which then owns the channel: it opens at
+// the follower's snapshot at or above min_txn within the catch-up limit.
+func (s *Server) openChannel(ctx context.Context, d *database, leader *engine.Leader, follower *engine.Follower, req *wire.Request, who string) (*wire.Done, *wire.Error) {
 	ro := req.Mode == wire.ModeReadOnly
-	if head := leader.Head(); ro && head < uint64(req.MinTxn) { //nolint:gosec // min_txn is from 0 to 2^63-1
-		return nil, wire.NewError(wire.CodeBehind, fmt.Sprintf("the leader's head, transaction %d, is below min_txn %d", head, req.MinTxn))
-	}
-	t := s.table(d, leader)
-	if t == nil {
-		return nil, wire.NewError(wire.CodeNotServing, "the leader stopped serving the database")
+	var t *table
+	var head uint64
+	if leader == nil {
+		if !s.peered.Load() {
+			return nil, followerUnavailable()
+		}
+		pin, e := s.pinRead(ctx, follower, req.MinTxn)
+		if e != nil {
+			return nil, e
+		}
+		if !s.pool.txnRoom(who) {
+			return nil, wire.NewError(wire.CodeOverloaded, "read-only transactions hold their share of the server's or the principal's SQLite connections; retry later")
+		}
+		if t = s.readTable(d, follower, pin); t == nil {
+			return nil, followerUnavailable()
+		}
+		head = pin.Txn()
+	} else {
+		if head := leader.Head(); ro && head < uint64(req.MinTxn) { //nolint:gosec // min_txn is from 0 to 2^63-1
+			return nil, wire.NewError(wire.CodeBehind, fmt.Sprintf("the leader's head, transaction %d, is below min_txn %d", head, req.MinTxn))
+		}
+		if t = s.table(d, leader); t == nil {
+			return nil, wire.NewError(wire.CodeNotServing, "the leader stopped serving the database")
+		}
 	}
 	s.chMu.Lock()
 	defer s.chMu.Unlock()
 	if s.nChans >= s.chl.channels || len(t.chans) >= s.chl.perDB || t.by[who] >= s.chl.perPrincipal {
 		return nil, wire.NewError(wire.CodeTooManyChannels, "a channel bound of this server, its database or the principal was reached; close a channel")
 	}
-	head := leader.Head()
+	if leader != nil {
+		head = leader.Head()
+	}
 	secret := make([]byte, 32)
 	_, _ = rand.Read(secret)
 	id := make([]byte, 16)
@@ -389,12 +481,13 @@ func replayed(ch *channel) (*wire.Done, *wire.Error, []byte) {
 	return &d, nil, ch.data
 }
 
-// channelRequest serves a sequenced request on d, which leader leads; body
-// is its exact body and id its request id.
+// channelRequest serves a sequenced request on d, which leader leads, or, with
+// no leader, on a read-only channel of d's follower; body is its exact body
+// and id its request id.
 func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, leader *engine.Leader, req *wire.Request, body []byte, who, id string, log *slog.Logger) (_ *wire.Done, lostErr *wire.Error) {
-	t := s.table(d, leader)
-	if t == nil {
-		return nil, wire.NewError(wire.CodeNotServing, "the leader stopped serving the database")
+	t, e := s.owner(d, leader)
+	if e != nil {
+		return nil, e
 	}
 	seq, sum := req.Seq, sha256.Sum256(body)
 	// check returns the channel and the sequence table's verdict, with
@@ -443,12 +536,21 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 		limit = min(limit, time.Duration(req.TimeoutMS)*time.Millisecond)
 	}
 	deadline := time.Now().Add(limit)
-	if starts && req.MinTxn > 0 && leader.Head() < uint64(req.MinTxn) { //nolint:gosec // min_txn is from 0 to 2^63-1
-		return nil, s.ownedLocked(wire.NewError(wire.CodeBehind, fmt.Sprintf("the leader's head, transaction %d, is below min_txn %d", leader.Head(), req.MinTxn)), ch, seq)
+	// On a follower, the snapshot is pinned here, within the catch-up limit,
+	// and a transaction keeps it to its end.
+	var pin *engine.ReadPin
+	switch {
+	case pooled && t.follower != nil:
+		var e *wire.Error
+		if pin, e = s.pinRead(ctx, t.follower, req.MinTxn); e != nil {
+			return nil, s.ownedLocked(e, ch, seq)
+		}
+	case starts && req.MinTxn > 0 && t.leader.Head() < uint64(req.MinTxn): //nolint:gosec // min_txn is from 0 to 2^63-1
+		return nil, s.ownedLocked(wire.NewError(wire.CodeBehind, fmt.Sprintf("the leader's head, transaction %d, is below min_txn %d", t.leader.Head(), req.MinTxn)), ch, seq)
 	}
 	if fresh {
-		if err := leader.Admits(); err != nil {
-			return nil, s.ownedLocked(s.engineError(d, leader, err), ch, seq)
+		if err := t.leader.Admits(); err != nil {
+			return nil, s.ownedLocked(s.engineError(d, t.leader, err), ch, seq)
 		}
 	}
 	// A pooled connection, released after the request unless a read-only
@@ -472,7 +574,12 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 	if pooled {
 		var e *wire.Error
 		var err error
-		if pc, e, err = s.conn(ctx, d, leader, who, reserved); e != nil {
+		if pin != nil {
+			pc, e, err = s.readConn(ctx, pin, who, reserved)
+		} else {
+			pc, e, err = s.conn(ctx, d, t.leader, who, reserved)
+		}
+		if e != nil {
 			logInternal(ctx, log, e, err)
 			return nil, s.ownedLocked(e, ch, seq)
 		}
@@ -583,9 +690,9 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 		next = wire.TxnNone
 	case req.Op == wire.OpRollback && state != wire.TxnNone:
 		s.endTxn(ch)
-		rec, next = &wire.Receipt{Done: &wire.Done{Kind: wire.DoneRollback, Txn: int64(leader.Head())}}, wire.TxnNone //nolint:gosec // as in openChannel
+		rec, next = &wire.Receipt{Done: &wire.Done{Kind: wire.DoneRollback, Txn: int64(t.head())}}, wire.TxnNone //nolint:gosec // as in openChannel
 	case req.Op == wire.OpPing:
-		txn := leader.Head()
+		txn := t.head()
 		if tx != nil {
 			txn = tx.snap
 		}
@@ -655,7 +762,7 @@ func (s *Server) record(ch *channel, rec *wire.Receipt, lost *wire.Error, data [
 			s.replay += n
 		}
 	}
-	if ch.tx != nil && closed(ch.tx.c.ec.Aborted()) {
+	if ch.tx != nil && ch.tx.c.ec != nil && closed(ch.tx.c.ec.Aborted()) {
 		// The engine ended the transaction as the request finished; watch
 		// left it to this request.
 		s.abortTxn(ch, causeMaintenance)
@@ -735,9 +842,9 @@ func (s *Server) watch(ch *channel, tx *txn) {
 // commit point and answers once it has finished, with its receipt, and on a
 // closing channel once the close has rolled back its transaction.
 func (s *Server) cancelRequest(d *database, leader *engine.Leader, req *wire.Request, who, id string) (*wire.Done, *wire.Error) {
-	t := s.table(d, leader)
-	if t == nil {
-		return nil, wire.NewError(wire.CodeNotServing, "the leader stopped serving the database")
+	t, e := s.owner(d, leader)
+	if e != nil {
+		return nil, e
 	}
 	s.chMu.Lock()
 	defer s.chMu.Unlock()
@@ -826,9 +933,9 @@ func (s *Server) send(st *stream, data []byte) {
 // until that request has finished and the first close has rolled back its
 // transaction; every close and cancel that joined it answers after that.
 func (s *Server) closeChannel(d *database, leader *engine.Leader, req *wire.Request, who string) (*wire.Done, *wire.Error) {
-	t := s.table(d, leader)
-	if t == nil {
-		return nil, wire.NewError(wire.CodeNotServing, "the leader stopped serving the database")
+	t, e := s.owner(d, leader)
+	if e != nil {
+		return nil, e
 	}
 	s.chMu.Lock()
 	ch, e := s.lookup(t, req.Channel, who)
@@ -1116,7 +1223,7 @@ func (s *Server) inTxn(ctx context.Context, d *database, t *table, ch *channel, 
 	var done *wire.Done
 	var e *wire.Error
 	auto := false
-	_, err := tx.c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
+	err := tx.c.run(ctx, func(db *sqlite3.Conn) error {
 		var ferr error
 		done, e, ferr = s.write(db, tx.c, req, &req.Statement, false, false, w, nil)
 		auto = db.GetAutocommit() // SQLite rolls back the whole transaction after some errors
@@ -1138,7 +1245,7 @@ func (s *Server) inTxn(ctx context.Context, d *database, t *table, ch *channel, 
 	}
 	// A failed describe ran nothing; a failed statement may have.
 	rec, lost := s.failure(ctx, d, t, err, e, limit, req.Op != wire.OpDescribe, log)
-	maint := errors.Is(err, engine.ErrRetry) || errors.Is(err, engine.ErrTailBound)
+	maint := errors.Is(err, engine.ErrRetry) || errors.Is(err, engine.ErrTailBound) || errors.Is(err, engine.ErrCompacted)
 	if lost == nil && !auto && !maint && !errors.Is(err, engine.ErrBroken) && !errors.Is(context.Cause(ctx), errLifetime) {
 		return rec, nil, wire.TxnOpen
 	}
@@ -1258,10 +1365,13 @@ func (s *Server) failure(ctx context.Context, d *database, t *table, err error, 
 		return recorded(wire.NewError(wire.CodeCommitFailed, "the leader was fenced by another leader's epoch")), nil
 	case errors.Is(err, engine.ErrTailBound), errors.Is(err, engine.ErrRetry):
 		return recorded(s.engineError(d, t.leader, err)), nil
+	case errors.Is(err, engine.ErrCompacted):
+		// Compaction removed what the follower's snapshot reads.
+		return recorded(wire.NewError(wire.CodeMaintenance, "compaction overtook the follower's snapshot; retry")), nil
 	case errors.Is(err, engine.ErrBroken):
 		log.LogAttrs(ctx, slog.LevelError, "write failed", slog.String("class", engineClass(err)))
 		return recorded(wire.NewError(wire.CodeInternal, "the connection broke and was discarded")), nil
-	case errors.Is(err, engine.ErrStopped), t.leader.Err() != nil:
+	case errors.Is(err, engine.ErrStopped), t.leader != nil && t.leader.Err() != nil:
 		// The leader stopped: the channel has ended, and nothing is recorded.
 		l := wire.NewError(wire.CodeChannelLost, "the leader stopped serving the database while the request ran; it did not commit")
 		l.NotExecuted = false
@@ -1387,7 +1497,7 @@ func (s *Server) describe(ctx context.Context, d *database, t *table, c *pconn, 
 	var done *wire.Done
 	var e *wire.Error
 	trusted := false
-	_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
+	err := c.run(ctx, func(db *sqlite3.Conn) error {
 		ictx := db.GetInterrupt()
 		out, err := s.writer(ictx, w)
 		if err == nil {
@@ -1402,7 +1512,7 @@ func (s *Server) describe(ctx context.Context, d *database, t *table, c *pconn, 
 		return cmp.Or(berr, errEnded)
 	})
 	if err == nil {
-		done.Txn = int64(t.leader.Head()) //nolint:gosec // as in openChannel
+		done.Txn = int64(t.head()) //nolint:gosec // as in openChannel
 		return &wire.Receipt{Done: done}, nil, true
 	}
 	rec, lost := s.failure(ctx, d, t, err, e, limit, false, log)
@@ -1429,13 +1539,62 @@ func entryError(ictx context.Context, err error) (*wire.Error, error) {
 	return e, berr
 }
 
+// pinRead pins a fresh snapshot of follower f at or above minTxn within the
+// catch-up limit, or returns the refusal before acceptance: behind if f is
+// fresh but did not reach minTxn, not_serving if it is not fresh.
+func (s *Server) pinRead(ctx context.Context, f *engine.Follower, minTxn int64) (*engine.ReadPin, *wire.Error) {
+	pin, err := f.Pin(ctx, uint64(minTxn)) //nolint:gosec // min_txn is from 0 to 2^63-1
+	switch {
+	case err == nil:
+		return pin, nil
+	case errors.Is(err, engine.ErrStale), !f.Fresh():
+		return nil, followerUnavailable()
+	case errors.Is(err, engine.ErrBehind), errors.Is(err, context.DeadlineExceeded):
+		return nil, wire.NewError(wire.CodeBehind, fmt.Sprintf("the follower did not reach min_txn %d within the catch-up limit", minTxn))
+	case errors.Is(err, context.Canceled):
+		return nil, followerUnavailable()
+	}
+	s.log.LogAttrs(ctx, slog.LevelError, "follower snapshot refused", slog.String("class", engineClass(err)))
+	return nil, wire.NewError(wire.CodeInternal, "the follower could not validate its snapshot")
+}
+
+// readConn reserves a SQLite connection slot for who, held as for the
+// pool's await, and opens a connection on pin with the policy applied; its
+// release closes it. It returns the refusal before acceptance and the error
+// behind it if it cannot.
+func (s *Server) readConn(ctx context.Context, pin *engine.ReadPin, who string, held bool) (*pconn, *wire.Error, error) {
+	if _, e := s.reserve(ctx, nil, who, held); e != nil {
+		return nil, e, nil
+	}
+	rc, err := pin.Open(ctx)
+	if err == nil {
+		c := &pconn{rc: rc}
+		if err = rc.Run(ctx, func(db *sqlite3.Conn) error {
+			var err error
+			c.pc, err = s.policy.Apply(db.GetInterrupt(), db)
+			return broken(err)
+		}); err == nil {
+			return c, nil, nil
+		}
+		_ = rc.Close()
+	}
+	s.pool.release(who, nil, false)
+	if errors.Is(err, engine.ErrCompacted) {
+		return nil, followerUnavailable(), err
+	}
+	return nil, wire.NewError(wire.CodeInternal, "the follower connection could not be opened"), err
+}
+
 // startRead makes c refuse writes, with PRAGMA query_only, so that a write
 // on a read-only channel fails with SQLITE_READONLY (ADR 0005 decision 5),
 // begins a read transaction on it and returns the transaction number of its
-// snapshot.
+// snapshot: a follower connection's own.
 func startRead(c *pconn, ictx context.Context) (uint64, error) {
 	if err := c.pc.Privileged(func(db *sqlite3.Conn) error { return db.Exec("PRAGMA query_only = ON; BEGIN") }); err != nil {
 		return 0, broken(err)
+	}
+	if c.rc != nil {
+		return c.rc.Txn(), nil
 	}
 	snap, err := c.leader.Snapshot(ictx, func() error {
 		return c.pc.Privileged(func(db *sqlite3.Conn) error { return db.Exec("PRAGMA main.schema_version") })
@@ -1457,7 +1616,7 @@ func (s *Server) readBegin(ctx context.Context, d *database, t *table, ch *chann
 	var e *wire.Error
 	var snap uint64
 	auto := false
-	_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
+	err := c.run(ctx, func(db *sqlite3.Conn) error {
 		ictx := db.GetInterrupt()
 		var err error
 		if snap, err = startRead(c, ictx); err == nil && req.Execute != nil {
@@ -1489,7 +1648,9 @@ func (s *Server) readBegin(ctx context.Context, d *database, t *table, ch *chann
 	s.chMu.Lock()
 	ch.tx, *took = tx, true // together: from here dropTxn alone releases c and its place
 	s.chMu.Unlock()
-	go s.watch(ch, tx)
+	if c.ec != nil { // a follower's snapshot has no engine to end it
+		go s.watch(ch, tx)
+	}
 	return &wire.Receipt{Done: done}, nil, wire.TxnOpen
 }
 
@@ -1505,7 +1666,7 @@ func (s *Server) read(ctx context.Context, d *database, t *table, c *pconn, req 
 	var e *wire.Error
 	var snap uint64
 	clean, trusted := false, false
-	_, err := c.ec.Run(ctx, nil, func(db *sqlite3.Conn) error {
+	err := c.run(ctx, func(db *sqlite3.Conn) error {
 		ictx := db.GetInterrupt()
 		var err error
 		if snap, err = startRead(c, ictx); err == nil {
