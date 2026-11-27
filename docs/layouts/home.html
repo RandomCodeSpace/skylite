@@ -6,7 +6,7 @@
   <h1 id="hero-title">A SQL database server where object storage is the source of truth.</h1>
   <div class="hero-text">
     <p class="lede">skylite is a SQL server built on SQLite that keeps all durable state in object storage, with Azure Blob Storage as its primary backend. It needs no persistent volume: its own disk is scratch space. Applications connect over HTTPS with a Go <code>database/sql</code> driver or a JDBC driver.</p>
-    <p class="redmark"><strong>Beta, v0.0.3.</strong> The server runs reads, writes and transactions, with leader failover and follower reads. The Azure backend has been tested against a real storage account, failover included; S3 and Google Cloud Storage only against emulators. It has not run on a Kubernetes cluster yet, and there is no container image.</p>
+    <p class="redmark"><strong>Beta.</strong> The server runs reads, writes and transactions, with leader failover and follower reads. The Azure backend has been tested against a real storage account, failover included; S3 and Google Cloud Storage only against emulators. It has not run on a Kubernetes cluster yet. Releases are signed binaries; there is no container image.</p>
     <p class="actions">
       <a class="btn btn-primary" href="{{ $start.RelPermalink }}">Quick start</a>
       <a class="btn" href="{{ (site.GetPage "/docs").RelPermalink }}">Documentation</a>
