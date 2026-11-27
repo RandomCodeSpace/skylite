@@ -138,9 +138,9 @@ type Server struct {
 	afterCommit  func() error  // nil; a test sets it to fail a write after its COMMIT
 	hdrSem       chan struct{} // header reads in flight for resolves (resolve.go)
 	// nil; a test sets them to act between the sweep's start on a database
-	// and its look at the channel table, and between a resolve's step 1 and
-	// its observation.
-	sweepGap, resolveGap func()
+	// and its look at the channel table, between a resolve's step 1 and its
+	// observation, and between an open's choice of table and its insert.
+	sweepGap, resolveGap, openGap func()
 
 	budget              int64 // the memory budget, divided by shares
 	bodyMu              sync.Mutex

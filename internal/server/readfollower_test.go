@@ -220,6 +220,64 @@ func TestFollowerReadOnlyMinTxn(t *testing.T) {
 	pod.noReadTxns(t)
 }
 
+// TestFollowerReadOnlyStale: on a follower's channel, a request that needs
+// a new snapshot while the follower is not fresh is behind, not executed
+// and not final, so the driver opens a new channel; a transaction open on
+// the channel keeps reading its pinned snapshot.
+func TestFollowerReadOnlyStale(t *testing.T) {
+	p := peerConfig(t)
+	leader, _ := newPeerLeader(t, p)
+	leader.exec(t, "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1)")
+	st := &standbyStore{}
+	pod := newStandby(t, leader, p, st)
+	head := leader.head(t)
+	tok, _ := pod.openAt(t, head)
+	held, _ := pod.openAt(t, head)
+	if a := pod.post(t, "channel", "reader", sq(held, 1, "begin")); a.done()["txn_state"] != "open" {
+		t.Fatalf("begin: %v", a.frames)
+	}
+	pauseReplica(t, &st.replicaStore)
+	waitReplica(t, func() bool { return !pod.s.ready() }, 2200*time.Millisecond, "the follower stayed fresh")
+	for i, body := range []string{sq(tok, 1, "begin"), ex(tok, 1, "SELECT 1")} {
+		if a := pod.post(t, "channel", "reader", body); a.status != http.StatusServiceUnavailable || a.code() != "behind" || a.err()["not_executed"] != true || a.err()["final"] == true {
+			t.Errorf("request %d on a stale follower's channel: %d %v", i, a.status, a.frames)
+		}
+	}
+	if a := pod.post(t, "channel", "reader", ex(held, 2, "SELECT count(*) FROM t")); len(a.rows()) != 1 || a.rows()[0] != "[1]" || a.done()["txn_state"] != "open" {
+		t.Errorf("a read in the transaction on a stale follower: %d %v", a.status, a.frames)
+	}
+	pod.post(t, "channel/close", "reader", closeBody(held))
+	pod.post(t, "channel/close", "reader", closeBody(tok))
+	pod.noReadTxns(t)
+}
+
+// TestFollowerReadOnlyOpenRace: an open whose follower stops between the
+// choice of its table and the insert goes to the leader and leaves no
+// channel counted on the standby.
+func TestFollowerReadOnlyOpenRace(t *testing.T) {
+	p := peerConfig(t)
+	leader, _ := newPeerLeader(t, p)
+	leader.exec(t, "CREATE TABLE t (a INTEGER)")
+	pod := newStandby(t, leader, p, &standbyStore{})
+	d := pod.s.dbs["d"]
+	pod.s.openGap = func() { // as the follower's stop does
+		pod.s.openGap = nil
+		pod.s.chMu.Lock()
+		defer pod.s.chMu.Unlock()
+		pod.s.endTable(d.reads)
+		d.reads = nil
+	}
+	if tok, _ := pod.openAt(t, leader.head(t)); !strings.HasPrefix(tok, readTokenPrefix+"."+leader.s.instance+".") {
+		t.Errorf("an open racing its follower's stop went to %q", tok)
+	}
+	pod.s.chMu.Lock()
+	n := pod.s.nChans
+	pod.s.chMu.Unlock()
+	if n != 0 {
+		t.Errorf("the standby counts %d channels", n)
+	}
+}
+
 // TestFollowerReadOnlyPeerRecord: until its peer record is published, which
 // other pods route its channels by, a standby forwards read-only opens to
 // the leader.

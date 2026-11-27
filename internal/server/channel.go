@@ -340,15 +340,18 @@ func (s *Server) openChannel(ctx context.Context, d *database, leader *engine.Le
 	var t *table
 	var head uint64
 	if leader == nil {
+		if !ro {
+			return nil, wire.NewError(wire.CodeInternal, "a write channel opens only on the database's leader")
+		}
 		if !s.peered.Load() {
 			return nil, followerUnavailable()
+		}
+		if !s.pool.txnRoom(who) {
+			return nil, wire.NewError(wire.CodeOverloaded, "read-only transactions hold their share of the server's or the principal's SQLite connections; retry later")
 		}
 		pin, e := s.pinRead(ctx, follower, req.MinTxn)
 		if e != nil {
 			return nil, e
-		}
-		if !s.pool.txnRoom(who) {
-			return nil, wire.NewError(wire.CodeOverloaded, "read-only transactions hold their share of the server's or the principal's SQLite connections; retry later")
 		}
 		if t = s.readTable(d, follower, pin); t == nil {
 			return nil, followerUnavailable()
@@ -362,8 +365,14 @@ func (s *Server) openChannel(ctx context.Context, d *database, leader *engine.Le
 			return nil, wire.NewError(wire.CodeNotServing, "the leader stopped serving the database")
 		}
 	}
+	if s.openGap != nil {
+		s.openGap()
+	}
 	s.chMu.Lock()
 	defer s.chMu.Unlock()
+	if leader == nil && d.reads != t { // the follower stopped since readTable, which ended t
+		return nil, followerUnavailable()
+	}
 	if s.nChans >= s.chl.channels || len(t.chans) >= s.chl.perDB || t.by[who] >= s.chl.perPrincipal {
 		return nil, wire.NewError(wire.CodeTooManyChannels, "a channel bound of this server, its database or the principal was reached; close a channel")
 	}
@@ -543,6 +552,9 @@ func (s *Server) channelRequest(ctx context.Context, st *stream, d *database, le
 	case pooled && t.follower != nil:
 		var e *wire.Error
 		if pin, e = s.pinRead(ctx, t.follower, req.MinTxn); e != nil {
+			if e.Code == wire.CodeNotServing { // so the driver gives the channel up and opens a new one, on the leader
+				e = wire.NewError(wire.CodeBehind, "this server's follower is not fresh; open a new channel")
+			}
 			return nil, s.ownedLocked(e, ch, seq)
 		}
 	case starts && req.MinTxn > 0 && t.leader.Head() < uint64(req.MinTxn): //nolint:gosec // min_txn is from 0 to 2^63-1

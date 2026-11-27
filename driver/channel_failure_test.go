@@ -539,6 +539,37 @@ func TestBehindIsSentOnANewChannel(t *testing.T) {
 	}
 }
 
+// TestReadOnlyBehindIsSentOnANewChannel refuses a read-only begin with
+// behind, as a standby's stale follower does on a channel it owns: the
+// begin carries the watermark the open raised as min_txn, so the driver
+// closes the channel and begins again on a new one.
+func TestReadOnlyBehindIsSentOnANewChannel(t *testing.T) {
+	var begins atomic.Int32
+	f := newFake(t, true, channels(func(w http.ResponseWriter, ww *wire.Writer, c call, _ *http.Request) {
+		switch c.req.Op {
+		case wire.OpBegin:
+			if begins.Add(1) == 1 {
+				refuse(w, ww, wire.NewError(wire.CodeBehind, "the follower is not fresh"))
+				return
+			}
+			_ = ww.Done(&wire.Done{Kind: wire.DoneBegin, Seq: c.req.Seq, TxnState: wire.TxnOpen, Txn: 1})
+		case wire.OpRollback:
+			_ = ww.Done(&wire.Done{Kind: wire.DoneRollback, Seq: c.req.Seq, TxnState: wire.TxnNone, Txn: 1})
+		}
+	}))
+	db := openDB(t, f.config())
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := kinds(f.lastCalls()), "open begin close open begin rollback"; got != want {
+		t.Errorf("calls %q; want %q", got, want)
+	}
+}
+
 // TestExecDropsRows reads an answer's rows without keeping them when the
 // caller does not want them.
 func TestExecDropsRows(t *testing.T) {
