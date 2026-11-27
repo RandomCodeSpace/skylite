@@ -68,7 +68,7 @@ These timings are at the default `lease_ttl` of 60 seconds; the outage after a k
 
 ## Shutdown
 
-On SIGTERM or SIGINT the server reports itself not ready, stops accepting connections, waits up to one minute for running requests, releases its leases and exits with status 0. If requests are still running after a minute, it closes their connections and exits with status 1. A second signal ends it at once. Give the process more than 60 seconds between SIGTERM and SIGKILL (in Kubernetes, `terminationGracePeriodSeconds` above 60).
+On SIGTERM or SIGINT the server reports itself not ready, stops accepting connections, waits up to one minute for running requests, releases its leases and exits with status 0. If requests are still running after a minute, it closes their connections and exits with status 1. A second signal ends it at once. Give the process more than 60 seconds between SIGTERM and SIGKILL (in Kubernetes, `terminationGracePeriodSeconds` above 60). Releasing the leases can take up to `lease_ttl` more against a stalled store; a process killed during the release is safe, but the next leader then waits for the lease to expire.
 
 ## Readiness
 
