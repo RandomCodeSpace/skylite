@@ -22,10 +22,11 @@ var ErrStale = fmt.Errorf("%w: no fresh snapshot", ErrBehind)
 // FollowerMaxWait bounds the time spent waiting for a fresh snapshot.
 const FollowerMaxWait = 500 * time.Millisecond
 
-const (
-	followerPollInterval = 250 * time.Millisecond
-	followerFreshness    = 2 * time.Second
-)
+// FollowerFreshness is how old the follower's last observation of the log's
+// end may be for it to admit a snapshot.
+const FollowerFreshness = 2 * time.Second
+
+const followerPollInterval = 250 * time.Millisecond
 
 // Follower tails the durable history of one database. Its published
 // Reader and index are immutable and may be shared by any number of pins.
@@ -64,7 +65,7 @@ func (f *Follower) Fresh() bool {
 }
 
 func fresh(r *Reader) bool {
-	return r != nil && time.Since(r.observedAt) < followerFreshness
+	return r != nil && time.Since(r.observedAt) < FollowerFreshness
 }
 
 func (f *Follower) follow(st storage.Store, keys format.Keys, cache *Cache) {
@@ -85,7 +86,7 @@ func (f *Follower) follow(st storage.Store, keys format.Keys, cache *Cache) {
 		case <-t.C:
 		}
 		if err != nil {
-			delay = min(delay*2, followerFreshness)
+			delay = min(delay*2, FollowerFreshness)
 		}
 	}
 }
@@ -140,6 +141,20 @@ type ReadPin struct{ reader Reader }
 
 // Txn returns the pin's durable transaction number.
 func (p *ReadPin) Txn() uint64 { return p.reader.Txn() }
+
+// DB returns the identifier of the pin's database.
+func (p *ReadPin) DB() format.DatabaseID { return p.reader.a.m.DB }
+
+// Txn returns the transaction number of the follower's latest snapshot, or
+// 0 before its first.
+func (f *Follower) Txn() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.current == nil {
+		return 0
+	}
+	return f.current.Txn()
+}
 
 // Open opens a read-only SQLite connection on this pin, subject to ctx.
 func (p *ReadPin) Open(ctx context.Context) (*ReadConn, error) {

@@ -64,8 +64,8 @@ detail = "Request bounds per pod and per principal, separate capacity for closes
 
 [[items]]
 title = "Follower-owned read channels"
-status = "planned"
-detail = "Read-only channels served by a follower rather than the leader."
+status = "done"
+detail = "Read-only channels served by a follower rather than the leader. Exists now: with a peer listener and follower reads, a standby owns a read-only channel opened on it, once its peer record is written, when its follower reaches the open's min_txn within 500 ms and the principal has room there, and otherwise forwards the open to the leader. Each pod writes a peer record, through which every other pod forwards the channel's requests to it. A transaction reads the snapshot its begin pinned, within the read-only transaction limits and the pod's connections. The channels end when their pod takes office, shuts down or stops following, not when another pod takes office. Not yet: peer records of crashed pods are never removed, the page index an open follower transaction keeps is not charged to the memory budget, and a channel that fell back to the leader stays there."
 
 [[items]]
 title = "Verification beyond emulators"

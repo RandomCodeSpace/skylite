@@ -24,11 +24,29 @@ import (
 // privileged ROLLBACK.
 
 // pconn is a pooled connection: an engine connection with the policy
-// applied, of one leader.
+// applied, of one leader; or, with rc set and leader and ec nil, a
+// connection on a follower snapshot, which is never pooled.
 type pconn struct {
 	leader *engine.Leader
 	ec     *engine.Conn
+	rc     *engine.ReadConn
 	pc     *sqlpolicy.Conn
+}
+
+// run runs fn on c's SQLite connection under ctx, outside any commit.
+func (c *pconn) run(ctx context.Context, fn func(*sqlite3.Conn) error) error {
+	if c.rc != nil {
+		return c.rc.Run(ctx, fn)
+	}
+	_, err := c.ec.Run(ctx, nil, fn)
+	return err
+}
+
+func (c *pconn) close() error {
+	if c.rc != nil {
+		return c.rc.Close()
+	}
+	return c.ec.Close()
 }
 
 // pool holds the server's SQLite connections for stateless requests. Each
@@ -110,12 +128,23 @@ func (p *pool) take(leader *engine.Leader, who string) (c, evict *pconn, ok bool
 func (p *pool) holdTxn(who string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.txns >= max(1, p.capacity/2) || p.txnsBy[who] >= max(1, p.perPrincipal-1) {
+	if !p.txnRoomLocked(who) {
 		return false
 	}
 	p.txns++
 	p.txnsBy[who]++
 	return true
+}
+
+// txnRoom reports whether holdTxn would give who a place now.
+func (p *pool) txnRoom(who string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.txnRoomLocked(who)
+}
+
+func (p *pool) txnRoomLocked(who string) bool {
+	return p.txns < max(1, p.capacity/2) && p.txnsBy[who] < max(1, p.perPrincipal-1)
 }
 
 func (p *pool) unholdTxn(who string) {
@@ -244,6 +273,7 @@ func (p *pool) roomLocked(leader *engine.Leader, who string) (c, evict *pconn, o
 // release ends who's use of c, which goes back to the pool if keep, and is
 // otherwise closed. A nil c gives up the room take reserved.
 func (p *pool) release(who string, c *pconn, keep bool) {
+	keep = keep && c.rc == nil
 	p.mu.Lock()
 	if p.busy[who]--; p.busy[who] == 0 {
 		delete(p.busy, who)
@@ -257,7 +287,7 @@ func (p *pool) release(who string, c *pconn, keep bool) {
 	p.grantLocked()
 	p.mu.Unlock()
 	if !keep && c != nil {
-		_ = c.ec.Close()
+		_ = c.close()
 	}
 }
 
