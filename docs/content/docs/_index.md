@@ -31,7 +31,7 @@ Also verified by hand against a real Azure storage account: the Azure backend's 
 
 Not verified yet: Amazon S3 and Google Cloud Storage themselves (emulators only), a Kubernetes cluster, a service mesh or ingress, a real Entra ID tenant as the token issuer for clients, driver failover across several pods, Azure workload and managed identity, and a 24-hour soak.
 
-Not available: a container image, a Helm chart, and published Maven artifacts. Releases are signed binaries for Linux and macOS, and the Java artifacts are built from source. The [roadmap](/docs/roadmap/) lists what is planned.
+Releases are signed binaries for Linux and macOS; there is no container image or Helm chart, and none is planned. Published Maven artifacts are not available: the Java artifacts are built from source. The [roadmap](/docs/roadmap/) lists what is planned.
 
 ## Where to start
 

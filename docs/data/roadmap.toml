@@ -68,11 +68,6 @@ status = "planned"
 detail = "Read-only channels served by a follower rather than the leader."
 
 [[items]]
-title = "Container image"
-status = "planned"
-detail = "A container image of the server, published with each release."
-
-[[items]]
 title = "Verification beyond emulators"
 status = "planned"
 detail = "Runs against the real S3 and Google Cloud Storage services (the Azure Blob backend has been run by hand against the real service, not yet in CI), on a real Kubernetes cluster, with a real Entra ID tenant as token issuer, driver failover across several pods end to end, and a 24-hour soak."
