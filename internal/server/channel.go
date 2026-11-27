@@ -1553,7 +1553,8 @@ func entryError(ictx context.Context, err error) (*wire.Error, error) {
 
 // pinRead pins a fresh snapshot of follower f at or above minTxn within the
 // catch-up limit, or returns the refusal before acceptance: behind if f is
-// fresh but did not reach minTxn, not_serving if it is not fresh.
+// fresh but did not reach minTxn, not_serving if it is not fresh (which a
+// channel request already owned here answers as behind instead).
 func (s *Server) pinRead(ctx context.Context, f *engine.Follower, minTxn int64) (*engine.ReadPin, *wire.Error) {
 	pin, err := f.Pin(ctx, uint64(minTxn)) //nolint:gosec // min_txn is from 0 to 2^63-1
 	switch {
