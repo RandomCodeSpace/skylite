@@ -19,7 +19,7 @@
 
   <properties>
     <java.version>21</java.version>
-    <flight-sql-jdbc.version>19.0.0</flight-sql-jdbc.version>
+    <flight-sql-jdbc.version>20.0.0</flight-sql-jdbc.version>
     <!-- Overridable with -Djdbc.url=... -Djdbc.driver=... -Djdbc.dialect=... -->
     <jdbc.dialect>org.hibernate.community.dialect.SQLiteDialect</jdbc.dialect>
     <jdbc.argLine></jdbc.argLine>
